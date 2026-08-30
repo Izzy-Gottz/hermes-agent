@@ -25,9 +25,10 @@ about each (grep ``codex_app_server`` to audit):
                                                         would start a second `claude` that cannot
                                                         reach the `memory` / `skill_manage` tools
                                                         (they are _AGENT_LOOP_TOOLS, not MCP-exposable)
-    tui_gateway/server.py        image_routing       -> forces text mode for codex_app_server; claude
-                                                        images are not forwarded either (see
-                                                        _coerce_input_text) so the same downgrade applies
+    tui_gateway/server.py        image_routing       -> forces text mode for codex_app_server; the
+                                                        claude transport forwards base64 image parts as
+                                                        stream-json image blocks (_coerce_input_blocks),
+                                                        http(s) image URLs still degrade to a placeholder
     hermes_cli/runtime_provider.py _VALID_API_MODES  -> ``"claude_code"`` added; ``claude-code`` provider resolves
                                                         with no base_url / api_key
 

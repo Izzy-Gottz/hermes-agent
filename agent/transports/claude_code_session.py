@@ -68,6 +68,8 @@ healthy replacement.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import getpass
 import json
 import logging
@@ -1345,11 +1347,11 @@ class ClaudeCodeSession:
                 return False
 
     @staticmethod
-    def _user_message(text: str) -> dict:
-        return {
-            "type": "user",
-            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
-        }
+    def _user_message(content: Any) -> dict:
+        """One stream-json user message. ``content`` is a str or a list of
+        Claude content blocks (see :func:`_coerce_input_blocks`)."""
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": str(content)}]
+        return {"type": "user", "message": {"role": "user", "content": blocks}}
 
     # ---------- per-turn ----------
 
@@ -1365,7 +1367,7 @@ class ClaudeCodeSession:
         ``turn_timeout`` bounds the whole turn; ``idle_timeout`` bounds the
         silence between two events (a wedged CLI emits nothing at all).
         """
-        text = _coerce_input_text(user_input)
+        blocks = _coerce_input_blocks(user_input)
         if not self.is_alive():
             result = TurnResult(should_retire=True)
             result.error = self._format_error(
@@ -1379,7 +1381,7 @@ class ClaudeCodeSession:
             self._interrupt_event.clear()
             return TurnResult(interrupted=True, session_id=self._session_id)
         return self._run_turn_locked(
-            text, silent=False, turn_timeout=turn_timeout, idle_timeout=idle_timeout
+            blocks, silent=False, turn_timeout=turn_timeout, idle_timeout=idle_timeout
         )
 
     def _emit(self, event: dict) -> None:
@@ -1392,7 +1394,7 @@ class ClaudeCodeSession:
 
     def _run_turn_locked(
         self,
-        text: str,
+        content: Any,
         *,
         silent: bool,
         turn_timeout: float,
@@ -1407,7 +1409,7 @@ class ClaudeCodeSession:
 
         self._turn_active = True
         self._interrupt_event.clear()
-        if not self._write(self._user_message(text)):
+        if not self._write(self._user_message(content)):
             self._turn_active = False
             result.error = self._format_error("could not write to claude stdin")
             result.should_retire = True
@@ -1562,22 +1564,145 @@ class ClaudeCodeSession:
             projector.handle(obj, result, post_result=True)
 
 
+#: Largest image forwarded to the CLI as-is (decoded bytes). Anthropic's
+#: per-image limit is 5 MB; anything bigger is downscaled (Pillow) or, when
+#: Pillow is missing, passed through with a warning so the API says why.
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+_IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_IMAGE_PLACEHOLDER = "[image attached — not forwarded to claude]"
+
+
 def _coerce_input_text(user_input: Any) -> str:
-    """Flatten a Hermes user message (str or multipart list) to text."""
+    """Flatten a Hermes user message (str or multipart list) to text.
+
+    Images become a placeholder. Kept for callers that need a text view of
+    the turn; the wire uses :func:`_coerce_input_blocks`."""
+    parts: list[str] = []
+    for block in _coerce_input_blocks(user_input):
+        if block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+        elif block.get("type") == "image":
+            parts.append("[image]")
+    return "\n".join(p for p in parts if p)
+
+
+def _coerce_input_blocks(user_input: Any) -> list[dict]:
+    """Turn a Hermes user message (str or OpenAI-style multipart list) into
+    Claude content blocks for the stream-json ``user`` message.
+
+    Text parts are joined (newline-separated, as the text-only path always
+    did) into one text block; ``image_url`` parts carrying a ``data:image/…;
+    base64,`` URL become ``{"type": "image", "source": {"type": "base64", …}}``
+    blocks — the shape the CLI accepts in streaming-input mode. An image
+    that cannot be forwarded (http(s) URL, unknown media type, bad base64)
+    is replaced by a short text placeholder so the model knows something
+    was there. Image bytes are never logged.
+    """
     if isinstance(user_input, str):
-        return user_input
-    if isinstance(user_input, list):
-        parts: list[str] = []
-        for item in user_input:
-            if isinstance(item, dict):
-                if item.get("type") == "text":
-                    parts.append(str(item.get("text") or ""))
-                elif item.get("type") == "image_url":
-                    parts.append("[image attached — not forwarded to claude]")
-            elif isinstance(item, str):
-                parts.append(item)
-        return "\n".join(p for p in parts if p)
-    return str(user_input or "")
+        return [{"type": "text", "text": user_input}]
+    if not isinstance(user_input, list):
+        return [{"type": "text", "text": str(user_input or "")}]
+    blocks: list[dict] = []
+    text_parts: list[str] = []
+
+    def _flush_text() -> None:
+        joined = "\n".join(p for p in text_parts if p)
+        text_parts.clear()
+        if joined:
+            blocks.append({"type": "text", "text": joined})
+
+    for item in user_input:
+        if isinstance(item, str):
+            text_parts.append(item)
+        elif isinstance(item, dict):
+            kind = item.get("type")
+            if kind == "text":
+                text_parts.append(str(item.get("text") or ""))
+            elif kind in ("image_url", "input_image"):
+                block = _image_block_from_part(item)
+                if block is None:
+                    text_parts.append(_IMAGE_PLACEHOLDER)
+                else:
+                    _flush_text()
+                    blocks.append(block)
+    _flush_text()
+    if not blocks:
+        blocks.append({"type": "text", "text": ""})
+    return blocks
+
+
+def _image_block_from_part(part: dict) -> Optional[dict]:
+    """``{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}``
+    → a Claude base64 image block, or None when it cannot be forwarded."""
+    ref = part.get("image_url")
+    url = ref.get("url") if isinstance(ref, dict) else ref
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    header, sep, payload = url.partition(",")
+    if not sep:
+        return None
+    meta = header[len("data:"):].split(";")
+    media_type = (meta[0] or "").strip().lower()
+    if media_type == "image/jpg":
+        media_type = "image/jpeg"
+    if "base64" not in (m.strip().lower() for m in meta[1:]):
+        return None
+    if media_type not in _IMAGE_MEDIA_TYPES:
+        return None
+    data = "".join(payload.split())      # tolerate wrapped base64
+    try:
+        raw_len = len(base64.b64decode(data, validate=True))
+    except (binascii.Error, ValueError):
+        return None
+    if raw_len > _MAX_IMAGE_BYTES:
+        shrunk = _downscale_image_b64(data, raw_len)
+        if shrunk is None:
+            logger.warning(
+                "claude-code: image of %d bytes exceeds %d and Pillow is not "
+                "installed; forwarding as-is",
+                raw_len, _MAX_IMAGE_BYTES,
+            )
+        else:
+            media_type, data = shrunk
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": data},
+    }
+
+
+def _downscale_image_b64(data: str, raw_len: int) -> Optional[tuple[str, str]]:
+    """Re-encode an oversized image as JPEG under the cap, halving the
+    longest side until it fits. Returns (media_type, base64) or None when
+    Pillow is unavailable or the image cannot be decoded."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    import io
+
+    try:
+        im = Image.open(io.BytesIO(base64.b64decode(data)))
+        im.load()
+    except Exception:
+        logger.warning("claude-code: oversized image could not be decoded; forwarding as-is")
+        return None
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    # First guess from the byte ratio, then keep halving if still over.
+    factor = min(1.0, (_MAX_IMAGE_BYTES / float(raw_len)) ** 0.5)
+    for _ in range(8):
+        w = max(1, int(im.width * factor))
+        h = max(1, int(im.height * factor))
+        out = io.BytesIO()
+        im.resize((w, h)).save(out, format="JPEG", quality=80)
+        if out.tell() <= _MAX_IMAGE_BYTES:
+            logger.info(
+                "claude-code: downscaled a %d-byte image to %dx%d (%d bytes)",
+                raw_len, w, h, out.tell(),
+            )
+            return "image/jpeg", base64.b64encode(out.getvalue()).decode("ascii")
+        factor *= 0.5
+    return None
 
 
 class _TurnProjector:

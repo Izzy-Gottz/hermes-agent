@@ -9,7 +9,10 @@ an unexpected exit.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+import logging
 import os
 import queue
 import stat
@@ -21,6 +24,8 @@ from pathlib import Path
 import pytest
 
 from agent.transports import claude_code_session as session_mod
+from agent.transports import claude_code_session as ccs
+from agent.transports.claude_code_session import _IMAGE_PLACEHOLDER, _coerce_input_blocks, _coerce_input_text
 from agent.transports.claude_code_session import (
     DEFAULT_DENY_RULES,
     GATED_HERMES_TOOLS,
@@ -825,3 +830,97 @@ class TestSessionIdRotation:
             assert session.run_turn("x").final_text == "echo: x"
         finally:
             session.close()
+
+
+# ---------------------------------------------------------------------------
+# Images: OpenAI-style image_url data URLs → stream-json image blocks
+# ---------------------------------------------------------------------------
+
+def _png_b64(w: int = 8, h: int = 8, *, noisy: bool = False) -> str:
+    from PIL import Image
+    buf = io.BytesIO()
+    if noisy:
+        # Incompressible pixels, so the PNG is big and a JPEG at half size is
+        # comfortably smaller.
+        im = Image.frombytes("RGB", (w, h), os.urandom(w * h * 3))
+    else:
+        im = Image.new("RGB", (w, h), (200, 30, 30))
+    im.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _read_inbox(path: Path) -> list[dict]:
+    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+
+class TestImageForwarding:
+    def test_data_url_becomes_image_block_on_the_wire(self, fake_claude, tmp_path, monkeypatch):
+        inbox = tmp_path / "inbox.jsonl"
+        monkeypatch.setenv("FAKE_CLAUDE_INBOX", str(inbox))
+        png = _png_b64()
+        session = _session(fake_claude)
+        try:
+            session.ensure_started()
+            result = session.run_turn([
+                {"type": "text", "text": "what is on my screen"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + png}},
+            ])
+            assert result.error is None
+        finally:
+            session.close()
+        turns = [m for m in _read_inbox(inbox) if m["type"] == "user"]
+        blocks = turns[-1]["message"]["content"]
+        assert blocks[0] == {"type": "text", "text": "what is on my screen"}
+        assert blocks[1] == {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": png},
+        }
+        # The text path is unchanged: the warm-up turn was a single text block.
+        assert turns[0]["message"]["content"][0]["type"] == "text"
+
+    def test_jpeg_media_type_is_kept(self):
+        block = _coerce_input_blocks([
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + _png_b64()}},
+        ])
+        assert block[0]["type"] == "image"
+        assert block[0]["source"]["media_type"] == "image/jpeg"
+
+    def test_http_url_and_bad_data_fall_back_to_placeholder(self):
+        blocks = _coerce_input_blocks([
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,@@@not-base64@@@"}},
+            {"type": "image_url", "image_url": {"url": "data:text/plain;base64,aGk="}},
+        ])
+        assert blocks == [{"type": "text", "text": "hi\n" + "\n".join([_IMAGE_PLACEHOLDER] * 3)}]
+
+    def test_plain_string_and_text_only_list_unchanged(self):
+        assert _coerce_input_blocks("hello") == [{"type": "text", "text": "hello"}]
+        assert _coerce_input_blocks([{"type": "text", "text": "a"}, "b"]) == [{"type": "text", "text": "a\nb"}]
+        assert _coerce_input_text([{"type": "text", "text": "a"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _png_b64()}}]) == "a\n[image]"
+
+    def test_oversized_image_is_downscaled_to_jpeg(self, monkeypatch):
+        big = _png_b64(400, 300, noisy=True)
+        raw = len(base64.b64decode(big))
+        monkeypatch.setattr(ccs, "_MAX_IMAGE_BYTES", raw // 2)
+        block = _coerce_input_blocks([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + big}},
+        ])[0]
+        assert block["source"]["media_type"] == "image/jpeg"
+        assert len(base64.b64decode(block["source"]["data"])) <= raw // 2
+        from PIL import Image
+        im = Image.open(io.BytesIO(base64.b64decode(block["source"]["data"])))
+        assert max(im.size) < 400
+
+    def test_oversized_image_without_pillow_passes_through_with_warning(self, monkeypatch, caplog):
+        big = _png_b64(64, 64)
+        monkeypatch.setattr(ccs, "_MAX_IMAGE_BYTES", 10)
+        monkeypatch.setattr(ccs, "_downscale_image_b64", lambda data, raw_len: None)
+        with caplog.at_level(logging.WARNING, logger=ccs.logger.name):
+            block = _coerce_input_blocks([
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + big}},
+            ])[0]
+        assert block["source"]["data"] == big
+        assert any("exceeds" in r.getMessage() for r in caplog.records)
+        # Never the bytes themselves.
+        assert all(big[:32] not in r.getMessage() for r in caplog.records)
