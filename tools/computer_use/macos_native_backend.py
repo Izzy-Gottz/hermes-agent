@@ -17,7 +17,25 @@ is configured). It is deliberately small: the OS tools every Mac already has.
   out-of-band as ``argv``, never spliced into a script, so a quotation mark
   in something the model read cannot become code (same rule as Moe's
   ``mac.sh``). Key combos are validated against a fixed table.
-* **Windows / apps**: System Events.
+* **Windows / apps**: ``CGWindowListCopyWindowInfo`` (every on-screen
+  window, z-ordered) for ``list_windows``; System Events for the front
+  window and the focused UI element.
+
+Landing report
+--------------
+Every mutating action (click, drag, scroll, type, key) is followed by a
+read-only focus query and the result says where the input *landed*: the
+frontmost app (name + bundle id), the focused window title and the focused
+element's AX role — and for text fields whether the value now ends with the
+text just typed (a boolean only; the field's contents are never returned).
+If the frontmost app changed because of the action the message says so
+(``front app changed: Terminal → Finder``). Live sessions showed why: a
+click meant for a chat box landed on a Finder window and the text went to
+the Finder icon view while the tool reported ``typed 7 chars``. ``type``
+therefore also refuses (``code=focus_not_editable``) when the focused
+element is not text-editable, and ``key return`` refuses when Finder is
+front with a non-text focus (it would open/rename the selection); both
+accept ``force=True``.
 
 Coordinate space
 ----------------
@@ -91,6 +109,24 @@ _MODIFIERS: Dict[str, str] = {
     "shift": "shift down", "fn": "",
 }
 _PLAIN_KEY = re.compile(r"^[A-Za-z0-9`\-=\[\]\\;',./]$")
+
+#: AX roles that take typed text. Unknown ("" — query failed or app has no
+#: AX tree, e.g. some Electron/Java apps) is allowed through so an opaque
+#: app does not block typing; Finder is the exception (see ``type_text``).
+TEXT_EDITABLE_ROLES = frozenset({
+    "AXTextField", "AXTextArea", "AXComboBox", "AXWebArea", "AXGroup",
+    "AXSearchField", "AXSecureTextField",
+})
+#: Roles that are unambiguously text entry. Finder is held to this list:
+#: its desktop reports the focus as ``AXGroup`` (verified live) and its
+#: icon/list views take type-to-select, so the lenient list above would let
+#: the exact live failure through again.
+STRICT_TEXT_ROLES = frozenset({"AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"})
+_FINDER_BUNDLE = "com.apple.finder"
+#: Seconds to let the window server settle before the post-action focus query.
+_SETTLE_S = 0.12
+#: ``list_windows`` cap.
+MAX_WINDOWS = 40
 
 
 def is_macos() -> bool:
@@ -414,18 +450,173 @@ return 'ok ' + argv.join(' ');
                             verified=False, effect="unverifiable", path="cgevent_fg",
                             delivery_mode="foreground")
 
+    # ── focus / landing ──────────────────────────────────────────────
+    # System Events rather than AXUIElement via the JXA ObjC bridge: the
+    # bridge cannot type the CFTypeRef out-parameter of
+    # AXUIElementCopyAttributeValue ("Ref has incompatible type"), and PyObjC
+    # is not a dependency. The typed suffix is argv, never script text.
+    _AS_FOCUS = '''
+on run argv
+  set suffix to ""
+  if (count of argv) > 0 then set suffix to item 1 of argv
+  tell application "System Events"
+    set p to first application process whose frontmost is true
+    set appName to name of p
+    set bid to ""
+    try
+      set bid to bundle identifier of p
+    end try
+    set thePid to unix id of p
+    set winTitle to ""
+    set r to ""
+    set sr to ""
+    set vkind to ""
+    set vmatch to "unknown"
+    try
+      set el to value of attribute "AXFocusedUIElement" of p
+      set r to role of el
+      try
+        set sr to subrole of el
+      end try
+      try
+        set v to value of el
+        if class of v is text then
+          set vkind to "text"
+          set n to length of suffix
+          if n > 0 and (length of v) >= n then
+            considering case
+              if (text -n thru -1 of v) is suffix then
+                set vmatch to "yes"
+              else
+                set vmatch to "no"
+              end if
+            end considering
+          else
+            set vmatch to "no"
+          end if
+        end if
+      end try
+      try
+        set w to value of attribute "AXWindow" of el
+        set winTitle to name of w
+      end try
+    end try
+    if winTitle is "" then
+      try
+        set winTitle to name of (first window of p whose value of attribute "AXMain" is true)
+      end try
+    end if
+    if winTitle is missing value then set winTitle to ""
+    if sr is missing value then set sr to ""
+    if r is missing value then set r to ""
+    return appName & tab & bid & tab & thePid & tab & winTitle & tab & r & tab & sr & tab & vkind & tab & vmatch
+  end tell
+end run'''
+
+    def focused_element(self, typed_suffix: str = "") -> Dict[str, Any]:
+        """Read-only: frontmost app and the focused AX element.
+
+        Returns ``{app, bundle_id, pid, window_title, role, subrole,
+        value_kind, value_ends_with_typed}``. ``value_ends_with_typed`` is
+        ``True``/``False`` only when ``typed_suffix`` was given and the element
+        has a text value, else ``None``; the value itself is never returned.
+        On failure returns ``{"error": ...}`` with the other keys empty.
+        """
+        empty: Dict[str, Any] = {"app": "", "bundle_id": "", "pid": None, "window_title": "",
+                                 "role": "", "subrole": "", "value_kind": "",
+                                 "value_ends_with_typed": None}
+        try:
+            out = self._applescript(self._AS_FOCUS, [typed_suffix] if typed_suffix else [])
+        except Exception as exc:
+            logger.debug("focused element lookup failed: %s", exc)
+            empty["error"] = str(exc).splitlines()[0][:200] if str(exc) else "focus query failed"
+            return empty
+        parts = out.split("\t")
+        if len(parts) < 8:
+            empty["error"] = "unexpected focus query output"
+            return empty
+        info = dict(empty)
+        info.update({"app": parts[0], "bundle_id": parts[1], "window_title": parts[3],
+                     "role": parts[4], "subrole": parts[5], "value_kind": parts[6]})
+        try:
+            info["pid"] = int(parts[2])
+        except ValueError:
+            pass
+        if typed_suffix and parts[6] == "text":
+            info["value_ends_with_typed"] = parts[7] == "yes"
+        return info
+
+    @staticmethod
+    def _describe_focus(f: Dict[str, Any]) -> str:
+        if f.get("error") and not f.get("app"):
+            return "focus unknown (" + str(f["error"]) + ")"
+        s = f.get("app") or "?"
+        if f.get("window_title"):
+            s += f' "{f["window_title"]}"'
+        s += " " + (f.get("role") or "unknown-role")
+        if f.get("subrole"):
+            s += f"/{f['subrole']}"
+        return s
+
+    def _landing(self, res: ActionResult, before: Dict[str, Any],
+                 typed: Optional[str] = None) -> ActionResult:
+        """Decorate a mutating result with where the input landed.
+
+        Adds ``front_app``, ``focused``, ``front_app_changed`` (and
+        ``front_app_before`` when it changed) to ``meta`` and appends a
+        ``→ App "title" AXRole`` clause to the message.
+        """
+        if _SETTLE_S:
+            time.sleep(_SETTLE_S)
+        after = self.focused_element(typed or "")
+        res.meta["front_app"] = {"name": after.get("app", ""), "bundle_id": after.get("bundle_id", ""),
+                                 "pid": after.get("pid")}
+        focused = {"role": after.get("role", ""), "subrole": after.get("subrole", ""),
+                   "window_title": after.get("window_title", "")}
+        if typed:
+            focused["value_ends_with_typed"] = after.get("value_ends_with_typed")
+        if after.get("error"):
+            focused["error"] = after["error"]
+        res.meta["focused"] = focused
+        msg = res.message + " → " + self._describe_focus(after)
+        if typed:
+            v = after.get("value_ends_with_typed")
+            msg += " (value ends with typed text: " + ("yes" if v else "no" if v is False else "unknown") + ")"
+        b_id, a_id = before.get("bundle_id") or before.get("app"), after.get("bundle_id") or after.get("app")
+        changed = bool(b_id) and bool(a_id) and b_id != a_id
+        res.meta["front_app_changed"] = changed
+        if changed:
+            res.meta["front_app_before"] = {"name": before.get("app", ""), "bundle_id": before.get("bundle_id", "")}
+            msg += f"; front app changed: {before.get('app') or b_id} → {after.get('app') or a_id}"
+        res.message = msg
+        return res
+
+    def _guard_refusal(self, action: str, before: Dict[str, Any], reason: str) -> ActionResult:
+        return ActionResult(
+            ok=False, action=action, code="focus_not_editable",
+            message=f"{action} refused: {reason} — focus is {self._describe_focus(before)}. "
+                    "Click the intended field first (check `focused` in the click result, or "
+                    "action='focused_element'), or pass force=true to send it anyway.",
+            meta={"front_app": {"name": before.get("app", ""), "bundle_id": before.get("bundle_id", ""),
+                                "pid": before.get("pid")},
+                  "focused": {"role": before.get("role", ""), "subrole": before.get("subrole", ""),
+                              "window_title": before.get("window_title", "")}},
+            verified=False, effect="suspected_noop", path="cgevent_fg", delivery_mode="foreground")
+
     def click(self, *, element=None, x=None, y=None, button: str = "left", click_count: int = 1,
               modifiers=None, delivery_mode=None, bring_to_front=False) -> ActionResult:
         if element is not None:
             return ActionResult(ok=False, action="click", code="no_elements",
                                message="macOS-native backend has no element indices; pass coordinate=[x, y] from the screenshot")
         px, py = self._to_points(x, y)
+        before = self.focused_element()
         if modifiers:
             # Modifier-clicks go through System Events, which can hold keys.
-            return self._modifier_click(px, py, button, modifiers)
+            return self._landing(self._modifier_click(px, py, button, modifiers), before)
         self._mouse("click", px, py, max(1, int(click_count)), button)
-        return self._result("click", f"{button} click x{click_count} at screenshot ({x},{y}) = screen ({px},{py}) pt",
-                            screen_point=[px, py])
+        return self._landing(self._result(
+            "click", f"{button} click x{click_count} at screenshot ({x},{y}) = screen ({px},{py}) pt",
+            screen_point=[px, py]), before)
 
     def _modifier_click(self, px: int, py: int, button: str, modifiers: List[str]) -> ActionResult:
         clauses = []
@@ -455,8 +646,9 @@ return 'ok ' + argv.join(' ');
                                message="macOS-native backend needs from_coordinate/to_coordinate")
         x1, y1 = self._to_points(*from_xy)
         x2, y2 = self._to_points(*to_xy)
+        before = self.focused_element()
         self._mouse("drag", x1, y1, x2, y2)
-        return self._result("drag", f"dragged screen ({x1},{y1}) → ({x2},{y2}) pt")
+        return self._landing(self._result("drag", f"dragged screen ({x1},{y1}) → ({x2},{y2}) pt"), before)
 
     def scroll(self, *, direction: str, amount: int = 3, element=None, x=None, y=None,
                modifiers=None, delivery_mode=None, bring_to_front=False) -> ActionResult:
@@ -469,8 +661,9 @@ return 'ok ' + argv.join(' ');
         dx = {"left": amount, "right": -amount}.get(direction, 0)
         if not dx and not dy:
             return ActionResult(ok=False, action="scroll", message=f"bad direction {direction!r}")
+        before = self.focused_element()
         self._mouse("scroll", px, py, dy, dx)
-        return self._result("scroll", f"scrolled {direction} {amount} at screen ({px},{py}) pt")
+        return self._landing(self._result("scroll", f"scrolled {direction} {amount} at screen ({px},{py}) pt"), before)
 
     def move(self, x: int, y: int) -> ActionResult:
         px, py = self._to_points(x, y)
@@ -478,19 +671,51 @@ return 'ok ' + argv.join(' ');
         return self._result("move", f"pointer at screen ({px},{py}) pt", screen_point=[px, py])
 
     # ── keyboard (System Events, argv out-of-band) ───────────────────
-    def type_text(self, text: str, *, delivery_mode=None, bring_to_front=False) -> ActionResult:
+    def _type_refusal(self, before: Dict[str, Any]) -> Optional[str]:
+        """Why ``type`` should not proceed, or None. Finder is special-cased:
+        its icon/list views take type-to-select (and a Return would open the
+        selection), and an unknown role there almost always means the
+        desktop, so unknown is *not* let through for Finder."""
+        role = before.get("role") or ""
+        if before.get("bundle_id") == _FINDER_BUNDLE:
+            if role in STRICT_TEXT_ROLES:
+                return None
+            return ("Finder is frontmost and the focus is not a text field "
+                    "(typing would type-select desktop/window icons)")
+        if role in TEXT_EDITABLE_ROLES:
+            return None
+        if role == "":
+            return None  # opaque app — fail open
+        return f"focused element is {role}, not a text field"
+
+    def type_text(self, text: str, *, delivery_mode=None, bring_to_front=False,
+                  force: bool = False) -> ActionResult:
         if not text:
             return ActionResult(ok=False, action="type", message="nothing to type")
+        before = self.focused_element()
+        if not force:
+            why = self._type_refusal(before)
+            if why:
+                return self._guard_refusal("type", before, why)
         # Chunk like Anthropic's reference tool so long strings don't drop keys.
         for i in range(0, len(text), 50):
             self._applescript(
                 'on run argv\n  tell application "System Events" to keystroke (item 1 of argv)\nend run',
                 [text[i:i + 50]])
             time.sleep(0.02)
-        return self._result("type", f"typed {len(text)} chars into the focused field")
+        # Only the tail of what was typed is compared (a long paste may have
+        # wrapped/auto-corrected); 50 chars is plenty to prove the field.
+        return self._landing(self._result("type", f"typed {len(text)} chars"), before, typed=text[-50:])
 
-    def key(self, keys: str, *, delivery_mode=None, bring_to_front=False) -> ActionResult:
+    def key(self, keys: str, *, delivery_mode=None, bring_to_front=False,
+            force: bool = False) -> ActionResult:
         mods, key, code = parse_key_combo(keys)
+        before = self.focused_element()
+        if (not force and not mods and key in ("return", "enter")
+                and before.get("bundle_id") == _FINDER_BUNDLE
+                and (before.get("role") or "") not in STRICT_TEXT_ROLES):
+            return self._guard_refusal(
+                "key", before, f"{keys} with Finder frontmost and a non-text focus would open or rename the selection")
         using = (" using {" + ", ".join(mods) + "}") if mods else ""
         if code is not None:
             script = f'tell application "System Events" to key code {code}{using}'
@@ -501,7 +726,7 @@ return 'ok ' + argv.join(' ');
             script = ('on run argv\n  tell application "System Events" to keystroke (item 1 of argv)'
                       + using + "\nend run")
             self._applescript(script, [key])
-        return self._result("key", f"pressed {keys}")
+        return self._landing(self._result("key", f"pressed {keys}"), before)
 
     # ── apps / windows ───────────────────────────────────────────────
     def _front_window_info(self) -> Dict[str, Any]:
@@ -539,11 +764,97 @@ end tell'''
             'tell application "System Events" to get name of every application process whose visible is true')
         return [{"name": n.strip()} for n in out.split(",") if n.strip()]
 
+    _JXA_WINDOWS = r"""
+ObjC.import('Cocoa');
+ObjC.import('CoreGraphics');
+function run() {
+  var b = $.CGDisplayBounds($.CGMainDisplayID());
+  var fa = $.NSWorkspace.sharedWorkspace.frontmostApplication;
+  var front = fa.isNil() ? null : {name: ObjC.unwrap(fa.localizedName), bundle_id: ObjC.unwrap(fa.bundleIdentifier), pid: fa.processIdentifier};
+  var opts = $.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements;
+  var arr = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(opts, $.kCGNullWindowID))) || [];
+  var out = [];
+  for (var i = 0; i < arr.length; i++) {
+    var w = arr[i];
+    if (w.kCGWindowLayer !== 0) continue;
+    var bb = w.kCGWindowBounds || {};
+    out.push({app: w.kCGWindowOwnerName || '', pid: w.kCGWindowOwnerPID, window_id: w.kCGWindowNumber,
+              title: w.kCGWindowName || '', x: bb.X, y: bb.Y, w: bb.Width, h: bb.Height, alpha: w.kCGWindowAlpha});
+  }
+  return JSON.stringify({display: [b.size.width, b.size.height], front: front, windows: out});
+}
+"""
+
+    LIST_WINDOWS_NOTE = ("z-ordered front → back, on-screen windows of the current Space only "
+                         "(minimized windows and other Spaces are not listed); "
+                         "`frontmost` marks the active app's top window")
+
     def list_windows(self) -> List[Dict[str, Any]]:
+        """Every on-screen, layer-0 window of every app, front → back
+        (``CGWindowListCopyWindowInfo``), capped at :data:`MAX_WINDOWS`.
+        Falls back to the single System Events front window if the JXA
+        call fails."""
+        try:
+            data = json.loads(self._jxa(self._JXA_WINDOWS))
+        except Exception as exc:
+            logger.debug("CGWindowList lookup failed, falling back to System Events: %s", exc)
+            return self._list_windows_fallback()
+        disp = data.get("display") or [0, 0]
+        dw, dh = float(disp[0] or 0), float(disp[1] or 0)
+        front = data.get("front") or {}
+        front_pid = front.get("pid")
+        result: List[Dict[str, Any]] = []
+        for w in data.get("windows") or []:
+            if len(result) >= MAX_WINDOWS:
+                break
+            try:
+                x, y, ww, hh = (int(round(float(w.get(k) or 0))) for k in ("x", "y", "w", "h"))
+            except (TypeError, ValueError):
+                x = y = ww = hh = 0
+            if ww < 2 or hh < 2:
+                continue  # 1-px helper windows (Electron, status items)
+            is_front_app = front_pid is not None and w.get("pid") == front_pid
+            entry: Dict[str, Any] = {
+                "app": w.get("app") or "", "pid": w.get("pid"), "window_id": w.get("window_id"),
+                "title": w.get("title") or "", "z": len(result),
+                "bounds_points": {"x": x, "y": y, "w": ww, "h": hh},
+                "frontmost": False,
+                "front_app": is_front_app,
+            }
+            if front.get("bundle_id") and is_front_app:
+                entry["bundle_id"] = front["bundle_id"]
+            if self._ppp and self._last_size[0]:
+                entry["bounds_screenshot_px"] = {
+                    "x": int(round((x - self._origin[0]) * self._ppp)),
+                    "y": int(round((y - self._origin[1]) * self._ppp)),
+                    "w": int(round(ww * self._ppp)), "h": int(round(hh * self._ppp))}
+            notes = []
+            if dw and dh:
+                if x <= 0 and y <= 0 and ww >= dw and hh >= dh:
+                    notes.append("fullscreen")
+                if x >= dw or y >= dh or x + ww <= 0 or y + hh <= 0:
+                    notes.append("off main display (not in screenshots)")
+            if w.get("alpha") is not None and float(w["alpha"]) < 0.05:
+                notes.append("transparent")
+            if notes:
+                entry["note"] = "; ".join(notes)
+            result.append(entry)
+        # `frontmost` = the front app's top *titled* window. Chrome/Electron
+        # put untitled helper windows (tab strip, 41 px tall; tooltips) above
+        # the real window in CGWindowList z-order (verified live); fall back
+        # to the top untitled one only when nothing of the front app has a title.
+        front_entries = [e for e in result if e["front_app"]]
+        top = next((e for e in front_entries if e["title"]), front_entries[0] if front_entries else None)
+        if top is not None:
+            top["frontmost"] = True
+        return result
+
+    def _list_windows_fallback(self) -> List[Dict[str, Any]]:
         info = self._front_window_info()
         if not info:
             return []
-        entry = {"app": info.get("app", ""), "title": info.get("title", ""), "frontmost": True}
+        entry = {"app": info.get("app", ""), "title": info.get("title", ""), "frontmost": True,
+                 "front_app": True, "z": 0, "note": "CGWindowList unavailable; front window only"}
         if info.get("bounds"):
             x, y, w, h = info["bounds"]
             entry["bounds_points"] = {"x": x, "y": y, "w": w, "h": h}
@@ -572,6 +883,6 @@ end tell'''
 
 
 __all__ = [
-    "MAX_LONG_SIDE", "MacNativeBackend", "downscale_png", "fit_scale", "looks_blank",
+    "MAX_LONG_SIDE", "MAX_WINDOWS", "STRICT_TEXT_ROLES", "TEXT_EDITABLE_ROLES", "MacNativeBackend", "downscale_png", "fit_scale", "looks_blank",
     "native_backend_available", "parse_key_combo", "scale_back",
 ]
