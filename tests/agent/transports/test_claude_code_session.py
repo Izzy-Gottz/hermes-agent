@@ -23,15 +23,30 @@ import pytest
 from agent.transports import claude_code_session as session_mod
 from agent.transports.claude_code_session import (
     DEFAULT_DENY_RULES,
+    GATED_HERMES_TOOLS,
+    NATIVE_OS_TOOLS,
     SETTINGS_MARKER_KEY,
     ClaudeCodeSession,
     build_child_env,
     ensure_settings_file,
     hermes_tool_name,
+    mcp_server_credentials,
     resolve_oauth_token,
     resolve_permission,
     resume_transcript_exists,
     write_mcp_config,
+)
+from agent.transports.hermes_tools_mcp_server import (
+    CLAUDE_CODE_OS_TOOLS,
+    CLAUDE_CODE_PROFILE,
+    PROFILE_ENV,
+    SCRUB_ENV,
+)
+
+#: The native tools the #98533 reviewer required to be denied in normal modes.
+_REVIEWER_NATIVE_SET = (
+    "Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Task", "WebFetch",
+    "WebSearch",
 )
 
 _FAKE = Path(__file__).with_name("fake_claude_cli.py")
@@ -78,11 +93,15 @@ def _session(fake_claude, **kwargs) -> ClaudeCodeSession:
 class TestStaticHelpers:
     def test_child_env_strips_api_keys_and_guarantees_identity(self):
         env = build_child_env(
-            {"ANTHROPIC_API_KEY": "sk-ant-should-not-leak", "ANTHROPIC_AUTH_TOKEN": "x", "PATH": "/usr/bin"},
+            {"ANTHROPIC_API_KEY": "sk-ant-should-not-leak", "ANTHROPIC_AUTH_TOKEN": "x",
+             "OPENAI_API_KEY": "sk-openai", "FIRECRAWL_API_KEY": "fc", "PATH": "/usr/bin"},
             config_dir="/cfg",
         )
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_AUTH_TOKEN" not in env
+        # Tier-2 provider/tool credentials are stripped from the CLI too: the
+        # MCP server gets them through the mcp-config env block instead.
+        assert "OPENAI_API_KEY" not in env and "FIRECRAWL_API_KEY" not in env
         assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "fake-setup-token"
         assert env["CLAUDE_CONFIG_DIR"] == "/cfg"
         assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
@@ -90,7 +109,7 @@ class TestStaticHelpers:
         assert env["HOME"]
 
     @pytest.mark.parametrize(
-        "mode, expected_mode, must_allow",
+        "mode, expected_mode, legacy_allow",
         [
             ("auto", "acceptEdits", "Bash"),
             ("approval-required", "default", "Read"),
@@ -99,16 +118,23 @@ class TestStaticHelpers:
             (None, "acceptEdits", "Bash"),
         ],
     )
-    def test_permission_mapping(self, mode, expected_mode, must_allow):
-        got_mode, allowed = resolve_permission(mode)
+    def test_permission_mapping(self, mode, expected_mode, legacy_allow):
+        got_mode, allowed, disallowed = resolve_permission(mode)
         assert got_mode == expected_mode
-        if must_allow:
-            assert must_allow in allowed
+        # Invariant: no mode pre-authorises a native OS-level tool by default.
+        assert not set(allowed) & set(NATIVE_OS_TOOLS)
+        assert set(_REVIEWER_NATIVE_SET) <= set(disallowed)
+        # The pre-#98533 allowlist is only reachable through the opt-in.
+        got_mode2, allowed2, disallowed2 = resolve_permission(mode, native_tools=True)
+        assert got_mode2 == expected_mode and disallowed2 == ()
+        if legacy_allow:
+            assert legacy_allow in allowed2
 
     def test_unknown_security_mode_fails_closed(self):
-        got_mode, allowed = resolve_permission("garbage")
+        got_mode, allowed, disallowed = resolve_permission("garbage")
         assert got_mode == "default"  # approval-required mapping, never auto/bypass
         assert "Bash" not in allowed and "Write" not in allowed
+        assert "Bash" in disallowed
 
     def test_oauth_token_is_required(self, monkeypatch):
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -138,21 +164,177 @@ class TestStaticHelpers:
         assert resume_transcript_exists(str(cfg), sid) is True
 
     def test_approval_required_never_preapproves_bash(self):
-        _, allowed = resolve_permission("approval-required")
+        _, allowed, _ = resolve_permission("approval-required")
+        assert "Bash" not in allowed and "Write" not in allowed
+        _, allowed, _ = resolve_permission("approval-required", native_tools=True)
         assert "Bash" not in allowed and "Write" not in allowed
 
     def test_hermes_tool_name_strips_mcp_prefix(self):
         assert hermes_tool_name("mcp__hermes-tools__web_search") == "web_search"
         assert hermes_tool_name("Bash") == "Bash"
 
-    def test_mcp_config_launches_hermes_tools_server(self, tmp_path):
+    def test_mcp_config_launches_hermes_tools_server(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-secret")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
         path = write_mcp_config(directory=str(tmp_path))
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
         payload = json.loads(Path(path).read_text())
         server = payload["mcpServers"]["hermes-tools"]
         assert server["command"] == sys.executable
         assert server["args"] == ["-m", "agent.transports.hermes_tools_mcp_server"]
-        # Secrets are inherited from the process env, never written to disk.
-        assert not any(k.endswith("_API_KEY") for k in server["env"])
+        env = server["env"]
+        # The server runs the claude-code profile (terminal/file tools on).
+        assert env[PROFILE_ENV] == CLAUDE_CODE_PROFILE
+        # Tool credentials the CLI no longer inherits reach the server here.
+        assert env["FIRECRAWL_API_KEY"] == "fc-secret"
+        assert env["OPENAI_API_KEY"] == "sk-openai"
+        # The CLI credential is blanked and scrubbed, never forwarded.
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in env[SCRUB_ENV].split(",")
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in mcp_server_credentials()
+
+
+def _argv_tools(argv: list[str], flag: str) -> list[str]:
+    return argv[argv.index(flag) + 1].split(",") if flag in argv else []
+
+
+class TestToolAuthority:
+    """#98533: normal modes never pre-authorise a native OS-level tool that
+    bypasses Hermes' command/file policy."""
+
+    def test_auto_denies_native_mutating_tools_and_allows_only_hermes_mcp(self, fake_claude):
+        session = _session(fake_claude, security_mode="auto", expose_hermes_tools=True)
+        try:
+            session.ensure_started()
+            _, record = fake_claude
+            argv = json.loads(record.read_text())["argv"]
+            allowed = _argv_tools(argv, "--allowedTools")
+            disallowed = _argv_tools(argv, "--disallowedTools")
+            assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
+            # (a) nothing native+mutating is allowed; all of it is disallowed.
+            assert not set(_REVIEWER_NATIVE_SET) & set(allowed)
+            assert set(_REVIEWER_NATIVE_SET) <= set(disallowed)
+            # Read/Glob/Grep read absolute paths with no path policy: denied
+            # too; Hermes' read_file / search_files are the replacements.
+            assert {"Read", "Glob", "Grep", "LS"} <= set(disallowed)
+            assert not set(NATIVE_OS_TOOLS) & set(allowed)
+            # Only the Hermes MCP server (plus inert TodoWrite/ToolSearch).
+            assert "mcp__hermes-tools" in allowed
+            assert set(allowed) <= {"mcp__hermes-tools", "TodoWrite", "ToolSearch"}
+        finally:
+            session.close()
+
+    def test_config_allowed_tools_override_cannot_reopen_native_tools(self, fake_claude):
+        """An operator ``allowed_tools`` list does not beat the disallow list
+        unless native_tools is also set."""
+        session = _session(fake_claude, allowed_tools=["Bash", "Read", "TodoWrite"])
+        try:
+            session.ensure_started()
+            _, record = fake_claude
+            argv = json.loads(record.read_text())["argv"]
+            assert "Bash" not in _argv_tools(argv, "--allowedTools")
+            assert "Bash" in _argv_tools(argv, "--disallowedTools")
+        finally:
+            session.close()
+
+    def test_approval_required_gates_mutating_hermes_tools(self, fake_claude):
+        session = _session(fake_claude, security_mode="approval-required", expose_hermes_tools=True)
+        try:
+            session.ensure_started()
+            _, record = fake_claude
+            argv = json.loads(record.read_text())["argv"]
+            allowed = _argv_tools(argv, "--allowedTools")
+            assert "mcp__hermes-tools" not in allowed  # not the whole server
+            for name in GATED_HERMES_TOOLS:
+                assert f"mcp__hermes-tools__{name}" not in allowed
+            assert "mcp__hermes-tools__read_file" in allowed
+            assert "mcp__hermes-tools__web_search" in allowed
+            assert set(_REVIEWER_NATIVE_SET) <= set(_argv_tools(argv, "--disallowedTools"))
+        finally:
+            session.close()
+
+    def test_claude_child_env_has_no_provider_credentials(self, fake_claude, monkeypatch):
+        """(c) Provider/tool keys are absent from the claude child; they are
+        delivered to the MCP server via the mcp-config env block. The CLI's
+        own setup-token is present by necessity (documented) and scrubbed
+        on the server side."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-must-not-leak")
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-must-reach-server")
+        session = _session(fake_claude, expose_hermes_tools=True)
+        try:
+            session.ensure_started()
+            _, record = fake_claude
+            rec = json.loads(record.read_text())
+            env, argv = rec["env"], rec["argv"]
+            assert "ANTHROPIC_API_KEY" not in env
+            assert "OPENAI_API_KEY" not in env
+            assert "FIRECRAWL_API_KEY" not in env
+            assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "fake-setup-token"
+            mcp_env = json.loads(Path(argv[argv.index("--mcp-config") + 1]).read_text())[
+                "mcpServers"]["hermes-tools"]["env"]
+            assert mcp_env["FIRECRAWL_API_KEY"] == "fc-must-reach-server"
+            assert mcp_env["OPENAI_API_KEY"] == "sk-openai-must-not-leak"
+            assert mcp_env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+        finally:
+            session.close()
+
+    def test_hermes_mcp_tool_turn_still_works_under_the_boundary(self, fake_claude):
+        """(d) With native tools denied, an MCP tool call round-trips."""
+        session = _session(fake_claude, expose_hermes_tools=True)
+        try:
+            session.ensure_started()
+            _, record = fake_claude
+            argv = json.loads(record.read_text())["argv"]
+            assert "--disallowedTools" in argv and "--mcp-config" in argv
+            result = session.run_turn("please TOOL it")
+            assert result.error is None
+            assert result.tool_iterations == 1
+            assert result.final_text == "The version is 6.2"
+            calls = [m for m in result.projected_messages if m.get("tool_calls")]
+            assert calls and calls[0]["tool_calls"][0]["function"]["name"] == "web_search"
+            started = [e for e in session._test_events if e["kind"] == "tool_started"]
+            assert started and started[0]["name"] == "web_search"
+        finally:
+            session.close()
+
+    def test_native_tools_opt_in_restores_legacy_allowlist(self, fake_claude):
+        """(e) claude_code.native_tools: true re-opens the boundary explicitly."""
+        session = _session(fake_claude, security_mode="auto", native_tools=True, expose_hermes_tools=True)
+        try:
+            session.ensure_started()
+            _, record = fake_claude
+            argv = json.loads(record.read_text())["argv"]
+            assert "--disallowedTools" not in argv
+            allowed = _argv_tools(argv, "--allowedTools")
+            assert {"Bash", "Read", "Write", "Edit", "mcp__hermes-tools"} <= set(allowed)
+        finally:
+            session.close()
+
+    def test_hermes_terminal_permission_prompt_shows_the_command(self):
+        seen = {}
+
+        def approver(command, description, allow_permanent=False):
+            seen["command"], seen["description"] = command, description
+            return "no"
+
+        session = ClaudeCodeSession(claude_bin="/nonexistent", warmup=False, approval_callback=approver)
+        behavior, message = session.decide_permission({
+            "tool_name": "mcp__hermes-tools__terminal",
+            "input": {"command": "rm -rf build", "description": "clean"},
+        })
+        assert behavior == "deny" and seen["command"] == "rm -rf build"
+        assert "mcp__hermes-tools__terminal" in seen["description"]
+
+    def test_every_disallowed_native_tool_has_a_hermes_mcp_replacement_or_no_need(self):
+        exposed = set(CLAUDE_CODE_OS_TOOLS) | {"web_search", "web_extract"}
+        replacements = {
+            "Bash": "terminal", "Read": "read_file", "Write": "write_file",
+            "Edit": "patch", "MultiEdit": "patch", "Glob": "search_files",
+            "Grep": "search_files", "WebFetch": "web_extract", "WebSearch": "web_search",
+            "BashOutput": "process", "KillShell": "process",
+        }
+        for native, hermes in replacements.items():
+            assert native in NATIVE_OS_TOOLS and hermes in exposed
 
 
 class TestLifecycle:
@@ -284,7 +466,8 @@ class TestLifecycle:
             mcp_path = argv[argv.index("--mcp-config") + 1]
             assert Path(mcp_path).exists()
             allowed = argv[argv.index("--allowedTools") + 1].split(",")
-            assert "mcp__hermes-tools" in allowed and "Bash" in allowed
+            assert "mcp__hermes-tools" in allowed and "Bash" not in allowed
+            assert "Bash" in argv[argv.index("--disallowedTools") + 1].split(",")
         finally:
             session.close()
         assert not Path(mcp_path).exists()  # temp file cleaned on close
@@ -297,6 +480,11 @@ class TestLifecycle:
             argv = json.loads(record.read_text())["argv"]
             assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
             assert "--allowedTools" not in argv
+            # Even "don't prompt me" keeps the native OS tools denied: yolo
+            # is not an opt-in to a shell that skips Hermes' hardline blocks.
+            assert set(_REVIEWER_NATIVE_SET) <= set(
+                argv[argv.index("--disallowedTools") + 1].split(",")
+            )
         finally:
             session.close()
 

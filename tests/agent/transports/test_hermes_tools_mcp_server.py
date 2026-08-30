@@ -107,6 +107,65 @@ class TestModuleSurface:
             f"because codex has built-in equivalents: {leaked}"
         )
 
+    def test_claude_code_profile_adds_os_tools(self):
+        from agent.transports.hermes_tools_mcp_server import (
+            CLAUDE_CODE_OS_TOOLS, EXPOSED_TOOLS, exposed_tools_for_profile,
+        )
+        assert exposed_tools_for_profile(None) == EXPOSED_TOOLS
+        assert exposed_tools_for_profile("codex") == EXPOSED_TOOLS
+        cc = exposed_tools_for_profile("claude-code")
+        assert set(CLAUDE_CODE_OS_TOOLS) <= set(cc) and set(EXPOSED_TOOLS) <= set(cc)
+        assert {"terminal", "read_file", "write_file", "patch", "search_files", "process"} <= set(cc)
+
+    def test_scrub_environment_drops_named_and_blanked_keys(self):
+        from agent.transports.hermes_tools_mcp_server import SCRUB_ENV, scrub_environment
+        env = {SCRUB_ENV: "CLAUDE_CODE_OAUTH_TOKEN,OTHER", "CLAUDE_CODE_OAUTH_TOKEN": "",
+               "OTHER": "x", "KEEP": "y"}
+        assert sorted(scrub_environment(env)) == ["CLAUDE_CODE_OAUTH_TOKEN", "OTHER"]
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env and "OTHER" not in env and env["KEEP"] == "y"
+        assert scrub_environment({}) == []
+
+
+class _RecordingServer:
+    """Stand-in for mcp.server.MCPServer that just collects handlers."""
+
+    def __init__(self, name, instructions=None):
+        self.name, self.instructions, self.tools = name, instructions, {}
+
+    def add_tool(self, fn, name=None, description=None):
+        self.tools[name or fn.__name__] = fn
+
+
+class TestClaudeCodeProfileGuards:
+    def _build(self, monkeypatch, profile):
+        import mcp.server as mcp_server
+        monkeypatch.setattr(mcp_server, "MCPServer", _RecordingServer)
+        from agent.transports import hermes_tools_mcp_server as m
+        return m._build_server(profile)
+
+    def test_dangerous_terminal_command_consults_hermes_command_guards(self, monkeypatch):
+        """(b) A dangerous command via the MCP `terminal` tool goes through
+        tools.approval.check_all_command_guards, not around it."""
+        import tools.terminal_tool as tt
+        consulted = []
+
+        def guard(command, env_type, approval_callback=None, has_host_access=False):
+            consulted.append(command)
+            return {"approved": False, "description": "blocked-by-test", "message": "blocked-by-test"}
+
+        monkeypatch.setattr(tt, "_check_all_guards_impl", guard)
+        server = self._build(monkeypatch, "claude-code")
+        assert "terminal" in server.tools and "read_file" in server.tools
+        assert "Bash" in (server.instructions or "")
+        import json
+        out = json.loads(server.tools["terminal"](command="rm -rf /tmp/hermes-never-runs"))
+        assert consulted == ["rm -rf /tmp/hermes-never-runs"]
+        assert out["status"] == "blocked" and out["exit_code"] != 0
+
+    def test_default_profile_has_no_terminal(self, monkeypatch):
+        server = self._build(monkeypatch, None)
+        assert "terminal" not in server.tools and "web_search" in server.tools
+
 
 
 
