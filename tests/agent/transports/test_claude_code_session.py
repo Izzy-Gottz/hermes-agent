@@ -224,6 +224,44 @@ class TestToolAuthority:
         finally:
             session.close()
 
+    def test_builtin_allowlist_restricts_cli_to_inert_tools(self, fake_claude):
+        """--disallowedTools is a denylist; the CLI keeps growing built-ins
+        (Workflow, EnterWorktree, CronCreate, ... on 2.1.251). --tools is the
+        allowlist that excludes them by construction."""
+        session = _session(fake_claude, security_mode="auto", expose_hermes_tools=True)
+        try:
+            session.ensure_started()
+            _, record = fake_claude
+            argv = json.loads(record.read_text())["argv"]
+            assert set(_argv_tools(argv, "--tools")) == {"TodoWrite", "ToolSearch"}
+        finally:
+            session.close()
+        session = _session(fake_claude, security_mode="auto", native_tools=True)
+        try:
+            session.ensure_started()
+            assert "--tools" not in json.loads(record.read_text())["argv"]
+        finally:
+            session.close()
+
+    def test_stale_mcp_config_with_credentials_is_swept(self, tmp_path, monkeypatch):
+        """A session that died without close() leaves a 0600 file holding
+        provider keys; the next start removes it, but never a live one."""
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-secret")
+        live = write_mcp_config(directory=str(tmp_path))
+        stale = tmp_path / "hermes-claude-mcp-dead.json"
+        stale.write_text(json.dumps({"mcpServers": {"hermes-tools": {"env": {"FIRECRAWL_API_KEY": "fc-secret"}}}}))
+        other = tmp_path / "settings.json"
+        other.write_text("{}")
+        removed = session_mod.sweep_stale_mcp_configs(str(tmp_path))
+        assert removed == [str(stale)]
+        assert Path(live).exists() and other.exists()
+        session_mod.release_mcp_config(live)
+        assert not Path(live).exists()
+        assert live not in session_mod._MCP_CONFIG_LOCKS
+        # An open-but-unlocked file from another process is swept too.
+        stale.write_text("{}")
+        assert session_mod.sweep_stale_mcp_configs(str(tmp_path)) == [str(stale)]
+
     def test_config_allowed_tools_override_cannot_reopen_native_tools(self, fake_claude):
         """An operator ``allowed_tools`` list does not beat the disallow list
         unless native_tools is also set."""

@@ -119,6 +119,13 @@ NATIVE_OS_TOOLS: tuple[str, ...] = (
     "ListMcpResourcesTool", "ReadMcpResourceTool",
 )
 #: Built-ins that never leave the model's own context; safe to pre-approve.
+#: Also the ONLY built-ins the child is started with (``--tools``) when the
+#: boundary is on: ``--disallowedTools`` is a denylist and the CLI keeps
+#: adding built-ins (measured on 2.1.251 with the full NATIVE_OS_TOOLS list:
+#: Workflow, EnterWorktree/ExitWorktree, CronCreate/CronDelete/CronList,
+#: ScheduleWakeup, SendMessage, TaskCreate/…, DesignSync, ListAgents,
+#: ReportFindings still loaded). ``--tools`` is the allowlist counterpart:
+#: verified live to leave only these while MCP servers stay connected.
 _INERT_NATIVE_TOOLS: tuple[str, ...] = ("TodoWrite", "ToolSearch")
 
 #: Hermes MCP tools that mutate state or run commands. In
@@ -614,6 +621,76 @@ def resume_transcript_exists(config_dir: str, session_id: str) -> bool:
     return False
 
 
+_MCP_CONFIG_PREFIX = "hermes-claude-mcp-"
+#: path -> fd holding an ``flock`` for the life of the owning session. The
+#: file carries provider credentials, so a session that dies without
+#: ``close()`` (gateway killed, crash) must not leave it behind: the next
+#: start sweeps any config file whose lock is free (see
+#: :func:`sweep_stale_mcp_configs`).
+_MCP_CONFIG_LOCKS: dict[str, int] = {}
+
+
+def _flock(fd: int, *, blocking: bool) -> bool:
+    """True when the lock was taken; False when held elsewhere or unsupported."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return True
+    except OSError:
+        return False
+
+
+def sweep_stale_mcp_configs(directory: str) -> list[str]:
+    """Delete ``hermes-claude-mcp-*.json`` files in ``directory`` that no
+    live session holds a lock on. Returns the removed paths."""
+    removed: list[str] = []
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return removed
+    for entry in entries:
+        name = entry.name
+        if not (name.startswith(_MCP_CONFIG_PREFIX) and name.endswith(".json")):
+            continue
+        if entry.path in _MCP_CONFIG_LOCKS:
+            continue
+        try:
+            fd = os.open(entry.path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            if _flock(fd, blocking=False):
+                os.unlink(entry.path)
+                removed.append(entry.path)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    if removed:
+        logger.warning(
+            "claude-code: removed %d stale mcp-config file(s) left by a session "
+            "that did not close cleanly", len(removed),
+        )
+    return removed
+
+
+def release_mcp_config(path: str) -> None:
+    """Delete the config file written by :func:`write_mcp_config` and drop its lock."""
+    fd = _MCP_CONFIG_LOCKS.pop(path, None)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def write_mcp_config(
     *,
     python_executable: Optional[str] = None,
@@ -631,8 +708,9 @@ def write_mcp_config(
     with this file's ``env`` block. Because :func:`build_child_env` strips
     provider/tool credentials from the CLI, the ones the server needs are
     written here (:func:`mcp_server_credentials`; ``credential_env``
-    overrides). The file is created 0600 inside the Hermes-owned config dir
-    and removed when the session closes. The block also blanks
+    overrides). The file is created 0600 inside the Hermes-owned config dir,
+    ``flock``-ed for the life of the session and removed when it closes; a
+    file whose owner died without ``close()`` is swept at the next start. The block also blanks
     ``CLAUDE_CODE_OAUTH_TOKEN`` and lists it in ``HERMES_MCP_SCRUB_ENV`` so
     the server drops the CLI credential it would otherwise inherit.
     """
@@ -675,8 +753,16 @@ def write_mcp_config(
     if directory:
         _makedirs_or_explain(directory)
     fd, path = _mkstemp_or_explain(
-        prefix="hermes-claude-mcp-", suffix=".json", directory=directory or tempfile.gettempdir()
+        prefix=_MCP_CONFIG_PREFIX, suffix=".json", directory=directory or tempfile.gettempdir()
     )
+    # Lock BEFORE the content lands so a concurrent sweep can never see an
+    # unlocked file that holds credentials. The dup shares the open file
+    # description, so the lock survives the fdopen() close below.
+    lock_fd = os.dup(fd)
+    if _flock(lock_fd, blocking=True):
+        _MCP_CONFIG_LOCKS[path] = lock_fd
+    else:  # pragma: no cover - no flock on this platform
+        os.close(lock_fd)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     return path
@@ -942,8 +1028,12 @@ class ClaudeCodeSession:
         if self._disallowed_tools:
             # The tool-authority boundary (#98533): native OS-level tools are
             # denied in EVERY mode, including bypassPermissions, unless the
-            # operator set claude_code.native_tools. Deny rules win over
-            # allow rules and over the permission mode inside the CLI.
+            # operator set claude_code.native_tools. ``--tools`` restricts the
+            # built-in set to the inert allowlist (anything the CLI adds in a
+            # future release is excluded by construction); the deny list is
+            # belt-and-braces. Deny rules win over allow rules and over the
+            # permission mode inside the CLI.
+            cmd += ["--tools", ",".join(_INERT_NATIVE_TOOLS)]
             cmd += ["--disallowedTools", ",".join(dict.fromkeys(self._disallowed_tools))]
         allowed = [t for t in self._allowed_tools if t not in self._disallowed_tools]
         if self._expose_hermes_tools and self._mcp_config_path:
@@ -980,6 +1070,7 @@ class ClaudeCodeSession:
         _makedirs_or_explain(self._cwd)
         ensure_settings_file(self._settings_path, self._deny_rules)
         if self._expose_hermes_tools and not self._mcp_config_path:
+            sweep_stale_mcp_configs(self._config_dir)
             self._mcp_config_path = write_mcp_config(directory=self._config_dir)
             self._owns_mcp_config = True
         self._write_system_prompt_file()
@@ -1151,10 +1242,7 @@ class ClaudeCodeSession:
                     pass
                 setattr(self, attr, None)
         if self._owns_mcp_config and self._mcp_config_path:
-            try:
-                os.unlink(self._mcp_config_path)
-            except OSError:
-                pass
+            release_mcp_config(self._mcp_config_path)
             self._mcp_config_path = None
             self._owns_mcp_config = False
 
