@@ -162,6 +162,38 @@ class TestClaudeCodeProfileGuards:
         assert consulted == ["rm -rf /tmp/hermes-never-runs"]
         assert out["status"] == "blocked" and out["exit_code"] != 0
 
+    def test_claude_code_profile_registers_config_hooks_and_marks_headless(self, monkeypatch, tmp_path):
+        """The server is spawned by the claude CLI, so nothing else registers
+        config.yaml pre_tool_call hooks or marks the process as having no
+        approver. Without both, Moe's confirm-send hook never fires and
+        check_all_command_guards approves dangerous commands unprompted."""
+        from agent.transports import hermes_tools_mcp_server as m
+        import agent.shell_hooks as sh
+        import hermes_cli.config as cfgmod
+        seen = {}
+        monkeypatch.setattr(cfgmod, "load_config", lambda: {"hooks": {"pre_tool_call": []}, "hooks_auto_accept": True})
+        monkeypatch.setattr(sh, "register_from_config", lambda cfg, accept_hooks=False: seen.update(cfg=cfg) or ["spec"])
+        env = {}
+        assert m.prepare_claude_code_profile(env) == ["spec"]
+        assert env[m.HEADLESS_APPROVAL_ENV] == "1" and seen["cfg"]["hooks_auto_accept"] is True
+
+    def test_dangerous_command_is_denied_headless_with_real_guards(self, monkeypatch, tmp_path):
+        """No mocks on the guard: in the headless profile a dangerous command
+        is refused with a message the model sees, and nothing runs."""
+        from agent.transports import hermes_tools_mcp_server as m
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.setenv(m.HEADLESS_APPROVAL_ENV, "1")
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        server = self._build(monkeypatch, "claude-code")
+        import json
+        out = json.loads(server.tools["terminal"](command=f"rm -rf {victim}"))
+        assert victim.exists(), "dangerous command ran unprompted in the headless MCP server"
+        assert out.get("exit_code") not in (0, "0") and "BLOCKED" in json.dumps(out)
+        ok = json.loads(server.tools["terminal"](command="echo still-works"))
+        assert "still-works" in ok.get("output", "")
+
     def test_default_profile_has_no_terminal(self, monkeypatch):
         server = self._build(monkeypatch, None)
         assert "terminal" not in server.tools and "web_search" in server.tools

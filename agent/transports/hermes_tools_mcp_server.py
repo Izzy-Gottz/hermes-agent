@@ -205,6 +205,41 @@ def scrub_environment(env: Optional[dict] = None) -> list[str]:
     return removed
 
 
+#: Process-env marker that makes ``tools.approval.check_all_command_guards``
+#: treat this process as headless (no human can answer a prompt): dangerous /
+#: Tirith-flagged commands are DENIED with a message instead of silently
+#: approved, governed by ``approvals.single_query_mode`` (default ``deny``).
+HEADLESS_APPROVAL_ENV = "HERMES_SINGLE_QUERY_SESSION"
+
+
+def prepare_claude_code_profile(env: Optional[dict] = None) -> list:
+    """Make the ``claude-code`` profile enforce the policy it advertises.
+
+    The server is spawned by the ``claude`` CLI, not by the Hermes CLI or
+    gateway, so nothing has (a) registered the ``hooks.pre_tool_call`` shell
+    hooks from config.yaml on the plugin manager, or (b) marked the process
+    as one with no interactive approver. Without (a) config hooks never fire
+    for ``terminal`` / ``write_file`` calls; without (b)
+    ``check_all_command_guards`` falls into its "not CLI, not gateway"
+    branch and approves every non-hardline dangerous command unprompted.
+
+    Returns the registered hook specs (empty when none are configured).
+    Consent for the hook scripts follows the normal channels
+    (``hooks_auto_accept: true`` / ``HERMES_ACCEPT_HOOKS``); there is no TTY
+    here, so an unaccepted hook is skipped exactly as it is in the gateway.
+    """
+    target = os.environ if env is None else env
+    target.setdefault(HEADLESS_APPROVAL_ENV, "1")
+    try:
+        from agent.shell_hooks import register_from_config
+        from hermes_cli.config import load_config
+
+        return list(register_from_config(load_config(), accept_hooks=False))
+    except Exception:
+        logger.warning("claude-code profile: shell-hook registration failed", exc_info=True)
+        return []
+
+
 def _build_server(profile: Optional[str] = None) -> Any:
     """Create the MCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
@@ -335,6 +370,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     scrubbed = scrub_environment()
     if scrubbed:
         logger.info("scrubbed %s from the server environment", ",".join(scrubbed))
+    if (os.environ.get(PROFILE_ENV) or "").strip().lower() == CLAUDE_CODE_PROFILE:
+        hooks = prepare_claude_code_profile()
+        logger.info("claude-code profile: %d config hook(s) registered; headless approval", len(hooks))
 
     try:
         server = _build_server()
