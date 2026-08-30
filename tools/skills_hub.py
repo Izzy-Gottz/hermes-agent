@@ -526,6 +526,7 @@ GITHUB_TAP_PROVIDERS = {
     "voltagent/awesome-agent-skills": "VoltAgent",
     "garrytan/gstack": "gstack",
     "minimax-ai/cli": "MiniMax",
+    "pbakaus/impeccable": "Impeccable",
 }
 
 
@@ -583,6 +584,13 @@ class GitHubSource(SkillSource):
         # https://github.com/NVIDIA/skills/tree/main/skills
         {"repo": "NVIDIA/skills", "path": "skills/"},
         {"repo": "garrytan/gstack", "path": ""},
+        # pbakaus/impeccable: frontend-design skill (23 sub-commands, 61-rule
+        # anti-slop detector). The repo tracks a generated Hermes-native
+        # bundle under .hermes/skills/ (upstream maintains it; verified
+        # against hermes-agent, see their AGENTS.md "Add Hermes Agent as a
+        # supported provider"). Installing from the tap pulls that bundle
+        # live, so we never fork/vendor their daily-updated content.
+        {"repo": "pbakaus/impeccable", "path": ".hermes/skills/"},
     ]
 
     def __init__(self, auth: GitHubAuth, extra_taps: Optional[List[Dict]] = None):
@@ -670,22 +678,47 @@ class GitHubSource(SkillSource):
         files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
         tree = self._get_repo_tree(repo)
         if tree is not None:
+            # Download the FULL skill directory, not just SKILL.md-linked
+            # paths. Link-driven fetching silently dropped every support file
+            # a skill keeps under a non-canonical dir name (`reference/`,
+            # `agents/`, root-level LICENSE/params files) or that only a
+            # reference file links — the exact gap the optional-skills live
+            # fetch already works around (see _fetch_live_optional_bundle).
+            # Everything still flows through quarantine + scan before
+            # install, and the scanner sees MORE this way, not less.
             branch, entries = tree
             prefix = f"{skill_path.rstrip('/')}/"
-            entries_by_path = {item.get("path", ""): item for item in entries}
-            for rel_path in sorted(referenced):
-                item_path = f"{prefix}{rel_path}"
-                item = entries_by_path.get(item_path)
-                if item is None:
-                    logger.warning("Referenced skill support file is missing: %s", item_path)
-                    return None
+            for item in entries:
                 if item.get("type") != "blob" or item.get("mode") == "120000":
-                    logger.warning("Rejected non-regular file in skill bundle: %s", item_path)
+                    continue
+                item_path = item.get("path", "")
+                if not item_path.startswith(prefix):
+                    continue
+                rel_path = item_path[len(prefix):]
+                if rel_path == "SKILL.md":
+                    continue
+                base = rel_path.rsplit("/", 1)[-1]
+                if base.startswith(".") or base.endswith(".pyc") or "__pycache__" in rel_path.split("/"):
+                    continue
+                try:
+                    rel_path = _validate_bundle_rel_path(rel_path)
+                except ValueError:
+                    logger.warning("Rejected unsafe file path in skill bundle: %s", item_path)
                     return None
                 content = self._fetch_file_bytes(repo, item_path)
                 if content is None:
                     return None
                 files[rel_path] = content
+            # A support file SKILL.md links must actually exist as a regular
+            # file — a missing or symlinked referenced path rejects the
+            # bundle rather than installing a skill with dangling links.
+            for rel_path in sorted(referenced):
+                if rel_path not in files:
+                    logger.warning(
+                        "Referenced skill support file is missing: %s%s",
+                        prefix, rel_path,
+                    )
+                    return None
             revision = self._tree_revisions.get(repo) or branch
         else:
             for rel_path in referenced:

@@ -119,6 +119,69 @@ def test_github_source_rejects_symlink_in_referenced_directory(monkeypatch):
     assert source.fetch("owner/repo/skill") is None
 
 
+def test_github_source_fetch_downloads_full_skill_directory(monkeypatch):
+    """Support files a skill keeps outside SKILL.md-linked paths still install.
+
+    Regression for skills using non-canonical support dirs (impeccable keeps
+    everything under `reference/` singular and `scripts/` linked only from
+    reference files): the old link-driven fetch shipped SKILL.md alone.
+    """
+    source = GitHubSource(GitHubAuth())
+    skill_md = (
+        "---\nname: full-dir\ndescription: d\n---\n"
+        "See [audit](reference/audit.md) and run `node scripts/pin.mjs`.\n"
+    )
+    fetched: list = []
+    monkeypatch.setattr(source, "_fetch_file_content", lambda _repo, path: skill_md)
+    monkeypatch.setattr(
+        source, "_fetch_file_bytes",
+        lambda _repo, path: fetched.append(path) or b"content-of-" + path.encode(),
+    )
+    source._tree_cache["owner/repo"] = (
+        "main",
+        [
+            {"path": "skill/SKILL.md", "type": "blob", "mode": "100644"},
+            {"path": "skill/reference/audit.md", "type": "blob", "mode": "100644"},
+            {"path": "skill/reference/deep/native.md", "type": "blob", "mode": "100644"},
+            {"path": "skill/scripts/pin.mjs", "type": "blob", "mode": "100644"},
+            {"path": "skill/LICENSE", "type": "blob", "mode": "100644"},
+            # skipped: symlink, hidden file, pyc, out-of-prefix
+            {"path": "skill/reference/link.md", "type": "blob", "mode": "120000"},
+            {"path": "skill/.hidden", "type": "blob", "mode": "100644"},
+            {"path": "skill/scripts/x.pyc", "type": "blob", "mode": "100644"},
+            {"path": "other/README.md", "type": "blob", "mode": "100644"},
+        ],
+    )
+
+    bundle = source.fetch("owner/repo/skill")
+
+    assert bundle is not None
+    assert set(bundle.files) == {
+        "SKILL.md",
+        "reference/audit.md",
+        "reference/deep/native.md",
+        "scripts/pin.mjs",
+        "LICENSE",
+    }
+
+
+def test_github_source_fetch_still_requires_linked_references(monkeypatch):
+    """A SKILL.md-linked references/ path missing from the tree rejects the bundle."""
+    source = GitHubSource(GitHubAuth())
+    skill_md = (
+        "---\nname: dangling\ndescription: d\n---\n"
+        "Read [the guide](references/guide.md).\n"
+    )
+    monkeypatch.setattr(source, "_fetch_file_content", lambda _repo, path: skill_md)
+    monkeypatch.setattr(source, "_fetch_file_bytes", lambda _repo, path: b"x")
+    source._tree_cache["owner/repo"] = (
+        "main",
+        [{"path": "skill/SKILL.md", "type": "blob", "mode": "100644"}],
+    )
+
+    assert source.fetch("owner/repo/skill") is None
+
+
 def test_lock_file_persists_scan_provenance(tmp_path):
     lock = HubLockFile(tmp_path / "lock.json")
     provenance = {
