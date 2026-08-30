@@ -30,7 +30,8 @@ Protocol facts it reproduces on purpose:
   (comma-separated) it exits 1 with "already in use", also like the CLI.
 
 Argv and environment are recorded to ``$FAKE_CLAUDE_RECORD`` (JSON) so the
-tests can assert on the spawn contract.
+tests can assert on the spawn contract; every ``user`` message received is
+appended to ``$FAKE_CLAUDE_INBOX`` (JSON lines) when that is set.
 """
 
 from __future__ import annotations
@@ -188,6 +189,12 @@ def main() -> int:
             continue
         if msg.get("type") != "user":
             continue
+        inbox = os.environ.get("FAKE_CLAUDE_INBOX")
+        if inbox:
+            # Every user message as received, one JSON per line, so tests
+            # can assert on the exact content blocks that hit the wire.
+            with open(inbox, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(msg) + "\n")
         if not inited:
             inited = True
             _emit(
