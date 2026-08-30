@@ -319,6 +319,26 @@ def _w(app, pid, wid, title, x, y, w, h, alpha=1):
     return {"app": app, "pid": pid, "window_id": wid, "title": title, "x": x, "y": y, "w": w, "h": h, "alpha": alpha}
 
 
+def test_list_windows_frontmost_skips_untitled_helper_windows(monkeypatch, fake_screencapture):
+    """Verified live: Chrome's tab-strip helper (untitled, 41 px) sits above
+    its real window in z-order; `frontmost` must land on the titled window."""
+    b = _backend_with_fake_display(monkeypatch)
+    _cg_windows(monkeypatch, b, [
+        _w("Google Chrome", 5, 1, "", 0, 33, 1470, 41),
+        _w("Google Chrome", 5, 2, "", 0, 74, 1470, 47),
+        _w("Google Chrome", 5, 3, "Docs - Google Chrome", 0, 121, 1470, 835),
+        _w("Finder", 703, 4, "Desktop", 100, 100, 600, 400),
+    ], front={"name": "Google Chrome", "bundle_id": "com.google.Chrome", "pid": 5})
+    wins = b.list_windows()
+    assert [w["frontmost"] for w in wins] == [False, False, True, False]
+    assert [w["front_app"] for w in wins] == [True, True, True, False]
+    # All untitled → the top one is still marked so something is.
+    _cg_windows(monkeypatch, b, [_w("Google Chrome", 5, 1, "", 0, 33, 1470, 41),
+                                 _w("Google Chrome", 5, 2, "", 0, 74, 1470, 47)],
+                front={"name": "Google Chrome", "bundle_id": "com.google.Chrome", "pid": 5})
+    assert [w["frontmost"] for w in b.list_windows()] == [True, False]
+
+
 def test_list_windows_lists_every_app_z_ordered(monkeypatch, fake_screencapture):
     b = _backend_with_fake_display(monkeypatch)
     b.capture(mode="vision")

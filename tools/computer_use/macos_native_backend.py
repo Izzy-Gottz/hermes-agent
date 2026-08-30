@@ -484,11 +484,13 @@ on run argv
           set vkind to "text"
           set n to length of suffix
           if n > 0 and (length of v) >= n then
-            if (text -n thru -1 of v) is suffix then
-              set vmatch to "yes"
-            else
-              set vmatch to "no"
-            end if
+            considering case
+              if (text -n thru -1 of v) is suffix then
+                set vmatch to "yes"
+              else
+                set vmatch to "no"
+              end if
+            end considering
           else
             set vmatch to "no"
           end if
@@ -802,7 +804,6 @@ function run() {
         front = data.get("front") or {}
         front_pid = front.get("pid")
         result: List[Dict[str, Any]] = []
-        seen_front_top = False
         for w in data.get("windows") or []:
             if len(result) >= MAX_WINDOWS:
                 break
@@ -817,11 +818,9 @@ function run() {
                 "app": w.get("app") or "", "pid": w.get("pid"), "window_id": w.get("window_id"),
                 "title": w.get("title") or "", "z": len(result),
                 "bounds_points": {"x": x, "y": y, "w": ww, "h": hh},
-                "frontmost": is_front_app and not seen_front_top,
+                "frontmost": False,
                 "front_app": is_front_app,
             }
-            if is_front_app:
-                seen_front_top = True
             if front.get("bundle_id") and is_front_app:
                 entry["bundle_id"] = front["bundle_id"]
             if self._ppp and self._last_size[0]:
@@ -840,6 +839,14 @@ function run() {
             if notes:
                 entry["note"] = "; ".join(notes)
             result.append(entry)
+        # `frontmost` = the front app's top *titled* window. Chrome/Electron
+        # put untitled helper windows (tab strip, 41 px tall; tooltips) above
+        # the real window in CGWindowList z-order (verified live); fall back
+        # to the top untitled one only when nothing of the front app has a title.
+        front_entries = [e for e in result if e["front_app"]]
+        top = next((e for e in front_entries if e["title"]), front_entries[0] if front_entries else None)
+        if top is not None:
+            top["frontmost"] = True
         return result
 
     def _list_windows_fallback(self) -> List[Dict[str, Any]]:
