@@ -96,6 +96,10 @@ _BLOCKED_KEY_COMBOS = {
     frozenset({"cmd", "ctrl", "q"}),             # lock screen
     frozenset({"cmd", "shift", "q"}),            # log out
     frozenset({"cmd", "option", "shift", "q"}),  # force log out
+    frozenset({"cmd", "option", "escape"}),      # Force Quit dialog
+    frozenset({"cmd", "option", "esc"}),
+    frozenset({"cmd", "option", "shift", "escape"}),  # force-quit front app, no dialog
+    frozenset({"cmd", "option", "shift", "esc"}),
     # Windows secure/session shortcuts. The Windows driver accepts Win-key
     # combos, and Alt is canonicalized to option below, so block the
     # destructive variants before any backend sees them.

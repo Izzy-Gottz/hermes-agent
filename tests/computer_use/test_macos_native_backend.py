@@ -150,8 +150,10 @@ def test_capture_downscales_and_records_scale(monkeypatch, fake_screencapture):
     from PIL import Image
 
     assert Image.open(io.BytesIO(base64.b64decode(cap.png_b64))).size == (1568, 1020)
-    # Full-screen: no -R region flag.
-    assert "-R" not in fake_screencapture.read_text()
+    # Full-screen is still an explicit -R of the main display: a bare
+    # screencapture writes one file per display and the extras would be
+    # left behind in the temp dir.
+    assert "-R 0,0,1470,956" in fake_screencapture.read_text()
 
 
 def test_som_mode_degrades_to_vision_without_elements(monkeypatch, fake_screencapture):
@@ -315,3 +317,109 @@ def test_zoom_and_move_dispatch(monkeypatch, fake_screencapture):
     assert "zoom requires" in tool.handle_computer_use({"action": "zoom"})
     moved = tool.handle_computer_use({"action": "move", "coordinate": [10, 10]})
     assert calls[-1][0] == "move" and "pointer" in moved
+
+
+# ── coordinate truth table (concrete numbers, no display) ─────────────
+
+
+def _capture_with(monkeypatch, tmp_path, *, px, pts):
+    """Backend whose fake screencapture returns a ``px``-sized PNG for a
+    ``pts``-point main display; returns (backend, argv log)."""
+    fixture = tmp_path / "fixture.png"
+    fixture.write_bytes(_png(*px))
+    log = tmp_path / "argv.log"
+    stub = tmp_path / "screencapture"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        'for last; do :; done\n'
+        f'cp "{fixture}" "$last"\n'
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("HERMES_SCREENCAPTURE_BIN", str(stub))
+    monkeypatch.setenv("HERMES_SCREENSHOT_DIR", str(tmp_path / "shots"))
+    b = MacNativeBackend()
+    monkeypatch.setattr(b, "screen_points", lambda: pts)
+    monkeypatch.setattr(b, "_front_window_info", lambda: {"app": "X"})
+    b.capture(mode="vision")
+    return b, log
+
+
+@pytest.mark.parametrize(
+    "px, pts, image, clicks",
+    [
+        # 2x Retina, downscaled: 2880x1800 px on a 1440x900 pt display →
+        # 1568x980 image, 1.0889 px/pt. (784,450) is the image centre-ish →
+        # (720, 413) pt, NOT (720, 450): y scales too.
+        ((2880, 1800), (1440, 900), (1568, 980),
+         [((784, 450), (720, 413)), ((0, 0), (0, 0)), ((1568, 980), (1440, 900)), ((1567, 979), (1439, 899))]),
+        # Non-Retina 1440x900: nothing scales, pixels are points.
+        ((1440, 900), (1440, 900), (1440, 900), [((784, 450), (784, 450)), ((1439, 899), (1439, 899))]),
+        # MacBook "default" 1470x956 pt renders 2940x1912 px → 1568x1020.
+        ((2940, 1912), (1470, 956), (1568, 1020), [((784, 510), (735, 478)), ((1568, 1020), (1470, 956))]),
+        # 2x Retina that fits without downscale: 1280x800 pt / 2560x1600 px → 1568x980, 1.225 px/pt.
+        ((2560, 1600), (1280, 800), (1568, 980), [((1568, 980), (1280, 800)), ((784, 490), (640, 400))]),
+        # A small non-Retina display: 1024x768, untouched.
+        ((1024, 768), (1024, 768), (1024, 768), [((512, 384), (512, 384))]),
+    ],
+)
+def test_coordinate_truth_table(monkeypatch, tmp_path, px, pts, image, clicks):
+    b, _log = _capture_with(monkeypatch, tmp_path, px=px, pts=pts)
+    assert b._last_size == image
+    for (ix, iy), (sx, sy) in clicks:
+        assert b._to_points(ix, iy) == (sx, sy), f"{px}px/{pts}pt: image ({ix},{iy})"
+
+
+def test_coordinates_refused_before_any_capture(monkeypatch):
+    b = _backend_with_fake_display(monkeypatch)
+    calls = []
+    monkeypatch.setattr(b, "_jxa", lambda script, argv=None: calls.append(argv) or "ok")
+    with pytest.raises(ValueError, match="capture"):
+        b.click(x=10, y=10)
+    with pytest.raises(ValueError, match="capture"):
+        b.move(10, 10)
+    assert calls == []
+
+
+def test_zoom_region_is_clamped_to_the_display(monkeypatch, tmp_path):
+    # 1440x900 pt, image 1568 wide (1.0889 px/pt). A region hanging off the
+    # bottom-right corner is clamped so the px/pt ratio matches what
+    # screencapture actually returns (it crops silently).
+    b, log = _capture_with(monkeypatch, tmp_path, px=(2880, 1800), pts=(1440, 900))
+    b.zoom((1500, 900, 400, 300))
+    assert log.read_text().splitlines()[-1].split()[2] == "1378,827,62,73"
+    assert b._origin == (1378.0, 827.0)
+    # And a region entirely off-screen degrades to a 1x1-pt sliver, not a crash.
+    b._last_size = (1568, 980); b._ppp = 1568 / 1440; b._origin = (0.0, 0.0)
+    b.zoom((5000, 5000, 10, 10))
+    assert log.read_text().splitlines()[-1].split()[2] == "1439,899,1,1"
+
+
+def test_screen_points_prefers_coregraphics_main_display(monkeypatch):
+    b = MacNativeBackend()
+    monkeypatch.setattr(b, "_jxa", lambda script, argv=None: "[1470,956]")
+    monkeypatch.setattr(b, "_applescript", lambda *a, **k: pytest.fail("Finder should not be asked"))
+    assert b.screen_points() == (1470, 956)
+    # Finder fallback only when CoreGraphics is unavailable.
+    monkeypatch.setattr(b, "_jxa", lambda script, argv=None: (_ for _ in ()).throw(RuntimeError("no")))
+    monkeypatch.setattr(b, "_applescript", lambda *a, **k: "0, 0, 1440, 900")
+    assert b.screen_points() == (1440, 900)
+
+
+def test_screenshot_dir_and_file_are_private(monkeypatch, tmp_path):
+    b, _log = _capture_with(monkeypatch, tmp_path, px=(640, 480), pts=(640, 480))
+    shots = tmp_path / "shots"
+    assert stat.S_IMODE(shots.stat().st_mode) == 0o700
+    assert list(shots.iterdir()) == []  # unlinked after read
+
+
+def test_force_quit_and_lock_combos_are_hard_blocked(monkeypatch):
+    from tools.computer_use import tool
+
+    b = _backend_with_fake_display(monkeypatch)
+    monkeypatch.setattr(b, "_applescript", lambda *a, **k: pytest.fail("must not reach osascript"))
+    tool.reset_backend_for_tests()
+    monkeypatch.setattr(tool, "_get_backend", lambda session_id="": b)
+    for combo in ("cmd+option+esc", "cmd+alt+escape", "cmd-option-shift-escape", "ctrl+cmd+q", "cmd+shift+q"):
+        out = tool.handle_computer_use({"action": "key", "keys": combo})
+        assert "blocked key combo" in out, combo

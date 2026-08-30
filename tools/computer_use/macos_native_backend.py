@@ -241,8 +241,25 @@ class MacNativeBackend(ComputerUseBackend):
         return (proc.stdout or "").strip()
 
     # ── geometry ─────────────────────────────────────────────────────
+    _JXA_MAIN_DISPLAY = (
+        "ObjC.import('CoreGraphics');"
+        "var b = $.CGDisplayBounds($.CGMainDisplayID());"
+        "JSON.stringify([b.size.width, b.size.height])"
+    )
+
     def screen_points(self) -> Tuple[int, int]:
-        """Logical size of the main display in points."""
+        """Logical size of the **main** display in points (the one with the
+        menu bar, Quartz origin 0,0 — the only display this backend captures
+        and drives). CoreGraphics first: Finder's ``bounds of window of
+        desktop`` spans every display on a multi-monitor Mac, which would make
+        every click land short."""
+        try:
+            w, h = json.loads(self._jxa(self._JXA_MAIN_DISPLAY))
+            w, h = int(float(w)), int(float(h))
+            if w > 0 and h > 0:
+                return w, h
+        except Exception as exc:
+            logger.debug("CGDisplayBounds lookup failed, falling back to Finder: %s", exc)
         out = self._applescript('tell application "Finder" to get bounds of window of desktop')
         nums = [int(float(n)) for n in re.findall(r"-?\d+(?:\.\d+)?", out)]
         if len(nums) == 4:
@@ -252,19 +269,27 @@ class MacNativeBackend(ComputerUseBackend):
     def _to_points(self, x: Optional[int], y: Optional[int]) -> Tuple[int, int]:
         if x is None or y is None:
             raise ValueError("this backend needs coordinate=[x, y] (no element index on macOS-native)")
+        if not self._last_size[0]:
+            # Without a capture there is no scale: the coordinates would be
+            # treated as points, which on a Retina/downscaled screen is a
+            # click somewhere else. The model must look before it acts.
+            raise ValueError("no screenshot yet — run action='capture' first; coordinates are pixels of the last screenshot")
         return scale_back(float(x), float(y), pixels_per_point=self._ppp, origin=self._origin)
 
     # ── capture ──────────────────────────────────────────────────────
-    def _screencapture(self, region: Optional[Tuple[int, int, int, int]] = None) -> bytes:
-        os.makedirs(self._shot_dir, exist_ok=True)
+    def _screencapture(self, region: Tuple[int, int, int, int]) -> bytes:
+        """One PNG of ``region`` (screen points). Always ``-R``: a bare
+        ``screencapture`` on a multi-display Mac writes one file *per
+        display* (``shot-x.png``, ``shot-x 1.png`` …) and only the first
+        would be read and deleted here — the rest would sit in the temp dir.
+        The file is 0600 (mkstemp) in a 0700 dir and unlinked as soon as it
+        has been read; nothing about it is logged."""
+        os.makedirs(self._shot_dir, mode=0o700, exist_ok=True)
         fd, path = tempfile.mkstemp(prefix="shot-", suffix=".png", dir=self._shot_dir)
         os.close(fd)
         try:
-            cmd = [_screencapture_bin(), "-x"]
-            if region:
-                x, y, w, h = region
-                cmd += ["-R", f"{x},{y},{w},{h}"]
-            cmd.append(path)
+            x, y, w, h = region
+            cmd = [_screencapture_bin(), "-x", "-R", f"{x},{y},{w},{h}", path]
             proc = self._run(cmd, timeout=15)
             if proc.returncode != 0 or not os.path.exists(path) or os.path.getsize(path) == 0:
                 raise RuntimeError(
@@ -304,13 +329,22 @@ class MacNativeBackend(ComputerUseBackend):
         logical_w, logical_h = float(pts_w), float(pts_h)
         pt_region: Optional[Tuple[int, int, int, int]] = None
         if region:
-            # region is in pixels of the previous capture → convert to points.
+            # region is in pixels of the previous capture → convert to points,
+            # then clamp to the display: screencapture silently crops a region
+            # that hangs off the edge, and the image it returns is then smaller
+            # than the requested width — the px/pt ratio computed from the
+            # requested width would be wrong and every click in the zoomed
+            # image would land off target.
             rx, ry = self._to_points(region[0], region[1])
-            rw = max(1, int(round(region[2] / self._ppp)))
-            rh = max(1, int(round(region[3] / self._ppp)))
+            rw = int(round(region[2] / self._ppp))
+            rh = int(round(region[3] / self._ppp))
+            rx, ry = max(0, min(rx, pts_w - 1)), max(0, min(ry, pts_h - 1))
+            rw, rh = max(1, min(rw, pts_w - rx)), max(1, min(rh, pts_h - ry))
             pt_region = (rx, ry, rw, rh)
             origin = (float(rx), float(ry))
             logical_w, logical_h = float(rw), float(rh)
+        else:
+            pt_region = (0, 0, pts_w, pts_h)
         raw = self._screencapture(pt_region)
         png, w, h, _ = downscale_png(raw, self._max_side)
         self._origin = origin
