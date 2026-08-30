@@ -209,6 +209,44 @@ def test_ax_mode_has_no_image(monkeypatch):
 # ── input goes through validation, then osascript with argv out-of-band ──
 
 
+# ── focus stub ─────────────────────────────────────────────────────────
+# The backend asks System Events "who is frontmost / what is focused" before
+# and after every mutating action. ``_focus_stub`` answers those queries from
+# a queue of fake states and records everything else (the real keystrokes),
+# so nothing touches the screen.
+
+
+def _focus_line(app="Terminal", bid="com.apple.Terminal", pid=100, title="moe — zsh",
+                role="AXTextArea", subrole="", vkind="text", vmatch="unknown") -> str:
+    return "\t".join([app, bid, str(pid), title, role, subrole, vkind, vmatch])
+
+
+FINDER_DESKTOP = _focus_line("Finder", "com.apple.finder", 703, "", "AXGroup", "", "", "unknown")
+
+
+def _focus_stub(monkeypatch, b, states):
+    """Route ``_AS_FOCUS`` queries to successive ``states`` (the last one
+    repeats; a BaseException instance is raised); return the list of
+    (script, argv) for every *other* AppleScript call, plus the focus argv log."""
+    monkeypatch.setattr(mnb, "_SETTLE_S", 0)
+    states = list(states)
+    sent, focus_argv = [], []
+
+    def fake(script, argv=None):
+        if script is b._AS_FOCUS:
+            focus_argv.append(list(argv or []))
+            st = states.pop(0) if len(states) > 1 else states[0]
+            if isinstance(st, BaseException):
+                raise st
+            return st
+        sent.append((script, list(argv or [])))
+        return ""
+
+    monkeypatch.setattr(b, "_applescript", fake)
+    monkeypatch.setattr(b, "_jxa", lambda script, argv=None: sent.append(("jxa", list(argv or []))) or "ok")
+    return sent, focus_argv
+
+
 def test_click_needs_coordinates_not_elements(monkeypatch):
     b = _backend_with_fake_display(monkeypatch)
     res = b.click(element=3)
@@ -220,21 +258,23 @@ def test_click_needs_coordinates_not_elements(monkeypatch):
 def test_click_posts_scaled_point_via_jxa(monkeypatch, fake_screencapture):
     b = _backend_with_fake_display(monkeypatch)
     b.capture(mode="vision")
-    calls = []
-    monkeypatch.setattr(b, "_jxa", lambda script, argv=None: calls.append(list(argv or [])) or "ok")
+    sent, _ = _focus_stub(monkeypatch, b, [_focus_line()])
+    calls = [argv for kind, argv in sent if kind == "jxa"]
     res = b.click(x=784, y=510, click_count=2)
     assert res.ok and res.path == "cgevent_fg" and res.effect == "unverifiable"
+    calls = [argv for kind, argv in sent if kind == "jxa"]
     assert calls == [["click", "735", "478", "2", "left"]]
     b.drag(from_xy=(0, 0), to_xy=(1568, 1020))
+    calls = [argv for kind, argv in sent if kind == "jxa"]
     assert calls[-1] == ["drag", "0", "0", "1470", "956"]
     b.scroll(direction="down", amount=4)
+    calls = [argv for kind, argv in sent if kind == "jxa"]
     assert calls[-1][0] == "scroll" and calls[-1][3:] == ["-4", "0"]
 
 
 def test_type_and_key_pass_text_as_argv(monkeypatch):
     b = _backend_with_fake_display(monkeypatch)
-    calls = []
-    monkeypatch.setattr(b, "_applescript", lambda script, argv=None: calls.append((script, list(argv or []))) or "")
+    calls, _ = _focus_stub(monkeypatch, b, [_focus_line()])
     b.type_text('say "hi"; rm -rf /')
     script, argv = calls[-1]
     assert argv == ['say "hi"; rm -rf /'] and 'rm -rf' not in script
@@ -250,19 +290,219 @@ def test_type_and_key_pass_text_as_argv(monkeypatch):
 
 def test_type_chunks_long_text(monkeypatch):
     b = _backend_with_fake_display(monkeypatch)
-    calls = []
-    monkeypatch.setattr(b, "_applescript", lambda script, argv=None: calls.append(argv) or "")
+    calls, focus_argv = _focus_stub(monkeypatch, b, [_focus_line()])
     monkeypatch.setattr(mnb.time, "sleep", lambda s: None)
     b.type_text("x" * 120)
-    assert [len(a[0]) for a in calls] == [50, 50, 20]
+    assert [len(a[0]) for _, a in calls] == [50, 50, 20]
+    # The post-type verification compares only the last 50 chars, as argv.
+    assert focus_argv == [[], ["x" * 50]]
 
 
-def test_list_windows_reports_front_window_in_both_spaces(monkeypatch, fake_screencapture):
+def test_list_windows_falls_back_to_front_window_when_cgwindowlist_fails(monkeypatch, fake_screencapture):
     b = _backend_with_fake_display(monkeypatch)
     b.capture(mode="vision")
+    monkeypatch.setattr(b, "_jxa", lambda script, argv=None: (_ for _ in ()).throw(RuntimeError("no bridge")))
     (win,) = b.list_windows()
     assert win["app"] == "Safari" and win["bounds_points"] == {"x": 10, "y": 20, "w": 800, "h": 600}
     assert win["bounds_screenshot_px"]["w"] == round(800 * 1568 / 1470)
+    assert win["frontmost"] and "front window only" in win["note"]
+
+
+def _cg_windows(monkeypatch, b, windows, front=None, display=(1470, 956)):
+    import json as _json
+    payload = {"display": list(display), "front": front or {"name": "Safari", "bundle_id": "com.apple.Safari", "pid": 5},
+               "windows": windows}
+    monkeypatch.setattr(b, "_jxa", lambda script, argv=None: _json.dumps(payload))
+
+
+def _w(app, pid, wid, title, x, y, w, h, alpha=1):
+    return {"app": app, "pid": pid, "window_id": wid, "title": title, "x": x, "y": y, "w": w, "h": h, "alpha": alpha}
+
+
+def test_list_windows_lists_every_app_z_ordered(monkeypatch, fake_screencapture):
+    b = _backend_with_fake_display(monkeypatch)
+    b.capture(mode="vision")
+    _cg_windows(monkeypatch, b, [
+        _w("Finder", 703, 1, "Desktop", 100, 100, 600, 400),      # a Finder window in front of Safari
+        _w("Electron", 9, 2, "", 0, 0, 1, 1),                        # 1-px helper: skipped
+        _w("Safari", 5, 3, "Home", 10, 20, 800, 600),
+        _w("Safari", 5, 4, "Docs", 50, 60, 800, 600),
+        _w("Terminal", 7, 5, "moe — zsh", 0, 0, 1470, 956),         # fullscreen
+        _w("Music", 8, 6, "Music", 1470, 0, 500, 500),               # entirely on a second display
+        _w("Ghost", 10, 7, "hidden", 0, 0, 300, 300, alpha=0.0),
+    ])
+    wins = b.list_windows()
+    assert [w["app"] for w in wins] == ["Finder", "Safari", "Safari", "Terminal", "Music", "Ghost"]
+    assert [w["z"] for w in wins] == list(range(6))
+    # Only the front app's TOP window is `frontmost`; every window of the front app is `front_app`.
+    assert [w["frontmost"] for w in wins] == [False, True, False, False, False, False]
+    assert [w["front_app"] for w in wins] == [False, True, True, False, False, False]
+    assert wins[1]["bundle_id"] == "com.apple.Safari" and "bundle_id" not in wins[0]
+    assert wins[0]["pid"] == 703 and wins[0]["window_id"] == 1 and wins[0]["title"] == "Desktop"
+    assert wins[1]["bounds_points"] == {"x": 10, "y": 20, "w": 800, "h": 600}
+    assert wins[1]["bounds_screenshot_px"]["w"] == round(800 * 1568 / 1470)
+    assert wins[3]["note"] == "fullscreen"
+    assert wins[4]["note"].startswith("off main display")
+    assert wins[5]["note"] == "transparent"
+    assert "note" not in wins[0]
+
+
+def test_list_windows_is_capped(monkeypatch):
+    b = _backend_with_fake_display(monkeypatch)
+    _cg_windows(monkeypatch, b, [_w("A", 1, i, f"w{i}", 0, 0, 100, 100) for i in range(60)])
+    wins = b.list_windows()
+    assert len(wins) == mnb.MAX_WINDOWS == 40
+    assert "bounds_screenshot_px" not in wins[0]  # no capture yet → no pixel space
+
+
+def test_list_windows_is_empty_on_a_bare_desktop(monkeypatch):
+    # Verified live: Finder frontmost with no windows → zero layer-0 windows.
+    b = _backend_with_fake_display(monkeypatch)
+    _cg_windows(monkeypatch, b, [], front={"name": "Finder", "bundle_id": "com.apple.finder", "pid": 703})
+    assert b.list_windows() == []
+
+
+# ── landing report: where did the input go? ────────────────────────────
+
+
+def test_focused_element_parses_query_and_never_returns_value(monkeypatch):
+    b = _backend_with_fake_display(monkeypatch)
+    _, focus_argv = _focus_stub(monkeypatch, b, [_focus_line(vmatch="yes")])
+    f = b.focused_element("abc")
+    assert f == {"app": "Terminal", "bundle_id": "com.apple.Terminal", "pid": 100, "window_title": "moe — zsh",
+                 "role": "AXTextArea", "subrole": "", "value_kind": "text", "value_ends_with_typed": True}
+    assert focus_argv == [["abc"]]
+    # Without a suffix the comparison is not made and the argv is empty.
+    assert b.focused_element()["value_ends_with_typed"] is None and focus_argv[-1] == []
+
+
+def test_focused_element_reports_failure_softly(monkeypatch):
+    b = _backend_with_fake_display(monkeypatch)
+    _focus_stub(monkeypatch, b, [RuntimeError("Accessibility permission missing for the app")])
+    f = b.focused_element()
+    assert f["app"] == "" and f["role"] == "" and "Accessibility" in f["error"]
+    assert b._describe_focus(f).startswith("focus unknown (Accessibility")
+
+
+def test_type_message_reports_landing_and_value_match(monkeypatch):
+    b = _backend_with_fake_display(monkeypatch)
+    sent, focus_argv = _focus_stub(monkeypatch, b, [_focus_line(), _focus_line(vmatch="yes")])
+    res = b.type_text("testing")
+    assert res.ok
+    assert res.message == 'typed 7 chars → Terminal "moe — zsh" AXTextArea (value ends with typed text: yes)'
+    assert res.meta["front_app"] == {"name": "Terminal", "bundle_id": "com.apple.Terminal", "pid": 100}
+    assert res.meta["focused"] == {"role": "AXTextArea", "subrole": "", "window_title": "moe — zsh",
+                                   "value_ends_with_typed": True}
+    assert res.meta["front_app_changed"] is False and "front_app_before" not in res.meta
+    assert focus_argv == [[], ["testing"]]
+    assert "testing" not in str(res.meta)  # value/typed text never echoed in meta
+    # A mismatch is reported as "no"; a non-text focus as "unknown".
+    _focus_stub(monkeypatch, b, [_focus_line(), _focus_line(vmatch="no")])
+    assert b.type_text("x").message.endswith("(value ends with typed text: no)")
+    _focus_stub(monkeypatch, b, [_focus_line(role="AXWebArea", vkind="")])
+    assert b.type_text("x").message.endswith("AXWebArea (value ends with typed text: unknown)")
+
+
+def test_click_reports_front_app_change(monkeypatch, fake_screencapture):
+    # The live failure: a click meant for a chat box fronted Finder.
+    b = _backend_with_fake_display(monkeypatch)
+    b.capture(mode="vision")
+    _focus_stub(monkeypatch, b, [_focus_line(), FINDER_DESKTOP])
+    res = b.click(x=100, y=100)
+    assert res.ok
+    assert res.message.endswith("→ Finder AXGroup; front app changed: Terminal → Finder")
+    assert res.meta["front_app_changed"] is True
+    assert res.meta["front_app"] == {"name": "Finder", "bundle_id": "com.apple.finder", "pid": 703}
+    assert res.meta["front_app_before"] == {"name": "Terminal", "bundle_id": "com.apple.Terminal"}
+    assert res.meta["focused"] == {"role": "AXGroup", "subrole": "", "window_title": ""}
+    # Same app, different window/focus: no "changed" clause.
+    _focus_stub(monkeypatch, b, [_focus_line(), _focus_line(title="other", role="AXButton")])
+    res = b.click(x=100, y=100)
+    assert res.message.endswith('→ Terminal "other" AXButton') and res.meta["front_app_changed"] is False
+
+
+def test_landing_survives_a_failed_focus_query(monkeypatch, fake_screencapture):
+    b = _backend_with_fake_display(monkeypatch)
+    b.capture(mode="vision")
+    _focus_stub(monkeypatch, b, [RuntimeError("osascript exit 1")])
+    res = b.click(x=1, y=1)
+    assert res.ok and "focus unknown (osascript exit 1)" in res.message
+    assert res.meta["focused"]["error"] == "osascript exit 1" and res.meta["front_app_changed"] is False
+
+
+def test_every_mutating_action_carries_landing(monkeypatch, fake_screencapture):
+    b = _backend_with_fake_display(monkeypatch)
+    b.capture(mode="vision")
+    _focus_stub(monkeypatch, b, [_focus_line()])
+    results = [
+        b.click(x=1, y=1), b.click(x=1, y=1, click_count=2), b.click(x=1, y=1, button="right"),
+        b.click(x=1, y=1, modifiers=["cmd"]), b.drag(from_xy=(0, 0), to_xy=(9, 9)),
+        b.scroll(direction="up"), b.type_text("a"), b.key("cmd+s"), b.key("tab"),
+    ]
+    for r in results:
+        assert r.ok and "front_app" in r.meta and "focused" in r.meta and "→ Terminal" in r.message, r
+    # Read-only actions do not.
+    assert "front_app" not in b.move(1, 1).meta
+
+
+# ── pre-type guard ─────────────────────────────────────────────────────
+
+
+def test_type_refuses_on_finder_desktop_unless_forced(monkeypatch):
+    b = _backend_with_fake_display(monkeypatch)
+    sent, _ = _focus_stub(monkeypatch, b, [FINDER_DESKTOP])
+    res = b.type_text("testing")
+    assert not res.ok and res.code == "focus_not_editable" and res.effect == "suspected_noop"
+    assert "Finder is frontmost" in res.message and "force=true" in res.message
+    assert "focus is Finder AXGroup" in res.message
+    assert res.meta["front_app"]["bundle_id"] == "com.apple.finder" and res.meta["focused"]["role"] == "AXGroup"
+    assert sent == []  # nothing typed
+    res = b.type_text("testing", force=True)
+    assert res.ok and [a for _, a in sent] == [["testing"]]
+
+
+@pytest.mark.parametrize("role, allowed", [
+    ("AXTextField", True), ("AXTextArea", True), ("AXComboBox", True), ("AXWebArea", True),
+    ("AXGroup", True), ("AXSearchField", True), ("", True),  # unknown: opaque app, fail open
+    ("AXButton", False), ("AXImage", False), ("AXOutline", False), ("AXList", False), ("AXStaticText", False),
+])
+def test_type_guard_by_role_outside_finder(monkeypatch, role, allowed):
+    b = _backend_with_fake_display(monkeypatch)
+    sent, _ = _focus_stub(monkeypatch, b, [_focus_line(app="Safari", bid="com.apple.Safari", role=role, vkind="")])
+    res = b.type_text("hi")
+    assert res.ok is allowed, (role, res.message)
+    if not allowed:
+        assert res.code == "focus_not_editable" and f"focused element is {role}" in res.message and sent == []
+
+
+def test_finder_text_fields_still_accept_typing(monkeypatch):
+    b = _backend_with_fake_display(monkeypatch)
+    for role in ("AXTextField", "AXSearchField", "AXComboBox"):
+        _focus_stub(monkeypatch, b, [_focus_line(app="Finder", bid="com.apple.finder", role=role)])
+        assert b.type_text("rename").ok, role
+    # AXGroup/unknown are lenient elsewhere but not in Finder (desktop reports AXGroup).
+    for role in ("AXGroup", "", "AXOutline", "AXImage"):
+        _focus_stub(monkeypatch, b, [_focus_line(app="Finder", bid="com.apple.finder", role=role)])
+        assert b.type_text("x").code == "focus_not_editable", role
+
+
+def test_key_return_refused_on_finder_item_unless_forced(monkeypatch):
+    b = _backend_with_fake_display(monkeypatch)
+    sent, _ = _focus_stub(monkeypatch, b, [FINDER_DESKTOP])
+    for combo in ("return", "enter"):
+        res = b.key(combo)
+        assert not res.ok and res.code == "focus_not_editable" and "open or rename" in res.message, combo
+    assert sent == []
+    # Modified return, other keys, and forced return go through.
+    assert b.key("cmd+return").ok and b.key("tab").ok and b.key("escape").ok
+    assert b.key("return", force=True).ok
+    assert any("key code 36" in script for script, _ in sent)
+    # Return in a Finder text field (rename/search) is fine.
+    _focus_stub(monkeypatch, b, [_focus_line(app="Finder", bid="com.apple.finder", role="AXTextField")])
+    assert b.key("return").ok
+    # Return outside Finder with a non-text focus (e.g. a default button) is fine.
+    _focus_stub(monkeypatch, b, [_focus_line(app="Safari", bid="com.apple.Safari", role="AXButton")])
+    assert b.key("return").ok
 
 
 def test_set_value_is_unsupported():
@@ -431,3 +671,91 @@ def test_claude_code_profile_does_not_persist_screenshots(monkeypatch):
     assert cu._is_claude_code_profile()
     monkeypatch.delenv("HERMES_MCP_TOOL_PROFILE")
     assert not cu._is_claude_code_profile()
+
+
+# ── tool-level landing / focused_element / force ───────────────────────
+
+
+def _tool_with(monkeypatch, b):
+    from tools.computer_use import tool
+    tool.reset_backend_for_tests()
+    monkeypatch.setattr(tool, "_get_backend", lambda session_id="": b)
+    return tool
+
+
+def test_tool_payload_hoists_landing_info(monkeypatch, fake_screencapture):
+    import json
+    b = _backend_with_fake_display(monkeypatch)
+    b.capture(mode="vision")
+    tool = _tool_with(monkeypatch, b)
+    _focus_stub(monkeypatch, b, [_focus_line(), FINDER_DESKTOP])
+    out = json.loads(tool.handle_computer_use({"action": "click", "coordinate": [100, 100]}))
+    assert out["ok"] and out["front_app"]["name"] == "Finder" and out["front_app_changed"] is True
+    assert out["front_app_before"]["name"] == "Terminal" and out["focused"]["role"] == "AXGroup"
+    assert "front app changed: Terminal → Finder" in out["message"]
+    _focus_stub(monkeypatch, b, [_focus_line(), _focus_line(vmatch="yes")])
+    out = json.loads(tool.handle_computer_use({"action": "type", "text": "testing"}))
+    assert out["ok"] and out["focused"]["value_ends_with_typed"] is True
+    assert "value" not in out["focused"] and "testing" not in json.dumps(out["focused"])
+
+
+def test_tool_type_guard_and_force_passthrough(monkeypatch):
+    import json
+    b = _backend_with_fake_display(monkeypatch)
+    tool = _tool_with(monkeypatch, b)
+    sent, _ = _focus_stub(monkeypatch, b, [FINDER_DESKTOP])
+    out = json.loads(tool.handle_computer_use({"action": "type", "text": "testing"}))
+    assert out["ok"] is False and out["code"] == "focus_not_editable" and out["verdict"]["decision"] == "escalate"
+    assert out["front_app"]["bundle_id"] == "com.apple.finder" and out["focused"]["role"] == "AXGroup"
+    assert sent == []
+    out = json.loads(tool.handle_computer_use({"action": "type", "text": "testing", "force": True}))
+    assert out["ok"] and [a for _, a in sent] == [["testing"]]
+    out = json.loads(tool.handle_computer_use({"action": "key", "keys": "return"}))
+    assert out["ok"] is False and out["code"] == "focus_not_editable"
+    out = json.loads(tool.handle_computer_use({"action": "key", "keys": "return", "force": True}))
+    assert out["ok"]
+
+
+def test_force_is_dropped_for_backends_without_it():
+    from tools.computer_use import tool
+
+    def type_text(text, *, delivery_mode=None, bring_to_front=False): ...
+    def type_text_kw(text, **kw): ...
+    def type_text_force(text, *, force=False): ...
+    assert tool._force_kw(type_text, {"force": True}) == {}
+    assert tool._force_kw(type_text_kw, {"force": True}) == {"force": True}
+    assert tool._force_kw(type_text_force, {"force": True}) == {"force": True}
+    assert tool._force_kw(type_text_force, {}) == {}
+
+
+def test_tool_focused_element_action_is_safe_and_valueless(monkeypatch):
+    import json
+    b = _backend_with_fake_display(monkeypatch)
+    tool = _tool_with(monkeypatch, b)
+    assert "focused_element" in tool._SAFE_ACTIONS
+    sent, focus_argv = _focus_stub(monkeypatch, b, [_focus_line(subrole="AXStandardWindow", vmatch="yes")])
+    out = json.loads(tool.handle_computer_use({"action": "focused_element"}))
+    assert out == {"front_app": {"name": "Terminal", "bundle_id": "com.apple.Terminal", "pid": 100},
+                   "focused": {"role": "AXTextArea", "subrole": "AXStandardWindow", "window_title": "moe — zsh"}}
+    assert sent == [] and focus_argv == [[]]
+    _focus_stub(monkeypatch, b, [RuntimeError("boom")])
+    out = json.loads(tool.handle_computer_use({"action": "focused_element"}))
+    assert out["error"] == "boom" and out["focused"]["role"] == ""
+
+
+def test_tool_list_windows_carries_backend_note(monkeypatch):
+    import json
+    b = _backend_with_fake_display(monkeypatch)
+    tool = _tool_with(monkeypatch, b)
+    _cg_windows(monkeypatch, b, [_w("Safari", 5, 3, "Home", 10, 20, 800, 600)])
+    out = json.loads(tool.handle_computer_use({"action": "list_windows"}))
+    assert out["count"] == 1 and out["windows"][0]["frontmost"] and "z-ordered" in out["note"]
+
+
+def test_schema_mentions_landing_info_and_new_knobs():
+    from tools.computer_use.schema import COMPUTER_USE_SCHEMA as s
+    props = s["parameters"]["properties"]
+    assert "focused_element" in props["action"]["enum"]
+    assert props["force"]["type"] == "boolean" and "focus_not_editable" in props["force"]["description"]
+    for needle in ("front_app", "focused", "front_app_changed", "check", "list_windows"):
+        assert needle in s["description"], needle
