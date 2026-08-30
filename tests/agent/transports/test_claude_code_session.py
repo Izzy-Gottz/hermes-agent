@@ -924,3 +924,57 @@ class TestImageForwarding:
         assert any("exceeds" in r.getMessage() for r in caplog.records)
         # Never the bytes themselves.
         assert all(big[:32] not in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("header,expected", [
+        ("data:image/jpg;base64,", "image/jpeg"),            # common misspelling
+        ("data:IMAGE/JPEG;base64,", "image/jpeg"),           # case
+        ("data:image/png;charset=utf-8;base64,", "image/png"),  # extra parameter
+        ("data:image/webp;BASE64,", "image/webp"),
+    ])
+    def test_media_type_variants(self, header, expected):
+        block = _coerce_input_blocks([
+            {"type": "image_url", "image_url": {"url": header + _png_b64()}},
+        ])[0]
+        assert block["type"] == "image"
+        assert block["source"]["media_type"] == expected
+
+    @pytest.mark.parametrize("url", [
+        "data:image/png," + "aGk=",                  # no ;base64 → not forwardable
+        "data:;base64,aGk=",                          # no media type
+        "data:image/svg+xml;base64,aGk=",             # not an API image type
+        "data:image/png;base64",                      # no comma
+    ])
+    def test_unforwardable_data_urls_become_placeholder(self, url):
+        blocks = _coerce_input_blocks([{"type": "image_url", "image_url": {"url": url}}])
+        assert blocks == [{"type": "text", "text": _IMAGE_PLACEHOLDER}]
+
+    def test_cap_is_on_decoded_bytes_not_base64_length(self, monkeypatch):
+        # 4 raw bytes encode to 8 base64 chars: a cap of 6 must pass (raw 4 ≤ 6)
+        # even though the base64 string is longer than the cap.
+        raw = b"\x89PNG"
+        b64 = base64.b64encode(raw).decode()
+        monkeypatch.setattr(ccs, "_MAX_IMAGE_BYTES", 6)
+        called = []
+        monkeypatch.setattr(ccs, "_downscale_image_b64", lambda d, n: called.append(n) or None)
+        block = _coerce_input_blocks([{"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}])[0]
+        assert block["source"]["data"] == b64
+        assert called == []
+
+    def test_wrapped_base64_is_unwrapped(self):
+        png = _png_b64()
+        wrapped = "\n".join(png[i:i + 16] for i in range(0, len(png), 16))
+        block = _coerce_input_blocks([{"type": "image_url", "image_url": {"url": "data:image/png;base64," + wrapped}}])[0]
+        assert block["source"]["data"] == png
+
+    def test_image_only_turn_has_no_empty_text_block(self):
+        blocks = _coerce_input_blocks([{"type": "image_url", "image_url": {"url": "data:image/png;base64," + _png_b64()}}])
+        assert [b["type"] for b in blocks] == ["image"]
+
+    def test_text_after_image_is_a_separate_block(self):
+        blocks = _coerce_input_blocks([
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _png_b64()}},
+            {"type": "text", "text": "after"},
+        ])
+        assert [b["type"] for b in blocks] == ["text", "image", "text"]
+        assert blocks[2]["text"] == "after"
