@@ -137,9 +137,11 @@ model:
 ### 通过 Claude Code CLI 使用 Claude 订阅（`claude-code-cli`）
 
 让 Hermes 以子进程方式驱动官方 `claude` CLI（`api_mode: claude_code`），从而用 Claude Pro/Max
-订阅进行**真正的工具调用**：Claude Code 的原生工具（Bash、Read、Write、Edit、Glob、Grep、WebSearch、
-WebFetch）在 CLI 内运行，Hermes 自己的工具（网页搜索/抽取、浏览器、视觉、图像生成、技能、TTS）通过 MCP
-暴露给它。不需要 API Key，也不会从 CLI 读取任何令牌。
+订阅进行**真正的工具调用**：模型在 CLI 内运行，但所有工具调用都走 **Hermes 通过 MCP 暴露的工具**
+（`terminal`、`read_file`、`write_file`、`patch`、`search_files`、`process`，以及网页搜索/抽取、浏览器、
+视觉、图像生成、技能、TTS），因此 Hermes 的命令守卫、文件策略、环境变量清理和 `pre_tool_call` hooks 全部生效。
+Claude Code 自带的 Bash/Read/Write/Edit/Glob/Grep/WebFetch 原生工具默认被禁用（见下文）。不需要 API Key，
+也不会从 CLI 读取任何令牌。
 
 ```bash
 claude setup-token                     # 仅需一次，输出长期令牌
@@ -150,9 +152,15 @@ hermes chat --provider claude-code-cli --model sonnet
 - 必须提供 `CLAUDE_CODE_OAUTH_TOKEN`（可用 `claude_code.oauth_token_env` 改名）；不会共享你的交互式 `claude` 登录。
 - 子进程完全由 Hermes 拥有：`CLAUDE_CONFIG_DIR=$HERMES_HOME/claude-code`、`--setting-sources ""`（不加载你的 hooks/插件）、
   `--strict-mcp-config`、Hermes 只写一次的拒绝列表 `settings.json`、独立工作目录、关闭自动记忆。
-- 权限模式来自 `tools.terminal.security_mode`：`auto` 预先放行 Bash/文件/网页工具（受拒绝列表约束）；
-  `approval-required` 通过 `--permission-prompt-tool stdio` 把每次 Bash/Write/Edit 交给 Hermes 审批，无审批者时拒绝；
-  未知值回退到 `approval-required`；只有 `unrestricted`/`yolo` 才会 `bypassPermissions`。
+- **工具权限边界**：原生 Bash/Read/Write/Edit/Glob/Grep/WebFetch/Task 等会绕过 Hermes 的命令/文件策略，并能读取子进程
+  环境变量，因此在所有模式下都通过 `--disallowedTools` 禁用，`--allowedTools` 仅放行 `mcp__hermes-tools`；
+  `settings.json` 的拒绝列表仍作为双重保险。`claude_code.native_tools: true` 是显式的运维选项，会**重新打开该边界**
+  （恢复旧的原生工具放行列表，模型运行的 shell 不再经过 Hermes 策略，且可读取 `CLAUDE_CODE_OAUTH_TOKEN`）。
+- `claude` 子进程不再继承任何提供商/工具凭据（`OPENAI_API_KEY`、`FIRECRAWL_API_KEY` 等）；它们只通过 0600 的
+  `--mcp-config` 文件的 `env` 块交给 `hermes-tools` MCP 服务器，服务器启动时会清除继承到的 `CLAUDE_CODE_OAUTH_TOKEN`。
+- 权限模式来自 `tools.terminal.security_mode`：`auto` 放行整个 Hermes MCP 服务器（危险命令仍经过 `check_all_command_guards`）；
+  `approval-required` 通过 `--permission-prompt-tool stdio` 把每次 `terminal`/`write_file`/`patch`/`process` 交给 Hermes 审批，无审批者时拒绝；
+  未知值回退到 `approval-required`；只有 `unrestricted`/`yolo` 才会 `bypassPermissions`（原生工具仍被禁用，除非 `native_tools: true`）。
 - 每个 Hermes 会话保持一个热进程并跨请求复用；系统提示应在请求间保持稳定，否则会频繁重启。
   相关配置：`claude_code.idle_timeout`（默认 600 秒）、`silence_timeout`（300）、`max_sessions`（8）、`turn_timeout`（600）。
 
