@@ -387,7 +387,9 @@ def _claude_code_config() -> Dict[str, Any]:
           cwd: ""                   # child working dir (default $HERMES_HOME/claude-code/workspace)
           deny: []                  # permissions.deny rules for the first-written settings.json
           permission_mode: ""       # override: default|acceptEdits|plan|dontAsk|bypassPermissions
-          allowed_tools: []         # override the native-tool allowlist
+          native_tools: false       # true re-enables Claude Code's native Bash/Read/Write/...
+                                    # (bypasses Hermes' command/file policy; see providers.md)
+          allowed_tools: []         # override the native-tool allowlist (native_tools: true)
           expose_hermes_tools: true # register hermes-tools MCP server
           extra_args: []            # appended verbatim to the claude command line
           resume: true              # --resume the CLI transcript of a resumed Hermes session
@@ -638,6 +640,7 @@ def _build_session(agent):
         security_mode=security_mode,
         permission_mode=str(cfg.get("permission_mode") or "") or None,
         allowed_tools=[str(t) for t in allowed] if isinstance(allowed, list) else None,
+        native_tools=bool(cfg.get("native_tools", False)),
         system_prompt=combined_system_prompt(agent),
         expose_hermes_tools=bool(cfg.get("expose_hermes_tools", True)),
         extra_args=[str(a) for a in extra_args] if isinstance(extra_args, list) else None,

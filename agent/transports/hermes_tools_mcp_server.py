@@ -37,9 +37,24 @@ What we DO NOT expose:
                                            drive them. See the inline
                                            comment on EXPOSED_TOOLS below.
 
+Profiles (``HERMES_MCP_TOOL_PROFILE``):
+  - default / ``codex``      — EXPOSED_TOOLS above (codex owns shell + files).
+  - ``claude-code``          — EXPOSED_TOOLS + CLAUDE_CODE_OS_TOOLS (terminal,
+                               read_file, write_file, patch, search_files,
+                               process). The claude_code runtime disallows
+                               the CLI's native Bash/Read/Write/... so every
+                               shell command and file write goes through
+                               Hermes' own guards (check_all_command_guards,
+                               file policy, env sanitisation, hooks) here.
+
+``HERMES_MCP_SCRUB_ENV`` (comma-separated) names variables removed from the
+server's own environment at startup — the claude_code runtime lists the CLI
+credential (``CLAUDE_CODE_OAUTH_TOKEN``) the server would otherwise inherit.
+
 Run with: python -m agent.transports.hermes_tools_mcp_server
 Spawned by: CodexAppServerSession.ensure_started() when the runtime is
-            active and config opts in.
+            active and config opts in; ClaudeCodeSession.ensure_started()
+            via the --mcp-config it writes.
 """
 
 from __future__ import annotations
@@ -151,10 +166,86 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
-def _build_server() -> Any:
+#: OS-level Hermes tools exposed ONLY in the ``claude-code`` profile: the
+#: claude_code runtime denies the CLI's native equivalents and relies on
+#: these so Hermes' command/file policy is the single authority.
+CLAUDE_CODE_OS_TOOLS: tuple[str, ...] = (
+    "terminal",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "process",
+)
+PROFILE_ENV = "HERMES_MCP_TOOL_PROFILE"
+SCRUB_ENV = "HERMES_MCP_SCRUB_ENV"
+CLAUDE_CODE_PROFILE = "claude-code"
+
+
+def exposed_tools_for_profile(profile: Optional[str]) -> tuple[str, ...]:
+    """Tool names registered for ``profile`` (``None``/``codex`` -> default)."""
+    key = (profile or "").strip().lower()
+    if key == CLAUDE_CODE_PROFILE:
+        return CLAUDE_CODE_OS_TOOLS + EXPOSED_TOOLS
+    return EXPOSED_TOOLS
+
+
+def scrub_environment(env: Optional[dict] = None) -> list[str]:
+    """Drop the variables named in ``$HERMES_MCP_SCRUB_ENV`` from ``env``
+    (default ``os.environ``) and return the names removed. Also drops any of
+    them that arrived as an empty string (the mcp-config ``env`` block blanks
+    the CLI credential before this runs)."""
+    target = os.environ if env is None else env
+    names = [n.strip() for n in (target.get(SCRUB_ENV) or "").split(",") if n.strip()]
+    removed = []
+    for name in names:
+        if name in target:
+            target.pop(name, None)
+            removed.append(name)
+    return removed
+
+
+#: Process-env marker that makes ``tools.approval.check_all_command_guards``
+#: treat this process as headless (no human can answer a prompt): dangerous /
+#: Tirith-flagged commands are DENIED with a message instead of silently
+#: approved, governed by ``approvals.single_query_mode`` (default ``deny``).
+HEADLESS_APPROVAL_ENV = "HERMES_SINGLE_QUERY_SESSION"
+
+
+def prepare_claude_code_profile(env: Optional[dict] = None) -> list:
+    """Make the ``claude-code`` profile enforce the policy it advertises.
+
+    The server is spawned by the ``claude`` CLI, not by the Hermes CLI or
+    gateway, so nothing has (a) registered the ``hooks.pre_tool_call`` shell
+    hooks from config.yaml on the plugin manager, or (b) marked the process
+    as one with no interactive approver. Without (a) config hooks never fire
+    for ``terminal`` / ``write_file`` calls; without (b)
+    ``check_all_command_guards`` falls into its "not CLI, not gateway"
+    branch and approves every non-hardline dangerous command unprompted.
+
+    Returns the registered hook specs (empty when none are configured).
+    Consent for the hook scripts follows the normal channels
+    (``hooks_auto_accept: true`` / ``HERMES_ACCEPT_HOOKS``); there is no TTY
+    here, so an unaccepted hook is skipped exactly as it is in the gateway.
+    """
+    target = os.environ if env is None else env
+    target.setdefault(HEADLESS_APPROVAL_ENV, "1")
+    try:
+        from agent.shell_hooks import register_from_config
+        from hermes_cli.config import load_config
+
+        return list(register_from_config(load_config(), accept_hooks=False))
+    except Exception:
+        logger.warning("claude-code profile: shell-hook registration failed", exc_info=True)
+        return []
+
+
+def _build_server(profile: Optional[str] = None) -> Any:
     """Create the MCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
     (we degrade to a clear error only when actually run)."""
+    profile = profile if profile is not None else os.environ.get(PROFILE_ENV)
+    tools_to_expose = exposed_tools_for_profile(profile)
     try:
         # mcp 2.0 removed `mcp.server.fastmcp`; `mcp.server.MCPServer` is the
         # same decorator/add_tool surface under the new name.
@@ -170,16 +261,24 @@ def _build_server() -> Any:
         handle_function_call,
     )
 
-    mcp = MCPServer(
-        "hermes-tools",
-        instructions=(
+    if (profile or "").strip().lower() == CLAUDE_CODE_PROFILE:
+        instructions = (
+            "Hermes Agent's tool surface. Claude Code's native Bash/Read/"
+            "Write/Edit/Glob/Grep/WebFetch tools are disabled in this "
+            "session; use terminal, read_file, write_file, patch, "
+            "search_files and process from this server for shell and file "
+            "work, plus web search/extract, browser automation, vision, "
+            "image generation, skills and TTS."
+        )
+    else:
+        instructions = (
             "Hermes Agent's tool surface, exposed for use inside a Codex "
             "session. Use these for capabilities Codex's built-in toolset "
             "doesn't cover: web search/extract, browser automation, "
             "subagent delegation, vision, image generation, persistent "
             "memory, skills, and cross-session search."
-        ),
-    )
+        )
+    mcp = MCPServer("hermes-tools", instructions=instructions)
 
     # Pull authoritative Hermes tool schemas for the ones we expose, so
     # MCP clients see the same parameter docs Hermes gives the model.
@@ -191,7 +290,7 @@ def _build_server() -> Any:
 
     exposed_count = 0
 
-    for name in EXPOSED_TOOLS:
+    for name in tools_to_expose:
         spec = all_defs.get(name)
         if spec is None:
             logger.debug(
@@ -243,9 +342,10 @@ def _build_server() -> Any:
         exposed_count += 1
 
     logger.info(
-        "hermes-tools MCP server registered %d/%d tools",
+        "hermes-tools MCP server registered %d/%d tools (profile=%s)",
         exposed_count,
-        len(EXPOSED_TOOLS),
+        len(tools_to_expose),
+        profile or "default",
     )
     return mcp
 
@@ -265,6 +365,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Quiet mode: keep Hermes' own banners off stdout (which is the MCP wire).
     os.environ.setdefault("HERMES_QUIET", "1")
     os.environ.setdefault("HERMES_REDACT_SECRETS", "true")
+    # Credentials that belong to the spawning CLI, not to Hermes' tools
+    # (CLAUDE_CODE_OAUTH_TOKEN): drop them before any tool can spawn a shell.
+    scrubbed = scrub_environment()
+    if scrubbed:
+        logger.info("scrubbed %s from the server environment", ",".join(scrubbed))
+    if (os.environ.get(PROFILE_ENV) or "").strip().lower() == CLAUDE_CODE_PROFILE:
+        hooks = prepare_claude_code_profile()
+        logger.info("claude-code profile: %d config hook(s) registered; headless approval", len(hooks))
 
     try:
         server = _build_server()

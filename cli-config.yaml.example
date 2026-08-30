@@ -499,6 +499,52 @@ terminal:
 #     transport: builtin        # Or an explicitly enabled plugin transport name
 #     transport_fallback: deny  # Set builtin to opt into fallback on transport failure
 
+# -----------------------------------------------------------------------------
+# Claude subscription via the Claude Code CLI (--provider claude-code-cli,
+# api_mode: claude_code). Hermes drives a Hermes-owned `claude -p` subprocess
+# authenticated with `claude setup-token` ($CLAUDE_CODE_OAUTH_TOKEN).
+# See website/docs/integrations/providers.md ("Tool authority").
+# -----------------------------------------------------------------------------
+claude_code:
+  # binary: claude                          # path to the CLI
+  # oauth_token_env: CLAUDE_CODE_OAUTH_TOKEN  # env var holding the setup-token
+  # cwd: ""                                 # child working dir (default $HERMES_HOME/claude-code/workspace)
+  #
+  # TOOL AUTHORITY (SECURITY). Claude Code's native OS-level tools (Bash, Read,
+  # Write, Edit, MultiEdit, NotebookEdit, Glob, Grep, LS, Task, WebFetch,
+  # WebSearch, ...) run inside the CLI and bypass Hermes' command guards
+  # (Tirith, dangerous-command detection, approval mode, hardline blocks),
+  # file-path policy, env sanitisation and pre_tool_call hooks; native Bash can
+  # also print the child's environment (the setup-token). So in EVERY mode --
+  # auto, approval-required and even unrestricted/yolo -- they are passed to
+  # --disallowedTools and --allowedTools is limited to the hermes-tools MCP
+  # server, whose terminal / read_file / write_file / patch / search_files /
+  # process tools provide the same capability under Hermes' own policy.
+  #
+  # native_tools: true is the explicit opt-in that RE-OPENS that boundary:
+  # the old native allowlist comes back and the only gate on native Bash is
+  # the `deny` list below. Leave it false unless you accept that model-run
+  # shell commands then skip Hermes' policy entirely.
+  native_tools: false
+  # permissions.deny rules seeded into $HERMES_HOME/claude-code/settings.json
+  # the FIRST time the runtime starts (belt-and-braces; the file is never
+  # overwritten afterwards -- edit it directly). Empty = built-in defaults
+  # (rm -rf, sudo, git push, Messages/Gmail/Drive send/trash/share).
+  # NOTE: Bash(...) rules here only match Claude Code's native Bash, which is
+  # disabled unless native_tools: true. Shell deny rules for Hermes' terminal
+  # belong in approvals.deny (config.yaml, honoured even under yolo).
+  deny: []
+  # permission_mode: ""                     # override: default|acceptEdits|plan|dontAsk|bypassPermissions
+  # allowed_tools: []                       # override the native allowlist (only meaningful with native_tools: true)
+  expose_hermes_tools: true                 # register the hermes-tools MCP server (turning this off leaves the model with no shell/file tools)
+  # extra_args: []                          # appended verbatim to the claude command line
+  resume: true                              # --resume the CLI transcript of a resumed Hermes session
+  turn_timeout: 600                         # whole-turn bound (seconds)
+  silence_timeout: 300                      # max silence between two CLI events inside a turn
+  idle_timeout: 600                         # evict a warm `claude` process idle this long
+  max_sessions: 8                           # warm processes kept at once (LRU eviction beyond this)
+
+
 # =============================================================================
 # Browser Tool Configuration
 # =============================================================================

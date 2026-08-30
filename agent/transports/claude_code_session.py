@@ -5,13 +5,20 @@ bidirectional ``stream-json`` mode so a Hermes turn can run on a Claude
 *subscription* (a long-lived ``claude setup-token`` credential) while still
 making real tool calls:
 
-* Claude Code's native tools (Bash, Read, Write, Edit, Glob, Grep, WebSearch,
-  WebFetch, ...) run inside the CLI exactly as they do in a terminal session.
-* Hermes' own tool surface (web_search / web_extract / browser_* / vision /
-  image_generate / skills / TTS / kanban_*) is exposed to the CLI over stdio
-  MCP via ``agent.transports.hermes_tools_mcp_server`` — the same server the
-  ``codex_app_server`` runtime uses. The model sees them as
-  ``mcp__hermes-tools__<tool>``.
+* Hermes' own tool surface — terminal / read_file / write_file / patch /
+  search_files / process plus web_search / web_extract / browser_* / vision /
+  image_generate / skills / TTS / kanban_* — is exposed to the CLI over stdio
+  MCP via ``agent.transports.hermes_tools_mcp_server`` (the ``claude-code``
+  profile of the server the ``codex_app_server`` runtime uses). The model
+  sees them as ``mcp__hermes-tools__<tool>``. Every shell command and file
+  write therefore goes through Hermes' own policy: ``check_all_command_guards``
+  (Tirith + dangerous-command detection + approval mode), file-path policy,
+  env sanitisation and ``pre_tool_call`` hooks.
+* Claude Code's NATIVE OS-level tools (Bash, Read, Write, Edit, Glob, Grep,
+  WebFetch, Task, ...) are passed to ``--disallowedTools`` in every mode
+  unless the operator sets ``claude_code.native_tools: true``. They bypass all
+  of the Hermes policy above and can read the child's environment, so they
+  are never pre-authorised by default (see :data:`NATIVE_OS_TOOLS`).
 
 Why a subprocess and not the Anthropic Messages transport: subscription
 credentials must only ever be touched by the official CLI. Nothing here reads,
@@ -84,10 +91,53 @@ logger = logging.getLogger(__name__)
 HERMES_TOOLS_MCP_SERVER_NAME = "hermes-tools"
 _MCP_TOOL_PREFIX = f"mcp__{HERMES_TOOLS_MCP_SERVER_NAME}__"
 
-#: Native Claude Code tools that are pre-approved in ``auto`` mode. This is
-#: today's Moe posture (``dontAsk`` + a deny list) and Hermes' own ``auto``
-#: terminal mode: the shell runs unprompted, and the ONLY gate is the deny
-#: list in the Hermes-owned ``settings.json`` passed via ``--settings`` (see
+#: Every Claude Code built-in that touches the OS or the network: shell and
+#: code execution, filesystem reads *and* writes, web access, subagents,
+#: skills and slash commands (each of which can run the others). These run
+#: inside the CLI and never see Hermes' command/file policy, its env
+#: sanitisation or its ``pre_tool_call`` hooks; native ``Bash`` can also print
+#: the child's environment (``$CLAUDE_CODE_OAUTH_TOKEN``). In every normal
+#: mode they are passed to ``--disallowedTools``; the equivalent capability is
+#: provided by the Hermes tools over MCP. ``Read`` / ``Glob`` / ``Grep`` are
+#: included on purpose: they accept absolute paths outside the workspace
+#: (``~/.hermes/.env``, ``~/.claude/.credentials.json``) with no path policy,
+#: while Hermes' ``read_file`` / ``search_files`` are exposed instead.
+#: Audited against ``claude --help`` 2.1.251 plus the documented built-in
+#: set; unknown names are harmless to deny.
+NATIVE_OS_TOOLS: tuple[str, ...] = (
+    # shell / code execution and its background-process helpers
+    "Bash", "PowerShell", "REPL", "BashOutput", "KillShell", "KillBash",
+    "TaskOutput", "TaskStop", "Monitor",
+    # filesystem
+    "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "NotebookRead",
+    "Glob", "Grep", "LS",
+    # network
+    "WebFetch", "WebSearch",
+    # anything that can invoke the above indirectly
+    "Task", "Agent", "Skill", "SlashCommand",
+    # resources of other MCP servers (none are configured, belt-and-braces)
+    "ListMcpResourcesTool", "ReadMcpResourceTool",
+)
+#: Built-ins that never leave the model's own context; safe to pre-approve.
+#: Also the ONLY built-ins the child is started with (``--tools``) when the
+#: boundary is on: ``--disallowedTools`` is a denylist and the CLI keeps
+#: adding built-ins (measured on 2.1.251 with the full NATIVE_OS_TOOLS list:
+#: Workflow, EnterWorktree/ExitWorktree, CronCreate/CronDelete/CronList,
+#: ScheduleWakeup, SendMessage, TaskCreate/…, DesignSync, ListAgents,
+#: ReportFindings still loaded). ``--tools`` is the allowlist counterpart:
+#: verified live to leave only these while MCP servers stay connected.
+_INERT_NATIVE_TOOLS: tuple[str, ...] = ("TodoWrite", "ToolSearch")
+
+#: Hermes MCP tools that mutate state or run commands. In
+#: ``approval-required`` mode they are NOT pre-approved: each call comes back
+#: over ``can_use_tool`` and is routed to Hermes' approval prompt (denied
+#: with a message when no approver is wired), exactly like native Bash was.
+GATED_HERMES_TOOLS: tuple[str, ...] = ("terminal", "write_file", "patch", "process")
+
+#: Native tools that are pre-approved in ``auto`` mode **only when the
+#: operator opted in with** ``claude_code.native_tools: true``. This is the
+#: pre-#98533 posture: the shell runs unprompted inside the CLI and the ONLY
+#: gate is the deny list in the Hermes-owned ``settings.json`` (see
 #: :data:`DEFAULT_DENY_RULES`). Anything NOT on this allowlist still goes
 #: through the ``can_use_tool`` approval bridge below.
 _AUTO_MODE_ALLOWED_TOOLS: tuple[str, ...] = (
@@ -95,8 +145,8 @@ _AUTO_MODE_ALLOWED_TOOLS: tuple[str, ...] = (
     "Glob", "Grep", "LS", "WebSearch", "WebFetch", "TodoWrite", "Task",
     "ToolSearch",
 )
-#: Read-only native tools that are safe to pre-approve when the user asked
-#: for approval on everything mutating.
+#: Read-only native tools pre-approved with ``native_tools: true`` when the
+#: user asked for approval on everything mutating.
 _APPROVAL_MODE_ALLOWED_TOOLS: tuple[str, ...] = (
     "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch", "TodoWrite",
     "ToolSearch",
@@ -234,8 +284,18 @@ class TurnResult:
     should_retire: bool = False
 
 
-def resolve_permission(security_mode: Optional[str]) -> tuple[str, tuple[str, ...]]:
-    """Map a Hermes terminal security mode to ``(permission_mode, allowed_tools)``."""
+def resolve_permission(
+    security_mode: Optional[str], *, native_tools: bool = False,
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Map a Hermes terminal security mode to
+    ``(permission_mode, allowed_native_tools, disallowed_native_tools)``.
+
+    Invariant (#98533): unless ``native_tools`` is True, no mode — not even
+    ``unrestricted`` — pre-authorises a native OS-level tool. ``unrestricted``
+    / ``yolo`` mean "don't prompt me", not "swap Hermes' shell for one that
+    skips its hardline blocks and env sanitisation"; only the explicit
+    ``claude_code.native_tools: true`` re-opens that boundary.
+    """
     key = str(security_mode or "auto").strip().lower() or "auto"
     if key not in _HERMES_TO_CLAUDE_PERMISSION:
         logger.warning(
@@ -243,7 +303,31 @@ def resolve_permission(security_mode: Optional[str]) -> tuple[str, tuple[str, ..
             security_mode, _FAIL_CLOSED_SECURITY_MODE,
         )
         key = _FAIL_CLOSED_SECURITY_MODE
-    return _HERMES_TO_CLAUDE_PERMISSION[key]
+    mode, legacy_allowed = _HERMES_TO_CLAUDE_PERMISSION[key]
+    if native_tools:
+        return mode, legacy_allowed, ()
+    return mode, _INERT_NATIVE_TOOLS, NATIVE_OS_TOOLS
+
+
+def hermes_mcp_allow_rules(permission_mode: str) -> list[str]:
+    """``--allowedTools`` entries for the hermes-tools MCP server.
+
+    * ``acceptEdits`` (auto): the whole server — every tool is already gated
+      by Hermes' own policy (command guards, file policy, hooks).
+    * ``default`` (approval-required): every tool except
+      :data:`GATED_HERMES_TOOLS`, which fall through to ``can_use_tool`` and
+      Hermes' approval prompt.
+    """
+    if permission_mode != "default":
+        return [f"mcp__{HERMES_TOOLS_MCP_SERVER_NAME}"]
+    from agent.transports.hermes_tools_mcp_server import exposed_tools_for_profile
+
+    gated = set(GATED_HERMES_TOOLS)
+    return [
+        f"{_MCP_TOOL_PREFIX}{name}"
+        for name in exposed_tools_for_profile("claude-code")
+        if name not in gated
+    ]
 
 
 def hermes_tool_name(wire_name: str) -> str:
@@ -405,10 +489,14 @@ def build_child_env(
 ) -> dict[str, str]:
     """Environment for the ``claude`` child.
 
-    * Starts from Hermes' sanitized subprocess env (Tier-1 gateway/infra
-      secrets always stripped). Provider credentials are inherited because
-      the hermes-tools MCP server — spawned *by* the CLI — needs tool API
-      keys (Firecrawl, browser, TTS, ...).
+    * Starts from Hermes' sanitized subprocess env with Tier-1 gateway/infra
+      secrets AND Tier-2 provider/tool credentials stripped
+      (``hermes_subprocess_env(inherit_credentials=False)``). The ``claude``
+      process itself needs none of them. The hermes-tools MCP server —
+      spawned *by* the CLI — does need tool API keys (Firecrawl, browser,
+      TTS, ...); those travel in the ``env`` block of the ``--mcp-config``
+      file instead (see :func:`write_mcp_config`), which the CLI merges over
+      the inherited environment when it spawns the server.
     * ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` are removed so the CLI
       can only authenticate with the subscription token. This is the whole
       point of the runtime, not an optimisation.
@@ -426,11 +514,14 @@ def build_child_env(
         try:
             from tools.environments.local import hermes_subprocess_env
 
-            env = hermes_subprocess_env(inherit_credentials=True)
+            env = hermes_subprocess_env(inherit_credentials=False)
         except Exception:  # pragma: no cover - import-time fallback
             env = dict(os.environ)
     else:
         env = dict(base_env)
+    # Same Tier-2 strip for a caller-supplied base env (tests, embedders).
+    for key in _provider_credential_keys():
+        env.pop(key, None)
     # Anything that could redirect the CLI away from the subscription (API
     # key, alt endpoint, Bedrock/Vertex routing) or pin a model behind
     # Hermes' back is stripped.
@@ -442,13 +533,18 @@ def build_child_env(
     token = oauth_token if oauth_token is not None else os.environ.get(token_env)
     if token:
         # SECURITY NOTE (measured live on Claude Code 2.1.251): this variable
-        # IS visible to model-run shell commands — `env` inside the child's
+        # IS visible to anything the CLI itself runs — `env` inside a native
         # Bash tool prints it, and the CLI has no per-tool env sanitisation
         # setting. It cannot be stripped: the CLI reads it to authenticate.
-        # Mitigations are (a) it is a dedicated setup-token that can be
-        # revoked without touching the user's own login, (b) the deny list
-        # in settings.json, (c) Hermes' output redaction. Treat anything the
-        # child can run as able to read this token.
+        # Mitigations are (a) native Bash/Read/... are in --disallowedTools
+        # unless claude_code.native_tools is set, so by default nothing the
+        # model drives runs inside the CLI process, (b) the hermes-tools MCP
+        # server scrubs it from its own environment at startup (it inherits
+        # the CLI's env) so Hermes' terminal never sees it either, (c) it is
+        # a dedicated setup-token revocable without touching the user's own
+        # login, (d) the deny list in settings.json, (e) Hermes' output
+        # redaction. With native_tools: true, treat anything the child can
+        # run as able to read this token.
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     env["CLAUDE_CONFIG_DIR"] = config_dir or claude_code_home()
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
@@ -478,6 +574,37 @@ def build_child_env(
     return env
 
 
+def _provider_credential_keys() -> frozenset:
+    """Hermes' Tier-2 provider/tool credential names (single source of truth
+    in ``tools.environments.local``). Empty when that module is unavailable."""
+    try:
+        from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
+
+        return frozenset(_HERMES_PROVIDER_ENV_BLOCKLIST)
+    except Exception:  # pragma: no cover - import-time fallback
+        return frozenset()
+
+
+#: Never forwarded to the MCP server through the config file, whatever the
+#: blocklist says: the CLI's own credential (the server scrubs it instead).
+_NEVER_FORWARD_TO_MCP: frozenset = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+
+
+def mcp_server_credentials(source: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Provider/tool credentials the hermes-tools MCP server needs.
+
+    Exactly the keys :func:`build_child_env` strips from the ``claude`` child
+    (Tier-2 blocklist), taken from ``source`` (default ``os.environ``), so
+    nothing is lost relative to plain inheritance and nothing extra leaks.
+    """
+    src = os.environ if source is None else source
+    return {
+        key: src[key]
+        for key in sorted(_provider_credential_keys())
+        if key in src and src[key] and key not in _NEVER_FORWARD_TO_MCP
+    }
+
+
 def resume_transcript_exists(config_dir: str, session_id: str) -> bool:
     """True when the CLI already has a transcript for ``session_id`` under
     ``config_dir`` (``projects/<cwd-slug>/<id>.jsonl``), i.e. ``--resume``
@@ -494,32 +621,124 @@ def resume_transcript_exists(config_dir: str, session_id: str) -> bool:
     return False
 
 
+_MCP_CONFIG_PREFIX = "hermes-claude-mcp-"
+#: path -> fd holding an ``flock`` for the life of the owning session. The
+#: file carries provider credentials, so a session that dies without
+#: ``close()`` (gateway killed, crash) must not leave it behind: the next
+#: start sweeps any config file whose lock is free (see
+#: :func:`sweep_stale_mcp_configs`).
+_MCP_CONFIG_LOCKS: dict[str, int] = {}
+
+
+def _flock(fd: int, *, blocking: bool) -> bool:
+    """True when the lock was taken; False when held elsewhere or unsupported."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return True
+    except OSError:
+        return False
+
+
+def sweep_stale_mcp_configs(directory: str) -> list[str]:
+    """Delete ``hermes-claude-mcp-*.json`` files in ``directory`` that no
+    live session holds a lock on. Returns the removed paths."""
+    removed: list[str] = []
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return removed
+    for entry in entries:
+        name = entry.name
+        if not (name.startswith(_MCP_CONFIG_PREFIX) and name.endswith(".json")):
+            continue
+        if entry.path in _MCP_CONFIG_LOCKS:
+            continue
+        try:
+            fd = os.open(entry.path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            if _flock(fd, blocking=False):
+                os.unlink(entry.path)
+                removed.append(entry.path)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    if removed:
+        logger.warning(
+            "claude-code: removed %d stale mcp-config file(s) left by a session "
+            "that did not close cleanly", len(removed),
+        )
+    return removed
+
+
+def release_mcp_config(path: str) -> None:
+    """Delete the config file written by :func:`write_mcp_config` and drop its lock."""
+    fd = _MCP_CONFIG_LOCKS.pop(path, None)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def write_mcp_config(
     *,
     python_executable: Optional[str] = None,
     project_root: Optional[str] = None,
     directory: Optional[str] = None,
+    credential_env: Optional[dict[str, str]] = None,
 ) -> str:
     """Write the ``--mcp-config`` JSON that launches ``hermes_tools_mcp_server``.
 
     The server runs on the *same* interpreter as this process so it sees the
-    same installed tools and config. Only non-secret env is written to the
-    file; everything else is inherited from the CLI's environment (which is
-    :func:`build_child_env`).
+    same installed tools and config, in its ``claude-code`` profile (adds
+    terminal / read_file / write_file / patch / search_files / process).
+
+    Credentials: the CLI spawns the server with its own environment merged
+    with this file's ``env`` block. Because :func:`build_child_env` strips
+    provider/tool credentials from the CLI, the ones the server needs are
+    written here (:func:`mcp_server_credentials`; ``credential_env``
+    overrides). The file is created 0600 inside the Hermes-owned config dir,
+    ``flock``-ed for the life of the session and removed when it closes; a
+    file whose owner died without ``close()`` is swept at the next start. The block also blanks
+    ``CLAUDE_CODE_OAUTH_TOKEN`` and lists it in ``HERMES_MCP_SCRUB_ENV`` so
+    the server drops the CLI credential it would otherwise inherit.
     """
     py = python_executable or sys.executable
     root = project_root or os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
+    from agent.transports.hermes_tools_mcp_server import (
+        CLAUDE_CODE_PROFILE, PROFILE_ENV, SCRUB_ENV,
+    )
+
     server_env: dict[str, str] = {
         "PYTHONPATH": root,
         "HERMES_QUIET": "1",
         "HERMES_REDACT_SECRETS": "true",
+        PROFILE_ENV: CLAUDE_CODE_PROFILE,
+        SCRUB_ENV: ",".join(sorted(_NEVER_FORWARD_TO_MCP)),
     }
+    for key in _NEVER_FORWARD_TO_MCP:
+        server_env[key] = ""
     for passthrough in ("HERMES_HOME", "HERMES_KANBAN_TASK", "HERMES_KANBAN_DB"):
         value = os.environ.get(passthrough)
         if value:
             server_env[passthrough] = value
+    creds = mcp_server_credentials() if credential_env is None else dict(credential_env)
+    for key, value in creds.items():
+        if key not in _NEVER_FORWARD_TO_MCP:
+            server_env[key] = value
     payload = {
         "mcpServers": {
             HERMES_TOOLS_MCP_SERVER_NAME: {
@@ -534,8 +753,16 @@ def write_mcp_config(
     if directory:
         _makedirs_or_explain(directory)
     fd, path = _mkstemp_or_explain(
-        prefix="hermes-claude-mcp-", suffix=".json", directory=directory or tempfile.gettempdir()
+        prefix=_MCP_CONFIG_PREFIX, suffix=".json", directory=directory or tempfile.gettempdir()
     )
+    # Lock BEFORE the content lands so a concurrent sweep can never see an
+    # unlocked file that holds credentials. The dup shares the open file
+    # description, so the lock survives the fdopen() close below.
+    lock_fd = os.dup(fd)
+    if _flock(lock_fd, blocking=True):
+        _MCP_CONFIG_LOCKS[path] = lock_fd
+    else:  # pragma: no cover - no flock on this platform
+        os.close(lock_fd)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     return path
@@ -572,7 +799,7 @@ def _tool_preview(name: str, args: Any) -> Optional[str]:
     """Short human-readable preview for the tool.started bubble."""
     if not isinstance(args, dict) or not args:
         return None
-    if name == "Bash":
+    if name == "Bash" or hermes_tool_name(name) == "terminal":
         desc = args.get("description") or args.get("command") or ""
         return str(desc)[:120] or None
     for key in ("file_path", "path", "pattern", "query", "url", "prompt"):
@@ -594,7 +821,8 @@ class ClaudeCodeSession:
     workspace cwd, ``--setting-sources ""`` (no ``~/.claude`` / project /
     local settings, hence no user hooks or plugins), ``--settings`` pointing
     at the Hermes-managed deny list, ``--strict-mcp-config`` (only the
-    hermes-tools server) and auto-memory disabled.
+    hermes-tools server), ``--disallowedTools`` covering every native
+    OS-level tool (unless ``native_tools``) and auto-memory disabled.
 
     Not thread-safe from the caller's perspective — one caller drives it at a
     time (AIAgent's conversation thread). :meth:`request_interrupt` is the one
@@ -610,6 +838,7 @@ class ClaudeCodeSession:
         security_mode: Optional[str] = None,
         permission_mode: Optional[str] = None,
         allowed_tools: Optional[list[str]] = None,
+        native_tools: bool = False,
         system_prompt: Optional[str] = None,
         expose_hermes_tools: bool = True,
         mcp_config_path: Optional[str] = None,
@@ -636,7 +865,10 @@ class ClaudeCodeSession:
         self._oauth_token_env = oauth_token_env
         self._claude_bin = claude_bin
         self._model = (model or "").strip() or None
-        mode, tools = resolve_permission(security_mode)
+        self._native_tools = bool(native_tools)
+        mode, tools, disallowed = resolve_permission(
+            security_mode, native_tools=self._native_tools
+        )
         if permission_mode:
             if permission_mode not in _VALID_PERMISSION_MODES:
                 raise ValueError(
@@ -646,6 +878,7 @@ class ClaudeCodeSession:
             mode = permission_mode
         self._permission_mode = mode
         self._allowed_tools: list[str] = list(allowed_tools) if allowed_tools is not None else list(tools)
+        self._disallowed_tools: list[str] = list(disallowed)
         self._system_prompt = system_prompt or ""
         self._system_prompt_path: Optional[str] = None
         self._expose_hermes_tools = expose_hermes_tools
@@ -792,13 +1025,25 @@ class ClaudeCodeSession:
             cmd += ["--session-id", self._requested_session_id]
         if self._model:
             cmd += ["--model", self._model]
-        allowed = list(self._allowed_tools)
+        if self._disallowed_tools:
+            # The tool-authority boundary (#98533): native OS-level tools are
+            # denied in EVERY mode, including bypassPermissions, unless the
+            # operator set claude_code.native_tools. ``--tools`` restricts the
+            # built-in set to the inert allowlist (anything the CLI adds in a
+            # future release is excluded by construction); the deny list is
+            # belt-and-braces. Deny rules win over allow rules and over the
+            # permission mode inside the CLI.
+            cmd += ["--tools", ",".join(_INERT_NATIVE_TOOLS)]
+            cmd += ["--disallowedTools", ",".join(dict.fromkeys(self._disallowed_tools))]
+        allowed = [t for t in self._allowed_tools if t not in self._disallowed_tools]
         if self._expose_hermes_tools and self._mcp_config_path:
             cmd += ["--mcp-config", self._mcp_config_path]
-            # Pre-approve every Hermes tool: they are already gated by
-            # Hermes' own pre_tool_call hooks and the operator chose to expose
-            # them. Without this, ``default`` mode silently denies them.
-            allowed.append(f"mcp__{HERMES_TOOLS_MCP_SERVER_NAME}")
+            # Pre-approve the Hermes tools: they are gated by Hermes' own
+            # command/file policy and pre_tool_call hooks, and the operator
+            # chose to expose them. Without this, ``default`` mode silently
+            # denies them. In ``default`` mode the mutating ones are left
+            # out so they reach Hermes' approval prompt via can_use_tool.
+            allowed.extend(hermes_mcp_allow_rules(self._permission_mode))
         if allowed and self._permission_mode != "bypassPermissions":
             cmd += ["--allowedTools", ",".join(dict.fromkeys(allowed))]
         if self._system_prompt_path:
@@ -825,6 +1070,7 @@ class ClaudeCodeSession:
         _makedirs_or_explain(self._cwd)
         ensure_settings_file(self._settings_path, self._deny_rules)
         if self._expose_hermes_tools and not self._mcp_config_path:
+            sweep_stale_mcp_configs(self._config_dir)
             self._mcp_config_path = write_mcp_config(directory=self._config_dir)
             self._owns_mcp_config = True
         self._write_system_prompt_file()
@@ -996,10 +1242,7 @@ class ClaudeCodeSession:
                     pass
                 setattr(self, attr, None)
         if self._owns_mcp_config and self._mcp_config_path:
-            try:
-                os.unlink(self._mcp_config_path)
-            except OSError:
-                pass
+            release_mcp_config(self._mcp_config_path)
             self._mcp_config_path = None
             self._owns_mcp_config = False
 
@@ -1274,7 +1517,7 @@ class ClaudeCodeSession:
         """
         tool_name = str(request.get("tool_name") or "tool")
         args = request.get("input") if isinstance(request.get("input"), dict) else {}
-        if tool_name == "Bash":
+        if tool_name == "Bash" or hermes_tool_name(tool_name) == "terminal":
             command = str(args.get("command") or "")
             description = str(args.get("description") or request.get("description") or "")
         else:

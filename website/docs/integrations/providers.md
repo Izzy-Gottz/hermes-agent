@@ -182,10 +182,13 @@ model:
 ### Claude subscription via the Claude Code CLI (`claude-code-cli`)
 
 Use a Claude Pro/Max subscription **with real tool calls** by letting Hermes drive the
-official `claude` CLI as a subprocess (`api_mode: claude_code`). Claude Code's native
-tools (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch) run inside the CLI, and
-Hermes' own tools (web search/extract, browser, vision, image generation, skills, TTS)
-are exposed to it over MCP. No API key and no token is ever read out of the CLI.
+official `claude` CLI as a subprocess (`api_mode: claude_code`). The model runs inside
+the CLI, but every tool call goes through **Hermes' tools over MCP** — `terminal`,
+`read_file`, `write_file`, `patch`, `search_files`, `process`, plus web search/extract,
+browser, vision, image generation, skills and TTS — so Hermes' command guards, file
+policy, env sanitisation and `pre_tool_call` hooks apply exactly as on the native
+runtime. Claude Code's own Bash/Read/Write/Edit/Glob/Grep/WebFetch tools are disabled
+(see *Tool authority* below). No API key and no token is ever read out of the CLI.
 
 ```bash
 claude setup-token                     # once — prints a long-lived token
@@ -211,14 +214,56 @@ other and log each other out. One token owned by Hermes ends that race.
   different list with `claude_code.deny` before the first run.
 - Working directory `$HERMES_HOME/claude-code/workspace` (or `claude_code.cwd`), and
   `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` — Hermes owns memory.
+- The `claude` process inherits **no provider or tool credentials** (`OPENAI_API_KEY`,
+  `FIRECRAWL_API_KEY`, ...): they are handed only to the `hermes-tools` MCP server through
+  the `env` block of a 0600 `--mcp-config` file that is deleted when the session closes.
+  The one secret the CLI must hold is its own `CLAUDE_CODE_OAUTH_TOKEN`; the MCP server
+  scrubs that from its environment at startup so Hermes' `terminal` never sees it.
+
+**Tool authority.** Claude Code's native OS-level tools never pass through Hermes'
+policy — native `Bash` skips `check_all_command_guards` (Tirith, dangerous-command
+detection, approval mode, hardline blocks), native `Read`/`Glob`/`Grep` accept absolute
+paths outside the workspace with no file policy, and native `Bash` can print the child's
+environment. So in every mode the child is started with
+
+```
+--tools          TodoWrite,ToolSearch                            # built-in allowlist: nothing else is loaded
+--disallowedTools Bash,PowerShell,REPL,BashOutput,KillShell,KillBash,TaskOutput,TaskStop,Monitor,Read,Write,Edit,MultiEdit,NotebookEdit,NotebookRead,Glob,Grep,LS,WebFetch,WebSearch,Task,Agent,Skill,SlashCommand,ListMcpResourcesTool,ReadMcpResourceTool
+--allowedTools   TodoWrite,ToolSearch,mcp__hermes-tools        # auto
+```
+
+`--tools` is the allowlist (the CLI keeps adding built-ins — `Workflow`, `EnterWorktree`,
+`CronCreate`, `ScheduleWakeup`, ... on 2.1.251 — and a denylist alone would keep loading
+them); the deny list is belt-and-braces. `--strict-mcp-config` and `--setting-sources ""`
+mean no other MCP server, hook, plugin or allow rule from `~/.claude` can reach the child,
+and Claude Code's deny rules cannot be overridden by any allow rule or permission mode.
+
+and the equivalent capability comes from the Hermes MCP tools (`terminal`, `read_file`,
+`write_file`, `patch`, `search_files`, `process`, `web_search`, `web_extract`).
+
+Because the shell is now Hermes' `terminal`, **`Bash(...)` rules in the `settings.json`
+deny list no longer match anything** (they only apply to native Bash); the
+`mcp__claude_ai_*` rules still do. Put shell deny rules in `approvals.deny` in
+`config.yaml` instead — they fire before every Hermes approval mode, including yolo.
+The `hermes-tools` server process is spawned by the `claude` CLI, so it registers your
+`hooks.pre_tool_call` shell hooks itself (`hooks_auto_accept` / `HERMES_ACCEPT_HOOKS`
+apply, exactly as in the gateway) and marks itself headless: a dangerous or
+Tirith-flagged command is **denied with a message** rather than silently approved, unless
+`approvals.single_query_mode: approve` is set.
+
+`claude_code.native_tools: true` is the explicit operator opt-in that **re-opens this
+boundary**: the pre-existing native allowlist (Bash, Read, Write, Edit, ... pre-approved
+in `auto`) comes back and the only gate on native Bash is the `settings.json` deny list.
+Only set it if you accept that model-run shell commands then bypass Hermes' command/file
+policy and can read `CLAUDE_CODE_OAUTH_TOKEN`.
 
 **Permission modes** (from `tools.terminal.security_mode`):
 
-| security_mode | `claude --permission-mode` | shell |
+| security_mode | `claude --permission-mode` | shell / files |
 |---|---|---|
-| `auto` (default) | `acceptEdits` + pre-approved Bash/file/web tools | runs, gated only by the deny list |
-| `approval-required` | `default` + read-only tools, `--permission-prompt-tool stdio` | **gated** — every Bash/Write/Edit call is sent to Hermes' approval prompt; with no interactive approver (gateway, cron) it is denied with a message the model sees, and Hermes tells you once per session |
-| `unrestricted` / `yolo` (or `--yolo`) | `bypassPermissions` | unrestricted |
+| `auto` (default) | `acceptEdits`; `--allowedTools mcp__hermes-tools` | Hermes `terminal` / file tools run under Hermes' own guards and your `pre_tool_call` hooks; dangerous commands are denied (no approver exists in the server process) |
+| `approval-required` | `default`, `--permission-prompt-tool stdio`; every Hermes tool except `terminal`, `write_file`, `patch`, `process` pre-approved | **gated** — each `terminal`/`write_file`/`patch`/`process` call is sent to Hermes' approval prompt; with no interactive approver (gateway, cron) it is denied with a message the model sees, and Hermes tells you once per session |
+| `unrestricted` / `yolo` (or `--yolo`) | `bypassPermissions` | no CLI-side prompts; native tools **still disallowed** unless `native_tools: true` — yolo means "don't ask", not "use a shell that skips Hermes' hardline blocks" |
 
 Unknown values fail closed to `approval-required`. Context compaction is done by the
 CLI itself (like `compression.codex_app_server_auto: native`); background memory/skill
@@ -237,6 +282,8 @@ logs a warning and defeats the cache.
 
 ```yaml
 claude_code:
+  native_tools: false    # true re-enables Claude Code's native Bash/Read/Write/... (bypasses Hermes policy)
+  deny: []               # permissions.deny rules seeded into settings.json on first run
   idle_timeout: 600      # seconds a warm process may sit idle before it is closed
   silence_timeout: 300   # max silence between two CLI events inside a turn
   max_sessions: 8        # warm processes kept at once; least-recently-used is closed beyond this
