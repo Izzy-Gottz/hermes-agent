@@ -227,13 +227,29 @@ paths outside the workspace with no file policy, and native `Bash` can print the
 environment. So in every mode the child is started with
 
 ```
+--tools          TodoWrite,ToolSearch                            # built-in allowlist: nothing else is loaded
 --disallowedTools Bash,PowerShell,REPL,BashOutput,KillShell,KillBash,TaskOutput,TaskStop,Monitor,Read,Write,Edit,MultiEdit,NotebookEdit,NotebookRead,Glob,Grep,LS,WebFetch,WebSearch,Task,Agent,Skill,SlashCommand,ListMcpResourcesTool,ReadMcpResourceTool
 --allowedTools   TodoWrite,ToolSearch,mcp__hermes-tools        # auto
 ```
 
+`--tools` is the allowlist (the CLI keeps adding built-ins — `Workflow`, `EnterWorktree`,
+`CronCreate`, `ScheduleWakeup`, ... on 2.1.251 — and a denylist alone would keep loading
+them); the deny list is belt-and-braces. `--strict-mcp-config` and `--setting-sources ""`
+mean no other MCP server, hook, plugin or allow rule from `~/.claude` can reach the child,
+and Claude Code's deny rules cannot be overridden by any allow rule or permission mode.
+
 and the equivalent capability comes from the Hermes MCP tools (`terminal`, `read_file`,
-`write_file`, `patch`, `search_files`, `process`, `web_search`, `web_extract`). The
-`permissions.deny` list in `settings.json` stays as belt-and-braces.
+`write_file`, `patch`, `search_files`, `process`, `web_search`, `web_extract`).
+
+Because the shell is now Hermes' `terminal`, **`Bash(...)` rules in the `settings.json`
+deny list no longer match anything** (they only apply to native Bash); the
+`mcp__claude_ai_*` rules still do. Put shell deny rules in `approvals.deny` in
+`config.yaml` instead — they fire before every Hermes approval mode, including yolo.
+The `hermes-tools` server process is spawned by the `claude` CLI, so it registers your
+`hooks.pre_tool_call` shell hooks itself (`hooks_auto_accept` / `HERMES_ACCEPT_HOOKS`
+apply, exactly as in the gateway) and marks itself headless: a dangerous or
+Tirith-flagged command is **denied with a message** rather than silently approved, unless
+`approvals.single_query_mode: approve` is set.
 
 `claude_code.native_tools: true` is the explicit operator opt-in that **re-opens this
 boundary**: the pre-existing native allowlist (Bash, Read, Write, Edit, ... pre-approved
@@ -245,7 +261,7 @@ policy and can read `CLAUDE_CODE_OAUTH_TOKEN`.
 
 | security_mode | `claude --permission-mode` | shell / files |
 |---|---|---|
-| `auto` (default) | `acceptEdits`; `--allowedTools mcp__hermes-tools` | Hermes `terminal` / file tools run under Hermes' own guards (dangerous commands hit `check_all_command_guards`; with no approver they are denied) |
+| `auto` (default) | `acceptEdits`; `--allowedTools mcp__hermes-tools` | Hermes `terminal` / file tools run under Hermes' own guards and your `pre_tool_call` hooks; dangerous commands are denied (no approver exists in the server process) |
 | `approval-required` | `default`, `--permission-prompt-tool stdio`; every Hermes tool except `terminal`, `write_file`, `patch`, `process` pre-approved | **gated** — each `terminal`/`write_file`/`patch`/`process` call is sent to Hermes' approval prompt; with no interactive approver (gateway, cron) it is denied with a message the model sees, and Hermes tells you once per session |
 | `unrestricted` / `yolo` (or `--yolo`) | `bypassPermissions` | no CLI-side prompts; native tools **still disallowed** unless `native_tools: true` — yolo means "don't ask", not "use a shell that skips Hermes' hardline blocks" |
 

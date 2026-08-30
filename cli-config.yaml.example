@@ -530,6 +530,9 @@ claude_code:
   # the FIRST time the runtime starts (belt-and-braces; the file is never
   # overwritten afterwards -- edit it directly). Empty = built-in defaults
   # (rm -rf, sudo, git push, Messages/Gmail/Drive send/trash/share).
+  # NOTE: Bash(...) rules here only match Claude Code's native Bash, which is
+  # disabled unless native_tools: true. Shell deny rules for Hermes' terminal
+  # belong in approvals.deny (config.yaml, honoured even under yolo).
   deny: []
   # permission_mode: ""                     # override: default|acceptEdits|plan|dontAsk|bypassPermissions
   # allowed_tools: []                       # override the native allowlist (only meaningful with native_tools: true)
