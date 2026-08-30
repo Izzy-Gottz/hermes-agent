@@ -1056,9 +1056,13 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             or image_dimensions[1] < _MIN_PROVIDER_IMAGE_DIMENSION
         )
     )
+    # Under the claude-code MCP profile the screenshot goes to the model as
+    # an image block and nowhere else: a desktop assistant must not leave a
+    # rolling cache of the user's screen in ~/.hermes/cache/images.
     screenshot_path = (
         _persist_capture_image(cap)
         if cap.png_b64 and cap.mode != "ax" and not image_too_small
+        and not _is_claude_code_profile()
         else None
     )
 
@@ -1539,6 +1543,10 @@ _MAX_SPILL_FILES = 20
 # periodic media-cache cleanup. CLI-only sessions may never start the gateway,
 # and capture_after can otherwise leave an unbounded screenshot trail.
 _MAX_CAPTURE_FILES = 20
+
+
+def _is_claude_code_profile() -> bool:
+    return (os.environ.get("HERMES_MCP_TOOL_PROFILE") or "").strip().lower() == "claude-code"
 
 
 def _persist_capture_image(cap: CaptureResult) -> Optional[str]:

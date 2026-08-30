@@ -423,3 +423,11 @@ def test_force_quit_and_lock_combos_are_hard_blocked(monkeypatch):
     for combo in ("cmd+option+esc", "cmd+alt+escape", "cmd-option-shift-escape", "ctrl+cmd+q", "cmd+shift+q"):
         out = tool.handle_computer_use({"action": "key", "keys": combo})
         assert "blocked key combo" in out, combo
+
+
+def test_claude_code_profile_does_not_persist_screenshots(monkeypatch):
+    from tools.computer_use import tool as cu
+    monkeypatch.setenv("HERMES_MCP_TOOL_PROFILE", "claude-code")
+    assert cu._is_claude_code_profile()
+    monkeypatch.delenv("HERMES_MCP_TOOL_PROFILE")
+    assert not cu._is_claude_code_profile()
