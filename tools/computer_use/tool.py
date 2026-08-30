@@ -34,6 +34,16 @@ For captures / actions with `capture_after=True`:
   adapter splices the base64 image into a `tool_result` block (see
   `agent/anthropic_adapter.py`). Every provider that supports multi-part
   tool content gets the image; text-only providers see the summary only.
+
+Landing info (macOS-native backend)
+-----------------------------------
+Every mutating action result carries `front_app` (name, bundle_id, pid),
+`focused` (AX role, window title, and for `type` whether the field's value
+now ends with the typed text — never the value itself) and
+`front_app_changed`. The model must check `front_app`/`focused` in every
+result before continuing: a click that lands on the desktop or a window
+behind the intended one is only visible there. `action='focused_element'`
+returns the same information without acting.
 """
 
 from __future__ import annotations
@@ -79,7 +89,7 @@ def set_approval_callback(cb) -> None:
 
 # Actions that read, not mutate. Always allowed.
 _SAFE_ACTIONS = frozenset({
-    "capture", "wait", "list_apps", "list_windows",
+    "capture", "wait", "list_apps", "list_windows", "focused_element",
 })
 
 # Actions that mutate user-visible state. Go through approval.
@@ -706,6 +716,21 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
     return action + fg
 
 
+def _force_kw(fn, args: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"force": True}`` when the model asked for it AND the backend's
+    method takes it (only macOS-native's focus guards do); else ``{}``."""
+    if not args.get("force"):
+        return {}
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "force" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return {"force": True}
+    return {}
+
+
 def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) -> Any:
     capture_after = bool(args.get("capture_after"))
 
@@ -751,7 +776,24 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
 
     if action == "list_windows":
         windows = backend.list_windows()
-        return json.dumps({"windows": windows, "count": len(windows)})
+        out: Dict[str, Any] = {"windows": windows, "count": len(windows)}
+        note = getattr(backend, "LIST_WINDOWS_NOTE", None)
+        if note:
+            out["note"] = note
+        return json.dumps(out)
+
+    if action == "focused_element":
+        fe = getattr(backend, "focused_element", None)
+        if fe is None:
+            return json.dumps({"error": "focused_element is not supported by this backend; use capture(mode='ax')"})
+        f = fe()
+        # Never the field's value — only where the focus is.
+        return json.dumps({
+            "front_app": {"name": f.get("app", ""), "bundle_id": f.get("bundle_id", ""), "pid": f.get("pid")},
+            "focused": {"role": f.get("role", ""), "subrole": f.get("subrole", ""),
+                        "window_title": f.get("window_title", "")},
+            **({"error": f["error"]} if f.get("error") else {}),
+        })
 
     if action == "focus_app":
         app = args.get("app")
@@ -845,12 +887,14 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
 
     if action == "type":
         res = backend.type_text(args.get("text", ""),
-                                delivery_mode=delivery_mode, bring_to_front=bring_to_front)
+                                delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+                                **_force_kw(backend.type_text, args))
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "key":
         res = backend.key(args.get("keys", ""),
-                          delivery_mode=delivery_mode, bring_to_front=bring_to_front)
+                          delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+                          **_force_kw(backend.key, args))
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "set_value":
@@ -950,6 +994,11 @@ def _action_payload(res: ActionResult) -> Dict[str, Any]:
         payload["code"] = res.code
     if res.meta:
         payload["meta"] = res.meta
+        # Landing info is hoisted to the top level so it is impossible to
+        # miss: where the input went matters more than that it was sent.
+        for k in ("front_app", "focused", "front_app_changed", "front_app_before"):
+            if k in res.meta:
+                payload[k] = res.meta[k]
     payload["verdict"] = _classify_action_result(res)
     return payload
 
