@@ -59,10 +59,13 @@ Spawned by: CodexAppServerSession.ensure_started() when the runtime is
 
 from __future__ import annotations
 
+import base64
 import inspect
+import io
 import json
 import logging
 import os
+import re
 import sys
 from typing import Any, Optional
 
@@ -176,6 +179,12 @@ CLAUDE_CODE_OS_TOOLS: tuple[str, ...] = (
     "patch",
     "search_files",
     "process",
+    # Eyes and hands. Screenshots come back as MCP image blocks (see
+    # to_mcp_content); every mutating action still runs through
+    # handle_function_call, so pre_tool_call hooks and guards apply. Only
+    # registered when tools.computer_use's check_fn passes (cua-driver, or
+    # the macOS-native backend).
+    "computer_use",
 )
 PROFILE_ENV = "HERMES_MCP_TOOL_PROFILE"
 SCRUB_ENV = "HERMES_MCP_SCRUB_ENV"
@@ -238,6 +247,113 @@ def prepare_claude_code_profile(env: Optional[dict] = None) -> list:
     except Exception:
         logger.warning("claude-code profile: shell-hook registration failed", exc_info=True)
         return []
+
+
+#: Longest side (px) of any image block sent over the bridge. Anthropic
+#: downsamples above 1568 px anyway, so larger only costs tokens and time.
+IMAGE_MAX_LONG_SIDE = 1568
+
+_DATA_URL = re.compile(r"^data:(?P<mime>[\w.+-]+/[\w.+-]+);base64,(?P<b64>[A-Za-z0-9+/=\s]+)$")
+
+
+def _shrink_image(data_b64: str, mime: str, max_side: int = IMAGE_MAX_LONG_SIDE) -> tuple[str, str, Optional[float]]:
+    """Downscale a base64 image so its longest side is ≤ ``max_side``.
+
+    Returns ``(b64, mime, scale)`` — ``scale`` is ``None`` when untouched,
+    else new/original so the caller can tell the model how coordinates map.
+    Anything PIL can't read is passed through unchanged.
+    """
+    try:
+        from tools.computer_use.macos_native_backend import downscale_png, fit_scale
+        from PIL import Image  # noqa: F401 — presence check
+    except Exception:
+        return data_b64, mime, None
+    try:
+        raw = base64.b64decode(data_b64, validate=False)
+        from PIL import Image as _Image
+        im = _Image.open(io.BytesIO(raw))
+        w, h = im.size
+    except Exception:
+        return data_b64, mime, None
+    if fit_scale(w, h, max_side) >= 1.0:
+        return data_b64, mime, None
+    try:
+        png, _nw, _nh, scale = downscale_png(raw, max_side)
+    except Exception:
+        return data_b64, mime, None
+    return base64.b64encode(png).decode("ascii"), "image/png", scale
+
+
+def to_mcp_content(result: Any) -> Any:
+    """Turn a Hermes tool result into what the MCP SDK should send.
+
+    Plain strings pass through (the SDK wraps them in a text block). A
+    Hermes multimodal result — ``{"_multimodal": True, "content": [{"type":
+    "text", ...}, {"type": "image_url", "image_url": {"url": "data:…"}}]}``,
+    the shape ``computer_use`` captures and ``vision``-style tools return —
+    becomes ``[TextContent, ImageContent, ...]`` so the CLI's model actually
+    *sees* the screenshot instead of a base64 blob or a file path. Images
+    wider than :data:`IMAGE_MAX_LONG_SIDE` are shrunk here and the text
+    block says so, with the factor, so coordinates read off the picture can
+    be scaled back by the tool that made it.
+    """
+    if not (isinstance(result, dict) and result.get("_multimodal")):
+        if isinstance(result, (dict, list)):
+            return json.dumps(result, ensure_ascii=False, default=str)
+        return result
+    try:
+        from mcp.types import ImageContent, TextContent
+    except ImportError:  # pragma: no cover - mcp missing → text summary only
+        return str(result.get("text_summary") or "")
+    blocks: list = []
+    notes: list[str] = []
+    for part in result.get("content") or []:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            blocks.append(TextContent(type="text", text=str(part.get("text") or "")))
+        elif ptype in {"image_url", "image"}:
+            url = ((part.get("image_url") or {}).get("url") if ptype == "image_url" else None) or ""
+            m = _DATA_URL.match(url.strip()) if url else None
+            if m:
+                data, mime = m.group("b64").replace("\n", ""), m.group("mime")
+            else:
+                src = part.get("source") or {}
+                data, mime = str(src.get("data") or part.get("data") or ""), str(
+                    src.get("media_type") or part.get("mimeType") or "image/png")
+            if not data:
+                continue
+            data, mime, scale = _shrink_image(data, mime)
+            if scale:
+                notes.append(
+                    f"(image downscaled by {scale:.3f} to fit {IMAGE_MAX_LONG_SIDE}px; "
+                    f"multiply pixel coordinates by {1 / scale:.3f} to address the original)")
+            blocks.append(ImageContent(type="image", data=data, mimeType=mime))
+    if not any(isinstance(b, TextContent) for b in blocks):
+        blocks.insert(0, TextContent(type="text", text=str(result.get("text_summary") or "")))
+    if notes:
+        blocks.append(TextContent(type="text", text="\n".join(notes)))
+    return blocks
+
+
+def _install_schema(mcp: Any, name: str, params_schema: dict) -> bool:
+    """Replace the SDK's signature-derived input schema for ``name`` with the
+    Hermes JSON schema. Returns True when it took."""
+    try:
+        manager = getattr(mcp, "_tool_manager", None)
+        tools = getattr(manager, "_tools", None)
+        tool = tools.get(name) if isinstance(tools, dict) else None
+        if tool is None or not isinstance(params_schema, dict) or not params_schema.get("properties"):
+            return False
+        schema = {k: v for k, v in params_schema.items() if not k.startswith("_")}
+        schema["properties"] = {k: v for k, v in schema["properties"].items() if not k.startswith("_")}
+        schema.setdefault("type", "object")
+        tool.parameters = schema
+        return True
+    except Exception:
+        logger.debug("could not install Hermes schema for %s", name, exc_info=True)
+        return False
 
 
 def _build_server(profile: Optional[str] = None) -> Any:
@@ -310,12 +426,12 @@ def _build_server(profile: Optional[str] = None) -> Any:
         def _make_handler(tool_name: str, schema: dict | None):
             sig, annots = _signature_from_schema(schema)
 
-            def _dispatch(**kwargs: Any) -> str:
+            def _dispatch(**kwargs: Any) -> Any:
                 try:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
-                    return handle_function_call(tool_name, args or {})
+                    return to_mcp_content(handle_function_call(tool_name, args or {}))
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})
@@ -323,22 +439,33 @@ def _build_server(profile: Optional[str] = None) -> Any:
             _dispatch.__name__ = tool_name
             _dispatch.__doc__ = description
             _dispatch.__signature__ = sig
+            # The SDK derives the *input* schema from the signature; the return
+            # annotation stays ``str`` so no structured-output schema is
+            # generated (an image block is not JSON-schema-able).
             _dispatch.__annotations__ = {**annots, "return": str}
             return _dispatch
 
+        handler = _make_handler(name, params_schema)
         try:
-            mcp.add_tool(
-                _make_handler(name, params_schema),
-                name=name,
-                description=description,
-            )
+            # structured_output=False: the return annotation is ``str`` for
+            # the schema generator's sake, but a handler may return content
+            # blocks (text + image); an output model would reject those.
+            mcp.add_tool(handler, name=name, description=description, structured_output=False)
         except TypeError:
-            # Older mcp SDK signature — fall back to decorator-style. The
-            # synthesized __signature__ on the handler still drives schema
-            # generation there.
-            handler = _make_handler(name, params_schema)
-            handler = mcp.tool(name=name, description=description)(handler)
+            try:
+                # Older SDK add_tool() without the keyword.
+                mcp.add_tool(handler, name=name, description=description)
+            except TypeError:
+                # Oldest: decorator-style only. The synthesized __signature__
+                # on the handler still drives schema generation there.
+                handler = mcp.tool(name=name, description=description)(handler)
 
+        # The signature-derived schema knows only types. Hand the client the
+        # authoritative Hermes schema (enums, per-parameter descriptions,
+        # array item types) — for computer_use that is the difference between
+        # the model knowing the action list and guessing it. Best effort:
+        # private SDK attribute, so a layout change just leaves the plain one.
+        _install_schema(mcp, name, params_schema)
         exposed_count += 1
 
     logger.info(

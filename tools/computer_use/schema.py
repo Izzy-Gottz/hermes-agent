@@ -54,14 +54,16 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "type",
                     "key",
                     "set_value",
+                    "zoom",
+                    "move",
                     "wait",
                     "list_apps",
                     "list_windows",
                     "focus_app",
                 ],
                 "description": (
-                    "Which action to perform. `capture` is free (no side "
-                    "effects). All other actions require approval unless "
+                    "Which action to perform. `capture` and `zoom` are free (no side "
+                    "effects); `move` only moves the pointer. All other actions require approval unless "
                     "auto-approved. Use `set_value` for select/popup elements "
                     "and sliders — it selects the matching option directly "
                     "without opening the native menu (no focus steal)."
@@ -104,6 +106,19 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "Optional exact native window target for action='capture'. "
                     "Pair with pid when an external cua-driver list_windows "
                     "lookup has already identified the window."
+                ),
+            },
+            # ── zoom ───────────────────────────────────────────────
+            "region": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 4,
+                "maxItems": 4,
+                "description": (
+                    "For action='zoom': [x, y, width, height] in pixels of the "
+                    "last full screenshot. Returns that region magnified so "
+                    "small text is legible. Coordinates in the zoomed image "
+                    "are mapped back for you. (macOS-native backend.)"
                 ),
             },
             # ── click / drag / scroll targeting ────────────────────

@@ -96,6 +96,10 @@ _BLOCKED_KEY_COMBOS = {
     frozenset({"cmd", "ctrl", "q"}),             # lock screen
     frozenset({"cmd", "shift", "q"}),            # log out
     frozenset({"cmd", "option", "shift", "q"}),  # force log out
+    frozenset({"cmd", "option", "escape"}),      # Force Quit dialog
+    frozenset({"cmd", "option", "esc"}),
+    frozenset({"cmd", "option", "shift", "escape"}),  # force-quit front app, no dialog
+    frozenset({"cmd", "option", "shift", "esc"}),
     # Windows secure/session shortcuts. The Windows driver accepts Win-key
     # combos, and Alt is canonicalized to option below, so block the
     # destructive variants before any backend sees them.
@@ -274,6 +278,42 @@ def _cua_permission_mode(session_id: str) -> str:
         return "standard"
 
 
+def _configured_backend_name() -> str:
+    """``computer_use.backend`` from config.yaml (``auto`` when unset)."""
+    try:
+        from hermes_cli.config import load_config
+
+        raw = ((load_config() or {}).get("computer_use") or {}).get("backend", "auto")
+    except Exception:
+        raw = "auto"
+    return str(raw or "auto").strip().lower()
+
+
+def _select_backend_name() -> str:
+    """Which backend to construct.
+
+    ``$HERMES_COMPUTER_USE_BACKEND`` wins (tests, one-off runs), then
+    ``computer_use.backend`` in config.yaml. ``auto`` (the default) means
+    cua-driver when its binary is installed, else — on macOS only — the
+    dependency-free native backend (``screencapture`` + CGEvent + System
+    Events), so a Mac without cua-driver still gets eyes and hands.
+    """
+    env = (os.environ.get("HERMES_COMPUTER_USE_BACKEND") or "").strip().lower()
+    name = env or _configured_backend_name()
+    if name != "auto":
+        return name
+    try:
+        from tools.computer_use.cua_backend import cua_driver_binary_available
+
+        if cua_driver_binary_available():
+            return "cua"
+    except Exception:
+        pass
+    from tools.computer_use.macos_native_backend import native_backend_available
+
+    return "macos" if native_backend_available() else "cua"
+
+
 def _get_backend(session_id: str = "") -> ComputerUseBackend:
     global _backend
     sid = str(session_id or "")
@@ -304,13 +344,15 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                 if sid == "":
                     _backend = None
             else:
-                backend_name = os.environ.get(
-                    "HERMES_COMPUTER_USE_BACKEND", "cua"
-                ).lower()
+                backend_name = _select_backend_name()
                 if backend_name in {"cua", "cua-driver", ""}:
                     from tools.computer_use.cua_backend import CuaDriverBackend
 
                     backend = CuaDriverBackend(permission_mode=permission_mode)
+                elif backend_name in {"macos", "macos-native", "native"}:
+                    from tools.computer_use.macos_native_backend import MacNativeBackend
+
+                    backend = MacNativeBackend()
                 elif backend_name == "noop":  # pragma: no cover
                     backend = _NoopBackend()
                 else:
@@ -680,6 +722,24 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         cap = backend.capture(**capture_kwargs)
         return _capture_response(cap)
 
+    if action == "zoom":
+        region = args.get("region")
+        if not (isinstance(region, (list, tuple)) and len(region) == 4):
+            return json.dumps({"error": "zoom requires region=[x, y, width, height] in screenshot pixels"})
+        zoom_fn = getattr(backend, "zoom", None)
+        if zoom_fn is None:
+            return json.dumps({"error": "zoom is not supported by this backend; use capture"})
+        cap = zoom_fn(tuple(int(v) for v in region))
+        return _capture_response(cap)
+
+    if action == "move":
+        coord = args.get("coordinate") or (None, None)
+        move_fn = getattr(backend, "move", None)
+        if move_fn is None or coord[0] is None:
+            return json.dumps({"error": "move requires coordinate=[x, y] and a backend that supports it"})
+        res = move_fn(int(coord[0]), int(coord[1]))
+        return _maybe_follow_capture(backend, res, capture_after)
+
     if action == "wait":
         seconds = float(args.get("seconds", 1.0))
         res = backend.wait(seconds)
@@ -996,9 +1056,13 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             or image_dimensions[1] < _MIN_PROVIDER_IMAGE_DIMENSION
         )
     )
+    # Under the claude-code MCP profile the screenshot goes to the model as
+    # an image block and nowhere else: a desktop assistant must not leave a
+    # rolling cache of the user's screen in ~/.hermes/cache/images.
     screenshot_path = (
         _persist_capture_image(cap)
         if cap.png_b64 and cap.mode != "ax" and not image_too_small
+        and not _is_claude_code_profile()
         else None
     )
 
@@ -1212,7 +1276,14 @@ def _should_route_through_aux_vision() -> bool:
     etc.) returns False so the existing multimodal envelope continues to be
     returned — fail open on the routing decision so a broken config can
     never silently drop the screenshot for vision-capable main models.
+
+    Inside the hermes-tools MCP server's ``claude-code`` profile the model on
+    the other end of the bridge is a Claude model reading MCP image blocks,
+    so the screenshot must stay in the multimodal envelope regardless of
+    what config.yaml says about the provider.
     """
+    if (os.environ.get("HERMES_MCP_TOOL_PROFILE") or "").strip().lower() == "claude-code":
+        return False
     try:
         from agent.auxiliary_client import _read_main_model, _read_main_provider
         from hermes_cli.config import load_config
@@ -1474,6 +1545,10 @@ _MAX_SPILL_FILES = 20
 _MAX_CAPTURE_FILES = 20
 
 
+def _is_claude_code_profile() -> bool:
+    return (os.environ.get("HERMES_MCP_TOOL_PROFILE") or "").strip().lower() == "claude-code"
+
+
 def _persist_capture_image(cap: CaptureResult) -> Optional[str]:
     """Save a capture in Hermes' media cache and return its absolute path.
 
@@ -1687,8 +1762,23 @@ def check_computer_use_requirements() -> bool:
     """
     if sys.platform not in ("darwin", "win32", "linux"):
         return False
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = (load_config() or {}).get("computer_use") or {}
+        if cfg.get("enabled") is False:
+            return False
+    except Exception:
+        pass
     from tools.computer_use.cua_backend import cua_driver_binary_available
-    return cua_driver_binary_available()
+    if cua_driver_binary_available():
+        return True
+    # macOS without cua-driver: the native backend needs nothing installed.
+    if sys.platform == "darwin" and _select_backend_name() in {"macos", "macos-native", "native"}:
+        from tools.computer_use.macos_native_backend import native_backend_available
+
+        return native_backend_available()
+    return False
 
 
 def get_computer_use_schema() -> Dict[str, Any]:
