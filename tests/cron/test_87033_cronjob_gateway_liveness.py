@@ -318,3 +318,96 @@ class TestCronStatusLockFirst:
     def test_no_lock_no_pids_still_warns(self, hermes_env):
         text = self._run_status(pids=[], lock_active=False)
         assert "NOT fire" in text
+
+
+class TestTickerHeartbeatLiveness:
+    """A fresh ticker heartbeat is itself proof the scheduler will fire.
+
+    Third site of the same false-alarm class as #95947. Both existing
+    signals — a `find_gateway_pids()` argv scan and the runtime lock — are
+    proxies for "the ticker's process is alive". An externally supervised
+    gateway (spawned as a grandchild of an embedding app's own wrapper)
+    defeats both while ticking normally, so `hermes cron status` and the
+    `cronjob` model tool reported a working scheduler as dead.
+
+    The heartbeat file is written by the ticker loop itself on every
+    iteration, so it is direct evidence rather than a proxy. It only ever
+    votes "alive": a missing (None) or stale stamp is not evidence either
+    way and leaves the existing signals to decide.
+    """
+
+    def _liveness(self, *, pids, lock_active, heartbeat_age):
+        from unittest.mock import patch
+
+        import hermes_cli.cron as cron_cli
+
+        with (
+            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
+            patch("hermes_cli.gateway.find_gateway_pids", return_value=list(pids)),
+            patch(
+                "gateway.status.is_gateway_runtime_lock_active",
+                return_value=lock_active,
+            ),
+            patch("cron.jobs.get_ticker_heartbeat_age", return_value=heartbeat_age),
+        ):
+            return cron_cli._builtin_gateway_liveness()
+
+    def test_fresh_heartbeat_proves_alive_without_pid_or_lock(self, hermes_env):
+        assert self._liveness(pids=[], lock_active=False, heartbeat_age=43.0) is True
+
+    def test_stale_heartbeat_is_not_evidence(self, hermes_env):
+        # 3 missed iterations + slack = 200s at the 60s default.
+        assert self._liveness(pids=[], lock_active=False, heartbeat_age=600.0) is False
+
+    def test_missing_heartbeat_is_not_evidence(self, hermes_env):
+        assert self._liveness(pids=[], lock_active=False, heartbeat_age=None) is False
+
+    def test_heartbeat_never_overrides_a_positive_pid_scan(self, hermes_env):
+        assert self._liveness(pids=[4242], lock_active=False, heartbeat_age=None) is True
+
+    def _run_status(self, *, pids, lock_active, heartbeat_age, success_age=None):
+        from unittest.mock import patch
+        import io
+        from contextlib import redirect_stdout
+
+        import hermes_cli.cron as cron_cli
+
+        out = io.StringIO()
+        with (
+            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
+            patch("hermes_cli.gateway.find_gateway_pids", return_value=list(pids)),
+            patch(
+                "gateway.status.is_gateway_runtime_lock_active",
+                return_value=lock_active,
+            ),
+            patch("gateway.status.get_running_pid", return_value=None),
+            patch("cron.jobs.get_ticker_heartbeat_age", return_value=heartbeat_age),
+            patch(
+                "cron.jobs.get_ticker_success_age",
+                return_value=heartbeat_age if success_age is None else success_age,
+            ),
+            redirect_stdout(out),
+        ):
+            cron_cli.cron_status()
+        return out.getvalue()
+
+    def test_status_reports_firing_on_heartbeat_alone(self, hermes_env):
+        text = self._run_status(pids=[], lock_active=False, heartbeat_age=43.0)
+        assert "NOT fire" not in text
+        assert "will fire automatically" in text
+
+    def test_status_claims_only_the_ticker_when_heartbeat_is_sole_witness(self, hermes_env):
+        # We never observed the process, so we must not report that we did.
+        text = self._run_status(pids=[], lock_active=False, heartbeat_age=43.0)
+        assert "Cron ticker is running" in text
+        assert "Gateway is running" not in text
+
+    def test_status_still_warns_when_heartbeat_is_stale(self, hermes_env):
+        text = self._run_status(pids=[], lock_active=False, heartbeat_age=600.0)
+        assert "NOT fire" in text
+
+    def test_status_stall_report_survives_for_an_observed_gateway(self, hermes_env):
+        # Gateway seen, heartbeat stale — the pre-existing stall path, not the
+        # new one. Heartbeat liveness must not swallow this warning.
+        text = self._run_status(pids=[4242], lock_active=False, heartbeat_age=600.0)
+        assert "STALLED" in text

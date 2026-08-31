@@ -64,6 +64,50 @@ def _active_cron_provider_name() -> str:
         return "builtin"
 
 
+def _ticker_stale_after_seconds() -> float:
+    """Seconds of heartbeat silence tolerated before the ticker looks stalled.
+
+    Allow ~3 missed ticker iterations plus a little slack, derived from the
+    shared interval constant so the threshold tracks the ticker cadence
+    instead of assuming a hardcoded 60s. Single definition so the liveness
+    probe and ``cron status``'s stall report cannot drift apart.
+    """
+    from cron.jobs import TICKER_INTERVAL_SECONDS
+
+    return TICKER_INTERVAL_SECONDS * 3 + 20
+
+
+def _ticker_heartbeat_proves_alive() -> bool:
+    """True when the ticker's OWN heartbeat is fresh enough to prove it runs.
+
+    The heartbeat file is written by the ticker loop itself, inside the
+    gateway process, on every iteration. A fresh stamp is therefore direct
+    evidence that the thing we actually care about — "will a due job fire?"
+    — is running, where ``find_gateway_pids`` and the runtime lock are both
+    only proxies for it.
+
+    That matters when the gateway is supervised by something other than
+    ``hermes gateway install``: an embedding app that spawns the gateway as
+    a grandchild of its own wrapper process is invisible to a pid scan
+    matching on argv, and holds no runtime lock this process can see, so
+    both proxies report "not running" while the ticker is demonstrably
+    ticking. Reporting a live scheduler as dead is the worse error of the
+    two: it tells the user (and the ``cronjob`` model tool) that scheduling
+    is pointless when it is in fact working.
+
+    Conservative in the other direction: a missing or unreadable heartbeat
+    is "unknown", not "alive" (``get_ticker_heartbeat_age`` returns None),
+    and a stale one is not evidence of anything. Only a fresh stamp votes.
+    """
+    try:
+        from cron.jobs import get_ticker_heartbeat_age
+
+        age = get_ticker_heartbeat_age()
+    except Exception:
+        return False
+    return age is not None and age <= _ticker_stale_after_seconds()
+
+
 def _builtin_gateway_liveness() -> Optional[bool]:
     """Tri-state liveness of the builtin cron scheduler's trigger.
 
@@ -95,7 +139,13 @@ def _builtin_gateway_liveness() -> Optional[bool]:
             pass
         from hermes_cli.gateway import find_gateway_pids
 
-        return bool(find_gateway_pids())
+        if find_gateway_pids():
+            return True
+        # Third signal, and the most direct one: the ticker's own heartbeat.
+        # Both probes above are proxies for "is the ticker's process alive";
+        # an externally supervised gateway defeats both while the ticker runs
+        # normally. See _ticker_heartbeat_proves_alive.
+        return _ticker_heartbeat_proves_alive()
     except Exception:
         return None
 
@@ -421,7 +471,16 @@ def cron_status():
                     pids = [lock_pid]
         except Exception:
             pass
-    if pids or gateway_alive_via_lock:
+    # Third signal: the ticker's own heartbeat. A pid scan matching on argv and
+    # the runtime lock are both proxies for the ticker's process; an externally
+    # supervised gateway (spawned as a grandchild of an embedding app's wrapper)
+    # defeats both while ticking normally. The heartbeat is written by the
+    # ticker loop itself, so a fresh stamp settles it. See
+    # _ticker_heartbeat_proves_alive.
+    gateway_alive_via_heartbeat = False
+    if not pids and not gateway_alive_via_lock:
+        gateway_alive_via_heartbeat = _ticker_heartbeat_proves_alive()
+    if pids or gateway_alive_via_lock or gateway_alive_via_heartbeat:
         # The gateway PROCESS is alive — but the cron ticker THREAD inside it
         # can die silently, or stay alive while every tick fails. Check both
         # the liveness heartbeat and the last-successful-tick marker so we
@@ -431,14 +490,12 @@ def cron_status():
             get_ticker_heartbeat_age,
             get_ticker_last_error,
             get_ticker_success_age,
-            TICKER_INTERVAL_SECONDS,
         )
         from cron.scheduler import _is_fd_exhaustion_text as _cron_is_fd_exhaustion_text
 
         # Allow ~3 missed ticker iterations (+ a little slack) before declaring
-        # trouble. Derived from the shared interval constant so this threshold
-        # tracks the ticker cadence instead of assuming a hardcoded 60s.
-        STALE_AFTER = TICKER_INTERVAL_SECONDS * 3 + 20  # = 200s at the 60s default
+        # trouble. Shared with the liveness probe so the two cannot drift.
+        STALE_AFTER = _ticker_stale_after_seconds()  # = 200s at the 60s default
         hb_age = get_ticker_heartbeat_age()
         ok_age = get_ticker_success_age()
 
@@ -488,7 +545,22 @@ def cron_status():
                     ))
             print("  Check the gateway log for 'Cron tick error'.")
         else:
-            print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
+            # Only claim what was actually observed. When the heartbeat is the
+            # sole witness we know the ticker is alive; we have not seen the
+            # process itself, so don't report it as if we had.
+            if gateway_alive_via_heartbeat:
+                print(color(
+                    "✓ Cron ticker is running — jobs will fire automatically",
+                    Colors.GREEN,
+                ))
+                print(color(
+                    "  (Gateway process not matched by pid scan or runtime lock — "
+                    "normal when it is supervised by another app. The ticker's own "
+                    "heartbeat is the evidence.)",
+                    Colors.DIM,
+                ))
+            else:
+                print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
             if pids:
                 print(f"  PID: {', '.join(map(str, pids))}")
             if hb_age is not None:
