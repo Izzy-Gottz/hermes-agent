@@ -24450,7 +24450,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         loop = asyncio.get_running_loop()
         try:
+            import contextvars
+            import functools
+
+            from agent.secret_scope import is_multiplex_active
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+
+            # On a MULTIPLEXED gateway this command arrives inside one
+            # profile's ``_profile_runtime_scope``, and both halves of the
+            # reload must stay inside it:
+            #
+            #  * ``profile_only=True`` so one tenant typing /reload-mcp does
+            #    not tear down (and SIGKILL the stdio children of) every
+            #    OTHER tenant's MCP servers — a cross-tenant outage.
+            #  * ``copy_context()`` because ``run_in_executor`` does NOT
+            #    propagate contextvars, so without it the worker thread
+            #    would lose the HERMES_HOME override and the secret scope
+            #    and re-discover the DEFAULT profile's ``mcp_servers``.
+            #
+            # Single-profile gateways never set multiplex_profiles, so they
+            # keep the historical process-wide reload verbatim.
+            multiplexed = bool(is_multiplex_active())
+
+            def _in_scope(fn, **kwargs):
+                call = functools.partial(fn, **kwargs) if kwargs else fn
+                if not multiplexed:
+                    return call
+                return functools.partial(contextvars.copy_context().run, call)
 
             # Capture old server names before shutdown
             with _lock:
@@ -24458,10 +24484,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            await loop.run_in_executor(
+                None, _in_scope(shutdown_mcp_servers, profile_only=multiplexed)
+            )
 
             # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            new_tools = await loop.run_in_executor(None, _in_scope(discover_mcp_tools))
 
             # Compute what changed
             with _lock:
