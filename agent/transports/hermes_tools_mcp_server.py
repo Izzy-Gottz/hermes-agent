@@ -37,6 +37,11 @@ What we DO NOT expose:
                                            drive them. See the inline
                                            comment on EXPOSED_TOOLS below.
 
+External MCP servers (``mcp_servers`` in ``~/.hermes/config.yaml``) are
+registered on top of whichever profile is active, under their registry names
+``mcp__<server>__<tool>``. The profile lists curate *Hermes' own* tools, not
+the user's connections.
+
 Profiles (``HERMES_MCP_TOOL_PROFILE``):
   - default / ``codex``      — EXPOSED_TOOLS above (codex owns shell + files).
   - ``claude-code``          — EXPOSED_TOOLS + CLAUDE_CODE_OS_TOOLS (terminal,
@@ -189,6 +194,41 @@ CLAUDE_CODE_OS_TOOLS: tuple[str, ...] = (
 PROFILE_ENV = "HERMES_MCP_TOOL_PROFILE"
 SCRUB_ENV = "HERMES_MCP_SCRUB_ENV"
 CLAUDE_CODE_PROFILE = "claude-code"
+
+
+#: Registry-name prefix for tools that came from an external MCP server
+#: (mirrors ``tools.mcp_tool.MCP_TOOL_NAME_PREFIX``; duplicated so this
+#: module still imports when the optional ``mcp`` package is absent).
+EXTERNAL_MCP_PREFIX = "mcp__"
+
+
+def discover_external_mcp_servers() -> list[str]:
+    """Register the user's own MCP servers into *this* process's registry.
+
+    ``model_tools`` deliberately dropped module-level MCP discovery (#16856,
+    it blocked the gateway's event loop), so every entry point runs it at its
+    own startup. This server is an entry point and was not on that list — the
+    reason a child could see Hermes' built-ins but nothing the user had
+    connected.
+
+    Cheap by design: ``_register_from_cache_sync`` puts cached manifests into
+    the registry without spawning anything and the first real call connects.
+    Best effort — an unreachable server must not stop Hermes' own tools from
+    being served.
+    """
+    try:
+        from tools.mcp_tool import discover_mcp_tools
+    except Exception:
+        logger.debug("MCP client support unavailable — no external servers", exc_info=True)
+        return []
+    try:
+        return list(discover_mcp_tools() or [])
+    except Exception:
+        logger.warning(
+            "external MCP discovery failed — serving Hermes' own tools only",
+            exc_info=True,
+        )
+        return []
 
 
 def exposed_tools_for_profile(profile: Optional[str]) -> tuple[str, ...]:
@@ -377,6 +417,12 @@ def _build_server(profile: Optional[str] = None) -> Any:
         handle_function_call,
     )
 
+    # Before any schema is read: whatever the user has connected has to be in
+    # the registry, or get_tool_definitions() below simply will not see it.
+    external_names = discover_external_mcp_servers()
+    if external_names:
+        logger.info("discovered %d tool(s) from external MCP servers", len(external_names))
+
     if (profile or "").strip().lower() == CLAUDE_CODE_PROFILE:
         instructions = (
             "Hermes Agent's tool surface. Claude Code's native Bash/Read/"
@@ -384,7 +430,10 @@ def _build_server(profile: Optional[str] = None) -> Any:
             "session; use terminal, read_file, write_file, patch, "
             "search_files and process from this server for shell and file "
             "work, plus web search/extract, browser automation, vision, "
-            "image generation, skills and TTS."
+            "image generation, skills and TTS. Tools named mcp__<server>__* "
+            "come from the user's own connected MCP servers and are as real "
+            "as the rest — prefer them over guessing or answering from "
+            "context when a question is about the system they front."
         )
     else:
         instructions = (
@@ -398,11 +447,28 @@ def _build_server(profile: Optional[str] = None) -> Any:
 
     # Pull authoritative Hermes tool schemas for the ones we expose, so
     # MCP clients see the same parameter docs Hermes gives the model.
+    # skip_tool_search_assembly: with tools.tool_search.enabled the assembled
+    # catalog collapses most tools behind a `tool_search` meta-tool, and every
+    # external MCP tool lands in the deferred half — invisible here, which is
+    # why a connected server still looked like "no tools" to the child. The
+    # bridge wants the real catalog: this server's own allowlist is the filter,
+    # and Claude Code does its own tool-surface management downstream.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (get_tool_definitions(quiet_mode=True) or [])
+        for td in (
+            get_tool_definitions(quiet_mode=True, skip_tool_search_assembly=True) or []
+        )
         if isinstance(td, dict) and td.get("type") == "function"
     }
+
+    # Everything the user connected, passed through unfiltered.
+    # `exposed_tools_for_profile` is an allowlist of *Hermes' own* tools, and
+    # deliberately so: those are the ones with native CLI equivalents to
+    # arbitrate between. A third-party MCP tool has no such conflict and no
+    # reason to be curated — anything Hermes can reach, the child can call.
+    external = tuple(sorted(n for n in all_defs if n.startswith(EXTERNAL_MCP_PREFIX)))
+    if external:
+        tools_to_expose = tuple(tools_to_expose) + external
 
     exposed_count = 0
 

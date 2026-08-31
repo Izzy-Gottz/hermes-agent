@@ -237,3 +237,57 @@ class TestMain:
         monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
         rc = m.main([])
         assert rc == 1
+
+
+class TestExternalMcpPassthrough:
+    """The user's own MCP servers reach the child.
+
+    Regression for the failure where a connected server (`pulse`) was
+    invisible to Moe's brain: the bridge never ran MCP discovery, and the
+    assembled tool catalog hid every external tool behind `tool_search`.
+    """
+
+    def _build(self, monkeypatch, defs, discovered=("mcp__pulse__run_sql",)):
+        import mcp.server as mcp_server
+        from agent.transports import hermes_tools_mcp_server as m
+        import model_tools
+
+        monkeypatch.setattr(mcp_server, "MCPServer", _RecordingServer)
+        monkeypatch.setattr(m, "discover_external_mcp_servers", lambda: list(discovered))
+        seen = {}
+
+        def fake_defs(quiet_mode=True, **kw):
+            seen.update(kw)
+            return [{"type": "function", "function": {"name": n, "parameters": {}}} for n in defs]
+
+        monkeypatch.setattr(model_tools, "get_tool_definitions", fake_defs)
+        return m._build_server("claude-code"), seen
+
+    def test_external_mcp_tools_are_exposed_without_being_allowlisted(self, monkeypatch):
+        server, _ = self._build(monkeypatch, ["terminal", "mcp__pulse__run_sql"])
+        # Not in EXPOSED_TOOLS or CLAUDE_CODE_OS_TOOLS, and exposed anyway.
+        from agent.transports.hermes_tools_mcp_server import (
+            CLAUDE_CODE_OS_TOOLS,
+            EXPOSED_TOOLS,
+        )
+        assert "mcp__pulse__run_sql" not in EXPOSED_TOOLS + CLAUDE_CODE_OS_TOOLS
+        assert "mcp__pulse__run_sql" in server.tools
+        assert "terminal" in server.tools
+
+    def test_catalog_is_read_pre_assembly_so_tool_search_cannot_hide_them(self, monkeypatch):
+        _, kwargs = self._build(monkeypatch, ["terminal", "mcp__pulse__run_sql"])
+        assert kwargs.get("skip_tool_search_assembly") is True
+
+    def test_no_external_servers_leaves_the_surface_unchanged(self, monkeypatch):
+        server, _ = self._build(monkeypatch, ["terminal"], discovered=())
+        assert [n for n in server.tools if n.startswith("mcp__")] == []
+
+    def test_discovery_failure_still_serves_hermes_own_tools(self, monkeypatch):
+        from agent.transports import hermes_tools_mcp_server as m
+        import tools.mcp_tool as mcp_tool
+
+        def boom():
+            raise RuntimeError("server unreachable")
+
+        monkeypatch.setattr(mcp_tool, "discover_mcp_tools", boom)
+        assert m.discover_external_mcp_servers() == []

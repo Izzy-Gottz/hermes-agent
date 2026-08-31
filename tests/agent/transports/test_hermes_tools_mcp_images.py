@@ -106,7 +106,7 @@ def test_registered_tools_do_not_validate_structured_output(monkeypatch):
     monkeypatch.setattr("mcp.server.MCPServer", FakeServer)
     monkeypatch.setattr(
         "model_tools.get_tool_definitions",
-        lambda quiet_mode=True: [{"type": "function", "function": {"name": "computer_use", "parameters": {}}}],
+        lambda quiet_mode=True, **_kw: [{"type": "function", "function": {"name": "computer_use", "parameters": {}}}],
     )
     srv._build_server("claude-code")
     assert captured["computer_use"].get("structured_output") is False
