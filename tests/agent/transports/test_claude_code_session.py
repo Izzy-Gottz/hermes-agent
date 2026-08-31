@@ -27,6 +27,7 @@ from agent.transports import claude_code_session as session_mod
 from agent.transports import claude_code_session as ccs
 from agent.transports.claude_code_session import _IMAGE_PLACEHOLDER, _coerce_input_blocks, _coerce_input_text
 from agent.transports.claude_code_session import (
+    _wire_names,
     DEFAULT_DENY_RULES,
     GATED_HERMES_TOOLS,
     NATIVE_OS_TOOLS,
@@ -152,8 +153,16 @@ class TestStaticHelpers:
         path = str(tmp_path / "cc" / "settings.json")
         ensure_settings_file(path)
         data = json.loads(Path(path).read_text())
-        assert data["permissions"]["deny"] == list(DEFAULT_DENY_RULES)
-        assert "Bash(git push *)" in data["permissions"]["deny"]
+        # The rules are written as the CHILD names the tool. Everything this
+        # runtime serves arrives over the hermes-tools MCP server, so a rule
+        # spelled `mcp__claude_ai_Gmail__send_message` matched nothing on the
+        # wire — the deny list was decorative until this prefix was added.
+        deny = data["permissions"]["deny"]
+        assert deny == _wire_names(list(DEFAULT_DENY_RULES))
+        assert "Bash(git push *)" in deny
+        assert "mcp__hermes-tools__mcp__claude_ai_Gmail__send_message" in deny
+        assert not any(r.startswith("mcp__") and not r.startswith("mcp__hermes-tools__")
+                       for r in deny)
         assert SETTINGS_MARKER_KEY in data
         # User edits survive: a second call with different rules is a no-op.
         Path(path).write_text('{"permissions": {"deny": ["Bash(custom *)"]}}')

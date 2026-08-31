@@ -362,6 +362,28 @@ def default_workspace_dir() -> str:
     return os.path.join(claude_code_home(), "workspace")
 
 
+def _wire_names(rules: list[str]) -> list[str]:
+    """Deny rules as the CHILD sees the tool, not as Hermes names it.
+
+    Every tool this runtime serves arrives over the hermes-tools MCP server,
+    so the child's name for it is ``mcp__hermes-tools__<name>`` — including
+    when ``<name>`` is itself an MCP tool, giving the double prefix
+    ``mcp__hermes-tools__mcp__cloudflare__...``. Rules written as plain
+    ``mcp__claude_ai_Gmail__send_message`` therefore matched nothing: the deny
+    list was decorative, and had been since the tools moved behind the bridge.
+
+    ``Bash(...)`` rules are left alone — those name the CLI's own native tool,
+    which is a different namespace and is disallowed outright anyway.
+    """
+    out: list[str] = []
+    for rule in rules:
+        if rule.startswith("mcp__") and not rule.startswith(_MCP_TOOL_PREFIX):
+            out.append(_MCP_TOOL_PREFIX + rule)
+        else:
+            out.append(rule)
+    return out
+
+
 def ensure_settings_file(
     path: str, deny_rules: Optional[list[str]] = None
 ) -> str:
@@ -372,7 +394,7 @@ def ensure_settings_file(
     """
     if os.path.exists(path):
         return path
-    rules = list(deny_rules) if deny_rules else list(DEFAULT_DENY_RULES)
+    rules = _wire_names(list(deny_rules) if deny_rules else list(DEFAULT_DENY_RULES))
     payload = {
         SETTINGS_MARKER_KEY: SETTINGS_MARKER_TEXT,
         "permissions": {"deny": rules},
