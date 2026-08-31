@@ -241,6 +241,39 @@ def discover_external_mcp_servers() -> list[str]:
         return []
 
 
+#: The only tools that genuinely cannot come through this server.
+#: ``model_tools._AGENT_LOOP_TOOLS`` — handle_function_call answers them with
+#: "must be handled by the agent loop", because they need the running AIAgent
+#: (mid-loop state) and a stateless MCP callback has none. Offering one would
+#: be offering a tool that always fails.
+AGENT_LOOP_TOOLS: tuple[str, ...] = ("todo", "memory", "session_search", "delegate_task")
+
+
+def tools_to_offer(profile: Optional[str], available: "set[str] | frozenset[str]") -> tuple[str, ...]:
+    """Everything Hermes has, minus what cannot work here.
+
+    This used to be an ALLOWLIST — a hand-written tuple of about thirty names.
+    Anything Hermes gained afterwards, and anything a plugin registered, was
+    invisible to the child forever: the moe-connectors plugin's whatsapp_send,
+    telegram_status and nine siblings were all present in the registry and
+    none of them reached the model, so Moe answered that it could not read the
+    user's WhatsApp while holding the tool that reads it. send_message was
+    missing for the same reason and got written up as a messaging decision.
+
+    An allowlist over a registry that grows is a list that is wrong by
+    default. The rule is the other way round now: everything, minus the few
+    that cannot be dispatched statelessly, minus (on codex) the OS tools codex
+    owns itself.
+    """
+    key = (profile or "").strip().lower()
+    blocked = set(AGENT_LOOP_TOOLS)
+    if key != CLAUDE_CODE_PROFILE:
+        # codex brings its own shell and file tools; two of each confuses the
+        # model and routes approval through the wrong UI.
+        blocked |= set(CLAUDE_CODE_OS_TOOLS)
+    return tuple(sorted(n for n in available if n not in blocked))
+
+
 def exposed_tools_for_profile(profile: Optional[str]) -> tuple[str, ...]:
     """Tool names registered for ``profile`` (``None``/``codex`` -> default)."""
     key = (profile or "").strip().lower()
@@ -411,7 +444,6 @@ def _build_server(profile: Optional[str] = None) -> Any:
     so the module can be imported without the mcp package installed
     (we degrade to a clear error only when actually run)."""
     profile = profile if profile is not None else os.environ.get(PROFILE_ENV)
-    tools_to_expose = exposed_tools_for_profile(profile)
     try:
         # mcp 2.0 removed `mcp.server.fastmcp`; `mcp.server.MCPServer` is the
         # same decorator/add_tool surface under the new name.
@@ -471,14 +503,9 @@ def _build_server(profile: Optional[str] = None) -> Any:
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
-    # Everything the user connected, passed through unfiltered.
-    # `exposed_tools_for_profile` is an allowlist of *Hermes' own* tools, and
-    # deliberately so: those are the ones with native CLI equivalents to
-    # arbitrate between. A third-party MCP tool has no such conflict and no
-    # reason to be curated — anything Hermes can reach, the child can call.
-    external = tuple(sorted(n for n in all_defs if n.startswith(EXTERNAL_MCP_PREFIX)))
-    if external:
-        tools_to_expose = tuple(tools_to_expose) + external
+    # Everything Hermes has: its own tools, its plugins' tools (the Moe
+    # connectors live here), and every external MCP server's tools.
+    tools_to_expose = tools_to_offer(profile, set(all_defs))
 
     exposed_count = 0
 
