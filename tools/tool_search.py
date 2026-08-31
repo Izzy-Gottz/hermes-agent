@@ -231,7 +231,18 @@ def _core_tool_names() -> frozenset[str]:
 
 # Session-gated GUI toolsets. Off ``_HERMES_CORE_TOOLS`` so non-GUI clients
 # never pay their schema; once a session enables them they stay direct.
-_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
+#
+# The plugin toolsets below are direct for a different reason: they are the
+# ones a *person* asked for. moe-connectors registers whatsapp_send,
+# gmail_send, calendar_pull and their siblings — the things the user
+# connected on purpose — and deferring them is how "Moe cannot read your
+# WhatsApp" happened while the tool sat in the registry. An MCP server's
+# thousand endpoints are a catalogue to search; a connector the user set up
+# is part of the assistant.
+_DIRECT_SURFACE_TOOLSETS = frozenset({
+    "desktop_ui", "project",
+    "connectors", "moe_profile", "code_execution", "browser-use",
+})
 
 
 def is_deferrable_tool_name(name: str) -> bool:

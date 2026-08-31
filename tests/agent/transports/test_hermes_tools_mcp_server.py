@@ -274,9 +274,34 @@ class TestExternalMcpPassthrough:
         assert "mcp__pulse__run_sql" in server.tools
         assert "terminal" in server.tools
 
-    def test_catalog_is_read_pre_assembly_so_tool_search_cannot_hide_them(self, monkeypatch):
+    def test_catalog_is_read_after_assembly_so_the_prompt_stays_affordable(self, monkeypatch):
+        """The assembled catalogue, deliberately.
+
+        Reading it pre-assembly handed the child every tool name Hermes knew.
+        Measured on a live config with one large MCP server: 87,907 input
+        tokens for a one-word turn against 8,887 with no MCP config — ~79k
+        tokens and ~14x the cost on every uncached turn, before the user has
+        said anything. tool_search is Hermes' own answer, its bridge tools
+        dispatch from this stateless process, and every deferred tool stays
+        callable through them.
+        """
         _, kwargs = self._build(monkeypatch, ["terminal", "mcp__pulse__run_sql"])
-        assert kwargs.get("skip_tool_search_assembly") is True
+        assert kwargs.get("skip_tool_search_assembly") in (None, False)
+
+    def test_the_connectors_the_user_set_up_are_never_deferred(self):
+        """whatsapp_send and its siblings must stay in the eager surface.
+
+        They are registered by the moe-connectors plugin, and a plugin
+        toolset is deferrable by default — which is how "Moe cannot read your
+        WhatsApp" happened while the tool sat in the registry. Pinned in
+        tool_search rather than worked around in the bridge.
+        """
+        from tools.tool_search import _DIRECT_SURFACE_TOOLSETS, is_deferrable_tool_name
+        assert "connectors" in _DIRECT_SURFACE_TOOLSETS
+        from tools.registry import registry
+        for name in ("whatsapp_send", "telegram_send", "gmail_send"):
+            if registry.get_toolset_for_tool(name) == "connectors":
+                assert not is_deferrable_tool_name(name), name
 
     def test_no_external_servers_leaves_the_surface_unchanged(self, monkeypatch):
         server, _ = self._build(monkeypatch, ["terminal"], discovered=())

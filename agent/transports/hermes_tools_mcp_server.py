@@ -489,17 +489,30 @@ def _build_server(profile: Optional[str] = None) -> Any:
 
     # Pull authoritative Hermes tool schemas for the ones we expose, so
     # MCP clients see the same parameter docs Hermes gives the model.
-    # skip_tool_search_assembly: with tools.tool_search.enabled the assembled
-    # catalog collapses most tools behind a `tool_search` meta-tool, and every
-    # external MCP tool lands in the deferred half — invisible here, which is
-    # why a connected server still looked like "no tools" to the child. The
-    # bridge wants the real catalog: this server's own allowlist is the filter,
-    # and Claude Code does its own tool-surface management downstream.
+    # The ASSEMBLED catalogue, not the raw one.
+    #
+    # This used to pass skip_tool_search_assembly=True, on the reasoning that
+    # the child does its own tool-surface management. Measured, that reasoning
+    # cost 79,000 tokens and about 14x the price on every uncached turn: the
+    # CLI defers the schemas but every one of ~2000 tool NAMES still lands in
+    # the prompt (87,907 input tokens for "say only: ok", against 8,887 with
+    # no MCP config at all).
+    #
+    # tool_search is Hermes' own answer to exactly this, and the Cloudflare
+    # manifest says so in as many words — it pins ?codemode=false precisely so
+    # "Hermes's tool_search then defers the whole surface behind its bridge
+    # tools and searches the FULL catalog with complete schemas". Nothing is
+    # hidden by taking it: tool_search, tool_describe and tool_call are in the
+    # assembled list, they dispatch from this stateless process (model_tools
+    # handles them before the agent-loop rejection), and every deferred tool
+    # stays callable through them.
+    #
+    # What must NOT be deferred is the connectors plugin — the tools the user
+    # connected on purpose. That is pinned in tool_search._DIRECT_SURFACE_TOOLSETS
+    # rather than worked around here.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (
-            get_tool_definitions(quiet_mode=True, skip_tool_search_assembly=True) or []
-        )
+        for td in (get_tool_definitions(quiet_mode=True) or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
