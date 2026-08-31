@@ -110,11 +110,12 @@ import shutil
 import sys
 import threading
 import time
+from collections.abc import MutableMapping, MutableSet
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple, TypeVar
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
@@ -2396,11 +2397,18 @@ class MCPServerTask:
         "_reconnect_retries", "_session_proven", "_was_parked",
         "_inflight_tasks", "_reconnecting", "_suspect_reason",
         "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
-        "_ever_connected",
+        "_ever_connected", "_profile_key",
     )
 
     def __init__(self, name: str):
         self.name = name
+        # Profile that owns this server, captured at construction (i.e.
+        # inside the connecting profile's ``_profile_runtime_scope``).
+        # Held explicitly rather than re-read from the ambient context:
+        # ``run()`` is a long-lived task that re-enters the registry for
+        # self-eviction and post-reconnect tool publication, and it must
+        # address ITS OWN partition even if the contextvar were ever lost.
+        self._profile_key: str = _mcp_profile_key()
         self.session: Optional[Any] = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
@@ -3918,7 +3926,7 @@ class MCPServerTask:
             return
         if not self._ready.is_set():
             with _lock:
-                if _servers.get(self.name) is not self:
+                if _partition_for(_servers, self._profile_key).get(self.name) is not self:
                     return
         self._registered_tool_names = _register_server_tools(
             self.name, self, self._config
@@ -3927,8 +3935,10 @@ class MCPServerTask:
         # recovered: drop its stale connect error so status surfaces stop
         # reporting it as failed.
         with _lock:
-            if _servers.get(self.name) is self:
-                _server_connect_errors.pop(self.name, None)
+            if _partition_for(_servers, self._profile_key).get(self.name) is self:
+                _partition_for(_server_connect_errors, self._profile_key).pop(
+                    self.name, None
+                )
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -4477,16 +4487,267 @@ class MCPServerTask:
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
+#
+# PROFILE PARTITIONING (cross-tenant isolation)
+# ---------------------------------------------
+# Every registry below used to be a plain dict keyed by the BARE server
+# name. That is safe in the single-profile deployment Hermes ships by
+# default, but a multiplexing gateway (``gateway.multiplex_profiles``)
+# serves many profiles from ONE process: two profiles that each configure
+# a server called ``github`` would share ONE subprocess, started with
+# whichever profile connected first and holding that profile's
+# credentials. Profile B's turns then reached profile A's GitHub account.
+#
+# The registries are therefore partitioned by profile. The partition key
+# comes from the SAME scope the rest of the multiplexed path uses — the
+# context-local HERMES_HOME override installed by
+# ``gateway.run._profile_runtime_scope`` alongside
+# ``agent.secret_scope.set_secret_scope`` — so there is exactly one notion
+# of "who is this" in the process. See ``_mcp_profile_key``.
+#
+# Single-profile behaviour is bit-for-bit unchanged: the key is the empty
+# string whenever the process is not a multiplexer, so every access lands
+# in one partition, exactly as before.
 
-_servers: Dict[str, MCPServerTask] = {}
-_server_connecting: set[str] = set()
-_server_connect_errors: Dict[str, str] = {}
+# Partition key for a process that is not a multiplexer: one partition,
+# legacy behaviour.
+_ROOT_PROFILE_KEY = ""
+
+# Partition key for a read that happens under multiplexing with NO profile
+# scope installed. ``agent.secret_scope.get_secret`` fails closed (raises)
+# in that situation; a registry cannot raise (status/banner paths consult
+# it), so it does the next-safest thing and hands the caller a dedicated
+# partition that can never alias a real profile's servers. The NUL prefix
+# keeps it disjoint from every ``hermes_home_key`` (a normcased path).
+_UNSCOPED_PROFILE_KEY = "\x00unscoped"
+
+# Value type of a profile-partitioned mapping (keys are always server names).
+_VT = TypeVar("_VT")
+
+# Memoized module handles for ``_mcp_profile_key``. It runs on every
+# registry access — including per-tool ``check_fn`` evaluation on every
+# turn — so the two lazy imports (kept lazy to avoid an import cycle
+# through ``agent.secret_scope`` → ``hermes_cli.config``) are resolved
+# once. The MODULE is cached, not the functions, so tests that
+# monkeypatch ``is_multiplex_active`` still take effect.
+_secret_scope_mod = None
+_hermes_constants_mod = None
+
+
+def _mcp_profile_key() -> str:
+    """Return the partition key for the profile owning the current context.
+
+    Mirrors ``tools.registry.check_fn_cache_scope`` — the established
+    idiom for "which multiplex profile is this?" in this codebase:
+
+    * Multiplexing OFF (the default deployment, and every CLI/TUI/test
+      process): always :data:`_ROOT_PROFILE_KEY`. A HERMES_HOME override
+      is used by plenty of single-profile paths (``hermes_cli.plugins``,
+      ``hermes_cli.mcp_startup``'s discovery thread, ``bot_mode_probe``,
+      the desktop backend) and partitioning on it there would strand a
+      server started under an override behind a key nothing looks up.
+    * Multiplexing ON with a profile scope installed: the canonical
+      ``hermes_home_key`` of that profile's home — the same identity
+      ``_profile_runtime_scope`` installs, resolved and normcased so two
+      spellings of one home cannot fork a profile's registry in half.
+    * Multiplexing ON with no scope: :data:`_UNSCOPED_PROFILE_KEY`.
+
+    Never raises: an unresolvable identity degrades to the isolated
+    unscoped partition rather than aliasing somebody else's credentials.
+    """
+    global _secret_scope_mod, _hermes_constants_mod
+    try:
+        mod = _secret_scope_mod
+        if mod is None:
+            import agent.secret_scope as mod
+            _secret_scope_mod = mod
+        if not mod.is_multiplex_active():
+            return _ROOT_PROFILE_KEY
+    except Exception:
+        # secret_scope unavailable ⇒ not a multiplexer.
+        return _ROOT_PROFILE_KEY
+    try:
+        consts = _hermes_constants_mod
+        if consts is None:
+            import hermes_constants as consts
+            _hermes_constants_mod = consts
+        override = consts.get_hermes_home_override()
+        if not override:
+            return _UNSCOPED_PROFILE_KEY
+        return consts.hermes_home_key(override)
+    except Exception:
+        logger.debug("Could not resolve MCP profile key", exc_info=True)
+        return _UNSCOPED_PROFILE_KEY
+
+
+class _ProfileScopedDict(MutableMapping[str, _VT]):
+    """A dict whose contents are private to the active profile.
+
+    Presents the full ``MutableMapping`` surface so the ~90 existing call
+    sites (``_servers.get(name)``, ``_servers[name] = srv``,
+    ``dict(_servers)``, ``_lazy_server_configs.pop(name, None)``, …) and
+    the test suite's ``monkeypatch``-style save/restore fixtures keep
+    working verbatim.
+
+    ``partitions()`` is the deliberate escape hatch for the handful of
+    genuinely PROCESS-global operations — full shutdown, the shared MCP
+    event loop's idle check — which must see every profile's entries.
+    """
+
+    __slots__ = ("_partitions",)
+
+    def __init__(self):
+        self._partitions: Dict[str, Dict[str, _VT]] = {}
+
+    # -- partition plumbing ------------------------------------------------
+    def partitions(self) -> Dict[str, Dict[str, _VT]]:
+        """Return the raw ``{profile_key: dict}`` map (do not mutate keys)."""
+        return self._partitions
+
+    def for_key(self, key: str) -> Dict[str, _VT]:
+        """Return (creating if needed) the partition for an explicit key.
+
+        Used where the profile identity must be carried explicitly rather
+        than read from the ambient context — a long-lived server task, or
+        a coroutine handed to the MCP loop by
+        ``asyncio.run_coroutine_threadsafe`` (which does NOT copy the
+        caller's context).
+        """
+        part = self._partitions.get(key)
+        if part is None:
+            part = self._partitions[key] = {}
+        return part
+
+    def _current(self) -> Dict[str, _VT]:
+        return self.for_key(_mcp_profile_key())
+
+    # -- MutableMapping ----------------------------------------------------
+    def __getitem__(self, key):
+        return self._current()[key]
+
+    def __setitem__(self, key, value):
+        self._current()[key] = value
+
+    def __delitem__(self, key):
+        del self._current()[key]
+
+    def __iter__(self):
+        return iter(self._current())
+
+    def __len__(self):
+        return len(self._current())
+
+    def __contains__(self, key):
+        return key in self._current()
+
+    def __repr__(self):
+        return repr(self._current())
+
+
+class _ProfileScopedSet(MutableSet[str]):
+    """A set whose contents are private to the active profile.
+
+    Same rationale as :class:`_ProfileScopedDict`. Implements the concrete
+    ``set`` methods the call sites use (``add``/``discard``/``update``/
+    ``difference_update``/``clear``) on top of ``MutableSet``.
+    """
+
+    __slots__ = ("_partitions",)
+
+    def __init__(self):
+        self._partitions: Dict[str, Set[str]] = {}
+
+    def partitions(self) -> Dict[str, Set[str]]:
+        return self._partitions
+
+    def for_key(self, key: str) -> Set[str]:
+        part = self._partitions.get(key)
+        if part is None:
+            part = self._partitions[key] = set()
+        return part
+
+    def _current(self) -> Set[str]:
+        return self.for_key(_mcp_profile_key())
+
+    def __contains__(self, value):
+        return value in self._current()
+
+    def __iter__(self):
+        return iter(self._current())
+
+    def __len__(self):
+        return len(self._current())
+
+    def add(self, value):
+        self._current().add(value)
+
+    def discard(self, value):
+        self._current().discard(value)
+
+    def update(self, other):
+        self._current().update(other)
+
+    def difference_update(self, other):
+        self._current().difference_update(other)
+
+    def clear(self):
+        self._current().clear()
+
+    def __repr__(self):
+        return repr(self._current())
+
+
+def _all_partitions(container):
+    """Every partition of a scoped container (or the container itself).
+
+    Tolerates a plain ``dict``/``set`` so a test that monkeypatches one of
+    these module globals with a bare container still works.
+    """
+    getter = getattr(container, "partitions", None)
+    if callable(getter):
+        return list(getter().values())
+    return [container]
+
+
+def _all_partition_values(container) -> list:
+    values: list = []
+    for part in _all_partitions(container):
+        values.extend(part.values() if hasattr(part, "values") else part)
+    return values
+
+
+def _clear_all_partitions(container) -> None:
+    for part in _all_partitions(container):
+        part.clear()
+
+
+def _any_partition_populated(container) -> bool:
+    return any(bool(part) for part in _all_partitions(container))
+
+
+def _partition_for(container, key: str):
+    """The partition for an explicit profile key (plain containers pass through)."""
+    getter = getattr(container, "for_key", None)
+    if callable(getter):
+        return getter(key)
+    return container
+
+
+_servers: "_ProfileScopedDict[MCPServerTask]" = _ProfileScopedDict()
+_server_connecting: _ProfileScopedSet = _ProfileScopedSet()
+_server_connect_errors: "_ProfileScopedDict[str]" = _ProfileScopedDict()
 # Lazy MCP startup (#56832): servers whose tools were registered from the
 # on-disk schema cache without spawning/connecting. Keyed by server name;
 # entries are popped once a real connection is established on first use.
-_lazy_server_configs: Dict[str, dict] = {}
-_lazy_server_fingerprints: Dict[str, str] = {}
-_lazy_server_tool_names: Dict[str, List[str]] = {}
+#
+# Profile-partitioned for the same reason as ``_servers``, and arguably
+# more urgently: ``_load_mcp_config`` interpolates ``${VAR}`` refs through
+# the ACTIVE profile's secret scope before the config is cached here, so
+# an entry holds that profile's resolved credentials verbatim. A bare-name
+# cache would spawn another profile's first call with them.
+_lazy_server_configs: "_ProfileScopedDict[dict]" = _ProfileScopedDict()
+_lazy_server_fingerprints: "_ProfileScopedDict[str]" = _ProfileScopedDict()
+_lazy_server_tool_names: "_ProfileScopedDict[List[str]]" = _ProfileScopedDict()
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -4514,8 +4775,8 @@ _connect_server_claim: contextvars.ContextVar[
 # server is retried on a backoff schedule instead of on every worker
 # session -- isolating it from the rest of the bridge. A successful
 # connection clears the state.
-_server_connect_retry_after: Dict[str, float] = {}   # name -> monotonic deadline
-_server_connect_failures: Dict[str, int] = {}        # name -> consecutive failures
+_server_connect_retry_after: "_ProfileScopedDict[float]" = _ProfileScopedDict()  # name -> deadline
+_server_connect_failures: "_ProfileScopedDict[int]" = _ProfileScopedDict()       # name -> failures
 _CONNECT_RETRY_BASE_BACKOFF_SEC = 30.0
 _CONNECT_RETRY_MAX_BACKOFF_SEC = 600.0
 
@@ -4549,6 +4810,23 @@ def _connect_cooldown_active(server_name: str) -> bool:
     deadline = _server_connect_retry_after.get(server_name)
     return deadline is not None and time.monotonic() < deadline
 
+
+def _clear_connect_state(profile_key: str, profile_only: bool) -> None:
+    """Drop connect-backoff state for one profile, or for every profile.
+
+    Call under ``_lock``. ``profile_only`` mirrors ``shutdown_mcp_servers``:
+    a profile-scoped teardown must not clear another tenant's backoff (that
+    would re-arm the #50394 restart storm for a profile that never asked for
+    a restart), while the process-wide default keeps the historical
+    "wipe everything" behaviour.
+    """
+    if profile_only:
+        _partition_for(_server_connect_retry_after, profile_key).clear()
+        _partition_for(_server_connect_failures, profile_key).clear()
+    else:
+        _clear_all_partitions(_server_connect_retry_after)
+        _clear_all_partitions(_server_connect_failures)
+
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
 # a "server unreachable" message that tells the model to stop retrying,
@@ -4566,8 +4844,8 @@ def _connect_cooldown_active(server_name: str) -> bool:
 # the breaker most recently transitioned into the open state. Use the
 # ``_bump_server_error`` / ``_reset_server_error`` helpers to mutate
 # this state — they keep the count and timestamp in sync.
-_server_error_counts: Dict[str, int] = {}
-_server_breaker_opened_at: Dict[str, float] = {}
+_server_error_counts: "_ProfileScopedDict[int]" = _ProfileScopedDict()
+_server_breaker_opened_at: "_ProfileScopedDict[float]" = _ProfileScopedDict()
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 
@@ -4598,8 +4876,8 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 # Classification happens at CALL TIME from data captured at DISCOVERY —
 # no toolset or schema mutation, so the conversation's toolset stays
 # byte-stable and prompt caching is preserved.
-_server_trust_levels: Dict[str, str] = {}
-_tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
+_server_trust_levels: "_ProfileScopedDict[str]" = _ProfileScopedDict()
+_tool_read_only_hints: "_ProfileScopedDict[Dict[str, bool]]" = _ProfileScopedDict()
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
@@ -5237,7 +5515,7 @@ def _handle_session_expired_and_retry(
 # Exact raw server names whose ``supports_parallel_tool_calls`` config is True.
 # Raw identity matters: distinct names such as ``foo-bar`` and ``foo_bar`` both
 # sanitize to ``foo_bar`` but must not share policy.
-_parallel_safe_servers: set = set()
+_parallel_safe_servers: _ProfileScopedSet = _ProfileScopedSet()
 
 # Exact MCP tool-name provenance. The generated registry name is lossy because
 # provider-safe normalization maps punctuation to ``_``. Keep the raw server
@@ -8350,15 +8628,35 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     return staged_engine_names
 
 
-def shutdown_mcp_servers():
-    """Close all MCP server connections and stop the background loop.
+def shutdown_mcp_servers(*, profile_only: bool = False):
+    """Close MCP server connections and stop the background loop.
 
     Each server Task is signalled to exit its ``async with`` block so that
     the anyio cancel-scope cleanup happens in the same Task that opened it.
     All servers are shut down in parallel via ``asyncio.gather``.
+
+    ``profile_only=False`` (the default, and every existing caller —
+    process exit in ``hermes_cli.main`` / ``cli.py``, ``/reload-mcp``)
+    keeps the historical PROCESS-wide semantics: every profile's servers
+    are reaped and the shared loop is stopped. In a single-profile process
+    there is exactly one partition, so this is bit-for-bit what it always
+    did.
+
+    ``profile_only=True`` reaps only the ACTIVE profile's servers and
+    leaves other profiles' subprocesses running on the shared loop (which
+    is stopped only if it goes idle). That is the teardown a multiplexing
+    gateway needs when it stops serving one profile; tearing down all of
+    them would be a cross-tenant outage.
     """
+    # Captured on the CALLER's context. ``asyncio.run_coroutine_threadsafe``
+    # below does not copy it onto the MCP loop, so the inner coroutine must
+    # address partitions by this explicit key, never by ambient lookup.
+    profile_key = _mcp_profile_key()
     with _lock:
-        servers_snapshot = list(_servers.values())
+        if profile_only:
+            servers_snapshot = list(_partition_for(_servers, profile_key).values())
+        else:
+            servers_snapshot = _all_partition_values(_servers)
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded
@@ -8368,9 +8666,8 @@ def shutdown_mcp_servers():
     # configured server immediately.
     if not servers_snapshot:
         with _lock:
-            _server_connect_retry_after.clear()
-            _server_connect_failures.clear()
-        _stop_mcp_loop()
+            _clear_connect_state(profile_key, profile_only)
+        _stop_mcp_loop(only_if_idle=profile_only)
         return
 
     async def _shutdown():
@@ -8384,12 +8681,14 @@ def shutdown_mcp_servers():
                     "Error closing MCP server '%s': %s", server.name, result,
                 )
         with _lock:
-            _servers.clear()
+            if profile_only:
+                _partition_for(_servers, profile_key).clear()
+            else:
+                _clear_all_partitions(_servers)
             # Drop connect-retry cooldowns too: a full shutdown/restart
             # should re-attempt every server immediately, not honour a
             # stale per-server backoff from before the restart (#50394).
-            _server_connect_retry_after.clear()
-            _server_connect_failures.clear()
+            _clear_connect_state(profile_key, profile_only)
 
     with _lock:
         loop = _mcp_loop
@@ -8411,10 +8710,9 @@ def shutdown_mcp_servers():
     # shutdown must leave no stale connect-cooldown state behind — the
     # next start should re-attempt every server immediately (#50394).
     with _lock:
-        _server_connect_retry_after.clear()
-        _server_connect_failures.clear()
+        _clear_connect_state(profile_key, profile_only)
 
-    _stop_mcp_loop()
+    _stop_mcp_loop(only_if_idle=profile_only)
 
 
 def _kill_orphaned_mcp_children(
@@ -8613,7 +8911,14 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
     with _lock:
-        if only_if_idle and (_servers or _server_connecting):
+        if only_if_idle and (
+            # The event loop is process-GLOBAL and shared by every profile,
+            # so idleness is a question about all partitions. Asking only
+            # the active profile would tear the loop out from under another
+            # tenant's live servers.
+            _any_partition_populated(_servers)
+            or _any_partition_populated(_server_connecting)
+        ):
             logger.debug("Leaving MCP event loop running; active servers are registered or connecting")
             return False
         loop = _mcp_loop
