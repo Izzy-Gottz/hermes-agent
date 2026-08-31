@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import base64
 import inspect
+import keyword
 import io
 import json
 import logging
@@ -103,6 +104,15 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
 
     for pname, pspec in props.items():
         if pname.startswith("_"):
+            continue
+        # A JSON Schema property may be called anything; a Python parameter
+        # may not. Cloudflare's MCP ships "action.type", and inspect.Parameter
+        # raises ValueError on it — which used to take the whole server down
+        # (see the guard in _build_server). Skipped here rather than fatal:
+        # _install_schema hands the client the authoritative Hermes schema a
+        # moment later, so the signature only has to be *valid*, not complete.
+        if not pname.isidentifier() or keyword.iskeyword(pname):
+            logger.debug("parameter %r cannot be a Python parameter name — omitted from the signature", pname)
             continue
         py = _JSON_TO_PY.get((pspec or {}).get("type"), Any)
         ann, default = (
@@ -511,7 +521,16 @@ def _build_server(profile: Optional[str] = None) -> Any:
             _dispatch.__annotations__ = {**annots, "return": str}
             return _dispatch
 
-        handler = _make_handler(name, params_schema)
+        # Belt and braces for everything the first guard cannot foresee. This
+        # server is the child's ENTIRE tool surface: an exception building one
+        # handler used to abort _build_server, so a single odd schema on one
+        # connected MCP server left the model with no tools at all — not even
+        # terminal — and looked exactly like "nothing is connected".
+        try:
+            handler = _make_handler(name, params_schema)
+        except Exception:
+            logger.warning("skipping %s — its schema cannot be turned into a tool", name, exc_info=True)
+            continue
         try:
             # structured_output=False: the return annotation is ``str`` for
             # the schema generator's sake, but a handler may return content
