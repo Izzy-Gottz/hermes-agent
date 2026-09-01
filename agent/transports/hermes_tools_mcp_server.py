@@ -78,7 +78,7 @@ import logging
 import os
 import re
 import sys
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -256,14 +256,59 @@ def discover_external_mcp_servers() -> list[str]:
 #: a tool that always fails.
 AGENT_LOOP_TOOLS: tuple[str, ...] = ("todo", "memory", "session_search", "delegate_task")
 
+#: Toolsets that only work where a GUI renderer can answer them — the Hermes
+#: desktop app's own panes (annotate_preview, focus_pane, read_terminal, tip,
+#: tour, desktop_project, …). toolsets.py keeps them off _HERMES_CORE_TOOLS for
+#: exactly that reason and the GUI gateway enables them per session. They
+#: reach this server anyway, because tool_search pins ``desktop_ui`` and
+#: ``project`` as direct surfaces and get_tool_definitions() here has no
+#: session to consult. Measured on a live Moe install: 11 tools, 9,542 chars,
+#: 14% of everything the child was offered, every one guaranteed to fail.
+GUI_ONLY_TOOLSETS: frozenset[str] = frozenset({"desktop_ui", "project"})
+
+#: Claude Code defers EVERY MCP tool behind its own ToolSearch by default —
+#: measured on 2.1.252: a stub server with THREE tools of sixty characters each
+#: was deferred, the same as eighty-two. There is no surface small enough. So
+#: the guarantee Hermes makes about its own loop ("core tools are never
+#: deferred", tools/tool_search.py) silently stopped at this process boundary:
+#: the model had to run ToolSearch to find ``terminal``, and ``memory`` — one
+#: search away, among eighty names — was never called in 274 sessions.
+#:
+#: This server's surface is already the ASSEMBLED catalogue (see _build_server):
+#: Hermes' own tool_search has decided what is eager and what sits behind
+#: ``tool_search``/``tool_describe``/``tool_call``. Everything offered here is
+#: therefore what Hermes' own loop would show directly, and is marked so. The
+#: per-tool ``_meta`` key is what the CLI reads (its deferrable predicate is
+#: ``alwaysLoad===true`` → not deferrable, before ``isMcp===true`` → deferrable);
+#: write_mcp_config() also sets the documented server-level ``alwaysLoad`` so
+#: either mechanism alone keeps the contract. tests/agent/transports/
+#: test_claude_code_tool_deferral_live.py pins the outcome against the real CLI.
+ALWAYS_LOAD_META: dict = {"anthropic/alwaysLoad": True}
+
+
+def _registry_toolset(name: str) -> Optional[str]:
+    """The toolset ``name`` is registered under, or None when unknown."""
+    try:
+        from tools.registry import registry
+        return registry.get_toolset_for_tool(name)
+    except Exception:
+        return None
+
 
 def tools_to_offer(
     profile: Optional[str],
     available: "set[str] | frozenset[str]",
     *,
     bridge: "bool | tuple[str, ...] | set[str]" = False,
+    toolset_of: "Callable[[str], Optional[str]] | None" = None,
 ) -> tuple[str, ...]:
     """Everything Hermes has, minus what cannot work here.
+
+    "Cannot work here" is three things: an agent-loop tool with no bridge to
+    run it on, an OS tool on a runtime that brings its own (codex), and a
+    GUI-only tool (:data:`GUI_ONLY_TOOLSETS`) — there is no renderer at the
+    other end of this pipe. ``toolset_of`` answers the last question; it
+    defaults to the registry and exists so tests can answer it themselves.
 
     This used to be an ALLOWLIST — a hand-written tuple of about thirty names.
     Anything Hermes gained afterwards, and anything a plugin registered, was
@@ -297,7 +342,15 @@ def tools_to_offer(
         # codex brings its own shell and file tools; two of each confuses the
         # model and routes approval through the wrong UI.
         blocked |= set(CLAUDE_CODE_OS_TOOLS)
-    return tuple(sorted(n for n in available if n not in blocked))
+    lookup = toolset_of or _registry_toolset
+    offered = []
+    for n in sorted(available):
+        if n in blocked:
+            continue
+        if lookup(n) in GUI_ONLY_TOOLSETS:
+            continue
+        offered.append(n)
+    return tuple(offered)
 
 
 def exposed_tools_for_profile(profile: Optional[str]) -> tuple[str, ...]:
@@ -654,15 +707,23 @@ def _build_server(profile: Optional[str] = None) -> Any:
             # structured_output=False: the return annotation is ``str`` for
             # the schema generator's sake, but a handler may return content
             # blocks (text + image); an output model would reject those.
-            mcp.add_tool(handler, name=name, description=description, structured_output=False)
+            # meta: see ALWAYS_LOAD_META — without it the CLI defers this tool
+            # behind its own ToolSearch, core or not.
+            mcp.add_tool(handler, name=name, description=description,
+                         meta=ALWAYS_LOAD_META, structured_output=False)
         except TypeError:
             try:
-                # Older SDK add_tool() without the keyword.
-                mcp.add_tool(handler, name=name, description=description)
+                mcp.add_tool(handler, name=name, description=description, meta=ALWAYS_LOAD_META)
             except TypeError:
-                # Oldest: decorator-style only. The synthesized __signature__
-                # on the handler still drives schema generation there.
-                handler = mcp.tool(name=name, description=description)(handler)
+                # Older SDK add_tool() without either keyword. The server-level
+                # alwaysLoad in the mcp-config still holds the line.
+                logger.debug("mcp SDK add_tool() takes no meta — relying on server-level alwaysLoad for %s", name)
+                try:
+                    mcp.add_tool(handler, name=name, description=description)
+                except TypeError:
+                    # Oldest: decorator-style only. The synthesized __signature__
+                    # on the handler still drives schema generation there.
+                    handler = mcp.tool(name=name, description=description)(handler)
 
         # The signature-derived schema knows only types. Hand the client the
         # authoritative Hermes schema (enums, per-parameter descriptions,

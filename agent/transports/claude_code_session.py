@@ -843,6 +843,14 @@ def write_mcp_config(
                 "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
                 "cwd": root,
                 "env": server_env,
+                # The CLI defers every MCP tool behind its own ToolSearch by
+                # default, at any size (measured: three tools were deferred).
+                # This server is not a catalogue to search — it is the
+                # assistant's own hands, already curated by Hermes' tool_search
+                # — so it is exempt. The server marks each tool the same way
+                # (ALWAYS_LOAD_META); both, so a change to either mechanism in
+                # a future CLI leaves the contract standing.
+                "alwaysLoad": True,
             }
         }
     }

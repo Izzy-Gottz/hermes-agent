@@ -129,10 +129,22 @@ class TestModuleSurface:
 
 
 class _RecordingServer:
-    """Stand-in for mcp.server.MCPServer that just collects handlers."""
+    """Stand-in for mcp.server.MCPServer that just collects handlers.
+
+    Accepts the mcp 2.0 keywords (``meta``, ``structured_output``) and
+    records ``meta`` per tool, so the always-load contract is testable."""
 
     def __init__(self, name, instructions=None):
         self.name, self.instructions, self.tools = name, instructions, {}
+        self.meta = {}
+
+    def add_tool(self, fn, name=None, description=None, meta=None, structured_output=None):
+        self.tools[name or fn.__name__] = fn
+        self.meta[name or fn.__name__] = meta
+
+
+class _MetalessServer(_RecordingServer):
+    """An older SDK whose add_tool() knows neither meta nor structured_output."""
 
     def add_tool(self, fn, name=None, description=None):
         self.tools[name or fn.__name__] = fn
@@ -509,3 +521,103 @@ class TestLocalToolsHoldTheLine:
             assert not bridge.active
         finally:
             bridge.close()
+
+
+class TestTheChildSeesWhatHermesWouldShow:
+    """The core-tool guarantee has to survive the process boundary.
+
+    Hermes' own loop never defers a core tool (tools/tool_search.py: "Always-
+    load means always-load. No exceptions."). The claude-code child reaches
+    this server over MCP, and the CLI defers EVERY MCP tool behind its own
+    ToolSearch by default — measured on 2.1.252 with a three-tool stub. So the
+    model ran ToolSearch to find `terminal`, and `memory` sat one search away
+    among eighty names and was never called in 274 sessions.
+
+    Two mechanisms hold the line: the per-tool meta this server emits and the
+    server-level alwaysLoad write_mcp_config() writes. Either alone keeps the
+    contract; test_claude_code_tool_deferral_live.py checks the real CLI
+    honours them. The GUI-only tools are withheld for the opposite reason:
+    they can never work here, and they were 14% of the surface.
+    """
+
+    def _defs(self, names):
+        return [{"type": "function", "function": {"name": n, "parameters": {}}} for n in names]
+
+    def _build(self, monkeypatch, names, *, server_cls=_RecordingServer):
+        import mcp.server as mcp_server
+        import model_tools
+        from agent.transports import hermes_tools_mcp_server as m
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, BRIDGE_TOOLS_ENV,
+        )
+        monkeypatch.setattr(mcp_server, "MCPServer", server_cls)
+        monkeypatch.setattr(m, "discover_external_mcp_servers", lambda: [])
+        monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: self._defs(names))
+        for var in (BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, BRIDGE_TOOLS_ENV):
+            monkeypatch.delenv(var, raising=False)
+        return m._build_server("claude-code")
+
+    def test_every_offered_tool_is_marked_always_load(self, monkeypatch):
+        from agent.transports.hermes_tools_mcp_server import ALWAYS_LOAD_META
+        server = self._build(
+            monkeypatch,
+            ["terminal", "read_file", "clarify", "gmail_send", "mcp__pulse__run_sql",
+             "tool_search", "tool_describe", "tool_call"],
+        )
+        assert server.tools, "nothing registered"
+        for name in server.tools:
+            assert server.meta[name] == ALWAYS_LOAD_META, name
+        # The Hermes-side catalogue bridge is eager too: it is how the model
+        # reaches everything Hermes deferred, so it must not itself be deferred.
+        assert {"tool_search", "tool_describe", "tool_call"} <= set(server.tools)
+
+    def test_the_meta_key_is_the_one_the_cli_reads(self):
+        from agent.transports.hermes_tools_mcp_server import ALWAYS_LOAD_META
+        assert ALWAYS_LOAD_META == {"anthropic/alwaysLoad": True}
+
+    def test_an_sdk_without_meta_still_registers_every_tool(self, monkeypatch):
+        """Older add_tool() signatures degrade to "registered, unmarked" —
+        the server-level alwaysLoad in the mcp-config then carries it — and
+        never to "missing"."""
+        server = self._build(monkeypatch, ["terminal", "clarify"], server_cls=_MetalessServer)
+        assert set(server.tools) >= {"terminal", "clarify"}
+
+    def test_gui_only_tools_are_withheld(self, monkeypatch):
+        from tools.registry import registry
+        toolsets = {"tip": "desktop_ui", "tour": "desktop_ui", "desktop_project": "project",
+                    "terminal": "terminal"}
+        monkeypatch.setattr(registry, "get_toolset_for_tool", lambda n: toolsets.get(n))
+        server = self._build(monkeypatch, ["terminal", "tip", "tour", "desktop_project"])
+        assert "terminal" in server.tools
+        assert not {"tip", "tour", "desktop_project"} & set(server.tools)
+
+    def test_tools_to_offer_subtracts_gui_only_by_toolset(self):
+        from agent.transports.hermes_tools_mcp_server import GUI_ONLY_TOOLSETS, tools_to_offer
+        assert GUI_ONLY_TOOLSETS == {"desktop_ui", "project"}
+        toolsets = {"tip": "desktop_ui", "desktop_project": "project"}
+        out = tools_to_offer(
+            "claude-code", {"terminal", "tip", "desktop_project", "web_search"},
+            toolset_of=toolsets.get,
+        )
+        assert out == ("terminal", "web_search")
+
+    def test_unknown_names_are_not_mistaken_for_gui_tools(self):
+        """A name the registry does not know (an external MCP tool, a test
+        stub) must pass — withholding on a lookup miss would recreate "the
+        child could not see a single server the user had connected"."""
+        from agent.transports.hermes_tools_mcp_server import tools_to_offer
+        out = tools_to_offer("claude-code", {"mcp__pulse__run_sql", "terminal"}, toolset_of=lambda n: None)
+        assert out == ("mcp__pulse__run_sql", "terminal")
+
+    def test_the_live_registry_classifies_the_known_gui_tools(self):
+        """Pin the names measured on the install so a rename upstream shows
+        up here rather than as 14% of the child's prompt coming back."""
+        from tools.registry import registry
+        from agent.transports.hermes_tools_mcp_server import GUI_ONLY_TOOLSETS
+        import model_tools  # noqa: F401 — registers the toolsets
+        for name in ("annotate_preview", "focus_pane", "read_terminal", "tip", "tour", "setup_mcp"):
+            ts = registry.get_toolset_for_tool(name)
+            if ts is None:
+                continue  # not registered in this build — nothing to withhold
+            assert ts in GUI_ONLY_TOOLSETS, (name, ts)
+

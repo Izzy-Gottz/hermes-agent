@@ -197,6 +197,10 @@ class TestStaticHelpers:
         server = payload["mcpServers"]["hermes-tools"]
         assert server["command"] == sys.executable
         assert server["args"] == ["-m", "agent.transports.hermes_tools_mcp_server"]
+        # The CLI defers every MCP tool by default, at any size. This server is
+        # the assistant's own hands, not a catalogue: exempt at the server level
+        # here and per tool in hermes_tools_mcp_server (ALWAYS_LOAD_META).
+        assert server["alwaysLoad"] is True
         env = server["env"]
         # The server runs the claude-code profile (terminal/file tools on).
         assert env[PROFILE_ENV] == CLAUDE_CODE_PROFILE
