@@ -3093,19 +3093,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
-        if restrict_toolsets:
-            # Narrow-only. Keep only the requested toolsets api_server is already
-            # configured to expose, then re-resolve — a client can shrink its own
-            # turn's toolset (e.g. the learn seam asking for ["memory"]) but can
-            # never widen it beyond the platform. Breaks the lethal trifecta:
-            # the seam's memory-write turn holds connector-derived (untrusted)
-            # data with no send/browser/terminal tools available.
-            _rcfg = dict(user_config)
-            _rpts = dict(_rcfg.get("platform_toolsets") or {})
-            _allowed = set(_rpts.get("api_server") or [])
-            _rpts["api_server"] = [t for t in restrict_toolsets if t in _allowed]
-            _rcfg["platform_toolsets"] = _rpts
-            enabled_toolsets = sorted(_get_platform_tools(_rcfg, "api_server"))
+        if restrict_toolsets is not None:
+            # Narrow-only, applied to the ALREADY-RESOLVED set. Re-running
+            # _get_platform_tools with a rewritten platform_toolsets would re-add
+            # every enabled MCP server (vercel/pulse/supabase/cloudflare) and the
+            # default-on plugin toolsets (connectors/moe_profile) — all
+            # action/exfil-capable — defeating the point. Filtering the resolved
+            # set instead strips those too. A client can only shrink to a subset,
+            # never widen; an empty or unknown request fails CLOSED (no tools),
+            # never open. So the learn seam's memory-write turn holds untrusted
+            # connector-derived data with NO send/exfil tool — the "lethal
+            # trifecta" is actually broken, not just the shell/browser part.
+            _req = {t.strip() for t in restrict_toolsets if t.strip()}
+            enabled_toolsets = sorted(t for t in enabled_toolsets if t in _req)
 
         max_iterations = _current_max_iterations()
 
