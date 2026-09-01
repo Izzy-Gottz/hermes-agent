@@ -526,10 +526,21 @@ def _build_server(profile: Optional[str] = None) -> Any:
         instructions = (
             "Hermes Agent's tool surface, exposed for use inside a Codex "
             "session. Use these for capabilities Codex's built-in toolset "
-            "doesn't cover: web search/extract, browser automation, "
-            "subagent delegation, vision, image generation, persistent "
-            "memory, skills, and cross-session search."
+            "doesn't cover: web search/extract, browser automation, vision, "
+            "image generation and skills."
         )
+        if not has_bridge:
+            # Say it rather than let the model discover it by asking for a
+            # tool that is not there and concluding something false about the
+            # system. This is exactly how "the delegate_task tool is not
+            # available in this environment" reached a user as an answer.
+            instructions += (
+                " Subagent delegation (delegate_task), persistent memory,"
+                " todo and cross-session search are NOT available on this"
+                " runtime — they need Hermes' own agent loop. Say so plainly"
+                " if asked for one; switching runtimes (/codex-runtime auto)"
+                " is the user's call, not a workaround to invent."
+            )
     mcp = MCPServer("hermes-tools", instructions=instructions)
 
     # Pull authoritative Hermes tool schemas for the ones we expose, so

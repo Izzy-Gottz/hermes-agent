@@ -1186,6 +1186,7 @@ class ClaudeCodeSession:
         ensure_settings_file(self._settings_path, self._deny_rules)
         if self._expose_hermes_tools and not self._mcp_config_path:
             sweep_stale_mcp_configs(self._config_dir)
+            self._sweep_dead_bridges(self._config_dir)
             bridge = self._start_tool_bridge()
             self._mcp_config_path = write_mcp_config(
                 directory=self._config_dir,
@@ -1372,6 +1373,21 @@ class ClaudeCodeSession:
                 bridge.close()
             except Exception:
                 logger.debug("claude-code: tool bridge close failed", exc_info=True)
+
+    @staticmethod
+    def _sweep_dead_bridges(directory: str) -> None:
+        """Best effort: a bridge whose owner was killed leaves its directory."""
+        try:
+            from agent.claude_code_runtime import sweep_dead_bridges
+
+            removed = sweep_dead_bridges(directory)
+            if removed:
+                logger.info(
+                    "claude-code: removed %d dead tool-bridge director%s",
+                    removed, "y" if removed == 1 else "ies",
+                )
+        except Exception:
+            logger.debug("claude-code: bridge sweep failed", exc_info=True)
 
     def _tool_bridge_busy(self, since: Optional[float] = None) -> bool:
         """True while the child is waiting on work this process is doing.

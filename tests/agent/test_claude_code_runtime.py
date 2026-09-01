@@ -258,6 +258,34 @@ class TestRegistryHardening:
         assert fresh.exists() and young.exists()
         assert not old.exists() and not old_mcp.exists() and not dead.exists()
 
+    def test_dead_bridges_are_swept_at_the_next_session_start(self):
+        """The 24-hour prune is too slow to keep the config dir honest: every
+        gateway that is killed rather than closed leaves a directory. Swept on
+        liveness, not age — and never one younger than the bind race."""
+        import os
+        import tempfile
+
+        from agent.transports.hermes_tool_bridge import ToolBridge
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as cfg:
+            live = ToolBridge(lambda *_: "ok", directory=cfg)
+            live.start()
+            try:
+                dead = os.path.join(cfg, "bridge-dead")
+                os.mkdir(dead)
+                Path(dead, "s.sock").touch()
+                young = os.path.join(cfg, "bridge-young")
+                os.mkdir(young)  # created just now: mid-bind, hands off
+                os.utime(dead, (0, 0))
+                os.utime(os.path.dirname(live.socket_path), (0, 0))
+
+                assert rt.sweep_dead_bridges(cfg) == 1
+                assert not os.path.exists(dead)
+                assert os.path.exists(young)
+                assert os.path.exists(live.socket_path)
+            finally:
+                live.close()
+
     def test_prune_never_unlinks_a_socket_that_still_answers(self, tmp_path):
         """A socket's mtime is fixed at bind, so an age test alone would
         eventually delete the socket of a session that has merely been alive a

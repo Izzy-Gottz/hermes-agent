@@ -271,6 +271,27 @@ def prune_stale_temp_files(config_dir: str, *, max_age: float = _STALE_TEMP_AGE_
     return removed
 
 
+#: A bridge directory younger than this is left alone by a sweep, even with no
+#: socket in it: `_bind_path` creates the directory a moment before it binds,
+#: and another session sweeping in that window would delete a bridge that is
+#: about to work.
+_BRIDGE_SWEEP_MIN_AGE_SECONDS = 60.0
+
+
+def sweep_dead_bridges(config_dir: str, *, now: Optional[float] = None) -> int:
+    """Remove ``bridge-*/`` directories whose socket nothing answers on.
+
+    Mirrors :func:`agent.transports.claude_code_session.sweep_stale_mcp_configs`
+    and runs at the same moment, for the same reason: a process that was
+    killed rather than closed leaves its artefacts behind, and the 24-hour
+    prune is too slow to keep the config dir honest. Liveness is a connect,
+    not an age — a socket's mtime is fixed at bind, so an old-but-live bridge
+    would otherwise be swept out from under a working session.
+    """
+    now = time.time() if now is None else now
+    return _prune_bridge_dirs(config_dir, now - _BRIDGE_SWEEP_MIN_AGE_SECONDS)
+
+
 def _prune_bridge_dirs(config_dir: str, cutoff: float) -> int:
     """Remove ``bridge-*/`` directories left by a killed process.
 
