@@ -126,3 +126,38 @@ def test_cron_construction_sets_skip_background_review() -> None:
     assert "skip_background_review=True" in text, (
         "cron/scheduler.py must construct AIAgent with skip_background_review=True."
     )
+
+def test_claude_code_runtime_is_not_skipped_anymore() -> None:
+    """The hardcoded api_mode==claude_code refusal is gone: a review on the
+    Claude-subscription runtime runs past the point where it used to return
+    (the tool bridge makes `memory` reachable). Regression lock for the
+    deliberate turn-on — re-add the refusal and this fails.
+
+    `_parent_can_emit_tool_calls` is the first thing _run_review_in_thread
+    touches AFTER where the claude_code refusal used to early-return, so
+    reaching it proves the refusal is gone. We raise there to stop before a
+    real `claude` fork (there is none in a unit test).
+    """
+    import agent.background_review as br
+
+    agent = _make_agent()
+    agent.api_mode = "claude_code"
+    agent.session_id = "s"
+
+    reached = {"past_refusal": False}
+    orig = br._parent_can_emit_tool_calls
+    def spy(a):
+        reached["past_refusal"] = True
+        raise RuntimeError("stop — reached the code after the (removed) refusal")
+    br._parent_can_emit_tool_calls = spy
+    try:
+        try:
+            br._run_review_in_thread(agent, [], "review", task_cfg=None, review_run=None)
+        except RuntimeError:
+            pass
+    finally:
+        br._parent_can_emit_tool_calls = orig
+    assert reached["past_refusal"], (
+        "_run_review_in_thread early-returned on claude_code — the refusal is back"
+    )
+

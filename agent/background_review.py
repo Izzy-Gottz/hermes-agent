@@ -1413,26 +1413,23 @@ def _run_review_in_thread(
     if review_run is not None and review_run.cancel_requested.is_set():
         finish_background_review_run(agent, review_run)
         return
-    # claude_code runtime: still refused, but no longer for the reason first
-    # written here. That reason was that a forked `claude` could not reach
-    # `memory` (an _AGENT_LOOP_TOOL, not exposable over MCP) and so could
-    # never save anything; the tool bridge
-    # (agent/transports/hermes_tool_bridge.py) made it reachable. What argues
-    # for the refusal now is cost: the fork is a whole second `claude`
-    # process with its own MCP server, its own bridge and its own slot in the
-    # warm-process registry, per review. Revisit deliberately, not by
-    # deleting a stale comment. Every caller (automatic turn-boundary review,
-    # /refine, the CLI review command) converges on this thread target
-    # (#25267).
-    if getattr(agent, "api_mode", None) == "claude_code":
-        logger.info(
-            "background review skipped: api_mode=claude_code would fork a "
-            "second claude process per review (session=%s)",
-            getattr(agent, "session_id", None),
-        )
-        if review_run is not None:
-            finish_background_review_run(agent, review_run)
-        return
+    # claude_code once refused background review outright. That refusal is
+    # gone, on purpose. The reason first written for it — a forked `claude`
+    # could not reach `memory` — was solved by the tool bridge
+    # (agent/transports/hermes_tool_bridge.py), which the fork inherits, so a
+    # review on this runtime CAN write memories now. What was left was a cost
+    # argument (the fork is a second `claude` process per review), and the
+    # owner's call is to pay it: automatic memory is the point of the product,
+    # and "hope the model saved it mid-turn" is the exact failure that argued
+    # against leaving it off. It runs in a daemon thread and never touches the
+    # live turn or its prompt cache, so it costs quota, not latency. To turn it
+    # back off — globally, or to route it onto a cheaper model instead of a
+    # second `claude` — set auxiliary.background_review.enabled: false, or
+    # auxiliary.background_review.{provider,model}; no code change, and every
+    # runtime honours it the same way (is_background_review_enabled /
+    # _resolve_review_runtime). codex_app_server is a separate matter: it has
+    # no tool bridge, so a review fork there has no memory tool to write with —
+    # that needs the codex bridge built before this does anything for it.
 
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
