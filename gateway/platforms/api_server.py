@@ -2826,6 +2826,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        restrict_toolsets: Optional[List[str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3092,6 +3093,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if restrict_toolsets:
+            # Narrow-only. Keep only the requested toolsets api_server is already
+            # configured to expose, then re-resolve — a client can shrink its own
+            # turn's toolset (e.g. the learn seam asking for ["memory"]) but can
+            # never widen it beyond the platform. Breaks the lethal trifecta:
+            # the seam's memory-write turn holds connector-derived (untrusted)
+            # data with no send/browser/terminal tools available.
+            _rcfg = dict(user_config)
+            _rpts = dict(_rcfg.get("platform_toolsets") or {})
+            _allowed = set(_rpts.get("api_server") or [])
+            _rpts["api_server"] = [t for t in restrict_toolsets if t in _allowed]
+            _rcfg["platform_toolsets"] = _rpts
+            enabled_toolsets = sorted(_get_platform_tools(_rcfg, "api_server"))
 
         max_iterations = _current_max_iterations()
 
@@ -5187,6 +5201,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        _restrict = request.headers.get("X-Hermes-Enabled-Toolsets", "").strip()
+        if _restrict:
+            # Opt-in, narrow-only: a client (the learn seam's memory-only save
+            # turn, or a read-only gather turn) shrinks THIS turn's toolset to a
+            # subset of what api_server exposes. _create_agent enforces narrow-
+            # only — it can shrink but never widen — breaking the "lethal
+            # trifecta" for connector-derived data.
+            agent_overrides["restrict_toolsets"] = [
+                t.strip() for t in _restrict.split(",") if t.strip()
+            ]
+
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
 
@@ -7240,6 +7265,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        restrict_toolsets: Optional[List[str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7311,6 +7337,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        restrict_toolsets=restrict_toolsets,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
