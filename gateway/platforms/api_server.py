@@ -5202,15 +5202,22 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(selection_error), status=400)
 
         _restrict = request.headers.get("X-Hermes-Enabled-Toolsets", "").strip()
+        _applied_toolsets = None
         if _restrict:
             # Opt-in, narrow-only: a client (the learn seam's memory-only save
             # turn, or a read-only gather turn) shrinks THIS turn's toolset to a
-            # subset of what api_server exposes. _create_agent enforces narrow-
-            # only — it can shrink but never widen — breaking the "lethal
-            # trifecta" for connector-derived data.
-            agent_overrides["restrict_toolsets"] = [
-                t.strip() for t in _restrict.split(",") if t.strip()
-            ]
+            # subset of what api_server exposes. Compute the set that will
+            # ACTUALLY be applied — the requested names intersected with what
+            # api_server exposes — pass it to the agent (_create_agent re-applies
+            # the same narrow-only filter), and echo it on the response as
+            # X-Hermes-Applied-Toolsets so a client can FAIL CLOSED when a
+            # gateway that predates this feature silently ignores the header.
+            # Breaks the "lethal trifecta" for connector-derived data.
+            from gateway.run import _load_gateway_config as _lgc
+            from hermes_cli.tools_config import _get_platform_tools as _gpt
+            _req = {t.strip() for t in _restrict.split(",") if t.strip()}
+            _applied_toolsets = sorted(t for t in set(_gpt(_lgc(), "api_server")) if t in _req)
+            agent_overrides["restrict_toolsets"] = _applied_toolsets
 
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
@@ -5366,6 +5373,10 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        if _applied_toolsets is not None:
+            # Echo the actually-applied toolset so a restriction-aware client can
+            # confirm the turn was narrowed (and refuse to proceed otherwise).
+            response_headers["X-Hermes-Applied-Toolsets"] = ",".join(_applied_toolsets)
 
         # Hard-fail path: no usable assistant text AND a real failure → 5xx
         # with OpenAI-style error envelope so SDK clients raise instead of
