@@ -242,6 +242,30 @@ SETTINGS_MARKER_TEXT = (
 #: Default env var carrying the long-lived Claude Code credential.
 DEFAULT_OAUTH_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 
+#: ``MCP_TIMEOUT`` / ``MCP_TOOL_TIMEOUT`` for the CLI child (milliseconds).
+#: Startup covers importing Hermes' registry plus every cached MCP manifest.
+#: The per-call ceiling has to outlast a synchronous subagent fan-out AND stay
+#: strictly above ``hermes_tool_bridge.DEFAULT_TIMEOUT_SECONDS``, so that a
+#: call that runs too long comes back as the bridge's readable tool error
+#: rather than the CLI's opaque MCP abort (which would leave the dispatch
+#: running with nobody to answer). Pinned by a test, not by hope.
+_MCP_STARTUP_TIMEOUT_MS = 180_000
+_MCP_TOOL_TIMEOUT_MS = 1_800_000
+
+#: How much of a turn's silence budget work on this side may consume before
+#: the turn is declared dead anyway. Comfortably outlives the bridge's own
+#: client timeout, so a healthy long call ends by answering rather than by
+#: retiring the session; a wedged dispatcher still ends the turn.
+#:
+#: A backstop, not a routine path. Measured on Claude Code 2.1.252, the CLI
+#: keeps emitting stream events while an MCP tool call is outstanding: a
+#: delegation whose subagent ran `sleep 200` completed in 4m27s under a 120 s
+#: silence_timeout without this ever firing. But that streaming is an
+#: undocumented detail of a tool that ships weekly, and the failure it would
+#: cause — retiring a warm session, and abandoning subagents, in the middle of
+#: their own successful work — is bad enough to be worth one cheap guard.
+_BRIDGE_TURN_GRACE_SECONDS = 2_100.0
+
 _VALID_PERMISSION_MODES = frozenset(
     {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"}
 )
@@ -319,15 +343,23 @@ def hermes_mcp_allow_rules(permission_mode: str) -> list[str]:
     * ``default`` (approval-required): every tool except
       :data:`GATED_HERMES_TOOLS`, which fall through to ``can_use_tool`` and
       Hermes' approval prompt.
+
+    The bridged agent-loop tools are named here too. They are dispatched by
+    the parent process through ``_invoke_tool`` — the same hooks and the same
+    policy as any Hermes turn — so routing them through the CLI's approval
+    prompt as well would gate them twice, and in a gateway context (no
+    approver) would deny delegation outright.
     """
     if permission_mode != "default":
         return [f"mcp__{HERMES_TOOLS_MCP_SERVER_NAME}"]
+    from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
     from agent.transports.hermes_tools_mcp_server import exposed_tools_for_profile
 
     gated = set(GATED_HERMES_TOOLS)
+    names = tuple(exposed_tools_for_profile("claude-code")) + BRIDGED_TOOLS
     return [
         f"{_MCP_TOOL_PREFIX}{name}"
-        for name in exposed_tools_for_profile("claude-code")
+        for name in dict.fromkeys(names)
         if name not in gated
     ]
 
@@ -572,6 +604,13 @@ def build_child_env(
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     env["CLAUDE_CONFIG_DIR"] = config_dir or claude_code_home()
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    # The hermes-tools server is not a fast local shim: it imports Hermes'
+    # whole tool registry and every cached MCP manifest at startup, and one of
+    # its calls — a bridged ``delegate_task`` — runs subagents to completion
+    # before it answers. The CLI's defaults (30 s to start, 60 s per call)
+    # would kill both. ``setdefault`` so an operator can still say otherwise.
+    env.setdefault("MCP_TIMEOUT", str(_MCP_STARTUP_TIMEOUT_MS))
+    env.setdefault("MCP_TOOL_TIMEOUT", str(_MCP_TOOL_TIMEOUT_MS))
     home = env.get("HOME") or os.path.expanduser("~")
     env["HOME"] = home
     user = env.get("USER") or env.get("LOGNAME")
@@ -721,6 +760,9 @@ def write_mcp_config(
     project_root: Optional[str] = None,
     directory: Optional[str] = None,
     credential_env: Optional[dict[str, str]] = None,
+    bridge_socket: Optional[str] = None,
+    bridge_token: Optional[str] = None,
+    bridge_tools: Optional["tuple[str, ...] | list[str]"] = None,
 ) -> str:
     """Write the ``--mcp-config`` JSON that launches ``hermes_tools_mcp_server``.
 
@@ -737,6 +779,16 @@ def write_mcp_config(
     file whose owner died without ``close()`` is swept at the next start. The block also blanks
     ``CLAUDE_CODE_OAUTH_TOKEN`` and lists it in ``HERMES_MCP_SCRUB_ENV`` so
     the server drops the CLI credential it would otherwise inherit.
+
+    ``bridge_socket`` / ``bridge_token`` / ``bridge_tools`` address the
+    :mod:`agent.transports.hermes_tool_bridge` server running back in this
+    process, and are what let the child call ``delegate_task`` / ``memory`` /
+    ``session_search`` / ``todo`` at all. They are here rather than in the
+    CLI's environment because the CLI has no use for them — NOT as a secret:
+    Hermes' ``terminal`` runs inside this server, so the model can read this
+    block's env, and this file is readable by anything running as this user.
+    What actually bounds the bridge is its server-side allowlist and the
+    dispatcher's re-check against the agent's own tool surface.
     """
     py = python_executable or sys.executable
     root = project_root or os.path.dirname(
@@ -763,6 +815,19 @@ def write_mcp_config(
     for key, value in creds.items():
         if key not in _NEVER_FORWARD_TO_MCP:
             server_env[key] = value
+    if bridge_socket and bridge_token:
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TIMEOUT_ENV, BRIDGE_TOKEN_ENV,
+            BRIDGE_TOOLS_ENV, BRIDGED_TOOLS, DEFAULT_TIMEOUT_SECONDS,
+        )
+
+        server_env[BRIDGE_SOCKET_ENV] = bridge_socket
+        server_env[BRIDGE_TOKEN_ENV] = bridge_token
+        server_env[BRIDGE_TOOLS_ENV] = ",".join(bridge_tools or BRIDGED_TOOLS)
+        # Written explicitly rather than left to the client's default so the
+        # two ceilings that have to disagree — this one and MCP_TOOL_TIMEOUT
+        # in the CLI's own environment — are visible in the same artefact.
+        server_env[BRIDGE_TIMEOUT_ENV] = str(int(DEFAULT_TIMEOUT_SECONDS))
     payload = {
         "mcpServers": {
             HERMES_TOOLS_MCP_SERVER_NAME: {
@@ -879,6 +944,8 @@ class ClaudeCodeSession:
         session_key: Optional[str] = None,
         resume: bool = True,
         approval_callback: Optional[Callable[..., str]] = None,
+        tool_bridge_dispatch: Optional[Callable[[str, dict], Any]] = None,
+        tool_bridge_tools: Optional["tuple[str, ...] | list[str]"] = None,
     ) -> None:
         self._config_dir = config_dir or claude_code_home()
         self._cwd = cwd or default_workspace_dir()
@@ -929,6 +996,19 @@ class ClaudeCodeSession:
         # signature via tools.terminal_tool's registered callback). None in
         # gateway/cron contexts -> gated tools are denied.
         self._approval_callback = approval_callback
+        # Agent-loop tools (delegate_task, memory, session_search, todo) come
+        # back to this process over a Unix socket; without a dispatcher no
+        # bridge is started and the child simply does not see them, which is
+        # the pre-bridge behaviour. See agent/transports/hermes_tool_bridge.py.
+        self._tool_bridge_dispatch = tool_bridge_dispatch
+        # Which of them THIS agent may actually run. The MCP server is built
+        # from the whole registry in another process and cannot know, so a
+        # leaf subagent would otherwise be advertised delegate_task and told
+        # no when it called it.
+        self._tool_bridge_tools = (
+            tuple(tool_bridge_tools) if tool_bridge_tools is not None else None
+        )
+        self._tool_bridge: Optional[Any] = None
         self._resumed = False
         self._notice_emitted = False
 
@@ -990,12 +1070,23 @@ class ClaudeCodeSession:
         *,
         on_event: Optional[Callable[[dict], None]] = None,
         approval_callback: Optional[Callable[..., str]] = None,
+        tool_bridge_dispatch: Optional[Callable[[str, dict], Any]] = None,
     ) -> None:
         """Point the UI / approval hooks at a new owner. A warm process is
         shared across AIAgent instances (api_server builds one per request),
-        so each turn re-targets the callbacks at the instance driving it."""
+        so each turn re-targets the callbacks at the instance driving it.
+
+        The tool bridge is re-targeted for the same reason and matters more:
+        a bridged ``delegate_task`` dispatched onto last request's agent would
+        build its children from a dead session's toolsets and post their
+        results where nobody is listening. ``None`` leaves the current
+        dispatcher in place — only a real replacement replaces it."""
         self._on_event = on_event
         self._approval_callback = approval_callback
+        if tool_bridge_dispatch is not None:
+            self._tool_bridge_dispatch = tool_bridge_dispatch
+            if self._tool_bridge is not None:
+                self._tool_bridge.set_dispatch(tool_bridge_dispatch)
 
     def needs_respawn(self, system_prompt: Optional[str]) -> bool:
         """``--append-system-prompt-file`` is read at spawn; a changed prompt
@@ -1095,7 +1186,13 @@ class ClaudeCodeSession:
         ensure_settings_file(self._settings_path, self._deny_rules)
         if self._expose_hermes_tools and not self._mcp_config_path:
             sweep_stale_mcp_configs(self._config_dir)
-            self._mcp_config_path = write_mcp_config(directory=self._config_dir)
+            bridge = self._start_tool_bridge()
+            self._mcp_config_path = write_mcp_config(
+                directory=self._config_dir,
+                bridge_socket=bridge.socket_path if bridge else None,
+                bridge_token=bridge.token if bridge else None,
+                bridge_tools=bridge.allowed_tools if bridge else None,
+            )
             self._owns_mcp_config = True
         self._write_system_prompt_file()
 
@@ -1269,6 +1366,76 @@ class ClaudeCodeSession:
             release_mcp_config(self._mcp_config_path)
             self._mcp_config_path = None
             self._owns_mcp_config = False
+        bridge, self._tool_bridge = self._tool_bridge, None
+        if bridge is not None:
+            try:
+                bridge.close()
+            except Exception:
+                logger.debug("claude-code: tool bridge close failed", exc_info=True)
+
+    def _tool_bridge_busy(self, since: Optional[float] = None) -> bool:
+        """True while the child is waiting on work this process is doing.
+
+        Either a bridged tool call is running here, or the child's own MCP
+        server is holding the line while it runs an ordinary Hermes tool.
+        Either way the child is alive and waiting on us, which a silence
+        timeout cannot otherwise distinguish from a child that has died.
+
+        ``since`` is the moment the silence window opened: activity that
+        ENDED inside it counts too. When a bridged call returns, the CLI still
+        needs a moment to take the result and speak, and calling that moment
+        "silence started two minutes ago" retired a session six seconds after
+        its delegation had succeeded.
+        """
+        bridge = self._tool_bridge
+        if bridge is None:
+            return False
+        try:
+            if bridge.active:
+                return True
+            return since is not None and bridge.last_active >= since
+        except Exception:  # pragma: no cover - defensive
+            return False
+
+    def _start_tool_bridge(self) -> Optional[Any]:
+        """Listen for the child's agent-loop tool calls, or return ``None``.
+
+        No dispatcher (an embedder, a test, the codex path) means no bridge
+        and no bridged tools — the child's surface is exactly what a stateless
+        MCP server can serve. A bridge that cannot bind is logged and skipped
+        for the same reason: losing ``delegate_task`` is a smaller failure
+        than refusing to start the runtime at all.
+        """
+        if self._tool_bridge is not None:
+            return self._tool_bridge
+        if self._tool_bridge_dispatch is None:
+            return None
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGED_TOOLS, BridgeError, ToolBridge,
+        )
+
+        allowed = (
+            BRIDGED_TOOLS if self._tool_bridge_tools is None else self._tool_bridge_tools
+        )
+        if not allowed:
+            # Nothing this agent may run: no listener, no advertisement.
+            return None
+        bridge = ToolBridge(
+            self._tool_bridge_dispatch,
+            directory=self._config_dir,
+            allowed_tools=allowed,
+        )
+        try:
+            bridge.start()
+        except (BridgeError, OSError):
+            logger.warning(
+                "claude-code: tool bridge did not start — delegate_task, memory, "
+                "session_search and todo will not be offered to the child",
+                exc_info=True,
+            )
+            return None
+        self._tool_bridge = bridge
+        return bridge
 
     def __enter__(self) -> "ClaudeCodeSession":
         return self
@@ -1438,6 +1605,7 @@ class ClaudeCodeSession:
             return result
 
         deadline = time.monotonic() + turn_timeout
+        bridge_grace = _BRIDGE_TURN_GRACE_SECONDS if self._tool_bridge else 0.0
         projector = _TurnProjector(self, silent=silent)
         saw_result = False
         try:
@@ -1454,6 +1622,7 @@ class ClaudeCodeSession:
                     # request_interrupt() already sent the control request;
                     # give the CLI a short grace period to emit its `result`.
                     wait = min(wait, _INTERRUPT_GRACE_SECONDS)
+                window_start = time.monotonic()
                 try:
                     obj = self._lines.get(timeout=wait)
                 except queue.Empty:
@@ -1463,6 +1632,23 @@ class ClaudeCodeSession:
                         self._kill(proc)
                         result.should_retire = True
                         break
+                    if bridge_grace > 0 and self._tool_bridge_busy(since=window_start):
+                        # Not silence — the CLI is quiet because it is waiting
+                        # on US: a bridged tool call (a synchronous subagent
+                        # fan-out, say) is running in this process and the CLI
+                        # emits nothing while an MCP call is outstanding. The
+                        # time it costs is given back to both clocks, up to a
+                        # ceiling the bridge's own client timeout outlives, so
+                        # a wedged dispatcher still ends the turn.
+                        spent = min(wait, bridge_grace)
+                        bridge_grace -= spent
+                        deadline += spent
+                        logger.info(
+                            "claude-code: %.0fs of silence covered by the tool "
+                            "bridge (still working; %.0fs of grace left)",
+                            spent, bridge_grace,
+                        )
+                        continue
                     result.error = self._format_error(
                         f"claude produced no output for {int(idle_timeout)}s"
                     )

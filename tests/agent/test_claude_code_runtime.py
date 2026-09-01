@@ -202,6 +202,26 @@ class TestRegistryHardening:
         with rt._REGISTRY_LOCK:
             assert set(rt._REGISTRY) == {"L2", "L3"}
 
+    def test_dead_subagent_entries_never_evict_the_live_parent(self, monkeypatch):
+        """Every subagent is its own session and delegate_task closes its
+        child when it finishes — leaving a husk in the registry that owns no
+        process, counts against max_sessions, and is NEWER than the parent's
+        entry. Before the reap, three delegations off a max_sessions=2
+        registry threw away the parent's warm claude to make room for the
+        dead."""
+        cfg = rt._claude_code_config()
+        monkeypatch.setattr(rt, "_claude_code_config", lambda: {**cfg, "max_sessions": 2})
+        parent = _agent("P")
+        _turn(parent)
+        parent_session = parent._claude_code_session
+        for i in range(3):
+            child = _agent(f"child-{i}")
+            _turn(child)
+            child._claude_code_session.close()  # what delegate_task does
+        assert parent_session.is_alive()
+        with rt._REGISTRY_LOCK:
+            assert "P" in rt._REGISTRY
+
     def test_respawn_rate_guard_warns_once(self, caplog):
         with caplog.at_level("WARNING", logger="agent.claude_code_runtime"):
             for i in range(6):
@@ -226,8 +246,210 @@ class TestRegistryHardening:
         cfg.mkdir()
         old = cfg / "system-prompt-old.md"; old.write_text("x")
         old_mcp = cfg / "hermes-claude-mcp-old.json"; old_mcp.write_text("{}")
+        # A bridge removes its own directory on close, so one still here
+        # belongs to a process that was killed rather than closed.
+        dead = cfg / "bridge-deadbeef"; dead.mkdir(); (dead / "s.sock").write_text("")
         fresh = cfg / "system-prompt-new.md"; fresh.write_text("y")
+        young = cfg / "bridge-young"; young.mkdir()
         stale = _t.time() - 2 * 24 * 3600
-        os.utime(old, (stale, stale)); os.utime(old_mcp, (stale, stale))
-        assert rt.prune_stale_temp_files(str(cfg)) == 2
-        assert fresh.exists() and not old.exists() and not old_mcp.exists()
+        for f in (old, old_mcp, dead):
+            os.utime(f, (stale, stale))
+        assert rt.prune_stale_temp_files(str(cfg)) == 3
+        assert fresh.exists() and young.exists()
+        assert not old.exists() and not old_mcp.exists() and not dead.exists()
+
+    def test_prune_never_unlinks_a_socket_that_still_answers(self, tmp_path):
+        """A socket's mtime is fixed at bind, so an age test alone would
+        eventually delete the socket of a session that has merely been alive a
+        long time — and its four bridged tools would start failing with ENOENT
+        and no server-side signal at all."""
+        import os
+        import tempfile
+
+        from agent.transports.hermes_tool_bridge import ToolBridge
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as cfg:
+            bridge = ToolBridge(lambda *_: "ok", directory=cfg)
+            bridge.start()
+            try:
+                owned = os.path.dirname(bridge.socket_path)
+                os.utime(owned, (0, 0))  # ancient by every measure
+                assert rt.prune_stale_temp_files(cfg) == 0
+                assert os.path.exists(bridge.socket_path)
+            finally:
+                bridge.close()
+            # Once it is gone, the husk of a killed process is swept.
+            husk = os.path.join(cfg, "bridge-husk")
+            os.mkdir(husk)
+            Path(husk, "s.sock").touch()
+            os.utime(husk, (0, 0))
+            assert rt.prune_stale_temp_files(cfg) == 1
+            assert not os.path.exists(husk)
+
+
+class TestToolBridgeDispatch:
+    """What arrives from the child, and how it is run.
+
+    The child's delegate_task / memory / session_search / todo calls come back
+    over the bridge and are dispatched HERE, on the agent that owns the
+    session — which is what makes a subagent inherit this agent's provider,
+    model and Claude Code credential instead of being built in the MCP
+    server's process, which has neither.
+    """
+
+    def _recording_agent(self, session_id="bridge-1", tools=None):
+        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
+
+        agent = _agent(session_id)
+        agent.valid_tool_names = set(BRIDGED_TOOLS if tools is None else tools)
+        calls: list[tuple] = []
+
+        def _invoke_tool(name, args, task_id, tool_call_id=None, *rest, **kw):
+            from tools.delegate_tool import synchronous_delegation_forced
+
+            calls.append(
+                (name, args, task_id, synchronous_delegation_forced(), tool_call_id)
+            )
+            return f"ran:{name}"
+
+        agent._invoke_tool = _invoke_tool
+        agent._calls = calls
+        return agent
+
+    def test_a_bridged_call_goes_through_invoke_tool(self):
+        """Not the tool function directly: a bridged call must fire the same
+        pre_tool_call hooks (Moe's confirm gate) and post-call accounting as
+        a call from Hermes' own loop."""
+        agent = self._recording_agent()
+        agent._claude_code_task_id = "task-7"
+        dispatch = rt.make_tool_bridge_dispatch(agent)
+        assert dispatch("memory", {"action": "read"}) == "ran:memory"
+        name, args, task_id, forced, call_id = agent._calls[0]
+        assert (name, args, task_id, forced) == ("memory", {"action": "read"}, "task-7", False)
+        # Hooks and post-call accounting key on a call id; two bridged calls
+        # in one turn are indistinguishable without one.
+        assert call_id and call_id.startswith("bridge-")
+
+    def test_delegation_from_the_child_is_forced_synchronous(self):
+        """The caller is holding an open MCP tool call and will only ever see
+        this return value; a background handle would be a receipt for work it
+        is never shown."""
+        agent = self._recording_agent()
+        dispatch = rt.make_tool_bridge_dispatch(agent)
+        dispatch("delegate_task", {"goal": "x"})
+        name, args, task_id, forced, _call_id = agent._calls[0]
+        assert (name, forced) == ("delegate_task", True)
+        # ...and the flag does not leak past the call.
+        from tools.delegate_tool import synchronous_delegation_forced
+
+        assert not synchronous_delegation_forced()
+
+    def test_the_session_id_stands_in_for_a_missing_task_id(self):
+        agent = self._recording_agent("sess-9")
+        rt.make_tool_bridge_dispatch(agent)("todo", {})
+        assert agent._calls[0][2] == "sess-9"
+
+    def test_only_bridged_names_are_accepted(self):
+        agent = self._recording_agent()
+        with pytest.raises(ValueError, match="not a bridged tool"):
+            rt.make_tool_bridge_dispatch(agent)("terminal", {"command": "id"})
+        assert agent._calls == []
+
+    def test_a_child_cannot_delegate_just_because_its_mcp_server_offers_it(self):
+        """The MCP server builds its list from the whole registry in its own
+        process and cannot know the child's toolsets, so a leaf subagent's
+        `claude` IS offered delegate_task and memory — which
+        DELEGATE_BLOCKED_TOOLS denies it. The agent's own surface decides."""
+        agent = self._recording_agent(tools=("todo", "session_search"))
+        agent.platform = "subagent"
+        dispatch = rt.make_tool_bridge_dispatch(agent)
+        for blocked in ("delegate_task", "memory"):
+            out = json.loads(dispatch(blocked, {}))
+            assert "not available to this agent" in out["error"]
+        assert dispatch("todo", {}) == "ran:todo"
+        assert [c[0] for c in agent._calls] == ["todo"]
+
+    def test_an_agent_with_no_tool_list_at_all_is_not_second_guessed(self):
+        """An embedder or a stand-in that never built a tool surface is taken
+        as unrestricted; an agent that HAS one is taken at its word."""
+        agent = self._recording_agent()
+        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
+
+        del agent.valid_tool_names
+        assert rt.bridged_tools_for(agent) == BRIDGED_TOOLS
+        assert rt.make_tool_bridge_dispatch(agent)("memory", {}) == "ran:memory"
+
+    def test_an_empty_tool_surface_grants_nothing(self):
+        """`if valid and tool not in valid` would fall OPEN here — an empty
+        set is falsy, and a build that resolved to no tools would silently
+        hand back all four, DELEGATE_BLOCKED_TOOLS included."""
+        agent = self._recording_agent(tools=())
+        assert rt.bridged_tools_for(agent) == ()
+        out = json.loads(rt.make_tool_bridge_dispatch(agent)("delegate_task", {}))
+        assert "not available to this agent" in out["error"]
+        assert agent._calls == []
+
+    def test_the_child_is_only_offered_what_the_agent_can_run(self):
+        """Same source of truth decides what the child is TOLD it has and
+        what it is allowed to call — otherwise a leaf subagent is advertised
+        delegate_task and refused when it uses it."""
+        leaf = self._recording_agent(tools=("todo", "session_search"))
+        assert rt.bridged_tools_for(leaf) == ("todo", "session_search")
+        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
+
+        parent = self._recording_agent()
+        assert set(rt.bridged_tools_for(parent)) == set(BRIDGED_TOOLS)
+
+    def test_a_bridged_call_really_goes_through_the_tool_pipeline(self, monkeypatch):
+        """The whole justification for dispatching through _invoke_tool rather
+        than the tool function is that a bridged call is gated and accounted
+        like any other. A stubbed _invoke_tool cannot show that, so this one
+        builds a real AIAgent and watches the pre_tool_call hook fire."""
+        import hermes_cli.plugins as plugins
+        from run_agent import AIAgent
+
+        seen = []
+
+        def fake_hooks(function_name, function_args, **kw):
+            seen.append((function_name, kw.get("tool_call_id"), kw.get("task_id")))
+            return None, None
+
+        monkeypatch.setattr(plugins, "_dispatch_pre_tool_call_hooks", fake_hooks)
+
+        agent = AIAgent(
+            provider="claude-code-cli", model="haiku", quiet_mode=True,
+            skip_memory=True, skip_context_files=True, platform="api_server",
+            enabled_toolsets=["todo"],
+        )
+        try:
+            agent._claude_code_task_id = "task-real"
+            out = rt.make_tool_bridge_dispatch(agent)(
+                "todo", {"todos": [{"content": "bridge check", "status": "pending"}]}
+            )
+            assert "bridge check" in out
+            assert seen and seen[0][0] == "todo"
+            assert seen[0][1].startswith("bridge-")
+            assert seen[0][2] == "task-real"
+        finally:
+            try:
+                agent.close()
+            except Exception:
+                pass
+
+    def test_a_turn_binds_the_bridge_to_the_agent_driving_it(self):
+        """api_server builds an AIAgent per request against one warm process;
+        a delegation dispatched onto last request's agent would build its
+        children from a dead session."""
+        first = self._recording_agent("shared")
+        _turn(first)
+        session = first._claude_code_session
+        assert first._claude_code_task_id == "t"
+        session._tool_bridge_dispatch("todo", {})
+        assert [c[0] for c in first._calls] == ["todo"]
+
+        second = self._recording_agent("shared")
+        _turn(second)
+        assert second._claude_code_session is session
+        session._tool_bridge_dispatch("todo", {})
+        assert [c[0] for c in second._calls] == ["todo"]
+        assert [c[0] for c in first._calls] == ["todo"]  # not called twice

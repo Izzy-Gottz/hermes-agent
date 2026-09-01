@@ -29,13 +29,18 @@ What we DO NOT expose:
   - read_file / write_file / patch       — codex's apply_patch + shell
   - search_files / process               — codex's shell
   - clarify                              — codex's own UX
-  - delegate_task / memory /             — `_AGENT_LOOP_TOOLS` in Hermes
-    session_search / todo                  (model_tools.py). They require
-                                           the running AIAgent context to
-                                           dispatch (mid-loop state), so a
-                                           stateless MCP callback can't
-                                           drive them. See the inline
-                                           comment on EXPOSED_TOOLS below.
+  - delegate_task / memory /             — only when there is no tool
+    session_search / todo                  bridge. These are Hermes'
+                                           `_AGENT_LOOP_TOOLS`: they need
+                                           the running AIAgent, which this
+                                           process does not have. Given
+                                           $HERMES_TOOL_BRIDGE_SOCKET they
+                                           are offered and forwarded to the
+                                           process that does — see
+                                           agent/transports/
+                                           hermes_tool_bridge.py. Without
+                                           one they stay hidden rather than
+                                           be offered and always fail.
 
 External MCP servers (``mcp_servers`` in ``~/.hermes/config.yaml``) are
 registered on top of whichever profile is active, under their registry names
@@ -137,11 +142,12 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
 #   - terminal / shell / read_file / write_file / patch / search_files /
 #     process — codex's built-ins cover these and approval routes through
 #     codex's own UI.
-#   - delegate_task / memory / session_search / todo — these are
-#     `_AGENT_LOOP_TOOLS` in Hermes (model_tools.py:493). They require
-#     the running AIAgent context to dispatch (mid-loop state), so a
-#     stateless MCP callback can't drive them. Hermes' default runtime
-#     keeps these working; the codex_app_server runtime cannot.
+#   - delegate_task / memory / session_search / todo — `_AGENT_LOOP_TOOLS`
+#     in Hermes (model_tools.py). They require the running AIAgent to
+#     dispatch (mid-loop state), which this process does not have. Under
+#     claude_code they are offered anyway and forwarded to the process that
+#     does, over the tool bridge (see AGENT_LOOP_TOOLS below); codex has no
+#     bridge wired, so there they are still withheld.
 EXPOSED_TOOLS: tuple[str, ...] = (
     "web_search",
     "web_extract",
@@ -241,15 +247,22 @@ def discover_external_mcp_servers() -> list[str]:
         return []
 
 
-#: The only tools that genuinely cannot come through this server.
 #: ``model_tools._AGENT_LOOP_TOOLS`` — handle_function_call answers them with
 #: "must be handled by the agent loop", because they need the running AIAgent
-#: (mid-loop state) and a stateless MCP callback has none. Offering one would
-#: be offering a tool that always fails.
+#: (mid-loop state) and this process has none. They are still offered when a
+#: tool bridge is configured: the call is forwarded to the Hermes process that
+#: owns the agent and dispatched there (agent/transports/hermes_tool_bridge.py).
+#: Without a bridge they are withheld, because offering one would be offering
+#: a tool that always fails.
 AGENT_LOOP_TOOLS: tuple[str, ...] = ("todo", "memory", "session_search", "delegate_task")
 
 
-def tools_to_offer(profile: Optional[str], available: "set[str] | frozenset[str]") -> tuple[str, ...]:
+def tools_to_offer(
+    profile: Optional[str],
+    available: "set[str] | frozenset[str]",
+    *,
+    bridge: "bool | tuple[str, ...] | set[str]" = False,
+) -> tuple[str, ...]:
     """Everything Hermes has, minus what cannot work here.
 
     This used to be an ALLOWLIST — a hand-written tuple of about thirty names.
@@ -264,9 +277,22 @@ def tools_to_offer(profile: Optional[str], available: "set[str] | frozenset[str]
     default. The rule is the other way round now: everything, minus the few
     that cannot be dispatched statelessly, minus (on codex) the OS tools codex
     owns itself.
+
+    ``bridge`` names the agent-loop tools the process at the other end of the
+    tool bridge will actually run for this child — all four for a top-level
+    agent, fewer (often none) for a subagent, whose ``DELEGATE_BLOCKED_TOOLS``
+    deny ``delegate_task`` and ``memory``. Passing ``True`` means all four;
+    the point of taking a set rather than a flag is that a child is never
+    *advertised* a tool the dispatcher would then refuse.
     """
     key = (profile or "").strip().lower()
-    blocked = set(AGENT_LOOP_TOOLS)
+    if bridge is True:
+        bridged = set(AGENT_LOOP_TOOLS)
+    elif bridge:
+        bridged = set(bridge)
+    else:
+        bridged = set()
+    blocked = set(AGENT_LOOP_TOOLS) - bridged
     if key != CLAUDE_CODE_PROFILE:
         # codex brings its own shell and file tools; two of each confuses the
         # model and routes approval through the wrong UI.
@@ -459,6 +485,13 @@ def _build_server(profile: Optional[str] = None) -> Any:
         handle_function_call,
     )
 
+    from agent.transports.hermes_tool_bridge import (
+        BridgeError, bridge_hold, bridged_tool_names, call_bridged_tool,
+    )
+
+    bridged_names = bridged_tool_names()
+    has_bridge = bool(bridged_names)
+
     # Before any schema is read: whatever the user has connected has to be in
     # the registry, or get_tool_definitions() below simply will not see it.
     external_names = discover_external_mcp_servers()
@@ -468,7 +501,7 @@ def _build_server(profile: Optional[str] = None) -> Any:
     if (profile or "").strip().lower() == CLAUDE_CODE_PROFILE:
         instructions = (
             "Hermes Agent's tool surface. Claude Code's native Bash/Read/"
-            "Write/Edit/Glob/Grep/WebFetch tools are disabled in this "
+            "Write/Edit/Glob/Grep/WebFetch/Task tools are disabled in this "
             "session; use terminal, read_file, write_file, patch, "
             "search_files and process from this server for shell and file "
             "work, plus web search/extract, browser automation, vision, "
@@ -477,6 +510,18 @@ def _build_server(profile: Optional[str] = None) -> Any:
             "as the rest — prefer them over guessing or answering from "
             "context when a question is about the system they front."
         )
+        if "delegate_task" in bridged_names:
+            instructions += (
+                " delegate_task is this session's subagent tool — it runs on "
+                "the parent Hermes agent, so its children get the same model, "
+                "the same account and the same tools."
+            )
+        persistent = [n for n in ("memory", "todo", "session_search") if n in bridged_names]
+        if persistent:
+            instructions += (
+                f" {', '.join(persistent)} run on the parent agent too, and are "
+                "the persistent ones."
+            )
     else:
         instructions = (
             "Hermes Agent's tool surface, exposed for use inside a Codex "
@@ -517,8 +562,14 @@ def _build_server(profile: Optional[str] = None) -> Any:
     }
 
     # Everything Hermes has: its own tools, its plugins' tools (the Moe
-    # connectors live here), and every external MCP server's tools.
-    tools_to_expose = tools_to_offer(profile, set(all_defs))
+    # connectors live here), and every external MCP server's tools — plus the
+    # four agent-loop tools when there is a bridge to run them on.
+    tools_to_expose = tools_to_offer(profile, set(all_defs), bridge=bridged_names)
+    if has_bridge:
+        logger.info(
+            "tool bridge configured — %s dispatch on the parent agent",
+            ", ".join(bridged_names),
+        )
 
     exposed_count = 0
 
@@ -542,12 +593,29 @@ def _build_server(profile: Optional[str] = None) -> Any:
         def _make_handler(tool_name: str, schema: dict | None):
             sig, annots = _signature_from_schema(schema)
 
+            bridged = tool_name in bridged_names
+
             def _dispatch(**kwargs: Any) -> Any:
                 try:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
-                    return to_mcp_content(handle_function_call(tool_name, args or {}))
+                    if bridged:
+                        # Home to the process that owns the agent — and the
+                        # credential a subagent has to be built with.
+                        return to_mcp_content(call_bridged_tool(tool_name, args or {}))
+                    # Hold the line for the parent while this runs, so a long
+                    # tool call cannot be mistaken for a dead CLI and retired
+                    # at claude_code.silence_timeout. Cheap insurance: one
+                    # AF_UNIX connect per call, and measured on 2.1.252 the
+                    # CLI keeps streaming during a tool call anyway.
+                    with bridge_hold():
+                        return to_mcp_content(handle_function_call(tool_name, args or {}))
+                except BridgeError as exc:
+                    # Not an exception the model should read as a crash: the
+                    # bridge is down, or the call took longer than it allows.
+                    logger.warning("bridged tool %s failed: %s", tool_name, exc)
+                    return json.dumps({"error": str(exc), "tool": tool_name})
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})

@@ -557,7 +557,11 @@ def _looks_like_test_tempdir(path: str) -> bool:
 def _build_hermes_tools_mcp_entry() -> dict:
     """Build the codex stdio-transport entry that launches Hermes' own
     tool surface as an MCP server. Codex's subprocess will call back into
-    this for browser/web/delegate_task/vision/memory/skills tools.
+    this for browser/web/vision/skills tools. NOT delegate_task or memory:
+    those need the running AIAgent, and the claude_code runtime's tool bridge
+    (agent/transports/hermes_tool_bridge.py) — which forwards them home — has
+    no address to write here, because this file is written once and a bridge
+    is minted per session.
 
     The command runs the worktree's Python via the current sys.executable
     so a hermes installed under /opt/, /usr/local/, or a venv all work.

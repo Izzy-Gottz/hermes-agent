@@ -219,6 +219,12 @@ other and log each other out. One token owned by Hermes ends that race.
   the `env` block of a 0600 `--mcp-config` file that is deleted when the session closes.
   The one secret the CLI must hold is its own `CLAUDE_CODE_OAUTH_TOKEN`; the MCP server
   scrubs that from its environment at startup so Hermes' `terminal` never sees it.
+- The same `env` block carries the **tool bridge** address — a Unix socket, a per-session
+  token and the list of agent-loop tools this child may call. That is not a secret from
+  the model (Hermes' `terminal` runs inside the MCP server and can read its environment);
+  what bounds the bridge is that only `todo`, `memory`, `session_search` and
+  `delegate_task` are dispatchable through it at all, and that the parent re-checks each
+  call against the calling agent's own tool surface.
 
 **Tool authority.** Claude Code's native OS-level tools never pass through Hermes'
 policy — native `Bash` skips `check_all_command_guards` (Tirith, dangerous-command
@@ -262,15 +268,33 @@ policy and can read `CLAUDE_CODE_OAUTH_TOKEN`.
 | security_mode | `claude --permission-mode` | shell / files |
 |---|---|---|
 | `auto` (default) | `acceptEdits`; `--allowedTools mcp__hermes-tools` | Hermes `terminal` / file tools run under Hermes' own guards and your `pre_tool_call` hooks; dangerous commands are denied (no approver exists in the server process) |
-| `approval-required` | `default`, `--permission-prompt-tool stdio`; every Hermes tool except `terminal`, `write_file`, `patch`, `process` pre-approved | **gated** — each `terminal`/`write_file`/`patch`/`process` call is sent to Hermes' approval prompt; with no interactive approver (gateway, cron) it is denied with a message the model sees, and Hermes tells you once per session |
+| `approval-required` | `default`, `--permission-prompt-tool stdio`; every Hermes tool except `terminal`, `write_file`, `patch`, `process` pre-approved — the four bridged tools included, deliberately: the parent dispatches them through its own hooks, and gating them again here would deny delegation outright wherever no approver exists | **gated** — each `terminal`/`write_file`/`patch`/`process` call is sent to Hermes' approval prompt; with no interactive approver (gateway, cron) it is denied with a message the model sees, and Hermes tells you once per session |
 | `unrestricted` / `yolo` (or `--yolo`) | `bypassPermissions` | no CLI-side prompts; native tools **still disallowed** unless `native_tools: true` — yolo means "don't ask", not "use a shell that skips Hermes' hardline blocks" |
 
 Unknown values fail closed to `approval-required`. Context compaction is done by the
 CLI itself (like `compression.codex_app_server_auto: native`); background memory/skill
-review is skipped on this runtime because the `memory` tool cannot be reached from a
-subprocess. A resumed Hermes session `--resume`s the same CLI transcript; if the CLI
+review is skipped on this runtime because each review would fork a second `claude`
+process (the `memory` tool itself is reachable — see **Subagents and memory** below). A resumed Hermes session `--resume`s the same CLI transcript; if the CLI
 rejects the resume, Hermes rotates to a fresh session id and remembers it in
 `$HERMES_HOME/claude-code/hermes-sessions.json`.
+
+**Subagents and memory.** `delegate_task`, `memory`, `session_search` and `todo` need the
+running agent, so a stateless MCP callback cannot dispatch them and they used to be
+withheld from the child entirely — asked to delegate, the model answered that the tool did
+not exist. They are now forwarded back to the Hermes process over a Unix socket (the tool
+bridge) and dispatched there, which is also what makes a subagent inherit the parent's
+provider, model, session lineage and Claude Code credential instead of being built in a
+process that has none of them. A bridged `delegate_task` is **synchronous**: the CLI is
+holding an open MCP call, so the children are joined and their results returned into it.
+A child is only offered the subset its own agent may run, so a leaf subagent sees neither
+`delegate_task` nor `memory`. Timeouts: `MCP_TIMEOUT` / `MCP_TOOL_TIMEOUT` are set on the
+CLI child (override them in the environment if you must), `HERMES_TOOL_BRIDGE_TIMEOUT`
+bounds the Hermes side and is kept strictly below the CLI's. A turn's
+`claude_code.silence_timeout` also does not tick while Hermes is doing work the child is
+waiting on — a bridged call, or any tool the child's own MCP server is running — so a
+long tool call cannot be mistaken for a dead CLI. (Measured on Claude Code 2.1.252 the
+CLI keeps streaming during a tool call, so that guard rarely fires; it is there because
+the alternative is retiring a session in the middle of its own successful work.)
 
 **Warm processes.** One `claude` process is kept per Hermes session and shared across
 requests (the gateway builds a fresh agent per request; the process outlives it), so

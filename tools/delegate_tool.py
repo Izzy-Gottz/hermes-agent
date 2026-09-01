@@ -18,6 +18,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import contextlib
 import contextvars
 import json
 import logging
@@ -44,6 +45,45 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+# ---------------------------------------------------------------------------
+# Forced-synchronous delegation
+#
+# A top-level ``delegate_task`` is normally backgrounded: it returns handles
+# and each child's result re-enters the conversation later as its own message.
+# That needs a loop able to inject a message. Under the CLI-owned runtimes
+# (claude_code, codex_app_server) the call arrives over the tool bridge from a
+# child process that is *holding an open tool call* and will only ever see
+# what this function returns, so the async handle would be a receipt for work
+# the model is never shown. The bridge wraps its dispatch in
+# ``forced_synchronous_delegation()`` and the children are joined before the
+# tool answers.
+#
+# A ContextVar, not a flag on the agent: the agent object is shared across a
+# warm session's requests, and a concurrent background delegation on another
+# thread must not be dragged synchronous by this one. Children DO inherit the
+# value — they are dispatched through ``contextvars.copy_context()`` below —
+# which changes nothing, because a child is already synchronous by depth.
+# ---------------------------------------------------------------------------
+_FORCED_SYNC_DELEGATION: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "hermes_forced_synchronous_delegation", default=False
+)
+
+
+@contextlib.contextmanager
+def forced_synchronous_delegation():
+    """Context manager: delegations started inside it join before returning."""
+    token = _FORCED_SYNC_DELEGATION.set(True)
+    try:
+        yield
+    finally:
+        _FORCED_SYNC_DELEGATION.reset(token)
+
+
+def synchronous_delegation_forced() -> bool:
+    """True inside :class:`forced_synchronous_delegation`."""
+    return bool(_FORCED_SYNC_DELEGATION.get())
 
 
 # Tools that children must never have access to
@@ -4892,13 +4932,15 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     batch (the whole batch is one async unit that joins on all children and
     returns one consolidated result). The one
     exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
-    case the intercept is bypassed. Direct Python callers of ``delegate_task``
-    keep the historical synchronous default.
+    needs its workers' results within its own turn — or one that arrived over
+    the tool bridge, whose caller is holding an open MCP call and will only
+    ever see this function's return value. The live path is
+    ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
+    the intercept is bypassed, and the two must not drift. Direct Python
+    callers of ``delegate_task`` keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    return (not is_subagent) and not synchronous_delegation_forced()
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

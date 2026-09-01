@@ -11,6 +11,8 @@ from __future__ import annotations
 import inspect
 from typing import get_args
 
+import pytest
+
 from agent.transports.hermes_tools_mcp_server import (
     _signature_from_schema,
 )
@@ -316,3 +318,139 @@ class TestExternalMcpPassthrough:
 
         monkeypatch.setattr(mcp_tool, "discover_mcp_tools", boom)
         assert m.discover_external_mcp_servers() == []
+
+
+class TestAgentLoopToolsOverTheBridge:
+    """The four tools that need the live agent are offered when — and only
+    when — there is a bridge to run them on.
+
+    Withholding them is what made Moe answer "The delegate_task tool is not
+    available in this environment" while running on Claude Code: the model
+    had no subagent tool at all. Offering them without a bridge would be
+    worse — every call would fail with "must be handled by the agent loop".
+    """
+
+    def _defs(self, names):
+        return [
+            {"type": "function", "function": {"name": n, "parameters": {}}}
+            for n in names
+        ]
+
+    def _build(self, monkeypatch, names, *, bridge=None, offered=None):
+        import mcp.server as mcp_server
+        import model_tools
+        from agent.transports import hermes_tools_mcp_server as m
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, BRIDGE_TOOLS_ENV,
+        )
+
+        monkeypatch.setattr(mcp_server, "MCPServer", _RecordingServer)
+        monkeypatch.setattr(m, "discover_external_mcp_servers", lambda: [])
+        monkeypatch.setattr(
+            model_tools, "get_tool_definitions", lambda **kw: self._defs(names)
+        )
+        monkeypatch.delenv(BRIDGE_TOOLS_ENV, raising=False)
+        if bridge is None:
+            monkeypatch.delenv(BRIDGE_SOCKET_ENV, raising=False)
+            monkeypatch.delenv(BRIDGE_TOKEN_ENV, raising=False)
+        else:
+            monkeypatch.setenv(BRIDGE_SOCKET_ENV, bridge.socket_path)
+            monkeypatch.setenv(BRIDGE_TOKEN_ENV, bridge.token)
+            if offered is not None:
+                monkeypatch.setenv(BRIDGE_TOOLS_ENV, ",".join(offered))
+        return m._build_server("claude-code")
+
+    def test_offered_only_with_a_bridge(self):
+        from agent.transports.hermes_tools_mcp_server import (
+            AGENT_LOOP_TOOLS, tools_to_offer,
+        )
+        available = set(AGENT_LOOP_TOOLS) | {"terminal", "web_search"}
+        without = tools_to_offer("claude-code", available)
+        assert not set(AGENT_LOOP_TOOLS) & set(without)
+        with_bridge = tools_to_offer("claude-code", available, bridge=True)
+        assert set(AGENT_LOOP_TOOLS) <= set(with_bridge)
+        # Codex still keeps its own shell and file tools out of the surface.
+        codex = tools_to_offer("codex", available, bridge=True)
+        assert "terminal" not in codex and "delegate_task" in codex
+
+    def test_only_the_names_the_parent_will_actually_run_are_offered(self):
+        """A leaf subagent's DELEGATE_BLOCKED_TOOLS deny delegate_task and
+        memory. Advertising them anyway costs the child a turn and contradicts
+        its own instructions."""
+        from agent.transports.hermes_tools_mcp_server import (
+            AGENT_LOOP_TOOLS, tools_to_offer,
+        )
+        available = set(AGENT_LOOP_TOOLS) | {"terminal"}
+        narrowed = tools_to_offer(
+            "claude-code", available, bridge=("todo", "session_search")
+        )
+        assert "todo" in narrowed and "session_search" in narrowed
+        assert "delegate_task" not in narrowed and "memory" not in narrowed
+
+    def test_a_narrowed_child_is_not_told_it_has_a_subagent_tool(self, monkeypatch, tmp_path):
+        from agent.transports.hermes_tool_bridge import ToolBridge
+
+        bridge = ToolBridge(lambda *_: "ok", directory=str(tmp_path))
+        bridge.start()
+        try:
+            server = self._build(
+                monkeypatch, ["todo", "delegate_task"], bridge=bridge,
+                offered=("todo",),
+            )
+            assert "todo" in server.tools and "delegate_task" not in server.tools
+            assert "delegate_task is this session's subagent tool" not in server.instructions
+            assert "todo" in server.instructions
+        finally:
+            bridge.close()
+
+    def test_a_bridged_call_runs_on_the_parent_not_here(self, monkeypatch, tmp_path):
+        import model_tools
+        from agent.transports.hermes_tool_bridge import ToolBridge
+
+        seen = []
+        bridge = ToolBridge(
+            lambda tool, args: seen.append((tool, args)) or "from-the-parent",
+            directory=str(tmp_path),
+        )
+        bridge.start()
+        try:
+            monkeypatch.setattr(
+                model_tools,
+                "handle_function_call",
+                lambda *a, **k: pytest.fail("a bridged tool must not dispatch locally"),
+            )
+            server = self._build(monkeypatch, ["delegate_task", "web_search"], bridge=bridge)
+            assert "delegate_task" in server.tools
+            out = server.tools["delegate_task"](goal="say pong", context=None)
+            assert out == "from-the-parent"
+            # None-valued optionals are dropped before the call, as locally.
+            assert seen == [("delegate_task", {"goal": "say pong"})]
+        finally:
+            bridge.close()
+
+    def test_a_dead_bridge_is_a_tool_error_the_model_can_read(self, monkeypatch, tmp_path):
+        import json as _json
+        from agent.transports.hermes_tool_bridge import ToolBridge
+
+        bridge = ToolBridge(lambda *_: "", directory=str(tmp_path))
+        bridge.start()
+        server = self._build(monkeypatch, ["delegate_task"], bridge=bridge)
+        bridge.close()
+        out = _json.loads(server.tools["delegate_task"](goal="x"))
+        assert out["tool"] == "delegate_task" and "not answering" in out["error"]
+
+    def test_unbridged_tools_still_dispatch_locally(self, monkeypatch, tmp_path):
+        import model_tools
+        from agent.transports.hermes_tool_bridge import ToolBridge
+
+        bridge = ToolBridge(lambda *_: pytest.fail("web_search is not bridged"),
+                            directory=str(tmp_path))
+        bridge.start()
+        try:
+            monkeypatch.setattr(
+                model_tools, "handle_function_call", lambda name, args: f"local:{name}"
+            )
+            server = self._build(monkeypatch, ["web_search"], bridge=bridge)
+            assert server.tools["web_search"](query="x") == "local:web_search"
+        finally:
+            bridge.close()

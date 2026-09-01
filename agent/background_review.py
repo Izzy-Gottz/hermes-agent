@@ -1413,16 +1413,21 @@ def _run_review_in_thread(
     if review_run is not None and review_run.cancel_requested.is_set():
         finish_background_review_run(agent, review_run)
         return
-    # claude_code runtime: the fork would spawn a second `claude` process that
-    # cannot reach the `memory` / `skill_manage` tools (they are
-    # _AGENT_LOOP_TOOLS, not exposable over MCP), so the review could never
-    # save anything. Refuse here — every caller (automatic turn-boundary
-    # review, /refine, the CLI review command) converges on this thread
-    # target (#25267).
+    # claude_code runtime: still refused, but no longer for the reason first
+    # written here. That reason was that a forked `claude` could not reach
+    # `memory` (an _AGENT_LOOP_TOOL, not exposable over MCP) and so could
+    # never save anything; the tool bridge
+    # (agent/transports/hermes_tool_bridge.py) made it reachable. What argues
+    # for the refusal now is cost: the fork is a whole second `claude`
+    # process with its own MCP server, its own bridge and its own slot in the
+    # warm-process registry, per review. Revisit deliberately, not by
+    # deleting a stale comment. Every caller (automatic turn-boundary review,
+    # /refine, the CLI review command) converges on this thread target
+    # (#25267).
     if getattr(agent, "api_mode", None) == "claude_code":
         logger.info(
-            "background review skipped: api_mode=claude_code cannot write "
-            "memory/skills from the claude subprocess (session=%s)",
+            "background review skipped: api_mode=claude_code would fork a "
+            "second claude process per review (session=%s)",
             getattr(agent, "session_id", None),
         )
         if review_run is not None:

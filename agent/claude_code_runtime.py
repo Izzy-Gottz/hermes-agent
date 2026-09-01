@@ -20,11 +20,14 @@ about each (grep ``codex_app_server`` to audit):
     agent/turn_context.py        preflight compress  -> skipped (native compaction; == ``codex_app_server_auto: native``)
     agent/turn_context.py        api-bytes stamp     -> skipped (the CLI never sees ``api_messages``)
     agent/conversation_compression.py compress_context -> no-op boundary (native compaction only)
-    agent/background_review.py   _run_review_in_thread -> refused on claude_code for EVERY caller
-                                                        (automatic, /refine, CLI command): the fork
-                                                        would start a second `claude` that cannot
-                                                        reach the `memory` / `skill_manage` tools
-                                                        (they are _AGENT_LOOP_TOOLS, not MCP-exposable)
+    agent/background_review.py   _run_review_in_thread -> still refused on claude_code for EVERY
+                                                        caller (automatic, /refine, CLI command).
+                                                        Its stated reason — that a forked `claude`
+                                                        cannot reach `memory` — stopped being true
+                                                        with the tool bridge; what still argues for
+                                                        the refusal is cost: the fork is a second
+                                                        `claude` process, its own bridge and its own
+                                                        registry slot, per review.
     tui_gateway/server.py        image_routing       -> forces text mode for codex_app_server; the
                                                         claude transport forwards base64 image parts as
                                                         stream-json image blocks (_coerce_input_blocks),
@@ -52,16 +55,28 @@ about each (grep ``codex_app_server`` to audit):
                                                         analogue because the CLI exposes no compact RPC.
     agent/transports/hermes_tools_mcp_server.py      -> docstring mentions only; shared as-is.
 
-Known gap shared with the codex runtime: Hermes tools that need the live
-agent loop (``memory``, ``delegate_task``, ``session_search``, ``todo``) are
-not exposed over MCP.
+Formerly a gap shared with the codex runtime, now closed for this one: the
+Hermes tools that need the live agent loop (``memory``, ``delegate_task``,
+``session_search``, ``todo``) are exposed over MCP and forwarded back to this
+process over a Unix socket, so they run on the agent that owns the session —
+and a subagent is therefore built with this agent's provider, model and
+Claude Code credential rather than from nothing. See
+``agent/transports/hermes_tool_bridge.py`` and ``make_tool_bridge_dispatch``
+below. The codex runtime spawns the same MCP server and could gain the same
+thing, but not for free: its hermes-tools entry is written once into a static
+``~/.codex/config.toml`` (``hermes_cli/codex_runtime_plugin_migration.py``),
+while a socket address and token are minted per session — so it needs either a
+per-session rewrite of that file or a stable re-bindable socket, a bridge
+started somewhere in ``agent/codex_runtime.py``, and a ``tool_timeout_sec``
+above the bridge's own ceiling (it pins 600 s).
 
-TODO: background memory/skill review is skipped on this runtime (the guard
-lives in ``agent/background_review._run_review_in_thread`` so every caller —
-automatic, ``/refine``, CLI command — converges on it). The follow-up that
-would restore it is a stateless ``memory`` MCP tool backed by a fresh
-``MemoryStore`` loaded from disk per call, with the parent reloading its
-store after each turn.
+TODO: background memory/skill review is still skipped on this runtime (the
+guard lives in ``agent/background_review._run_review_in_thread`` so every
+caller — automatic, ``/refine``, CLI command — converges on it). The stateless
+``memory`` MCP tool that used to be the proposed fix is no longer the right
+shape: ``memory`` reaches the live store over the bridge now. What remains to
+decide is whether a review fork — a second ``claude``, its own bridge, its own
+registry slot — is worth its cost per turn.
 
 Isolation contract (HIGH-2 in review): the child is a Hermes-owned Claude
 Code — ``CLAUDE_CONFIG_DIR=$HERMES_HOME/claude-code``, cwd
@@ -79,6 +94,7 @@ import atexit
 import glob
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -249,8 +265,41 @@ def prune_stale_temp_files(config_dir: str, *, max_age: float = _STALE_TEMP_AGE_
                     removed += 1
             except OSError:
                 pass
+    removed += _prune_bridge_dirs(config_dir, cutoff)
     if removed:
         logger.info("claude-code: removed %d stale temp file(s) from %s", removed, config_dir)
+    return removed
+
+
+def _prune_bridge_dirs(config_dir: str, cutoff: float) -> int:
+    """Remove ``bridge-*/`` directories left by a killed process.
+
+    A tool bridge removes its own directory on close, so one still here
+    belongs to a process that was killed instead. Age alone is NOT enough to
+    decide that: a socket's mtime is fixed at bind, so a session that has
+    simply been alive a long time would eventually have its live socket
+    unlinked and its four bridged tools would start failing with ENOENT and no
+    server-side signal at all. So an old directory whose socket still answers
+    is left exactly where it is.
+    """
+    from agent.transports.hermes_tool_bridge import socket_is_live
+
+    removed = 0
+    for path in glob.glob(os.path.join(config_dir, "bridge-*")):
+        if not os.path.isdir(path):
+            continue
+        try:
+            if os.path.getmtime(path) >= cutoff:
+                continue
+        except OSError:
+            continue
+        if socket_is_live(os.path.join(path, "s.sock")):
+            continue
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+        except OSError:
+            pass
     return removed
 
 
@@ -276,10 +325,30 @@ class TurnInFlightError(RuntimeError):
     """A second request for a session arrived while a turn was running."""
 
 
+def _reap_closed_locked() -> None:
+    """Under ``_REGISTRY_LOCK``: drop entries whose session is already closed.
+
+    Every subagent is its own session, and ``delegate_task`` closes its child
+    when it finishes — which closes the child's ``ClaudeCodeSession`` but left
+    the registry holding the husk. Those husks own no process and yet count
+    against ``max_sessions``, and each is *newer* than the parent's entry, so
+    after a handful of delegations the LRU victim chosen below was the live
+    parent: its warm ``claude`` and its prompt-cache warmth thrown away to
+    make room for the dead. Reaping first costs one pass over a dict of at
+    most ``max_sessions`` entries.
+    """
+    for key in [
+        k for k, e in _REGISTRY.items()
+        if e.ready.is_set() and (e.session is None or getattr(e.session, "_closed", False))
+    ]:
+        _REGISTRY.pop(key, None)
+
+
 def _evict_lru_locked(max_sessions: int) -> list[tuple[str, _RegistryEntry]]:
     """Under ``_REGISTRY_LOCK``: pop the least-recently-used NOT-in-flight
     entries until there is room for one more. Returns them for closing."""
     victims: list[tuple[str, _RegistryEntry]] = []
+    _reap_closed_locked()
     while len(_REGISTRY) >= max_sessions:
         candidates = sorted(_REGISTRY.items(), key=lambda kv: kv[1].last_used)
         for key, entry in candidates:
@@ -595,6 +664,81 @@ def _claude_session_id_for(agent) -> str:
     return str(uuid.uuid5(_CLAUDE_SESSION_NAMESPACE, f"hermes:{hermes_sid}"))
 
 
+def bridged_tools_for(agent) -> tuple:
+    """Which agent-loop tools ``agent`` may run over the bridge.
+
+    The MCP server builds its tool list from the whole registry, in its own
+    process; it cannot know this agent's toolsets. A subagent's ``claude`` is
+    therefore offered ``delegate_task`` and ``memory`` even though
+    ``DELEGATE_BLOCKED_TOOLS`` denies both to children. The agent's own
+    surface is the authority — used twice: once to decide what the child is
+    told it has, and again to refuse a call that arrived anyway.
+
+    An agent with no ``valid_tool_names`` attribute at all (an embedder, a
+    test stand-in) is not second-guessed. An agent that HAS the attribute is
+    taken at its word, including when it is empty: a build that resolved to
+    no tools grants none, rather than falling open on a falsy value.
+    """
+    from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
+
+    valid = getattr(agent, "valid_tool_names", None)
+    if valid is None:
+        return BRIDGED_TOOLS
+    return tuple(name for name in BRIDGED_TOOLS if name in valid)
+
+
+def make_tool_bridge_dispatch(agent):
+    """Run one bridged tool call on ``agent`` and return its result string.
+
+    This is what the child's ``delegate_task`` / ``memory`` / ``todo`` /
+    ``session_search`` calls arrive at, on a bridge thread, while the CLI turn
+    that made them waits. ``_invoke_tool`` is deliberately the entry point and
+    not the tool functions themselves: a bridged call must fire the same
+    ``pre_tool_call`` hooks (Moe's confirm gate), the same middleware and the
+    same ``post_tool_call`` accounting as a call from Hermes' own loop.
+
+    Delegation is forced SYNCHRONOUS here. From the top-level model a
+    ``delegate_task`` normally returns a handle at once and each child's
+    result re-enters the conversation later as its own message — the right
+    shape when Hermes owns the loop and can inject one. Under this runtime the
+    loop belongs to the CLI, which is sitting on an open MCP call: returning a
+    handle would hand the model a receipt for work it will never be shown,
+    while blocking returns the actual results into the tool call that asked
+    for them. That is also how the CLI's own subagent tool behaves.
+    """
+    def _dispatch(tool: str, args: dict) -> str:
+        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
+        from tools.delegate_tool import forced_synchronous_delegation
+
+        if tool not in BRIDGED_TOOLS:
+            raise ValueError(f"{tool!r} is not a bridged tool")
+        # The bridge's own allowlist is not enough: it is per session, and
+        # the agent driving the session can change under a warm process. A
+        # refusal is an ordinary tool answer, not a bridge failure, so it
+        # comes back in the shape every other denied Hermes tool uses.
+        if tool not in bridged_tools_for(agent):
+            from tools.registry import tool_error
+
+            return tool_error(
+                f"{tool} is not available to this agent "
+                f"(platform={getattr(agent, 'platform', '?')})"
+            )
+        task_id = (
+            str(getattr(agent, "_claude_code_task_id", "") or "")
+            or str(getattr(agent, "session_id", "") or "")
+        )
+        # Hooks and post-call accounting key on a tool_call_id; two bridged
+        # calls in one turn are indistinguishable without one.
+        call_id = f"bridge-{uuid.uuid4().hex[:12]}"
+        payload = dict(args or {})
+        if tool == "delegate_task":
+            with forced_synchronous_delegation():
+                return agent._invoke_tool(tool, payload, task_id, call_id)
+        return agent._invoke_tool(tool, payload, task_id, call_id)
+
+    return _dispatch
+
+
 def _build_session(agent):
     from agent.transports.claude_code_session import ClaudeCodeSession
 
@@ -646,6 +790,8 @@ def _build_session(agent):
         expose_hermes_tools=bool(cfg.get("expose_hermes_tools", True)),
         extra_args=[str(a) for a in extra_args] if isinstance(extra_args, list) else None,
         on_event=make_claude_code_event_bridge(agent),
+        tool_bridge_dispatch=make_tool_bridge_dispatch(agent),
+        tool_bridge_tools=bridged_tools_for(agent),
     )
 
 
@@ -673,6 +819,10 @@ def run_claude_code_turn(
 
     cfg = _claude_code_config()
     registry_key = _registry_key(agent)
+    # The id a bridged tool call is accounted under: hooks, middleware and
+    # post_tool_call all take one, and a call arriving from the child belongs
+    # to the turn that is waiting on it.
+    agent._claude_code_task_id = effective_task_id
     try:
         entry, created = _acquire_entry(agent)
     except TurnInFlightError as exc:
@@ -692,6 +842,7 @@ def run_claude_code_turn(
     session.rebind(
         on_event=make_claude_code_event_bridge(agent),
         approval_callback=_approval_callback(),
+        tool_bridge_dispatch=make_tool_bridge_dispatch(agent),
     )
     agent._claude_code_session = session
     try:

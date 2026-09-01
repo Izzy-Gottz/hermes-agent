@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -987,3 +988,314 @@ class TestImageForwarding:
         ])
         assert [b["type"] for b in blocks] == ["text", "image", "text"]
         assert blocks[2]["text"] == "after"
+
+
+class TestToolBridgeWiring:
+    """The child can reach delegate_task / memory / session_search / todo.
+
+    Before the bridge these four were withheld from the MCP server (they need
+    the live AIAgent) and the model was simply told the tool did not exist —
+    measured on the api_server: "The delegate_task tool is not available in
+    this environment." Anything the child could have built instead would have
+    been built in the MCP server's process, which has no agent and, by
+    design, no CLAUDE_CODE_OAUTH_TOKEN: not the same Claude Code.
+    """
+
+    def test_bridge_address_travels_in_the_mcp_config_not_the_cli_env(self, tmp_path):
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TIMEOUT_ENV, BRIDGE_TOKEN_ENV,
+            BRIDGE_TOOLS_ENV, DEFAULT_TIMEOUT_SECONDS,
+        )
+        path = write_mcp_config(
+            directory=str(tmp_path), bridge_socket="/tmp/b.sock", bridge_token="tok",
+            bridge_tools=("todo", "memory"),
+        )
+        env = json.loads(Path(path).read_text())["mcpServers"]["hermes-tools"]["env"]
+        assert env[BRIDGE_SOCKET_ENV] == "/tmp/b.sock"
+        assert env[BRIDGE_TOKEN_ENV] == "tok"
+        assert env[BRIDGE_TOOLS_ENV] == "todo,memory"
+        assert int(env[BRIDGE_TIMEOUT_ENV]) == int(DEFAULT_TIMEOUT_SECONDS)
+        # The CLI has no use for any of it, so it is not in the CLI's env —
+        # but this is housekeeping, not secrecy: Hermes' terminal runs inside
+        # the MCP server and can read that process's environment.
+        child_env = build_child_env({"PATH": "/usr/bin"})
+        assert BRIDGE_TOKEN_ENV not in child_env and BRIDGE_SOCKET_ENV not in child_env
+
+    def test_no_bridge_no_env(self, tmp_path):
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV,
+        )
+        path = write_mcp_config(directory=str(tmp_path))
+        env = json.loads(Path(path).read_text())["mcpServers"]["hermes-tools"]["env"]
+        assert BRIDGE_SOCKET_ENV not in env and BRIDGE_TOKEN_ENV not in env
+
+    def test_a_session_serves_the_bridge_for_its_lifetime(self, fake_claude):
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, call_bridged_tool,
+        )
+        seen: list[tuple[str, dict]] = []
+        session = _session(
+            fake_claude,
+            expose_hermes_tools=True,
+            tool_bridge_dispatch=lambda tool, args: seen.append((tool, args)) or "ok",
+        )
+        try:
+            session.ensure_started()
+            env = json.loads(Path(session._mcp_config_path).read_text())
+            server_env = env["mcpServers"]["hermes-tools"]["env"]
+            socket_path = server_env[BRIDGE_SOCKET_ENV]
+            assert os.path.exists(socket_path)
+            out = call_bridged_tool(
+                "delegate_task",
+                {"goal": "x"},
+                env={BRIDGE_SOCKET_ENV: socket_path,
+                     BRIDGE_TOKEN_ENV: server_env[BRIDGE_TOKEN_ENV]},
+            )
+            assert out == "ok" and seen == [("delegate_task", {"goal": "x"})]
+        finally:
+            session.close()
+        assert not os.path.exists(socket_path)
+
+    def test_without_a_dispatcher_nothing_listens(self, fake_claude):
+        from agent.transports.hermes_tool_bridge import BRIDGE_SOCKET_ENV
+        session = _session(fake_claude, expose_hermes_tools=True)
+        try:
+            session.ensure_started()
+            server_env = json.loads(
+                Path(session._mcp_config_path).read_text()
+            )["mcpServers"]["hermes-tools"]["env"]
+            assert BRIDGE_SOCKET_ENV not in server_env
+            assert session._tool_bridge is None
+        finally:
+            session.close()
+
+    def test_rebind_repoints_the_live_bridge(self, fake_claude):
+        """Over the wire, not by reading the attribute back: the failure this
+        guards against is `_handle` capturing the dispatcher once at start,
+        which an attribute check would not notice."""
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, call_bridged_tool,
+        )
+        first, second = [], []
+        session = _session(
+            fake_claude,
+            expose_hermes_tools=True,
+            tool_bridge_dispatch=lambda tool, args: first.append(tool) or "first",
+        )
+        try:
+            session.ensure_started()
+            bridge = session._tool_bridge
+            env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
+            assert call_bridged_tool("todo", env=env) == "first"
+            session.rebind(
+                on_event=None,
+                approval_callback=None,
+                tool_bridge_dispatch=lambda tool, args: second.append(tool) or "second",
+            )
+            assert call_bridged_tool("todo", env=env) == "second"
+            # A rebind that does not name a dispatcher keeps the current one.
+            session.rebind(on_event=None, approval_callback=None)
+            assert call_bridged_tool("todo", env=env) == "second"
+            assert first == ["todo"] and second == ["todo", "todo"]
+        finally:
+            session.close()
+
+    def test_a_bridge_that_cannot_bind_does_not_stop_the_session(self, fake_claude, monkeypatch):
+        from agent.transports import hermes_tool_bridge as htb
+
+        def boom(self):
+            raise htb.BridgeError("no socket for you")
+
+        monkeypatch.setattr(htb.ToolBridge, "start", boom)
+        session = _session(
+            fake_claude, expose_hermes_tools=True, tool_bridge_dispatch=lambda *_: "ok"
+        )
+        try:
+            assert session.ensure_started()
+            assert session._tool_bridge is None
+        finally:
+            session.close()
+
+    def test_approval_mode_preapproves_the_bridged_tools(self):
+        """They are dispatched by the parent, through its own hooks and
+        policy. Gating them again at the CLI would deny delegation outright
+        in a gateway context, where nobody can answer the prompt."""
+        from agent.transports.claude_code_session import hermes_mcp_allow_rules
+        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
+
+        rules = set(hermes_mcp_allow_rules("default"))
+        for name in BRIDGED_TOOLS:
+            assert f"mcp__hermes-tools__{name}" in rules
+        for name in GATED_HERMES_TOOLS:
+            assert f"mcp__hermes-tools__{name}" not in rules
+
+    def test_the_cli_ceiling_sits_above_the_bridges_own(self):
+        """A bridged delegate_task holds its MCP call until the children are
+        done; the CLI's 60 s default would kill it mid-flight. And the two
+        ceilings must not be equal: whichever fires first decides whether the
+        model gets the bridge's readable tool error or the CLI's opaque MCP
+        abort — which would leave the dispatch running with nobody to answer."""
+        from agent.transports.hermes_tool_bridge import DEFAULT_TIMEOUT_SECONDS
+
+        env = build_child_env({"PATH": "/usr/bin"})
+        assert int(env["MCP_TOOL_TIMEOUT"]) > DEFAULT_TIMEOUT_SECONDS * 1000
+        assert int(env["MCP_TIMEOUT"]) >= 60_000
+        override = build_child_env({"PATH": "/usr/bin", "MCP_TOOL_TIMEOUT": "1234"})
+        assert override["MCP_TOOL_TIMEOUT"] == "1234"
+
+    def test_a_turns_silence_clock_stops_while_the_bridge_is_working(
+        self, fake_claude, monkeypatch
+    ):
+        """The CLI emits nothing while an MCP call is outstanding, so a
+        bridged fan-out IS a silence window. Before this, any bridged call
+        longer than claude_code.silence_timeout (300 s by default) answered
+        the user with "claude produced no output for 300s", retired the warm
+        session, and left the subagents running with nobody to answer."""
+        monkeypatch.setattr(session_mod, "_BRIDGE_TURN_GRACE_SECONDS", 1.5)
+        session = _session(fake_claude, expose_hermes_tools=False)
+        session._tool_bridge = SimpleNamespace(
+            active=True, in_flight=1, last_active=time.monotonic()
+        )
+        try:
+            session.ensure_started()
+            started = time.monotonic()
+            result = session.run_turn(
+                user_input="HANG", turn_timeout=10.0, idle_timeout=0.3
+            )
+            waited = time.monotonic() - started
+            # Survived well past idle_timeout, then gave up when the grace ran
+            # out rather than waiting for the bridge forever.
+            assert 1.2 < waited < 6.0, waited
+            assert result.error and "no output" in result.error
+        finally:
+            session._tool_bridge = None
+            session.close()
+
+    def test_the_window_after_a_bridged_call_returns_is_not_silence(
+        self, fake_claude, monkeypatch
+    ):
+        """When a bridged call returns, the CLI still has to take the result
+        and speak. Calling that moment "silence started two minutes ago"
+        retired a session six seconds after its delegation had succeeded —
+        measured live, 22:46:32 child done, 22:46:38 parent retired."""
+        monkeypatch.setattr(session_mod, "_BRIDGE_TURN_GRACE_SECONDS", 1.0)
+        import threading
+
+        session = _session(fake_claude, expose_hermes_tools=False)
+        stub = SimpleNamespace(active=False, in_flight=0, last_active=0.0)
+        session._tool_bridge = stub
+        try:
+            session.ensure_started()
+            # A bridged call that finishes 0.2 s into the first 0.5 s window.
+            threading.Timer(
+                0.2, lambda: setattr(stub, "last_active", time.monotonic())
+            ).start()
+            started = time.monotonic()
+            result = session.run_turn(
+                user_input="HANG", turn_timeout=10.0, idle_timeout=0.5
+            )
+            waited = time.monotonic() - started
+            # One window survived because the call ended inside it, then the
+            # next window was real silence.
+            assert 0.9 < waited < 3.0, waited
+            assert result.error and "no output" in result.error
+        finally:
+            session._tool_bridge = None
+            session.close()
+
+    def test_a_hold_from_the_childs_own_tool_call_also_stops_the_clock(
+        self, fake_claude, monkeypatch
+    ):
+        """Not only bridged calls: the child's MCP server holds the line
+        around every tool it runs itself, because `terminal` running anything
+        longer than claude_code.silence_timeout used to kill the session that
+        asked for it."""
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, bridge_hold,
+        )
+
+        monkeypatch.setattr(session_mod, "_BRIDGE_TURN_GRACE_SECONDS", 1.5)
+        session = _session(
+            fake_claude,
+            expose_hermes_tools=True,
+            tool_bridge_dispatch=lambda tool, args: tool,
+        )
+        try:
+            session.ensure_started()
+            bridge = session._tool_bridge
+            env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
+            assert not bridge.active
+            with bridge_hold(env):
+                assert bridge.active
+                started = time.monotonic()
+                result = session.run_turn(
+                    user_input="HANG", turn_timeout=10.0, idle_timeout=0.3
+                )
+                waited = time.monotonic() - started
+            assert 1.2 < waited < 6.0, waited
+            assert result.error and "no output" in result.error
+            # The hold is released by closing the connection; the server
+            # notices on its next read.
+            deadline = time.monotonic() + 5
+            while bridge.active and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert not bridge.active
+        finally:
+            session.close()
+
+    def test_without_a_busy_bridge_silence_is_still_silence(self, fake_claude):
+        session = _session(fake_claude, expose_hermes_tools=False)
+        try:
+            session.ensure_started()
+            started = time.monotonic()
+            result = session.run_turn(
+                user_input="HANG", turn_timeout=10.0, idle_timeout=0.3
+            )
+            assert time.monotonic() - started < 2.0
+            assert result.error and "no output" in result.error
+            assert result.should_retire
+        finally:
+            session.close()
+
+    def test_a_session_offers_only_the_tools_its_agent_can_run(self, fake_claude):
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, BRIDGE_TOOLS_ENV, BridgeError,
+            call_bridged_tool,
+        )
+        session = _session(
+            fake_claude,
+            expose_hermes_tools=True,
+            tool_bridge_dispatch=lambda tool, args: tool,
+            tool_bridge_tools=("todo",),
+        )
+        try:
+            session.ensure_started()
+            env = json.loads(
+                Path(session._mcp_config_path).read_text()
+            )["mcpServers"]["hermes-tools"]["env"]
+            assert env[BRIDGE_TOOLS_ENV] == "todo"
+            addr = {BRIDGE_SOCKET_ENV: env[BRIDGE_SOCKET_ENV],
+                    BRIDGE_TOKEN_ENV: env[BRIDGE_TOKEN_ENV]}
+            assert call_bridged_tool("todo", env=addr) == "todo"
+            with pytest.raises(BridgeError, match="not bridged"):
+                call_bridged_tool("delegate_task", {"goal": "x"}, env=addr)
+        finally:
+            session.close()
+
+    def test_an_agent_that_may_run_none_of_them_gets_no_listener(self, fake_claude):
+        from agent.transports.hermes_tool_bridge import BRIDGE_SOCKET_ENV
+        session = _session(
+            fake_claude,
+            expose_hermes_tools=True,
+            tool_bridge_dispatch=lambda tool, args: tool,
+            tool_bridge_tools=(),
+        )
+        try:
+            session.ensure_started()
+            env = json.loads(
+                Path(session._mcp_config_path).read_text()
+            )["mcpServers"]["hermes-tools"]["env"]
+            assert BRIDGE_SOCKET_ENV not in env
+            assert session._tool_bridge is None
+        finally:
+            session.close()

@@ -1392,6 +1392,91 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+
+class TestForcedSynchronousDelegation(unittest.TestCase):
+    """Bridged delegations join before answering.
+
+    A top-level delegate_task is normally backgrounded and each child's result
+    re-enters the conversation later as its own message. Under the CLI-owned
+    runtimes the call arrives over the tool bridge from a child process that
+    is holding an open MCP tool call and will only ever see the return value,
+    so the handle would be a receipt for work the model is never shown.
+    """
+
+    def _background_flag(self, *, depth, forced):
+        import run_agent
+        from tools.delegate_tool import forced_synchronous_delegation
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=depth)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            if forced:
+                with forced_synchronous_delegation():
+                    run_agent.AIAgent._dispatch_delegate_task(parent, {"goal": "t"})
+            else:
+                run_agent.AIAgent._dispatch_delegate_task(parent, {"goal": "t"})
+        return captured["background"]
+
+    def test_top_level_still_backgrounds_by_default(self):
+        self.assertTrue(self._background_flag(depth=0, forced=False))
+
+    def test_forced_synchronous_wins_at_the_top_level(self):
+        self.assertFalse(self._background_flag(depth=0, forced=True))
+
+    def test_orchestrator_children_are_synchronous_either_way(self):
+        self.assertFalse(self._background_flag(depth=1, forced=False))
+        self.assertFalse(self._background_flag(depth=1, forced=True))
+
+    def test_the_flag_is_scoped_to_the_block(self):
+        from tools.delegate_tool import (
+            forced_synchronous_delegation,
+            synchronous_delegation_forced,
+        )
+
+        self.assertFalse(synchronous_delegation_forced())
+        with forced_synchronous_delegation():
+            self.assertTrue(synchronous_delegation_forced())
+        self.assertFalse(synchronous_delegation_forced())
+
+    def test_a_plain_thread_does_not_inherit_it(self):
+        """A ContextVar, so a concurrent background delegation on another
+        thread is not dragged synchronous by this one. (Children DO inherit
+        it — they are dispatched through contextvars.copy_context — which
+        changes nothing, since a child is synchronous by depth already.)"""
+        import threading
+
+        from tools.delegate_tool import (
+            forced_synchronous_delegation,
+            synchronous_delegation_forced,
+        )
+
+        seen = []
+        with forced_synchronous_delegation():
+            t = threading.Thread(target=lambda: seen.append(synchronous_delegation_forced()))
+            t.start()
+            t.join()
+        self.assertEqual(seen, [False])
+
+    def test_the_registry_fallback_mirrors_the_live_path(self):
+        """_model_background_value is documented as the mirror of
+        _dispatch_delegate_task for the rare case the intercept is bypassed;
+        the two must not disagree about a bridged call."""
+        from tools.delegate_tool import (
+            _model_background_value,
+            forced_synchronous_delegation,
+        )
+
+        parent = _make_mock_parent(depth=0)
+        self.assertTrue(_model_background_value({}, parent))
+        with forced_synchronous_delegation():
+            self.assertFalse(_model_background_value({}, parent))
+
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 

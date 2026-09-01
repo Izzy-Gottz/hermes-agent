@@ -70,7 +70,9 @@ When the model wants one of these, codex spawns the `hermes_tools_mcp_server` su
 
 ### What's NOT available on this runtime
 
-These four Hermes tools require the running AIAgent context (mid-loop state) to dispatch, and a stateless MCP callback can't drive them. Switch back to the default runtime (`/codex-runtime auto`) when you need any of them:
+These four Hermes tools require the running AIAgent context (mid-loop state) to dispatch, and a stateless MCP callback can't drive them. Switch back to the default runtime (`/codex-runtime auto`) when you need any of them.
+
+(The claude_code runtime solves this with a *tool bridge* — the MCP server forwards these four calls back to the Hermes process that owns the agent. Codex spawns the same MCP server and could gain the same thing, but its `hermes-tools` entry lives in a static `~/.codex/config.toml` while the bridge address is minted per session, so it is not wired here yet. The obstacle is the plumbing, not the idea.)
 
 - **`delegate_task`** — spawn subagents
 - **`memory`** — Hermes' persistent memory store

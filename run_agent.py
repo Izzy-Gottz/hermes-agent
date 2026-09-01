@@ -8497,6 +8497,7 @@ class AIAgent:
         from tools.delegate_tool import (
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
+            synchronous_delegation_forced,
         )
         # Delegations from the top-level MODEL always run in the background —
         # the model does not get to choose. delegate_task returns immediately
@@ -8508,15 +8509,20 @@ class AIAgent:
         #     synchronous: the orchestrator needs its workers' results within
         #     its own turn to compose a summary, and a subagent doesn't own the
         #     gateway session the async result would route back to.
+        #   - A call that arrived over the tool bridge from a CLI-owned
+        #     runtime (claude_code / codex_app_server): the caller is holding
+        #     an open MCP tool call and will only ever see this return value,
+        #     so a handle would be a receipt for work it is never shown.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        _background = (not _is_subagent) and not synchronous_delegation_forced()
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=_background,
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
