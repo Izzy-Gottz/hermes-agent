@@ -457,16 +457,22 @@ def take_spare(agent) -> Optional[Any]:
         logger.debug("claude-code: spare was not alive; building fresh")
         return None
     if spare.signature != wanted_signature or spare.system_prompt != wanted_prompt:
-        # Not a failure: the next turn simply wants a different process than
-        # the one we guessed. Close it rather than hand over a session that
-        # would respawn on its first use anyway.
-        logger.info(
-            "claude-code: spare did not match this turn's settings; discarding it"
-        )
-        try:
-            session.close()
-        except Exception:
-            logger.debug("claude-code: discarding spare failed", exc_info=True)
+        # Not for this caller — put it back. A SUBAGENT is the common case:
+        # every delegated child is its own session and asks here, and its
+        # bridged tool set is deliberately narrower than its parent's, so its
+        # signature never matches. Closing on mismatch would mean every
+        # delegation threw away the warm process the user's next conversation
+        # was going to start in.
+        with _SPARE_LOCK:
+            if _SPARE is None:
+                globals()["_SPARE"] = spare
+                spare = None
+        if spare is not None:
+            try:
+                spare.session.close()
+            except Exception:
+                logger.debug("claude-code: closing a surplus spare failed", exc_info=True)
+        logger.debug("claude-code: the spare is not for this caller; left warm")
         return None
     return session
 

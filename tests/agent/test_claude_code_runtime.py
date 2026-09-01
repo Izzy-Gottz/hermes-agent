@@ -692,6 +692,26 @@ class TestPreWarmedSpare:
         mapped = load_session_map(second._claude_code_session.config_dir)
         assert mapped.get("conv-2") == second._claude_code_session.requested_session_id
 
+    def test_a_caller_it_does_not_fit_leaves_it_warm_for_the_next_one(self):
+        """Every delegated subagent is its own session and asks here, and its
+        bridged tool set is deliberately narrower than its parent's — so its
+        signature never matches. Closing on mismatch would mean every
+        delegation threw away the process the user's next conversation was
+        going to start in."""
+        _turn(_agent("conv-1"))
+        spare = self._wait_for_spare()
+        assert spare is not None
+        warm_pid = spare.session.pid
+
+        subagent = _agent("child-1")
+        subagent.valid_tool_names = {"todo"}      # a leaf's narrowed surface
+        assert rt.take_spare(subagent) is None
+        with rt._SPARE_LOCK:
+            assert rt._SPARE is not None and rt._SPARE.session.pid == warm_pid
+
+        # ...and the conversation it WAS meant for still gets it.
+        assert rt.take_spare(_agent("conv-2")) is not None
+
     def test_a_spare_with_a_different_system_prompt_is_not_used(self):
         """The prompt is baked in at spawn (--append-system-prompt-file), so a
         mismatched spare would respawn on its first use anyway."""
@@ -703,8 +723,6 @@ class TestPreWarmedSpare:
         other = _agent("conv-2", ephemeral="PROMPT-TWO")
         _turn(other)
         assert other._claude_code_session.pid != stale_pid
-        with rt._SPARE_LOCK:
-            assert rt._SPARE is None or rt._SPARE.session.pid != stale_pid
 
     def test_a_spare_for_a_different_model_is_not_used(self):
         _turn(_agent("conv-1"))
