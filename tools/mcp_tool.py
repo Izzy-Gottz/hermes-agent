@@ -6202,14 +6202,53 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
         return False
 
 
+#: Env escape hatch for the cached-manifest default below. ``0`` restores the
+#: pre-2026 behaviour: nothing is lazy unless its config says so.
+LAZY_WHEN_CACHED_ENV = "HERMES_MCP_LAZY_WHEN_CACHED"
+
+
 def _resolve_server_lazy(name: str, config: dict) -> bool:
     """True when this server defers spawn/connect until first tool use.
 
-    Gated per-server by ``mcp_servers.<name>.lazy`` in config (default OFF),
-    following the same per-server key pattern as ``idle_timeout_seconds``.
-    Design from #56832 (Vansh5632).
+    Gated per-server by ``mcp_servers.<name>.lazy`` in config, following the
+    same per-server key pattern as ``idle_timeout_seconds``. Design from
+    #56832 (Vansh5632).
+
+    The DEFAULT is no longer a flat "off". A server we already hold a
+    fingerprint-matching manifest for is lazy unless its config says
+    otherwise, because for that server the eager connect buys nothing and
+    costs the whole of startup: the manifest it would fetch is the one
+    already on disk, written by a live connect against this very config.
+    Measured on a four-server config (1,948 tools, one server publishing
+    1,934 of them), per process start:
+
+        eager, every start          3.32 s
+        lazy from cache             0.58 s
+
+    and that cost is paid by every `claude` child the claude_code runtime
+    spawns — every new conversation, and every subagent. A server with no
+    cached manifest still connects eagerly, so the first run after a config
+    change behaves exactly as before and writes the cache for the next one.
+
+    This is the same trade every other client has landed on: Claude Code's
+    own discovery cache reports "cached 2h ago · connects on first use", and
+    VS Code starts MCP servers on demand rather than at startup. The risk it
+    accepts is a manifest that went stale between runs — a tool that has since
+    disappeared upstream fails its first call and the live connect corrects
+    the registry. Set ``lazy: false`` per server, or
+    ``HERMES_MCP_LAZY_WHEN_CACHED=0``, to refuse that trade.
     """
-    return _parse_boolish(config.get("lazy", False), default=False)
+    configured = config.get("lazy")
+    if configured is not None:
+        return _parse_boolish(configured, default=False)
+    if not _parse_boolish(os.environ.get(LAZY_WHEN_CACHED_ENV, "1"), default=True):
+        return False
+    try:
+        from tools.mcp_schema_cache import config_fingerprint, has_cached_entry
+
+        return has_cached_entry(name, config_fingerprint(config))
+    except Exception:  # pragma: no cover - cache module missing
+        return False
 
 
 def _ensure_lazy_server_connected(server_name: str) -> bool:

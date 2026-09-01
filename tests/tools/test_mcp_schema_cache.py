@@ -110,3 +110,74 @@ class TestWriteSkip:
         # Changed payload → rewrite.
         msc.write_cache_entry("srv", "fp2", tools=tools, utility_tools=[])
         assert len(saves) == 2
+
+
+class TestLazyDefaultsToTheCachedManifest:
+    """A server we already hold a fingerprint-matching manifest for is lazy
+    unless its config says otherwise.
+
+    The eager connect for such a server fetches the manifest that is already
+    on disk, written by a live connect against this very config — and it does
+    it inside every `claude` child the claude_code runtime spawns, i.e. on
+    every new conversation and every subagent. Measured on a four-server
+    config: 3.32 s eager against 0.58 s from cache.
+    """
+
+    def _cfg(self):
+        return {"url": "https://example.test/mcp"}
+
+    def _isolate(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(msc, "_cache_path", lambda: tmp_path / "cache.json")
+        monkeypatch.delenv("HERMES_MCP_LAZY_WHEN_CACHED", raising=False)
+
+    def test_no_cached_manifest_still_connects_eagerly(self, tmp_path, monkeypatch):
+        from tools.mcp_tool import _resolve_server_lazy
+
+        self._isolate(tmp_path, monkeypatch)
+        assert _resolve_server_lazy("srv", self._cfg()) is False
+
+    def test_a_cached_manifest_makes_it_lazy(self, tmp_path, monkeypatch):
+        from tools.mcp_tool import _resolve_server_lazy
+
+        self._isolate(tmp_path, monkeypatch)
+        cfg = self._cfg()
+        msc.write_cache_entry("srv", msc.config_fingerprint(cfg), tools=[{"name": "t"}])
+        assert _resolve_server_lazy("srv", cfg) is True
+
+    def test_a_manifest_for_a_DIFFERENT_config_does_not_count(self, tmp_path, monkeypatch):
+        from tools.mcp_tool import _resolve_server_lazy
+
+        self._isolate(tmp_path, monkeypatch)
+        cfg = self._cfg()
+        msc.write_cache_entry("srv", msc.config_fingerprint(cfg), tools=[{"name": "t"}])
+        moved = {"url": "https://elsewhere.test/mcp"}
+        assert _resolve_server_lazy("srv", moved) is False
+
+    def test_an_expired_manifest_does_not_count(self, tmp_path, monkeypatch):
+        from tools.mcp_tool import _resolve_server_lazy
+
+        self._isolate(tmp_path, monkeypatch)
+        cfg = self._cfg()
+        msc.write_cache_entry(
+            "srv", msc.config_fingerprint(cfg), tools=[{"name": "t"}], ttl_ms=1
+        )
+        monkeypatch.setattr(msc.time, "time", lambda: 1e12)
+        assert _resolve_server_lazy("srv", cfg) is False
+
+    def test_explicit_config_always_wins(self, tmp_path, monkeypatch):
+        from tools.mcp_tool import _resolve_server_lazy
+
+        self._isolate(tmp_path, monkeypatch)
+        cfg = self._cfg()
+        msc.write_cache_entry("srv", msc.config_fingerprint(cfg), tools=[{"name": "t"}])
+        assert _resolve_server_lazy("srv", {**cfg, "lazy": False}) is False
+        assert _resolve_server_lazy("srv", {"url": "https://cold.test", "lazy": True}) is True
+
+    def test_the_env_escape_hatch_restores_the_old_default(self, tmp_path, monkeypatch):
+        from tools.mcp_tool import _resolve_server_lazy
+
+        self._isolate(tmp_path, monkeypatch)
+        cfg = self._cfg()
+        msc.write_cache_entry("srv", msc.config_fingerprint(cfg), tools=[{"name": "t"}])
+        monkeypatch.setenv("HERMES_MCP_LAZY_WHEN_CACHED", "0")
+        assert _resolve_server_lazy("srv", cfg) is False

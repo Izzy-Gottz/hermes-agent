@@ -92,7 +92,27 @@ class TestLazyMcpRegistration:
 
         mock_run.assert_called_once()
 
-    def test_non_lazy_server_never_touches_cache(self):
+    def test_a_server_with_no_cached_manifest_connects_eagerly(self):
+        """The default is no longer a flat "off": a server we already hold a
+        fingerprint-matching manifest for is lazy unless its config says
+        otherwise (the eager connect would fetch the manifest already on
+        disk, and it does so inside every `claude` child — 3.32 s against
+        0.58 s, measured on a four-server config). A server with NO cached
+        manifest still connects eagerly, exactly as before."""
+        config = {"playwright": {"command": "npx", "args": []}}
+        with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_schema_cache.get_cached_entry", return_value=None), \
+             patch("tools.mcp_tool._ensure_mcp_loop"), \
+             patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
+
+            mcp.register_mcp_servers(config)
+
+        mock_run.assert_called_once()
+
+    def test_the_escape_hatch_restores_never_touching_the_cache(self, monkeypatch):
+        """HERMES_MCP_LAZY_WHEN_CACHED=0 puts the old default back: an
+        unmarked server is eager and the cache is not even consulted."""
+        monkeypatch.setenv("HERMES_MCP_LAZY_WHEN_CACHED", "0")
         config = {"playwright": {"command": "npx", "args": []}}
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_schema_cache.get_cached_entry") as mock_get, \
@@ -103,6 +123,21 @@ class TestLazyMcpRegistration:
 
         mock_get.assert_not_called()
         mock_run.assert_called_once()
+
+    def test_an_unmarked_server_with_a_cached_manifest_is_lazy(self):
+        """The new default, from the other side: no `lazy:` key in config,
+        but a manifest on disk that matches this config's fingerprint."""
+        config = {"playwright": {"command": "npx", "args": []}}
+        with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_schema_cache.get_cached_entry",
+                   return_value=_fake_cache_entry()), \
+             patch("tools.mcp_tool._ensure_mcp_loop"), \
+             patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
+
+            names = mcp.register_mcp_servers(config)
+
+        mock_run.assert_not_called()
+        assert any("browser_navigate" in n for n in names), names
 
     def test_lazy_server_not_reregistered_on_second_pass(self):
         config = _lazy_config()
