@@ -1021,6 +1021,39 @@ class TestToolBridgeWiring:
         child_env = build_child_env({"PATH": "/usr/bin"})
         assert BRIDGE_TOKEN_ENV not in child_env and BRIDGE_SOCKET_ENV not in child_env
 
+    def test_an_explicitly_empty_tool_set_means_empty(self, tmp_path):
+        """`",".join(bridge_tools or BRIDGED_TOOLS)` turned an empty tuple back
+        into all four — the same falsy fall-open the dispatcher's guard was
+        rewritten to avoid."""
+        from agent.transports.hermes_tool_bridge import BRIDGE_TOOLS_ENV
+
+        path = write_mcp_config(
+            directory=str(tmp_path), bridge_socket="/tmp/b.sock",
+            bridge_token="tok", bridge_tools=(),
+        )
+        env = json.loads(Path(path).read_text())["mcpServers"]["hermes-tools"]["env"]
+        assert env[BRIDGE_TOOLS_ENV] == ""
+
+    def test_rebind_can_renarrow_what_the_bridge_will_dispatch(self, fake_claude):
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, BridgeError, call_bridged_tool,
+        )
+        session = _session(
+            fake_claude, expose_hermes_tools=True,
+            tool_bridge_dispatch=lambda tool, args: tool,
+        )
+        try:
+            session.ensure_started()
+            bridge = session._tool_bridge
+            env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
+            assert call_bridged_tool("delegate_task", {"goal": "x"}, env=env)
+            session.rebind(tool_bridge_tools=("todo",))
+            with pytest.raises(BridgeError, match="not bridged"):
+                call_bridged_tool("delegate_task", {"goal": "x"}, env=env)
+            assert call_bridged_tool("todo", env=env) == "todo"
+        finally:
+            session.close()
+
     def test_no_bridge_no_env(self, tmp_path):
         from agent.transports.hermes_tool_bridge import (
             BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV,
@@ -1140,6 +1173,10 @@ class TestToolBridgeWiring:
         env = build_child_env({"PATH": "/usr/bin"})
         assert int(env["MCP_TOOL_TIMEOUT"]) > DEFAULT_TIMEOUT_SECONDS * 1000
         assert int(env["MCP_TIMEOUT"]) >= 60_000
+        # And the turn's own grace has to outlive the bridge's client budget,
+        # or a healthy long call ends by retiring the session instead of by
+        # answering. Asserted here rather than trusted to a comment.
+        assert session_mod._BRIDGE_TURN_GRACE_SECONDS > DEFAULT_TIMEOUT_SECONDS
         override = build_child_env({"PATH": "/usr/bin", "MCP_TOOL_TIMEOUT": "1234"})
         assert override["MCP_TOOL_TIMEOUT"] == "1234"
 
@@ -1179,17 +1216,27 @@ class TestToolBridgeWiring:
         retired a session six seconds after its delegation had succeeded —
         measured live, 22:46:32 child done, 22:46:38 parent retired."""
         monkeypatch.setattr(session_mod, "_BRIDGE_TURN_GRACE_SECONDS", 1.0)
-        import threading
+        class _EndedInsideTheFirstWindow:
+            """A bridge whose last call ended during the window that just
+            expired, and nothing since. No timer, so no bet on scheduling
+            latency: the first read IS the activity."""
+
+            active = False
+            in_flight = 0
+
+            def __init__(self):
+                self.reads = 0
+
+            @property
+            def last_active(self):
+                self.reads += 1
+                return time.monotonic() if self.reads == 1 else 0.0
 
         session = _session(fake_claude, expose_hermes_tools=False)
-        stub = SimpleNamespace(active=False, in_flight=0, last_active=0.0)
+        stub = _EndedInsideTheFirstWindow()
         session._tool_bridge = stub
         try:
             session.ensure_started()
-            # A bridged call that finishes 0.2 s into the first 0.5 s window.
-            threading.Timer(
-                0.2, lambda: setattr(stub, "last_active", time.monotonic())
-            ).start()
             started = time.monotonic()
             result = session.run_turn(
                 user_input="HANG", turn_timeout=10.0, idle_timeout=0.5
@@ -1197,6 +1244,7 @@ class TestToolBridgeWiring:
             waited = time.monotonic() - started
             # One window survived because the call ended inside it, then the
             # next window was real silence.
+            assert stub.reads >= 2
             assert 0.9 < waited < 3.0, waited
             assert result.error and "no output" in result.error
         finally:
@@ -1241,6 +1289,63 @@ class TestToolBridgeWiring:
                 time.sleep(0.02)
             assert not bridge.active
         finally:
+            session.close()
+
+    def test_the_grace_moves_the_turn_deadline_too_not_just_the_silence_clock(
+        self, fake_claude, monkeypatch
+    ):
+        """`deadline += spent` is the half nobody was testing.
+
+        The other grace tests give the turn ten seconds it never needs, so
+        only the silence clock is observable and dropping the deadline line
+        changes nothing they can see. Here turn_timeout is DELIBERATELY
+        shorter than the work: without the deadline moving, the turn dies at
+        0.6 s; with it, it lives until the grace runs out. A 20-minute bridged
+        delegation under a 300 s turn_timeout is the real case."""
+        monkeypatch.setattr(session_mod, "_BRIDGE_TURN_GRACE_SECONDS", 1.5)
+        session = _session(fake_claude, expose_hermes_tools=False)
+        session._tool_bridge = SimpleNamespace(
+            active=True, in_flight=1, last_active=time.monotonic()
+        )
+        try:
+            session.ensure_started()
+            started = time.monotonic()
+            result = session.run_turn(
+                user_input="HANG", turn_timeout=0.6, idle_timeout=0.3
+            )
+            waited = time.monotonic() - started
+            assert waited > 1.2, (
+                "the turn died at its nominal deadline: the grace moved the "
+                "silence clock but not the deadline (waited %.2fs)" % waited
+            )
+            # ...and the grace is a real cap, so this cannot run away.
+            assert waited < 4.0, waited
+            assert result.error
+        finally:
+            session._tool_bridge = None
+            session.close()
+
+    def test_the_timeout_message_names_the_time_the_turn_actually_got(
+        self, fake_claude, monkeypatch
+    ):
+        """"exceeded 300s" after 2400 s sends the reader hunting a setting
+        that was not the one that fired."""
+        monkeypatch.setattr(session_mod, "_BRIDGE_TURN_GRACE_SECONDS", 1.0)
+        session = _session(fake_claude, expose_hermes_tools=False)
+        session._tool_bridge = SimpleNamespace(
+            active=True, in_flight=1, last_active=time.monotonic()
+        )
+        try:
+            session.ensure_started()
+            result = session.run_turn(
+                user_input="HANG", turn_timeout=0.4, idle_timeout=0.3
+            )
+            assert result.error
+            if "exceeded" in result.error:
+                seconds = int(result.error.split("exceeded")[1].split("s")[0])
+                assert seconds >= 1, result.error
+        finally:
+            session._tool_bridge = None
             session.close()
 
     def test_without_a_busy_bridge_silence_is_still_silence(self, fake_claude):

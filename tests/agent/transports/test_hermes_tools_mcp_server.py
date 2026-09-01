@@ -454,3 +454,58 @@ class TestAgentLoopToolsOverTheBridge:
             assert server.tools["web_search"](query="x") == "local:web_search"
         finally:
             bridge.close()
+
+
+class TestLocalToolsHoldTheLine:
+    """A tool the child runs itself must tell the parent it is working.
+
+    Without it a `terminal` call longer than claude_code.silence_timeout looks
+    exactly like a dead CLI, and the parent retires the session in the middle
+    of its own command. The hold is the only signal that distinguishes them —
+    so deleting the `with bridge_hold():` wrapper has to fail a test.
+    """
+
+    def test_an_unbridged_tool_holds_the_bridge_while_it_runs(self, monkeypatch, tmp_path):
+        import threading
+        import time
+
+        import mcp.server as mcp_server
+        import model_tools
+        from agent.transports import hermes_tools_mcp_server as m
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, ToolBridge,
+        )
+
+        bridge = ToolBridge(lambda t, a: t, directory=str(tmp_path))
+        bridge.start()
+        seen = []
+
+        def slow_local(name, args):
+            seen.append(bridge.active)
+            time.sleep(0.2)
+            seen.append(bridge.active)
+            return "local"
+
+        monkeypatch.setattr(mcp_server, "MCPServer", _RecordingServer)
+        monkeypatch.setattr(m, "discover_external_mcp_servers", lambda: [])
+        monkeypatch.setattr(
+            model_tools, "get_tool_definitions",
+            lambda **kw: [{"type": "function",
+                           "function": {"name": "terminal", "parameters": {}}}],
+        )
+        monkeypatch.setattr(model_tools, "handle_function_call", slow_local)
+        monkeypatch.setenv(BRIDGE_SOCKET_ENV, bridge.socket_path)
+        monkeypatch.setenv(BRIDGE_TOKEN_ENV, bridge.token)
+        try:
+            server = m._build_server("claude-code")
+            assert not bridge.active
+            assert server.tools["terminal"](command="ls") == "local"
+            assert seen == [True, True], (
+                "the parent was not told the child was working: seen=%r" % (seen,)
+            )
+            deadline = time.time() + 5
+            while bridge.active and time.time() < deadline:
+                time.sleep(0.02)
+            assert not bridge.active
+        finally:
+            bridge.close()

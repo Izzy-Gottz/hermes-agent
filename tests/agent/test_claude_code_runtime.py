@@ -315,6 +315,160 @@ class TestRegistryHardening:
             assert not os.path.exists(husk)
 
 
+class TestBridgedDelegationOnARealAgent:
+    """The two promises the commit makes about a bridged delegate_task, on a
+    real AIAgent rather than a stub: that it joins instead of handing back a
+    handle, and that the confirm gate can still stop it."""
+
+    def _agent(self):
+        from run_agent import AIAgent
+
+        return AIAgent(
+            provider="claude-code-cli", model="haiku", quiet_mode=True,
+            skip_memory=True, skip_context_files=True, platform="api_server",
+            enabled_toolsets=["delegation"],
+        )
+
+    def test_it_joins_the_children_instead_of_returning_a_handle(self, monkeypatch):
+        import tools.delegate_tool as dt
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return json.dumps({"results": [{"response": "PONG"}]})
+
+        monkeypatch.setattr(dt, "delegate_task", fake_delegate_task)
+        agent = self._agent()
+        try:
+            out = rt.make_tool_bridge_dispatch(agent)("delegate_task", {"goal": "x"})
+            assert captured["background"] is False, (
+                "a bridged delegation was backgrounded: the caller is holding an "
+                "open MCP call and will never be shown the async result"
+            )
+            assert captured["goal"] == "x"
+            assert "PONG" in out
+        finally:
+            agent.close()
+
+    def test_the_confirm_gate_can_deny_a_bridged_delegation(self, monkeypatch):
+        """The whole reason bridged calls go through _invoke_tool rather than
+        the tool function: Moe's pre_tool_call hook must still be able to say
+        no, and the model must see why."""
+        import hermes_cli.plugins as plugins
+        import tools.delegate_tool as dt
+
+        ran = []
+        monkeypatch.setattr(dt, "delegate_task", lambda **kw: ran.append(kw) or "{}")
+        monkeypatch.setattr(
+            plugins, "_dispatch_pre_tool_call_hooks",
+            lambda name, args, **kw: ("blocked by the confirm gate", None),
+        )
+        agent = self._agent()
+        try:
+            out = json.loads(
+                rt.make_tool_bridge_dispatch(agent)("delegate_task", {"goal": "x"})
+            )
+            assert out["error"] == "blocked by the confirm gate"
+            assert ran == [], "a blocked delegation spawned children anyway"
+        finally:
+            agent.close()
+
+
+class TestTheRuntimeActuallyWiresTheBridge:
+    """The seam between `bridged_tools_for` and a real session.
+
+    Every other test in this file builds the pieces by hand. Deleting
+    `tool_bridge_dispatch=` from `_build_session` reintroduces the whole bug
+    this work exists to fix — no bridge, no delegate_task, the model told the
+    tool does not exist — and, measured, every one of those tests still
+    passed. This is the one that fails.
+    """
+
+    def _agent_with(self, session_id, tools):
+        agent = _agent(session_id)
+        agent.valid_tool_names = set(tools)
+        calls = []
+        agent._invoke_tool = (
+            lambda name, args, task_id, call_id=None, *r, **kw:
+            calls.append(name) or f"ran:{name}"
+        )
+        agent._calls = calls
+        return agent
+
+    def _addr(self, bridge):
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV,
+        )
+        return {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
+
+    def test_a_real_turn_starts_a_bridge_narrowed_to_that_agent(self, monkeypatch):
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGE_TOOLS_ENV, BridgeError, call_bridged_tool,
+        )
+        cfg = rt._claude_code_config()
+        monkeypatch.setattr(
+            rt, "_claude_code_config", lambda: {**cfg, "expose_hermes_tools": True}
+        )
+        agent = self._agent_with("wired", ("todo", "session_search"))
+        _turn(agent)
+        session = agent._claude_code_session
+        bridge = session._tool_bridge
+        assert bridge is not None, "the runtime did not start a bridge"
+        assert bridge.allowed_tools == ("todo", "session_search")
+
+        env = json.loads(
+            Path(session._mcp_config_path).read_text()
+        )["mcpServers"]["hermes-tools"]["env"]
+        assert env[BRIDGE_TOOLS_ENV] == "todo,session_search"
+
+        addr = self._addr(bridge)
+        assert call_bridged_tool("todo", env=addr) == "ran:todo"
+        assert agent._calls == ["todo"]
+        with pytest.raises(BridgeError, match="not bridged"):
+            call_bridged_tool("delegate_task", {"goal": "x"}, env=addr)
+
+    def test_a_second_turn_repoints_and_renarrows_the_warm_bridge(self, monkeypatch):
+        """api_server builds an AIAgent per request against one warm process."""
+        from agent.transports.hermes_tool_bridge import (
+            BridgeError, call_bridged_tool,
+        )
+        cfg = rt._claude_code_config()
+        monkeypatch.setattr(
+            rt, "_claude_code_config", lambda: {**cfg, "expose_hermes_tools": True}
+        )
+        first = self._agent_with("warm", ("todo", "delegate_task"))
+        _turn(first)
+        bridge = first._claude_code_session._tool_bridge
+        addr = self._addr(bridge)
+        assert call_bridged_tool("delegate_task", {"goal": "x"}, env=addr)
+
+        second = self._agent_with("warm", ("todo",))
+        _turn(second)
+        assert second._claude_code_session._tool_bridge is bridge
+        assert bridge.allowed_tools == ("todo",)
+        assert call_bridged_tool("todo", env=addr) == "ran:todo"
+        assert first._calls == ["delegate_task"] and second._calls == ["todo"]
+        with pytest.raises(BridgeError, match="not bridged"):
+            call_bridged_tool("delegate_task", {"goal": "x"}, env=addr)
+
+    def test_an_agent_with_no_agent_loop_tools_gets_no_bridge_at_all(self, monkeypatch):
+        cfg = rt._claude_code_config()
+        monkeypatch.setattr(
+            rt, "_claude_code_config", lambda: {**cfg, "expose_hermes_tools": True}
+        )
+        from agent.transports.hermes_tool_bridge import BRIDGE_SOCKET_ENV
+
+        agent = self._agent_with("bare", ("terminal",))
+        _turn(agent)
+        session = agent._claude_code_session
+        assert session._tool_bridge is None
+        env = json.loads(
+            Path(session._mcp_config_path).read_text()
+        )["mcpServers"]["hermes-tools"]["env"]
+        assert BRIDGE_SOCKET_ENV not in env
+
+
 class TestToolBridgeDispatch:
     """What arrives from the child, and how it is run.
 

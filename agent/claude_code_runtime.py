@@ -95,6 +95,7 @@ import glob
 import logging
 import os
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -289,10 +290,18 @@ def sweep_dead_bridges(config_dir: str, *, now: Optional[float] = None) -> int:
     would otherwise be swept out from under a working session.
     """
     now = time.time() if now is None else now
-    return _prune_bridge_dirs(config_dir, now - _BRIDGE_SWEEP_MIN_AGE_SECONDS)
+    cutoff = now - _BRIDGE_SWEEP_MIN_AGE_SECONDS
+    removed = _prune_bridge_dirs(config_dir, cutoff)
+    # A bridge whose HERMES_HOME was too deep for sun_path, or whose bind
+    # failed there, lives in the system temp dir instead — invisible to a
+    # sweep that only looks in the config dir, and so leaked forever.
+    fallback = tempfile.gettempdir()
+    if os.path.abspath(fallback) != os.path.abspath(config_dir):
+        removed += _prune_bridge_dirs(fallback, cutoff, ours_only=True)
+    return removed
 
 
-def _prune_bridge_dirs(config_dir: str, cutoff: float) -> int:
+def _prune_bridge_dirs(config_dir: str, cutoff: float, *, ours_only: bool = False) -> int:
     """Remove ``bridge-*/`` directories left by a killed process.
 
     A tool bridge removes its own directory on close, so one still here
@@ -310,7 +319,11 @@ def _prune_bridge_dirs(config_dir: str, cutoff: float) -> int:
         if not os.path.isdir(path):
             continue
         try:
-            if os.path.getmtime(path) >= cutoff:
+            info = os.stat(path)
+            if info.st_mtime >= cutoff:
+                continue
+            # In a shared directory (/tmp), never touch another user's.
+            if ours_only and info.st_uid != os.getuid():
                 continue
         except OSError:
             continue
@@ -358,11 +371,23 @@ def _reap_closed_locked() -> None:
     make room for the dead. Reaping first costs one pass over a dict of at
     most ``max_sessions`` entries.
     """
-    for key in [
-        k for k, e in _REGISTRY.items()
-        if e.ready.is_set() and (e.session is None or getattr(e.session, "_closed", False))
-    ]:
-        _REGISTRY.pop(key, None)
+    for key, entry in list(_REGISTRY.items()):
+        if not entry.ready.is_set():
+            continue
+        if not (entry.session is None or getattr(entry.session, "_closed", False)):
+            continue
+        # The same non-blocking turn-lock check the other two poppers use
+        # (_evict_lru_locked, sweep_idle_sessions). An AIAgent.close() from
+        # another thread can close the session while a turn still holds this
+        # entry; dropping it there would let a concurrent request build a
+        # SECOND session under the same key, with the TurnInFlightError guard
+        # gone.
+        if not entry.turn_lock.acquire(blocking=False):
+            continue
+        try:
+            _REGISTRY.pop(key, None)
+        finally:
+            entry.turn_lock.release()
 
 
 def _evict_lru_locked(max_sessions: int) -> list[tuple[str, _RegistryEntry]]:
@@ -864,6 +889,7 @@ def run_claude_code_turn(
         on_event=make_claude_code_event_bridge(agent),
         approval_callback=_approval_callback(),
         tool_bridge_dispatch=make_tool_bridge_dispatch(agent),
+        tool_bridge_tools=bridged_tools_for(agent),
     )
     agent._claude_code_session = session
     try:

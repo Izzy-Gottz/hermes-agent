@@ -257,6 +257,11 @@ _MCP_TOOL_TIMEOUT_MS = 1_800_000
 #: client timeout, so a healthy long call ends by answering rather than by
 #: retiring the session; a wedged dispatcher still ends the turn.
 #:
+#: It is a per-TURN budget while the bridge's own timeout is per-CALL, so two
+#: sequential maximal bridged calls in one turn exhaust it and the turn is
+#: retired while the second dispatch is still running. That is the cap doing
+#: its job, not a hole — but it is a cap, not a guarantee.
+#:
 #: A backstop, not a routine path. Measured on Claude Code 2.1.252, the CLI
 #: keeps emitting stream events while an MCP tool call is outstanding: a
 #: delegation whose subagent ran `sleep 200` completed in 4m27s under a 120 s
@@ -823,7 +828,9 @@ def write_mcp_config(
 
         server_env[BRIDGE_SOCKET_ENV] = bridge_socket
         server_env[BRIDGE_TOKEN_ENV] = bridge_token
-        server_env[BRIDGE_TOOLS_ENV] = ",".join(bridge_tools or BRIDGED_TOOLS)
+        server_env[BRIDGE_TOOLS_ENV] = ",".join(
+            BRIDGED_TOOLS if bridge_tools is None else bridge_tools
+        )
         # Written explicitly rather than left to the client's default so the
         # two ceilings that have to disagree — this one and MCP_TOOL_TIMEOUT
         # in the CLI's own environment — are visible in the same artefact.
@@ -1071,6 +1078,7 @@ class ClaudeCodeSession:
         on_event: Optional[Callable[[dict], None]] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         tool_bridge_dispatch: Optional[Callable[[str, dict], Any]] = None,
+        tool_bridge_tools: Optional["tuple[str, ...] | list[str]"] = None,
     ) -> None:
         """Point the UI / approval hooks at a new owner. A warm process is
         shared across AIAgent instances (api_server builds one per request),
@@ -1087,6 +1095,13 @@ class ClaudeCodeSession:
             self._tool_bridge_dispatch = tool_bridge_dispatch
             if self._tool_bridge is not None:
                 self._tool_bridge.set_dispatch(tool_bridge_dispatch)
+        if tool_bridge_tools is not None:
+            # What the child was TOLD it has was baked into the mcp-config at
+            # spawn and cannot be narrowed now — but what the bridge will
+            # actually dispatch can be, and that is the half that matters.
+            self._tool_bridge_tools = tuple(tool_bridge_tools)
+            if self._tool_bridge is not None:
+                self._tool_bridge.set_allowed_tools(self._tool_bridge_tools)
 
     def needs_respawn(self, system_prompt: Optional[str]) -> bool:
         """``--append-system-prompt-file`` is read at spawn; a changed prompt
@@ -1620,7 +1635,8 @@ class ClaudeCodeSession:
             result.should_retire = True
             return result
 
-        deadline = time.monotonic() + turn_timeout
+        started_at = time.monotonic()
+        deadline = started_at + turn_timeout
         bridge_grace = _BRIDGE_TURN_GRACE_SECONDS if self._tool_bridge else 0.0
         projector = _TurnProjector(self, silent=silent)
         saw_result = False
@@ -1628,8 +1644,12 @@ class ClaudeCodeSession:
             while True:
                 now = time.monotonic()
                 if now >= deadline:
+                    # The elapsed time, not turn_timeout: a turn held open by
+                    # the tool bridge can run far past its nominal budget, and
+                    # "exceeded 300s" after 2400 s sends the reader hunting a
+                    # setting that was not the one that fired.
                     result.error = self._format_error(
-                        f"claude turn exceeded {int(turn_timeout)}s"
+                        f"claude turn exceeded {int(now - started_at)}s"
                     )
                     result.should_retire = True
                     break

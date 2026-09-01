@@ -263,14 +263,16 @@ class TestHardening:
         try:
             import socket as _socket
 
-            before = threading.active_count()
             silent = [_socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) for _ in range(4)]
             for s_ in silent:
                 s_.connect(b.socket_path)
+            # The bridge's own bookkeeping, not threading.active_count():
+            # a process-global count is order-dependent and any unrelated
+            # thread started during the poll flips it.
             deadline = time.time() + 5
-            while threading.active_count() > before and time.time() < deadline:
+            while b._workers and time.time() < deadline:
                 time.sleep(0.05)
-            assert threading.active_count() <= before + 1
+            assert not b._workers
             for s_ in silent:
                 s_.close()
             # ...and the bridge still works afterwards.
@@ -278,7 +280,10 @@ class TestHardening:
         finally:
             b.close()
 
-    def test_concurrent_calls_are_capped_and_the_refusal_is_readable(self, tmp_path):
+    def test_expensive_calls_are_capped_and_the_refusal_is_readable(self, tmp_path):
+        """Only delegate_task is metered — it is a whole subagent fan-out.
+        Metering the cheap three measured 112 refusals out of 120 concurrent
+        `todo` calls, which is 112 hard errors for the model to reason about."""
         release = threading.Event()
         b = ToolBridge(
             lambda tool, args: (release.wait(10), "slow")[1],
@@ -286,9 +291,12 @@ class TestHardening:
             max_concurrent_calls=2,
         )
         b.start()
+        holders = []
         try:
             holders = [
-                threading.Thread(target=lambda: call_bridged_tool("todo", env=_env(b)))
+                threading.Thread(
+                    target=lambda: call_bridged_tool("delegate_task", env=_env(b))
+                )
                 for _ in range(2)
             ]
             for t in holders:
@@ -297,8 +305,18 @@ class TestHardening:
             while b.in_flight < 2 and time.time() < deadline:
                 time.sleep(0.02)
             assert b.in_flight == 2
-            with pytest.raises(BridgeError, match="already running 2 calls"):
-                call_bridged_tool("todo", env=_env(b))
+            with pytest.raises(BridgeError, match="already running 2 delegate_task"):
+                call_bridged_tool("delegate_task", env=_env(b))
+            # ...while the cheap three are not metered and still answer.
+            cheap = threading.Thread(
+                target=lambda: call_bridged_tool("todo", env=_env(b))
+            )
+            cheap.start()
+            deadline = time.time() + 5
+            while b.in_flight < 3 and time.time() < deadline:
+                time.sleep(0.02)
+            assert b.in_flight == 3
+            holders.append(cheap)
         finally:
             release.set()
             for t in holders:
@@ -309,6 +327,7 @@ class TestHardening:
         release = threading.Event()
         b = ToolBridge(lambda *_: (release.wait(10), "ok")[1], directory=str(tmp_path))
         b.start()
+        t = None
         try:
             assert b.in_flight == 0
             t = threading.Thread(target=lambda: call_bridged_tool("todo", env=_env(b)))
@@ -319,7 +338,8 @@ class TestHardening:
             assert b.in_flight == 1
         finally:
             release.set()
-            t.join(timeout=10)
+            if t is not None:
+                t.join(timeout=10)
             b.close()
         assert b.in_flight == 0
 
@@ -427,7 +447,6 @@ class TestHolds:
 
         b = ToolBridge(lambda tool, args: tool, directory=str(tmp_path))
         b.start()
-        before = threading.active_count()
         hold = bridge_hold(_env(b))
         hold.__enter__()
         try:
@@ -437,8 +456,206 @@ class TestHolds:
             assert b.active
             b.close()
             deadline = time.time() + 5
-            while threading.active_count() > before and time.time() < deadline:
+            while b._workers and time.time() < deadline:
                 time.sleep(0.05)
-            assert threading.active_count() <= before
+            assert not b._workers and not b._held
+            assert b.in_flight == 0
         finally:
             hold.__exit__(None, None, None)
+
+
+class TestAfterClose:
+    """close() stops the accept loop; it does not stop a connection already
+    accepted, and unlinking the socket path does nothing to one either."""
+
+    def test_a_call_that_arrives_after_close_is_refused_not_run(self, tmp_path):
+        import socket as _socket
+
+        from agent.transports.hermes_tool_bridge import _read_message, _write_message
+
+        ran = []
+        b = ToolBridge(lambda tool, args: ran.append(tool) or "ran", directory=str(tmp_path))
+        b.start()
+        conn = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        conn.connect(b.socket_path)          # accepted, nothing sent yet
+        time.sleep(0.1)
+        b.close()                            # session torn down
+        try:
+            _write_message(conn, {"token": b.token, "tool": "delegate_task", "args": {}})
+            reply = _read_message(conn)
+        finally:
+            conn.close()
+        assert reply["ok"] is False and "closed" in reply["error"]
+        assert ran == [], "a delegate_task ran on a torn-down session's agent"
+
+    def test_a_hold_that_arrives_after_close_does_not_leak(self, tmp_path):
+        import socket as _socket
+
+        from agent.transports.hermes_tool_bridge import _read_message, _write_message
+
+        b = ToolBridge(lambda *_: "", directory=str(tmp_path))
+        b.start()
+        conn = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        conn.connect(b.socket_path)
+        time.sleep(0.1)
+        b.close()
+        try:
+            _write_message(conn, {"token": b.token, "op": "hold"})
+            reply = _read_message(conn)
+            assert reply["ok"] is False and "closed" in reply["error"]
+            # close() snapshots _held and replaces the set, so a hold
+            # registered afterwards would never be shut down.
+            deadline = time.time() + 5
+            while b._workers and time.time() < deadline:
+                time.sleep(0.05)
+            assert b.in_flight == 0 and not b.active
+            assert not b._held and not b._workers
+        finally:
+            conn.close()
+
+
+class TestBindFallback:
+    def test_a_directory_that_cannot_host_a_socket_falls_through(self, tmp_path, monkeypatch):
+        """A bind can fail where the mkdir succeeded — AF_UNIX is not
+        supported on every filesystem, and a $HERMES_HOME on NFS returns
+        EOPNOTSUPP. Losing the four tools on such a machine would be exactly
+        the failure this module exists to end."""
+        import socket as _socket
+
+        real_bind = _socket.socket.bind
+        first = str(tmp_path)
+
+        def picky_bind(self, address):
+            if isinstance(address, str) and address.startswith(first):
+                raise OSError(45, "Operation not supported")
+            return real_bind(self, address)
+
+        monkeypatch.setattr(_socket.socket, "bind", picky_bind)
+        b = ToolBridge(lambda *_: "ok", directory=first)
+        b.start()
+        try:
+            assert not b.socket_path.startswith(first)
+            assert call_bridged_tool("todo", env=_env(b)) == "ok"
+        finally:
+            b.close()
+
+
+class TestReNarrowing:
+    def test_the_allowed_set_follows_the_agent_driving_the_turn(self, bridge):
+        env = _env(bridge)
+        assert call_bridged_tool("delegate_task", {"goal": "x"}, env=env)
+        bridge.set_allowed_tools(("todo",))
+        with pytest.raises(BridgeError, match="not bridged"):
+            call_bridged_tool("delegate_task", {"goal": "x"}, env=env)
+        assert call_bridged_tool("todo", env=env) == "todo-ok"
+
+
+class TestActivityStamp:
+    def test_last_active_is_stamped_when_a_call_ENDS_not_only_when_it_starts(
+        self, tmp_path
+    ):
+        """The end is the half that matters. Stamping only the start meant a
+        window that opened before the call and expired just after it looked
+        like two minutes of silence, and retired a session six seconds after
+        its delegation had succeeded."""
+        b = ToolBridge(lambda tool, args: (time.sleep(0.3), "done")[1],
+                       directory=str(tmp_path))
+        b.start()
+        try:
+            before = b.last_active
+            call_bridged_tool("todo", env=_env(b))
+            after = b.last_active
+            assert after > before
+            # ...and it is the END that was stamped, not the start.
+            assert after >= before + 0.25, (after - before)
+            assert b.in_flight == 0 and not b.active
+        finally:
+            b.close()
+
+
+class TestSlotAccounting:
+    def test_a_metered_slot_is_returned_after_every_call(self, tmp_path):
+        """Leak one and the bridge goes permanently deaf after N calls — with
+        no error anywhere, just delegate_task refusing forever."""
+        def dispatch(tool, args):
+            if args.get("boom"):
+                raise RuntimeError("nope")
+            return tool
+
+        b = ToolBridge(dispatch, directory=str(tmp_path), max_concurrent_calls=2)
+        b.start()
+        try:
+            for i in range(6):
+                if i % 2:
+                    with pytest.raises(BridgeError, match="nope"):
+                        call_bridged_tool("delegate_task", {"boom": 1}, env=_env(b))
+                else:
+                    assert call_bridged_tool("delegate_task", env=_env(b)) == "delegate_task"
+            # Both slots still free: two concurrent calls must still start.
+            release = threading.Event()
+            b.set_dispatch(lambda t, a: (release.wait(10), t)[1])
+            ts = [
+                threading.Thread(
+                    target=lambda: call_bridged_tool("delegate_task", env=_env(b))
+                )
+                for _ in range(2)
+            ]
+            for t in ts:
+                t.start()
+            deadline = time.time() + 5
+            while b.in_flight < 2 and time.time() < deadline:
+                time.sleep(0.02)
+            assert b.in_flight == 2, "a dispatch slot leaked"
+            release.set()
+            for t in ts:
+                t.join(timeout=10)
+        finally:
+            b.close()
+
+    def test_too_many_open_connections_are_refused_not_queued_forever(self, tmp_path):
+        import socket as _socket
+
+        import agent.transports.hermes_tool_bridge as htb
+
+        b = ToolBridge(lambda t, a: t, directory=str(tmp_path))
+        b.start()
+        # Fill the connection ceiling with silent peers.
+        b._conn_slots = threading.BoundedSemaphore(1)
+        parked = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        parked.connect(b.socket_path)
+        try:
+            deadline = time.time() + 5
+            while b._conn_slots.acquire(blocking=False):
+                b._conn_slots.release()
+                if time.time() > deadline:
+                    break
+                time.sleep(0.02)
+            with pytest.raises(BridgeError, match="too many open connections|refused"):
+                call_bridged_tool("todo", env=_env(b))
+        finally:
+            parked.close()
+            b.close()
+
+
+class TestWireGuards:
+    def test_a_message_larger_than_the_cap_is_refused(self, bridge, monkeypatch):
+        import agent.transports.hermes_tool_bridge as htb
+
+        monkeypatch.setattr(htb, "_MAX_MESSAGE_BYTES", 64)
+        with pytest.raises(BridgeError):
+            call_bridged_tool("todo", {"pad": "x" * 4096}, env=_env(bridge))
+
+    def test_a_message_that_is_not_an_object_is_refused(self, bridge):
+        import socket as _socket
+
+        from agent.transports.hermes_tool_bridge import _read_message
+
+        conn = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        conn.connect(bridge.socket_path)
+        try:
+            conn.sendall(b'["not", "an", "object"]\n')
+            reply = _read_message(conn)
+        finally:
+            conn.close()
+        assert reply["ok"] is False and "not an object" in reply["error"]
+        assert bridge.calls == []

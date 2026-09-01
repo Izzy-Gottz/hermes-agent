@@ -108,9 +108,14 @@ _REQUEST_READ_TIMEOUT = 30.0
 #: How long the reply may take to leave. A client that stopped reading must
 #: not pin the thread either.
 _REPLY_WRITE_TIMEOUT = 120.0
-#: Ceiling on dispatches running at once. Each one can be a whole synchronous
-#: subagent fan-out, so this bounds threads, `claude` children and spend.
-#: Refusals above it are ordinary tool errors, not silence.
+#: Ceiling on EXPENSIVE dispatches running at once — a bridged delegate_task
+#: is a whole synchronous subagent fan-out, so this bounds `claude` children
+#: and spend. The other three (todo, memory, session_search) are cheap, the
+#: CLI batches parallel tool calls freely, and metering them here only handed
+#: the model hard errors to reason about: measured, 120 concurrent `todo`
+#: calls against a ceiling of 8 produced 112 refusals. They are bounded by
+#: _MAX_CONNECTIONS instead.
+_METERED_TOOLS: frozenset = frozenset({"delegate_task"})
 _MAX_CONCURRENT_CALLS = 8
 #: Ceiling on open connections (threads). Higher than the dispatch ceiling
 #: because most connections are cheap: a `hold` is a thread blocked on recv.
@@ -241,12 +246,13 @@ class ToolBridge:
         with self._in_flight_lock:
             return self._last_active
 
-    def _touch(self) -> None:
-        self._last_active = time.monotonic()
-
     def set_dispatch(self, dispatch: Callable[[str, dict], Any]) -> None:
         """Point the bridge at the agent instance driving the current turn."""
         self._dispatch = dispatch
+
+    def set_allowed_tools(self, allowed: "tuple[str, ...] | list[str]") -> None:
+        """Re-narrow what may be dispatched when the driving agent changes."""
+        self._allowed = tuple(allowed)
 
     # ---------- lifecycle ----------
 
@@ -258,18 +264,31 @@ class ToolBridge:
             if self._closed:
                 raise BridgeError("tool bridge is closed")
             self._token = secrets.token_hex(32)
-            self._path = self._bind_path()
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                sock.bind(self._path)
-                os.chmod(self._path, stat.S_IRUSR | stat.S_IWUSR)
-                sock.listen(16)
-            except OSError as exc:
-                sock.close()
-                self._cleanup_path()
+            sock, failures = None, []
+            for candidate in self._candidate_paths():
+                trial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    trial.bind(candidate)
+                    os.chmod(candidate, stat.S_IRUSR | stat.S_IWUSR)
+                    trial.listen(_MAX_CONNECTIONS)
+                except OSError as exc:
+                    # A bind can fail where a mkdir succeeded — AF_UNIX sockets
+                    # are not supported on every filesystem, and a $HERMES_HOME
+                    # on NFS or SMB returns EOPNOTSUPP here. Falling through to
+                    # the next candidate is the difference between "one machine
+                    # keeps its subagents" and "this machine has none, and the
+                    # model is told the tool does not exist" — the failure this
+                    # module exists to end.
+                    trial.close()
+                    failures.append(f"{candidate}: {exc}")
+                    self._cleanup_path()
+                    continue
+                sock, self._path = trial, candidate
+                break
+            if sock is None:
                 raise BridgeError(
-                    f"tool bridge could not listen on {self._path}: {exc}"
-                ) from exc
+                    "tool bridge could not listen anywhere (" + "; ".join(failures) + ")"
+                )
             self._sock = sock
             self._thread = threading.Thread(
                 target=self._serve_forever, name=self._name, daemon=True
@@ -277,8 +296,8 @@ class ToolBridge:
             self._thread.start()
             logger.debug("tool bridge listening on %s", self._path)
 
-    def _bind_path(self) -> str:
-        """A private 0700 directory, and a socket path short enough to bind.
+    def _candidate_paths(self):
+        """Socket paths to try, in order, each in a fresh 0700 directory.
 
         ``os.makedirs(mode=0o700, exist_ok=True)`` is a no-op on a directory
         that already exists, so trusting it would have left the socket in
@@ -290,9 +309,11 @@ class ToolBridge:
         rather than binding somewhere unintended.
         """
         name = f"bridge-{secrets.token_hex(6)}"
+        tried = []
         for parent in (self._directory, tempfile.gettempdir()):
             if not parent:
                 continue
+            tried.append(parent)
             directory = os.path.join(parent, name)
             candidate = os.path.join(directory, "s.sock")
             if len(candidate.encode("utf-8")) >= 100:
@@ -305,11 +326,9 @@ class ToolBridge:
                 continue
             os.chmod(directory, stat.S_IRWXU)
             self._owned_dir = directory
-            return candidate
-        raise BridgeError(
-            "tool bridge: no directory short enough for a Unix socket path "
-            f"(tried {self._directory!r} and {tempfile.gettempdir()!r})"
-        )
+            yield candidate
+        if not tried:
+            raise BridgeError("tool bridge: no directory to bind in")
 
     def close(self) -> None:
         """Stop listening, remove the socket, and wait briefly for in-flight
@@ -317,8 +336,10 @@ class ToolBridge:
 
         The wait is bounded: a bridged ``delegate_task`` can be minutes long
         and the caller (a session teardown) cannot block on it. Anything still
-        running is left to finish and discard its result — it will find the
-        socket gone when it tries to answer.
+        running is left to finish; its reply goes to a client nobody is
+        reading. Unlinking the socket does NOT stop it — an accepted
+        connection is unaffected by the path disappearing — which is why
+        ``_handle`` and ``_serve_hold`` check ``_closed`` themselves.
         """
         with self._lock:
             if self._closed:
@@ -344,19 +365,27 @@ class ToolBridge:
                 conn.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        deadline = time.monotonic() + _CLOSE_JOIN_SECONDS
-        for worker in workers:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            worker.join(timeout=remaining)
-        still = self.in_flight
-        if still:
-            logger.warning(
-                "tool bridge closed with %d call(s) still running; their results "
-                "will be discarded", still,
-            )
-        self._cleanup_path()
+        try:
+            deadline = time.monotonic() + _CLOSE_JOIN_SECONDS
+            for worker in workers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    worker.join(timeout=remaining)
+                except RuntimeError:  # pragma: no cover - belt and braces
+                    logger.debug("tool bridge: worker not joinable", exc_info=True)
+            still = self.in_flight
+            if still:
+                logger.warning(
+                    "tool bridge closed with %d call(s) still running; their "
+                    "results will be discarded", still,
+                )
+        finally:
+            # Never conditional on the join: a close() that raised on its way
+            # here used to leave the socket and its 0700 directory behind, and
+            # the caller swallows the exception, so it was silent.
+            self._cleanup_path()
         logger.debug("tool bridge closed (%s)", self._path)
 
     def _cleanup_path(self) -> None:
@@ -398,9 +427,16 @@ class ToolBridge:
                     name=f"{self._name}-call",
                     daemon=True,
                 )
+                # Registered and started under the SAME lock close() takes to
+                # snapshot them. Started outside it, a close() landing in the
+                # gap between add and start joined a thread that had not
+                # begun — `RuntimeError: cannot join thread before it is
+                # started` — which escaped before _cleanup_path() and leaked
+                # the socket and its directory. Reproduced 3 times in 300
+                # trials under connection pressure.
                 with self._lock:
                     self._workers.add(worker)
-                worker.start()
+                    worker.start()
             except BaseException:
                 # Thread exhaustion must not kill the accept loop, or the
                 # bridge goes permanently deaf while still reporting healthy.
@@ -455,6 +491,9 @@ class ToolBridge:
             with self._lock:
                 self._workers.discard(threading.current_thread())
 
+    def _closed_reply(self) -> dict:
+        return {"ok": False, "error": "tool bridge: this session has closed"}
+
     def _serve_hold(self, conn: socket.socket, payload: dict) -> None:
         """Keep the line open while the child runs a tool of its own.
 
@@ -467,11 +506,18 @@ class ToolBridge:
         if not self._token or not hmac.compare_digest(token, self._token):
             _write_message(conn, {"ok": False, "error": "tool bridge: authentication failed"})
             return
+        with self._lock:
+            # close() snapshots `_held` and replaces the set; a hold that
+            # registered after that would never be shut down, and its thread
+            # would sit on recv() holding a reference to a closed session's
+            # agent until the peer process happened to die.
+            if self._closed:
+                _write_message(conn, self._closed_reply())
+                return
+            self._held.add(conn)
         with self._in_flight_lock:
             self._holds += 1
             self._last_active = time.monotonic()
-        with self._lock:
-            self._held.add(conn)
         try:
             _write_message(conn, {"ok": True, "result": ""})
             conn.settimeout(None)
@@ -492,18 +538,25 @@ class ToolBridge:
         if not self._token or not hmac.compare_digest(token, self._token):
             logger.warning("tool bridge rejected a call with a bad token")
             return {"ok": False, "error": "tool bridge: authentication failed"}
+        # close() stops the accept loop, but a connection already accepted has
+        # its whole read window to arrive. Without this, a delegate_task could
+        # start on a torn-down session's agent — subagents spawned and paid
+        # for, answering a `claude` that has already been killed.
+        if self._closed:
+            return self._closed_reply()
         tool = str(payload.get("tool") or "")
         if tool not in self._allowed:
             return {"ok": False, "error": f"tool bridge: {tool!r} is not bridged"}
         args = payload.get("args")
         if not isinstance(args, dict):
             args = {}
-        if not self._slots.acquire(blocking=False):
+        metered = tool in _METERED_TOOLS
+        if metered and not self._slots.acquire(blocking=False):
             return {
                 "ok": False,
                 "error": (
-                    f"tool bridge is already running {self._max_calls} calls; "
-                    "retry when one finishes"
+                    f"tool bridge is already running {self._max_calls} "
+                    f"{tool} calls; retry when one finishes"
                 ),
             }
         with self._in_flight_lock:
@@ -518,7 +571,8 @@ class ToolBridge:
             with self._in_flight_lock:
                 self._in_flight -= 1
                 self._last_active = time.monotonic()
-            self._slots.release()
+            if metered:
+                self._slots.release()
         if not isinstance(result, str):
             try:
                 result = json.dumps(result, ensure_ascii=True, default=str)
@@ -599,9 +653,15 @@ def call_bridged_tool(
             f"{tool} needs the running agent and no tool bridge is configured "
             "for this process"
         )
-    deadline = timeout if timeout is not None else bridge_timeout(env)
+    budget = timeout if timeout is not None else bridge_timeout(env)
+    # An absolute deadline, not a per-operation timeout: `_read_message` loops
+    # on recv, and a large multi-chunk reply (a fan-out's aggregated JSON is
+    # exactly that) would otherwise get the full budget on EVERY chunk and
+    # could outlast the CLI's own MCP ceiling — losing the race this budget
+    # exists to win.
+    ends_at = time.monotonic() + budget
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.settimeout(deadline)
+    conn.settimeout(budget)
     try:
         try:
             conn.connect(path)
@@ -622,10 +682,10 @@ def call_bridged_tool(
             raise BridgeError(
                 str(refusal.get("error") or f"tool bridge refused {tool}")
             ) from exc
-        reply = _read_message(conn)
+        reply = _read_message(conn, ends_at=ends_at)
     except socket.timeout as exc:
         raise BridgeError(
-            f"{tool} did not finish within {deadline:.0f}s on the agent side"
+            f"{tool} did not finish within {budget:.0f}s on the agent side"
         ) from exc
     finally:
         try:
@@ -654,8 +714,9 @@ class bridge_hold:
     work.
 
     Best-effort and silent: no bridge, or a bridge that will not answer, means
-    no hold and exactly the old behaviour. It never raises and never delays a
-    tool call by more than the connect.
+    no hold and exactly the old behaviour. It never raises, and the connect
+    costs 0.151 ms per tool call measured over 300 round trips on this
+    machine — small enough not to be worth a knob.
     """
 
     def __init__(self, env: Optional[dict] = None, *, connect_timeout: float = 2.0):
@@ -733,10 +794,15 @@ def _write_message(conn: socket.socket, payload: dict) -> None:
     conn.sendall(data)
 
 
-def _read_message(conn: socket.socket) -> dict:
+def _read_message(conn: socket.socket, *, ends_at: Optional[float] = None) -> dict:
     chunks: list[bytes] = []
     total = 0
     while True:
+        if ends_at is not None:
+            left = ends_at - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("tool bridge: read deadline passed")
+            conn.settimeout(left)
         chunk = conn.recv(65536)
         if not chunk:
             if not chunks:
