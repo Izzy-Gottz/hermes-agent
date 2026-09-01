@@ -659,3 +659,60 @@ class TestWireGuards:
             conn.close()
         assert reply["ok"] is False and "not an object" in reply["error"]
         assert bridge.calls == []
+
+
+class TestCloseUnderPressure:
+    def test_close_survives_a_worker_that_has_not_started_yet(self, tmp_path):
+        """The registered-but-not-started window, made deterministic.
+
+        close() snapshots `_workers` under the lock; a worker added there but
+        started outside it could be joined before it began —
+        `RuntimeError: cannot join thread before it is started` — which
+        escaped BEFORE _cleanup_path() and left the socket and its 0700
+        directory behind. The caller swallows the exception, so it was
+        silent: 3 leaks in 300 trials under connection pressure. Rather than
+        bet on hitting a ~1% race, put an unstarted thread in the set on
+        purpose."""
+        b = ToolBridge(lambda t, a: t, directory=str(tmp_path))
+        b.start()
+        path, owned = b.socket_path, os.path.dirname(b.socket_path)
+        never_started = threading.Thread(target=lambda: None)
+        with b._lock:
+            b._workers.add(never_started)
+        b.close()  # must not raise
+        assert not os.path.exists(path)
+        assert not os.path.exists(owned)
+
+    def test_closing_while_connections_are_arriving_never_leaks(self, monkeypatch):
+        """The same property from the outside, at the scale a test can afford."""
+        import socket as _socket
+        import tempfile
+
+        import agent.transports.hermes_tool_bridge as htb
+
+        monkeypatch.setattr(htb, "_CLOSE_JOIN_SECONDS", 0.05)
+        monkeypatch.setattr(htb, "_REQUEST_READ_TIMEOUT", 0.05)
+        leaked, errors = [], []
+        for _ in range(25):
+            with tempfile.TemporaryDirectory(dir="/tmp") as d:
+                b = ToolBridge(lambda t, a: t, directory=d)
+                b.start()
+                path, owned = b.socket_path, os.path.dirname(b.socket_path)
+                conns = []
+                for _ in range(3):
+                    c = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                    try:
+                        c.connect(path)
+                        conns.append(c)
+                    except OSError:
+                        pass
+                try:
+                    b.close()
+                except Exception as exc:
+                    errors.append(repr(exc))
+                for c in conns:
+                    c.close()
+                if os.path.exists(path) or os.path.exists(owned):
+                    leaked.append(owned)
+        assert errors == [], errors
+        assert leaked == [], leaked

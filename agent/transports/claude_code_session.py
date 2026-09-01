@@ -1099,9 +1099,21 @@ class ClaudeCodeSession:
             # What the child was TOLD it has was baked into the mcp-config at
             # spawn and cannot be narrowed now — but what the bridge will
             # actually dispatch can be, and that is the half that matters.
-            self._tool_bridge_tools = tuple(tool_bridge_tools)
+            wanted = tuple(tool_bridge_tools)
+            if self._mcp_config_path and set(wanted) - set(self._tool_bridge_tools or ()):
+                # Only ever narrows in practice — a warm session is one
+                # conversation and toolsets are per platform. Say so if it
+                # ever widens, because the child cannot learn about the new
+                # ones until the session is rebuilt.
+                logger.info(
+                    "claude-code: this session's agent now allows %s, which the "
+                    "child was not told about at spawn; it will not see them "
+                    "until the session is rebuilt",
+                    ", ".join(sorted(set(wanted) - set(self._tool_bridge_tools or ()))),
+                )
+            self._tool_bridge_tools = wanted
             if self._tool_bridge is not None:
-                self._tool_bridge.set_allowed_tools(self._tool_bridge_tools)
+                self._tool_bridge.set_allowed_tools(wanted)
 
     def needs_respawn(self, system_prompt: Optional[str]) -> bool:
         """``--append-system-prompt-file`` is read at spawn; a changed prompt
