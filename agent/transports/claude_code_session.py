@@ -1115,6 +1115,26 @@ class ClaudeCodeSession:
             if self._tool_bridge is not None:
                 self._tool_bridge.set_allowed_tools(wanted)
 
+    def claim(self, session_key: str) -> None:
+        """Bind an already-warm, unowned session to a conversation.
+
+        A spare is spawned before any conversation exists — ``--session-id``
+        pins a fresh CLI session at spawn, so the process can be booted, its
+        MCP servers connected and its warm-up round trip paid while nobody is
+        waiting. Claiming is just recording whose it is now, plus persisting
+        the id map so a later ``--resume`` of this Hermes session finds the
+        transcript the spare has been writing.
+        """
+        if self._session_key == session_key:
+            return
+        self._session_key = session_key
+        try:
+            save_session_mapping(
+                self._config_dir, session_key, self._requested_session_id
+            )
+        except Exception:
+            logger.debug("claude-code: could not map claimed session", exc_info=True)
+
     def needs_respawn(self, system_prompt: Optional[str]) -> bool:
         """``--append-system-prompt-file`` is read at spawn; a changed prompt
         needs a fresh process to take effect."""

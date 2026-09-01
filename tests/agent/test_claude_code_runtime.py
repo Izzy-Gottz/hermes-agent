@@ -39,6 +39,16 @@ def _env(tmp_path: Path, monkeypatch):
     with rt._REGISTRY_LOCK:
         rt._REGISTRY.clear()
     yield home
+    # A refill runs on a daemon thread and can land after the test that
+    # started it; wait for it before dropping, or the next test inherits a
+    # spare built for someone else's settings.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        with rt._SPARE_LOCK:
+            if not rt._SPARE_BUILDING:
+                break
+        time.sleep(0.05)
+    rt.drop_spare()
     for key in list(rt._REGISTRY):
         rt.evict_session(key)
 
@@ -635,3 +645,105 @@ class TestToolBridgeDispatch:
         session._tool_bridge_dispatch("todo", {})
         assert [c[0] for c in second._calls] == ["todo"]
         assert [c[0] for c in first._calls] == ["todo"]  # not called twice
+
+
+class TestPreWarmedSpare:
+    """A conversation should start in a process that is already answering.
+
+    Measured on this machine before any of this: the first turn of a new
+    conversation took 4.0 s against 1.4 s for the second. None of that cost
+    depends on WHICH conversation arrives — it is MCP servers connecting and
+    the CLI's warm-up round trip — and `--session-id` pins a fresh session at
+    spawn, so the whole process can be booted before the conversation exists.
+    """
+
+    def _wait_for_spare(self, timeout=25.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with rt._SPARE_LOCK:
+                if rt._SPARE is not None:
+                    return rt._SPARE
+            time.sleep(0.05)
+        return None
+
+    def test_a_turn_leaves_a_spare_warm_for_the_next_conversation(self):
+        first = _agent("conv-1")
+        _turn(first)
+        spare = self._wait_for_spare()
+        assert spare is not None, "no spare was minted after a turn"
+        assert spare.session.is_alive()
+        assert spare.session.session_id, "the spare never completed its warm-up"
+
+    def test_the_next_conversation_takes_it_instead_of_spawning(self):
+        first = _agent("conv-1")
+        _turn(first)
+        spare = self._wait_for_spare()
+        assert spare is not None
+        warm_pid = spare.session.pid
+
+        second = _agent("conv-2")
+        _turn(second)
+        assert second._claude_code_session.pid == warm_pid, (
+            "the second conversation spawned its own process instead of "
+            "taking the one already warm"
+        )
+        # ...and its transcript is findable again on a later --resume.
+        from agent.transports.claude_code_session import load_session_map
+        mapped = load_session_map(second._claude_code_session.config_dir)
+        assert mapped.get("conv-2") == second._claude_code_session.requested_session_id
+
+    def test_a_spare_with_a_different_system_prompt_is_not_used(self):
+        """The prompt is baked in at spawn (--append-system-prompt-file), so a
+        mismatched spare would respawn on its first use anyway."""
+        _turn(_agent("conv-1", ephemeral="PROMPT-ONE"))
+        spare = self._wait_for_spare()
+        assert spare is not None
+        stale_pid = spare.session.pid
+
+        other = _agent("conv-2", ephemeral="PROMPT-TWO")
+        _turn(other)
+        assert other._claude_code_session.pid != stale_pid
+        with rt._SPARE_LOCK:
+            assert rt._SPARE is None or rt._SPARE.session.pid != stale_pid
+
+    def test_a_spare_for_a_different_model_is_not_used(self):
+        _turn(_agent("conv-1"))
+        spare = self._wait_for_spare()
+        assert spare is not None
+        stale_pid = spare.session.pid
+
+        other = _agent("conv-2")
+        other.model = "opus"          # spawn-time setting, cannot be rebound
+        _turn(other)
+        assert other._claude_code_session.pid != stale_pid
+
+    def test_prewarm_can_be_turned_off(self, monkeypatch):
+        cfg = rt._claude_code_config()
+        monkeypatch.setattr(rt, "_claude_code_config", lambda: {**cfg, "prewarm": False})
+        _turn(_agent("conv-1"))
+        time.sleep(0.3)
+        with rt._SPARE_LOCK:
+            assert rt._SPARE is None
+        assert rt.take_spare(_agent("conv-2")) is None
+
+    def test_the_spare_is_closed_at_shutdown(self):
+        _turn(_agent("conv-1"))
+        spare = self._wait_for_spare()
+        assert spare is not None
+        session = spare.session
+        rt._shutdown_registry()
+        assert not session.is_alive()
+        with rt._SPARE_LOCK:
+            assert rt._SPARE is None
+
+    def test_a_spare_nobody_came_for_is_reaped(self):
+        """It costs as much resident memory as any other warm child; a spare
+        unclaimed for hours is a bet that has already lost."""
+        _turn(_agent("conv-1"))
+        spare = self._wait_for_spare()
+        assert spare is not None
+        session = spare.session
+        rt.sweep_idle_sessions(0.0)
+        with rt._SPARE_LOCK:
+            assert rt._SPARE is None
+        assert not session.is_alive()

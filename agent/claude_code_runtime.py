@@ -204,8 +204,19 @@ def _idle_timeout_from_config() -> float:
 
 def sweep_idle_sessions(idle_seconds: float, *, now: Optional[float] = None) -> int:
     """Close and drop every registered session idle for ``idle_seconds``.
-    Sessions with a turn in flight are never evicted. Returns the count."""
+    Sessions with a turn in flight are never evicted. Returns the count.
+
+    The unclaimed spare ages out on the same clock. It costs about as much
+    resident memory as any other warm child (~370 MB here, CLI plus its MCP
+    server), and a spare nobody has come for in hours is a bet that has
+    already lost — the next turn re-mints one at the end of the turn anyway.
+    """
     now = time.monotonic() if now is None else now
+    with _SPARE_LOCK:
+        stale = _SPARE is not None and (now - _SPARE.minted_at) >= idle_seconds
+    if stale:
+        logger.info("claude-code: dropping a spare nobody came for")
+        drop_spare()
     victims: list[tuple[str, _RegistryEntry]] = []
     with _REGISTRY_LOCK:
         for key, entry in list(_REGISTRY.items()):
@@ -241,6 +252,7 @@ def evict_session(key: Optional[str]) -> None:
 
 def _shutdown_registry() -> None:
     """atexit: close every warm child and unlink its temp prompt/MCP files."""
+    drop_spare()
     with _REGISTRY_LOCK:
         keys = list(_REGISTRY)
     for key in keys:
@@ -359,6 +371,164 @@ class TurnInFlightError(RuntimeError):
     """A second request for a session arrived while a turn was running."""
 
 
+# ---------------------------------------------------------------------------
+# Pre-warmed spare
+#
+# The cold cost of a conversation is not the `claude` binary — that boots in
+# ~0.1 s. It is the MCP servers connecting inside it and the warm-up round
+# trip the CLI needs before it will answer anything, and NOTHING about either
+# depends on which conversation is about to arrive. Measured on this machine,
+# Claude Code 2.1.252, four MCP servers:
+#
+#     first turn of a new conversation      4.0 s
+#     second turn of the same conversation  1.4 s
+#
+# `--session-id` pins a FRESH session at spawn, so a whole process can be
+# booted, connected and warmed while nobody is waiting, then handed to
+# whichever conversation turns up. `--input-format stream-json` is what makes
+# it wait: a plain `-p` child reads EOF on empty stdin and exits.
+#
+# One spare, not a pool: each holds a full CLI plus its MCP servers, and the
+# claim rate here is one per conversation, not one per turn. It is reaped by
+# the same idle sweep as everything else and closed at exit — Claude Code's
+# own daemon leaked 64 processes and 7 GB over six weeks by not doing that.
+#
+# A spare is only usable by an agent whose spawn-time settings match it: the
+# system prompt is baked in with --append-system-prompt-file, the mcp-config
+# (and so the bridged tool set) is read at spawn, and cwd/model/permission
+# mode cannot change afterwards. A mismatch is not a bug — the spare is
+# dropped and the session built the old way, which is exactly today's cost.
+# ---------------------------------------------------------------------------
+
+_UNSET = object()
+
+_SPARE_LOCK = threading.Lock()
+_SPARE: Optional["_Spare"] = None
+_SPARE_BUILDING = False
+
+
+@dataclass
+class _Spare:
+    session: Any
+    system_prompt: str
+    signature: tuple
+    minted_at: float = field(default_factory=time.monotonic)
+
+
+def _spare_enabled() -> bool:
+    """``claude_code.prewarm`` (default on)."""
+    value = _claude_code_config().get("prewarm", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
+def _spare_signature(agent) -> tuple:
+    """What must match for a spare to be usable by ``agent``.
+
+    Everything here is fixed at spawn and cannot be rebound afterwards.
+    Deliberately NOT included: the Hermes session id (that is what claiming
+    assigns) and the dispatch callable (``rebind`` re-points it per turn).
+    """
+    cfg = _claude_code_config()
+    return (
+        str(getattr(agent, "model", "") or ""),
+        str(cfg.get("cwd") or ""),
+        str(cfg.get("permission_mode") or ""),
+        bool(cfg.get("native_tools", False)),
+        bool(cfg.get("expose_hermes_tools", True)),
+        os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
+        tuple(bridged_tools_for(agent)),
+    )
+
+
+def take_spare(agent) -> Optional[Any]:
+    """A warm session for ``agent``, or ``None`` to build one the usual way."""
+    if not _spare_enabled():
+        return None
+    wanted_prompt = combined_system_prompt(agent)
+    wanted_signature = _spare_signature(agent)
+    with _SPARE_LOCK:
+        spare, globals()["_SPARE"] = _SPARE, None
+    if spare is None:
+        return None
+    session = spare.session
+    if not session.is_alive() or getattr(session, "_closed", False):
+        logger.debug("claude-code: spare was not alive; building fresh")
+        return None
+    if spare.signature != wanted_signature or spare.system_prompt != wanted_prompt:
+        # Not a failure: the next turn simply wants a different process than
+        # the one we guessed. Close it rather than hand over a session that
+        # would respawn on its first use anyway.
+        logger.info(
+            "claude-code: spare did not match this turn's settings; discarding it"
+        )
+        try:
+            session.close()
+        except Exception:
+            logger.debug("claude-code: discarding spare failed", exc_info=True)
+        return None
+    return session
+
+
+def refill_spare(agent) -> None:
+    """Boot the next spare in the background, if there isn't one.
+
+    Called after a claim and at the end of a turn: by the time the user starts
+    their NEXT conversation, the process it will run in is already answering.
+    """
+    if not _spare_enabled():
+        return
+    global _SPARE_BUILDING
+    prompt = combined_system_prompt(agent)
+    signature = _spare_signature(agent)
+    with _SPARE_LOCK:
+        if _SPARE is not None or _SPARE_BUILDING:
+            return
+        _SPARE_BUILDING = True
+
+    def _build() -> None:
+        global _SPARE_BUILDING
+        session = None
+        try:
+            session = _build_session(agent, session_key=None)
+            session.ensure_started()
+            with _SPARE_LOCK:
+                if _SPARE is None:
+                    globals()["_SPARE"] = _Spare(session, prompt, signature)
+                    session = None
+            if session is not None:      # someone else won the race
+                session.close()
+            else:
+                logger.info("claude-code: a spare session is warm and waiting")
+        except Exception:
+            logger.info(
+                "claude-code: could not pre-warm a spare; conversations will "
+                "start cold", exc_info=True,
+            )
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+        finally:
+            with _SPARE_LOCK:
+                _SPARE_BUILDING = False
+
+    threading.Thread(target=_build, name="claude-code-prewarm", daemon=True).start()
+
+
+def drop_spare() -> None:
+    """Close the spare, if any. Idle sweep, shutdown, and tests."""
+    with _SPARE_LOCK:
+        spare, globals()["_SPARE"] = _SPARE, None
+    if spare is not None:
+        try:
+            spare.session.close()
+        except Exception:
+            logger.debug("claude-code: closing the spare failed", exc_info=True)
+
+
 def _reap_closed_locked() -> None:
     """Under ``_REGISTRY_LOCK``: drop entries whose session is already closed.
 
@@ -449,7 +619,14 @@ def _acquire_entry(agent) -> tuple[_RegistryEntry, bool]:
             pass
     if created:
         try:
-            entry.session = _build_session(agent)
+            session = take_spare(agent)
+            if session is not None:
+                session.claim(key)
+                logger.info("claude-code: this conversation took the warm spare")
+                refill_spare(agent)
+            else:
+                session = _build_session(agent)
+            entry.session = session
         except BaseException:
             with _REGISTRY_LOCK:
                 if _REGISTRY.get(key) is entry:
@@ -785,7 +962,7 @@ def make_tool_bridge_dispatch(agent):
     return _dispatch
 
 
-def _build_session(agent):
+def _build_session(agent, *, session_key: Optional[str] = _UNSET):
     from agent.transports.claude_code_session import ClaudeCodeSession
 
     _prune_stale_temp_files_once()
@@ -817,7 +994,13 @@ def _build_session(agent):
     # installed one (same source the codex runtime uses). Gateway / cron
     # contexts have none -> gated tools are denied with a message.
     approval_callback = _approval_callback()
-    hermes_sid = str(getattr(agent, "session_id", "") or "").strip() or None
+    if session_key is _UNSET:
+        hermes_sid = str(getattr(agent, "session_id", "") or "").strip() or None
+    else:
+        # A spare belongs to no conversation yet: no session_key means no
+        # id-map lookup, so it spawns with a fresh --session-id rather than
+        # resuming somebody's transcript.
+        hermes_sid = session_key
     return ClaudeCodeSession(
         cwd=cwd,
         oauth_token_env=str(cfg.get("oauth_token_env") or DEFAULT_OAUTH_TOKEN_ENV),
@@ -960,6 +1143,12 @@ def run_claude_code_turn(
             agent._claude_code_session = None
     finally:
         entry.turn_lock.release()
+        # Boot the process the NEXT conversation will run in, now, while
+        # nobody is waiting for it. No-ops when one is already warm.
+        try:
+            refill_spare(agent)
+        except Exception:
+            logger.debug("claude-code: spare refill failed", exc_info=True)
     return _finish_turn(
         agent, turn, cfg,
         registry_key=registry_key, session=session,
