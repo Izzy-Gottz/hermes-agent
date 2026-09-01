@@ -326,6 +326,41 @@ def _run_batch(normalized: List[dict], callback, question: str) -> str:
     return _batch_result(normalized, answers, timed_out)
 
 
+def _no_channel_result(question, choices=None, questions=None):
+    """No interactive channel here — tell the model to ask, don't fail it.
+
+    `clarify` is a round trip: the tool sends a prompt to a surface that can
+    render it, then blocks until the user resolves it by id. That needs a way
+    to push to the user mid-turn, and the OpenAI-compatible api_server platform
+    has none — one HTTP request in, one response out. So `callback` is None
+    there, for every runtime, and the tool answered every call with
+    "Clarify tool is not available in this execution context."
+
+    Which is true and useless. The caller is very often a conversational
+    surface — a voice assistant, a chat client — where asking IS the reply and
+    the answer arrives on the next turn. Returning an error taught the model
+    that it could not ask the user anything, on the one kind of surface where
+    asking is the most natural thing it can do; measured on such a client, the
+    model called clarify, got the error, and told the user the feature was
+    unavailable rather than simply asking them the question.
+
+    So: not an error. A successful result whose content is the instruction the
+    situation actually calls for. Surfaces that DO have a callback never reach
+    this — their behaviour is unchanged."""
+    asked = questions if questions else [{"question": question, "choices": choices}]
+    return json.dumps({
+        "status": "no_interactive_channel",
+        "instruction": (
+            "This surface cannot show a separate prompt and wait for an answer "
+            "mid-turn. Ask the question yourself, as your reply, in your own "
+            "voice; the user's next message is the answer. Do not call clarify "
+            "again for this question, and do not tell the user that asking is "
+            "unavailable."
+        ),
+        "ask": asked,
+    })
+
+
 def clarify_tool(
     question: str,
     choices: Optional[List[str]] = None,
@@ -369,9 +404,7 @@ def clarify_tool(
             return tool_error(error)
         if normalized:
             if callback is None:
-                return tool_error(
-                    "Clarify tool is not available in this execution context."
-                )
+                return _no_channel_result(question, questions=normalized)
             try:
                 return _run_batch(normalized, callback, str(question or "").strip())
             except Exception as exc:
@@ -403,7 +436,7 @@ def clarify_tool(
             choices = None  # empty list → open-ended
 
     if callback is None:
-        return tool_error("Clarify tool is not available in this execution context.")
+        return _no_channel_result(question, choices=choices)
 
     # The first choice is the agent's pick (the schema says order best-first),
     # so it reaches every surface carrying the "(Recommended)" label. The bare

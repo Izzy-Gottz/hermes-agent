@@ -30,11 +30,27 @@ class TestClarifyToolBasics:
         assert result["user_response"] == "blue"
 
 
-    def test_no_callback_returns_error(self):
-        """Should return error when no callback is provided."""
-        result = json.loads(clarify_tool("What do you want?"))
-        assert "error" in result
-        assert "not available" in result["error"].lower()
+    def test_no_callback_tells_the_model_to_ask(self):
+        """No interactive channel is not an error — it is an instruction.
+
+        `clarify` is a round trip that needs a way to push a prompt mid-turn
+        and wait for a resolution by id. The OpenAI-compatible api_server
+        platform has none (one request in, one response out), so `callback` is
+        None there for every runtime. Returning an error taught the model it
+        could not ask the user anything, on exactly the kind of conversational
+        surface where asking IS the reply and the answer arrives next turn."""
+        result = json.loads(clarify_tool("What do you want?", choices=["a", "b"]))
+        assert "error" not in result
+        assert result["status"] == "no_interactive_channel"
+        assert "ask the question yourself" in result["instruction"].lower()
+        assert result["ask"][0]["question"] == "What do you want?"
+        assert result["ask"][0]["choices"] == ["a", "b"]
+
+    def test_no_callback_batch_carries_every_question(self):
+        result = json.loads(clarify_tool(
+            "", questions=[{"question": "One?"}, {"question": "Two?"}]))
+        assert result["status"] == "no_interactive_channel"
+        assert [q["question"] for q in result["ask"]] == ["One?", "Two?"]
 
 
 class TestClarifyToolChoicesValidation:
