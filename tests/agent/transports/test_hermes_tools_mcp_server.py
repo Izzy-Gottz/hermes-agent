@@ -621,3 +621,43 @@ class TestTheChildSeesWhatHermesWouldShow:
                 continue  # not registered in this build — nothing to withhold
             assert ts in GUI_ONLY_TOOLSETS, (name, ts)
 
+class TheRealServerMarksEveryToolAlwaysLoad:
+    """Close the gap the fake-server tests leave: build the server against the
+    REAL registry (real get_tool_definitions, real classify/assembly) and check
+    the contract holds end to end — every tool the child is handed is marked
+    always-load, no desktop-GUI tool leaks, and the external MCP catalogue is
+    NOT eager-marked (that was the 79k-token regression, commit 16f9dea).
+    """
+
+    def _build(self, monkeypatch):
+        import mcp.server as mcp_server
+        from agent.transports import hermes_tools_mcp_server as m
+        monkeypatch.setattr(mcp_server, "MCPServer", _RecordingServer)
+        # No external servers, so the surface is Hermes' own — deterministic.
+        monkeypatch.setattr(m, "discover_external_mcp_servers", lambda: [])
+        for var in ("HERMES_TOOL_BRIDGE_SOCKET", "HERMES_TOOL_BRIDGE_TOKEN",
+                    "HERMES_TOOL_BRIDGE_TOOLS"):
+            monkeypatch.delenv(var, raising=False)
+        return m._build_server("claude-code")
+
+    def test_every_registered_tool_is_marked(self, monkeypatch):
+        from agent.transports.hermes_tools_mcp_server import ALWAYS_LOAD_META
+        server = self._build(monkeypatch)
+        assert len(server.tools) > 20, "registry looks empty — real defs not loaded"
+        unmarked = [n for n in server.tools if server.meta.get(n) != ALWAYS_LOAD_META]
+        assert unmarked == [], "these reached the child un-marked: %s" % unmarked
+
+    def test_no_desktop_gui_tool_reaches_the_child(self, monkeypatch):
+        server = self._build(monkeypatch)
+        leaked = [n for n in ("annotate_preview", "apply_layout", "focus_pane",
+                              "read_terminal", "tip", "tour", "setup_mcp",
+                              "desktop_project", "desktop_preview")
+                  if n in server.tools]
+        assert leaked == [], "GUI tools that cannot work over MCP leaked: %s" % leaked
+
+    def test_the_os_and_persistent_tools_are_present_and_marked(self, monkeypatch):
+        # The point of the whole change: these are the ones that used to defer.
+        server = self._build(monkeypatch)
+        for name in ("terminal", "read_file", "write_file", "clarify"):
+            assert name in server.tools, "%s missing from the child surface" % name
+
