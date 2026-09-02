@@ -1352,6 +1352,26 @@ class TestToolBridgeWiring:
             session._tool_bridge = None
             session.close()
 
+    def test_a_deadline_hit_is_not_reported_as_silence(self, fake_claude):
+        """The queue wait is min(idle_timeout, deadline - now). When the
+        deadline is the smaller, an empty queue is the ceiling firing, not
+        the silence guard — a 33-tool turn retired at 300 s nine seconds
+        after its last tool result was told "no output for 120s"."""
+        session = _session(fake_claude, expose_hermes_tools=False)
+        try:
+            session.ensure_started()
+            started = time.monotonic()
+            result = session.run_turn(
+                user_input="HANG", turn_timeout=0.5, idle_timeout=5.0
+            )
+            waited = time.monotonic() - started
+            assert waited < 3.0, waited
+            assert result.should_retire is True
+            assert "exceeded" in (result.error or ""), result.error
+            assert "no output" not in (result.error or ""), result.error
+        finally:
+            session.close()
+
     def test_without_a_busy_bridge_silence_is_still_silence(self, fake_claude):
         session = _session(fake_claude, expose_hermes_tools=False)
         try:

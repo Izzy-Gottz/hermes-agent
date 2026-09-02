@@ -1725,6 +1725,12 @@ class ClaudeCodeSession:
                             spent, bridge_grace,
                         )
                         continue
+                    if time.monotonic() >= deadline:
+                        # The wait was `deadline - now`, not idle_timeout: the
+                        # turn ceiling ended it. Let the check at the top of
+                        # the loop say so; "no output for 120s" after nine
+                        # quiet seconds sent the reader to the wrong setting.
+                        continue
                     result.error = self._format_error(
                         f"claude produced no output for {int(idle_timeout)}s"
                     )
