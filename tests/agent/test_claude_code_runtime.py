@@ -765,3 +765,39 @@ class TestPreWarmedSpare:
         with rt._SPARE_LOCK:
             assert rt._SPARE is None
         assert not session.is_alive()
+
+
+class TestParagraphBreakAfterTools:
+    """The HTTP tool loop arms ``_stream_needs_break`` after every tool
+    iteration so ``_fire_stream_delta`` starts the next text on a new
+    paragraph. This runtime fires the same callback from the CLI's stream and
+    used to leave the flag alone, so every SSE client rendered
+    "...take a few minutes.Found the data blob." as one run-on line."""
+
+    def _recording_agent(self, session_id):
+        a = _agent(session_id)
+        a.seen = []          # (flag as the callback saw it, text)
+
+        def _fire(text):
+            a.seen.append((getattr(a, "_stream_needs_break", None), text))
+        a._fire_stream_delta = _fire
+        return a
+
+    def test_flag_is_armed_by_a_tool_result_and_clear_at_turn_start(self):
+        a = self._recording_agent("breaks-1")
+        _turn(a, "TOOL")
+        assert a.seen, "the fake streams text after its tool result"
+        # The first text after the tool result arrives with the break armed.
+        assert a.seen[0][0] is True
+        assert "".join(t for _, t in a.seen) == "The version is 6.2"
+        # A fresh turn starts clean even though the previous one left the
+        # flag where the last delta left it.
+        a._stream_needs_break = True
+        a.seen.clear()
+        _turn(a, "hello")
+        assert a.seen and a.seen[0][0] is False
+
+    def test_a_plain_turn_never_arms_it(self):
+        a = self._recording_agent("breaks-2")
+        _turn(a, "hello")
+        assert a.seen and all(flag is False for flag, _ in a.seen)

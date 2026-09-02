@@ -867,6 +867,14 @@ def make_claude_code_event_bridge(agent) -> Callable[[dict], None]:
                 "tool_complete_callback", event.get("call_id"), name,
                 event.get("args") or {}, event.get("result"),
             )
+            # The next text the child streams is a new paragraph, not the
+            # tail of the sentence it wrote before the tool call. The HTTP
+            # tool loop sets this flag after every tool iteration
+            # (conversation_loop) and _fire_stream_delta prepends one
+            # "\n\n" to the next real delta; this path fires the same
+            # callback and needs the same flag, or every SSE client sees
+            # "...take a few minutes.Found the data blob."
+            agent._stream_needs_break = True
         elif kind == "assistant_message":
             if not getattr(agent, "show_commentary", True):
                 return
@@ -1106,6 +1114,9 @@ def run_claude_code_turn(
         # run_conversation before dispatch). Do not append it again.
         try:
             session.ensure_started()
+            # A turn's first words never carry the break a previous turn
+            # may have left armed (a turn that ended on a tool call).
+            agent._stream_needs_break = False
             turn = session.run_turn(
                 user_input=user_message,
                 turn_timeout=float(cfg.get("turn_timeout") or 600.0),
