@@ -5267,6 +5267,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "running",
                 }))
 
+            def _on_status(event_type, message):
+                """Queue one lifecycle status as an SSE event.
+
+                ``event_type`` is run_agent's own vocabulary —
+                ``lifecycle`` for _emit_status, ``warn`` for
+                _emit_warning — and is passed through rather than
+                collapsed, so a client can treat a warning differently
+                from a notice without parsing the text.
+                """
+                text = str(message or "").strip()
+                if not text:
+                    return
+                _stream_q.put_threadsafe(("__status__", {
+                    "kind": str(event_type or "lifecycle"),
+                    "text": text,
+                }))
+
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Emit the matching ``status: completed`` event.
 
@@ -5300,6 +5317,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                status_callback=_on_status,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
@@ -5489,6 +5507,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__status__":
+                    # Additive: never a delta, so a client that does not
+                    # know this event sees the turn exactly as before.
+                    await response.write(_sse_frame(item[1], event="hermes.status"))
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -7277,6 +7299,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
         restrict_toolsets: Optional[List[str]] = None,
+        status_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7350,6 +7373,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         confirmed_runtime_lock=confirmed_runtime_lock,
                         restrict_toolsets=restrict_toolsets,
                     )
+                    # Lifecycle status (rate-limit warnings, compaction
+                    # notices) has no home on this platform otherwise:
+                    # the status adapter's send() is a stub here, so
+                    # run_agent._emit_status fires into nothing. Set
+                    # before agent_ref so a status emitted during setup
+                    # is not lost.
+                    if status_callback is not None:
+                        agent.status_callback = status_callback
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:
