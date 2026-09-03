@@ -4342,6 +4342,17 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     # ── Tool API keys ──
+    "COMPOSIO_API_KEY": {
+        "description": (
+            "Composio project API key, used by the hosted MCP session server "
+            "that brokers Google Workspace and ~500 other toolkits"
+        ),
+        "prompt": "Composio project API key",
+        "url": "https://platform.composio.dev/",
+        "tools": ["mcp"],
+        "password": True,
+        "category": "tool",
+    },
     "EXA_API_KEY": {
         "description": "Exa API key for AI-native web search and contents",
         "prompt": "Exa API key",
