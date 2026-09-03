@@ -1108,8 +1108,29 @@ def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
     }
 
 
+def claude_code_credentials_disabled() -> bool:
+    """HERMES_CLAUDE_CODE_CREDENTIALS=0 keeps Hermes away from the user's own
+    Claude Code login (the "Claude Code-credentials" keychain item and
+    ~/.claude/.credentials.json): never read as a fallback, never refreshed,
+    never written.
+
+    A host that hands Hermes its own CLAUDE_CODE_OAUTH_TOKEN sets this. Without
+    it, _prefer_refreshable_claude_code_token() quietly runs auxiliary calls on
+    the interactive login instead, and the auth-error retry refreshes it —
+    rotating its single-use refresh token, writing the new pair only to the
+    JSON file, and logging every Claude Code session on the machine out of the
+    keychain pair it still holds (observed 2026-09-02).
+    """
+    return os.environ.get("HERMES_CLAUDE_CODE_CREDENTIALS", "").strip().lower() in {
+        "0", "false", "no", "off",
+    }
+
+
 def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     """Read refreshable Claude Code OAuth credentials.
+
+    Returns None without touching either source when
+    HERMES_CLAUDE_CODE_CREDENTIALS=0 (see claude_code_credentials_disabled).
 
     Reads from two possible sources and reconciles them:
       1. macOS Keychain (Darwin only) — "Claude Code-credentials" entry
@@ -1129,6 +1150,8 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
+    if claude_code_credentials_disabled():
+        return None
     kc_creds = _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
 
@@ -1241,6 +1264,9 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     has already produced a valid token, adopt it and skip the POST entirely.
     Only fall back to refreshing ourselves when no fresh credential is found.
     """
+    if claude_code_credentials_disabled():
+        logger.debug("Claude Code credential refresh disabled (HERMES_CLAUDE_CODE_CREDENTIALS=0)")
+        return None
     # Claude Code may have already refreshed — adopt its token rather than
     # racing it with our (possibly already-rotated) refresh token. Only adopt
     # when the live re-read produced a DIFFERENT token with a real future
@@ -1294,6 +1320,9 @@ def _write_claude_code_credentials(
     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
     in the stored scopes before it will use the token.
     """
+    if claude_code_credentials_disabled():
+        logger.debug("Not writing ~/.claude/.credentials.json (HERMES_CLAUDE_CODE_CREDENTIALS=0)")
+        return
     cred_path = Path.home() / ".claude" / ".credentials.json"
     try:
         # Read existing file to preserve other fields
