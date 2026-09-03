@@ -4191,12 +4191,31 @@ def _refresh_codex_auth_tokens(
     return updated_tokens
 
 
+def codex_cli_credentials_disabled() -> bool:
+    """HERMES_CODEX_CLI_CREDENTIALS=0 keeps Hermes away from the user's own
+    Codex CLI login (~/.codex/auth.json or $CODEX_HOME/auth.json): never
+    adopted as a fallback, so never refreshed by Hermes.
+
+    A host that signs Hermes in on its own (device-code entry in Hermes's
+    store) sets this. OpenAI refresh tokens are single-use: adopting the CLI's
+    pair and refreshing it rotates the pair under the user's Codex CLI / IDE
+    session, which then dies — the same failure the Claude Code login had
+    (HERMES_CLAUDE_CODE_CREDENTIALS, agent/anthropic_adapter.py).
+    """
+    return os.environ.get("HERMES_CODEX_CLI_CREDENTIALS", "").strip().lower() in {
+        "0", "false", "no", "off",
+    }
+
+
 def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
     
     Returns tokens dict if valid and not expired, None otherwise.
-    Does NOT write to the shared file.
+    Does NOT write to the shared file. Returns None without reading when
+    HERMES_CODEX_CLI_CREDENTIALS=0 (see codex_cli_credentials_disabled).
     """
+    if codex_cli_credentials_disabled():
+        return None
     codex_home = os.getenv("CODEX_HOME", "").strip()
     if not codex_home:
         codex_home = str(Path.home() / ".codex")
