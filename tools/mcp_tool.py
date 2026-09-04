@@ -7998,7 +7998,23 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             for mcp_tool in server._tools:
                 if not _should_register(mcp_tool.name):
                     continue
-                schema_obj = getattr(mcp_tool, "inputSchema", None)
+                # `mcp_field`, not `getattr`. mcp 2.0 renamed every model
+                # field to snake_case and kept camelCase only as a
+                # SERIALIZATION alias, and pydantic aliases do not apply to
+                # attribute access — so `getattr(tool, "inputSchema", None)`
+                # returns the default on the pinned SDK rather than raising.
+                # Measured on the live cache before this line was fixed: all
+                # 1,994 cached tools were written with `inputSchema: {}`, so
+                # any server registered lazily from cache offered the model
+                # tools with no parameters at all and no error anywhere.
+                #
+                # Exactly the trap already documented for `readOnlyHint` a few
+                # thousand lines up, which turned every MCP tool on one Mac
+                # into a write-capable one. A rename that reads as a default
+                # is silent by construction; only measuring the artefact finds
+                # it. The on-disk key stays camelCase — that is the file
+                # format, and the reader below expects it.
+                schema_obj = mcp_field(mcp_tool, "input_schema", "inputSchema")
                 tools_payload.append({
                     "name": mcp_tool.name,
                     "description": mcp_tool.description or "",
