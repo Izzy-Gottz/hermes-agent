@@ -2847,13 +2847,16 @@ class CuaDriverBackend(ComputerUseBackend):
         # (for example, multiple unrelated Qt windows can say Qt6Application).
         self._last_target: Optional[Dict[str, Optional[int]]] = None
         # Surface 6 of NousResearch/hermes-agent#47072: per-snapshot
-        # `element_index -> element_token` map populated on capture().
+        # `element_index -> element_token` map populated on capture(), and the
+        # snapshot_id those indices belong to — either is enough to address an
+        # element, and a driver may publish only one of them.
         # Action tools (click/scroll/set_value/...) attach the matching
         # token alongside `element_index` so cua-driver detects "stale"
         # explicitly instead of silently re-resolving to a different
         # element. Cleared whenever a fresh capture overwrites the
         # snapshot context.
         self._snapshot_tokens: Dict[int, str] = {}
+        self._snapshot_id: Optional[str] = None
         # Per-instance public cua-driver session label. The MCP transport owns
         # the private lifecycle and releases it when the connection closes.
         # start_session/end_session attach this stable label to cursor,
@@ -2988,6 +2991,7 @@ class CuaDriverBackend(ComputerUseBackend):
         self._last_app = None
         self._last_target = None
         self._snapshot_tokens = {}
+        self._snapshot_id = None
 
     def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
         """Return an empty capture after disarming any prior target context."""
@@ -3464,6 +3468,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # Tokens belong to the prior window snapshot. Disarm them before any
         # capture call so an exception cannot pair old tokens with this target.
         self._snapshot_tokens = {}
+        self._snapshot_id = None
         app_name = target["app_name"]
         # Record the resolved app name so capture_after= follow-ups can re-target
         # the same app rather than falling back to the frontmost window.
@@ -3648,6 +3653,14 @@ class CuaDriverBackend(ComputerUseBackend):
                 for e in elements
                 if e.element_token
             }
+            # The driver accepts EITHER element_token OR element_index paired
+            # with the snapshot_id it came from. Keeping only the tokens meant
+            # that when a build stopped publishing per-element tokens there was
+            # no second route, and every element click was refused with "bare
+            # element_index is not accepted". Keep both.
+            sc = gws_out.get("structuredContent") if isinstance(gws_out, dict) else None
+            snap = (sc or {}).get("snapshot_id")
+            self._snapshot_id = snap if isinstance(snap, str) and snap else None
 
             # Image may arrive as an MCP image part or inside
             # structuredContent (screenshot_png_b64) depending on the driver
@@ -4179,6 +4192,7 @@ class CuaDriverBackend(ComputerUseBackend):
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
             self._snapshot_tokens = {}
+            self._snapshot_id = None
             self._last_app = target["app_name"] or app  # retained for back-compat diagnostics
             self._last_target = {
                 "pid": self._active_pid,
@@ -4506,6 +4520,20 @@ class CuaDriverBackend(ComputerUseBackend):
         idx = args.get("element_index")
         if not isinstance(idx, int):
             return
+
+        # The snapshot_id route first, because it is the one that survives.
+        # cua-driver 0.23.2 refuses a bare element_index — "pass element_token,
+        # or snapshot_id together with element_index" — and this Mac's driver
+        # advertises 56 tools with ZERO capability tokens on any of them, so
+        # the capability gate below is permanently False. A guard written to
+        # protect old drivers was refusing the current one, and every click by
+        # element index failed: the exact path the tool schema and Moe's own
+        # prompt tell the model to prefer. Measured on 2026-09-04, driving
+        # Freeform, which then fell back to raw coordinates.
+        snap = getattr(self, "_snapshot_id", None)
+        if snap and "snapshot_id" not in args:
+            args["snapshot_id"] = snap
+
         token = self._snapshot_tokens.get(idx)
         if not token:
             return

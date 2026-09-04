@@ -467,6 +467,52 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "clarify": "question", "skill_manage": "name",
     }
 
+    # computer_use: say what is being done to which app, not the tool's own
+    # name. Without this the label was literally "computer_use", so a person
+    # watching Moe drive their Mac heard "Working on your Mac" eight times in
+    # seventy-six seconds and could not tell a screenshot from a click, or
+    # progress from a loop. The preview is the only channel that carries it.
+    if tool_name == "computer_use":
+        action = str(args.get("action") or "").strip().lower()
+        where = str(args.get("app") or "").strip()
+        at = f" in {where}" if where and where.lower() not in ("screen", "desktop") else ""
+        if action == "steps":
+            inner = args.get("steps")
+            names = [str(s.get("action") or "?") for s in inner
+                     if isinstance(s, dict)] if isinstance(inner, list) else []
+            preview = f"{len(names)} steps: " + ", ".join(names[:4]) if names else "steps"
+        elif action == "invoke_menu":
+            path = args.get("path")
+            joined = " > ".join(str(p) for p in path) if isinstance(path, list) else ""
+            preview = f"menu {joined}{at}" if joined else f"menu{at}"
+        elif action == "capture":
+            preview = f"looking{at or ' at the screen'}"
+        elif action == "verify_state":
+            preview = f"checking it worked{at}"
+        elif action in ("click", "double_click", "right_click", "middle_click"):
+            el = args.get("element")
+            coord = args.get("coordinate")
+            target = (f"element {el}" if el is not None
+                      else f"({coord[0]}, {coord[1]})" if isinstance(coord, list)
+                      and len(coord) == 2 else "")
+            preview = f"{action.replace('_', ' ')} {target}{at}".strip()
+        elif action == "type":
+            text = _oneline(str(args.get("text", "") or ""))
+            preview = f"typing {_truncate_preview(text, 40)!r}{at}" if text else f"typing{at}"
+        elif action == "key":
+            preview = f"pressing {args.get('keys', '')}{at}".strip()
+        elif action == "scroll":
+            preview = f"scrolling {args.get('direction', '')}{at}".strip()
+        elif action in ("list_windows", "list_apps", "focused_element"):
+            preview = action.replace("_", " ")
+        elif action == "focus_app":
+            preview = f"switching to {where}" if where else "switching app"
+        elif action:
+            preview = f"{action.replace('_', ' ')}{at}"
+        else:
+            return None
+        return _truncate_preview(preview, max_len)
+
     # browser_exec: prefer the leading `# …` comment as a friendly step label
     if tool_name == "browser_exec":
         label = _browser_exec_step_label(args)
