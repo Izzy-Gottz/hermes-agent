@@ -62,6 +62,29 @@ WINDOW = 20
 # evidence of progress. Never counted, never refused.
 _EXEMPT = frozenset({"wait", "scroll", "key"})
 
+# Reading the screen. None of these change anything, so a run of them is not a
+# loop in the identical-call sense — every screenshot differs, so no two
+# fingerprint alike and the repeat detector cannot see it at all.
+#
+# Measured on a real session, 2026-09-04 20:27-20:37: 33 calls over 578 s. Tool
+# time was 80 s (14%); the model thinking was 498 s (86%). The shape was 22
+# captures against 5 actions, ending in SEVENTEEN consecutive looks with
+# nothing done in between — no failure, no error, just looking. The owner's
+# word for it was "stuck", and he was right. It matches the published
+# measurement (OSWorld-Human: planning and reflection 75-94% of wall clock,
+# grounding 2-4%), and it is the thing worth detecting: not a repeated call,
+# an unproductive one.
+_READ_ONLY = frozenset({
+    "capture", "zoom", "list_windows", "list_apps", "focused_element",
+    "verify_state",
+})
+
+# Six looks with nothing done is worth a word; ten is worth stopping.
+# Generous on purpose — real exploration takes several looks, and the run that
+# prompted this was seventeen.
+LOOK_SOFT_LIMIT = 6
+LOOK_HARD_LIMIT = 10
+
 # Actions that send input somewhere. Repeating one of these unverified is how
 # a message goes twice; repeating a read only costs time.
 _INPUT = frozenset({
@@ -142,6 +165,8 @@ class StallDetector:
     def __init__(self, window: int = WINDOW) -> None:
         self._history: Deque[Tuple[str, str]] = deque(maxlen=window)
         self._lock = threading.Lock()
+        # Consecutive read-only calls since anything last changed the screen.
+        self._looks = 0
 
     def _occurrences(self, call_fp: str) -> int:
         """How many times this call produced its own most recent result.
@@ -220,7 +245,45 @@ class StallDetector:
             ),
         }
 
+    def looks_without_acting(self) -> int:
+        with self._lock:
+            return self._looks
+
+    def looking_loop(self, action: str) -> Optional[Dict[str, Any]]:
+        """Advise, or refuse, a read that is going nowhere.
+
+        Only reads are ever refused here. Stopping someone from *looking* is
+        safe; stopping them from acting is not, and an agent that has looked
+        ten times without acting is not short of pixels.
+        """
+        if action not in _READ_ONLY:
+            return None
+        seen = self.looks_without_acting()
+        if seen + 1 < LOOK_SOFT_LIMIT:
+            return None
+        hard = seen + 1 >= LOOK_HARD_LIMIT
+        return {
+            "decision": "stop_and_report" if hard else "change_approach",
+            "looks_without_acting": seen + 1,
+            "refused": hard,
+            "hint": (
+                f"This is look number {seen + 1} with nothing done in between. "
+                f"Another screenshot will not tell you what the last {seen} "
+                f"did not. Either do the next thing — invoke_menu is usually "
+                f"the surest, and `mac.sh menus <app>` lists the paths — or "
+                f"tell the user plainly what you can see and what is stopping "
+                f"you."
+                + (" Further reads are refused until you act or answer."
+                   if hard else "")
+            ),
+        }
+
     def record(self, action: str, args: Dict[str, Any], result: Any) -> None:
+        with self._lock:
+            if action in _READ_ONLY:
+                self._looks += 1
+            else:
+                self._looks = 0
         if action in _EXEMPT:
             # Not counted — but the history is NOT cleared either. Clearing it
             # let "capture, wait, capture, wait" run forever: inserting a wait

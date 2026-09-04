@@ -795,6 +795,23 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         logger.warning("computer_use %s refused: repeated identical call", action)
         return blocked
 
+    # Looking without acting. Every screenshot differs, so the repeat detector
+    # above cannot see this at all — and it is the shape a real session took
+    # on 2026-09-04: seventeen consecutive captures, nothing done between
+    # them, 86% of ten minutes spent thinking rather than in a tool.
+    looping = detector.looking_loop(action)
+    if looping is not None and looping.get("refused"):
+        logger.warning("computer_use %s refused: %d looks without acting",
+                       action, looping["looks_without_acting"])
+        return json.dumps({
+            "error": (
+                f"refusing another read: {looping['looks_without_acting']} "
+                f"reads in a row without doing anything."
+            ),
+            "code": "looking_without_acting",
+            "verdict": looping,
+        })
+
     # Approval gate (destructive actions only).
     if action in _DESTRUCTIVE_ACTIONS:
         err = _request_approval(action, args, session_id)
@@ -850,7 +867,7 @@ def _attach_stall_advisory(
     verdict says whether *this* action landed, the stall note says the
     *strategy* is not working, and both are true at once.
     """
-    note = detector.advisory(action, args)
+    note = detector.advisory(action, args) or detector.looking_loop(action)
     if note is None:
         return result
     banner = f"[stall] {note['hint']}"
