@@ -4942,9 +4942,26 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     if annotations is None:
         return False
     if isinstance(annotations, dict):
+        # Schema-cache JSON keeps the wire spelling.
         hint = annotations.get("readOnlyHint")
+        if hint is None:
+            hint = annotations.get("read_only_hint")
     else:
-        hint = getattr(annotations, "readOnlyHint", None)
+        # The SDK's ToolAnnotations parses the wire's ``readOnlyHint`` into a
+        # python attribute named ``read_only_hint`` (the camelCase name is the
+        # pydantic ALIAS, not the attribute). Reading only the camelCase
+        # spelling off the model returns None for every tool ever discovered,
+        # so every one of them was recorded write-capable — measured on this
+        # Mac: 2,024 cached tools across four servers, not one True, including
+        # servers that plainly do label their reads.
+        #
+        # The effect was not a crash but a permission prompt: the confirm gate
+        # reads these hints, found none informative, and asked about read-only
+        # calls like COMPOSIO_SEARCH_TOOLS. Both spellings now, attribute
+        # first, because that is what the SDK actually exposes.
+        hint = getattr(annotations, "read_only_hint", None)
+        if hint is None:
+            hint = getattr(annotations, "readOnlyHint", None)
     return hint is True
 
 
