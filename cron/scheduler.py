@@ -5211,9 +5211,17 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     Consults the same ``readiness_status`` payload ``skill_view`` computes
     for interactive use. Skills that fail to load at all are left to the
     existing skipped-skill handling in ``_build_job_prompt`` (fail-open):
-    this check only blocks on an affirmative "setup needed" verdict, i.e.
-    the skill exists but its required environment is missing — a run that
-    is guaranteed to misfire.
+    this check only blocks on an affirmative verdict — the skill exists and
+    either its required environment is missing or a command it declares is
+    not on this machine. Both are runs that are guaranteed to misfire.
+
+    The command half is the stricter one and lives HERE rather than in
+    ``skill_view``'s ``setup_needed``: interactively a person can install the
+    binary and try again, so relabelling the skill everywhere would be too
+    blunt (``agentmail`` declares a command and deliberately keeps its key
+    optional so self-signup stays open). A scheduled run has nobody to ask —
+    it spends an LLM call and dies at the shell — so that is where an absent
+    binary is worth refusing over.
     """
     skills = job.get("skills")
     if skills is None:
@@ -5234,9 +5242,17 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
             continue  # unreadable/missing skill → existing skip handling
         if not isinstance(payload, dict) or not payload.get("success"):
             continue
+        # A missing binary blocks in its own right. It used to reach this
+        # branch only when some OTHER requirement had already set
+        # setup_needed — and `skill_view` hard-coded `missing_required_commands`
+        # to `[]` anyway, so the line below it could never fire. Consumer
+        # present, producer always silent: the job was dispatched, an LLM call
+        # was spent, and the run died at the shell.
+        missing_commands = payload.get("missing_required_commands") or []
         if (
             payload.get("setup_needed")
             or payload.get("readiness_status") == "setup_needed"
+            or missing_commands
         ):
             missing = [
                 f"env ${name}"
@@ -5244,10 +5260,7 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
                     "missing_required_environment_variables"
                 ) or []
             ]
-            missing += [
-                f"command '{name}'"
-                for name in payload.get("missing_required_commands") or []
-            ]
+            missing += [f"command '{name}'" for name in missing_commands]
             missing += [
                 f"credential file {name}"
                 for name in payload.get("missing_credential_files") or []

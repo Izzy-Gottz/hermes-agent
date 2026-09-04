@@ -37,7 +37,12 @@ SKILL.md Format (YAML Frontmatter, agentskills.io compatible):
     prerequisites:                # Optional — legacy runtime requirements
       env_vars: [API_KEY]         #   Legacy env var names are normalized into
                                   #   required_environment_variables on load.
-      commands: [curl, jq]        #   Command checks remain advisory only.
+      commands: [curl, jq]        #   Resolved against PATH plus the usual
+                                  #   local bin dirs and reported in
+                                  #   required_commands /
+                                  #   missing_required_commands. Advisory
+                                  #   interactively; a missing one REFUSES a
+                                  #   scheduled job (cron preflight).
     compatibility: Requires X     # Optional (agentskills.io)
     metadata:                     # Optional, arbitrary key-value (agentskills.io)
       hermes:
@@ -304,6 +309,46 @@ def _collect_prerequisite_values(
         _normalize_prerequisite_values(prereqs.get("env_vars")),
         _normalize_prerequisite_values(prereqs.get("commands")),
     )
+
+
+# A launchd- or gateway-spawned process inherits a PATH that is nothing like
+# the user's shell: on macOS it is typically /usr/bin:/bin:/usr/sbin:/sbin,
+# with neither Homebrew nor ~/.local/bin on it. Resolving a required command
+# against THAT path would report half the machine's binaries missing and, now
+# that a missing command blocks a job, would refuse jobs that work perfectly
+# when run by hand. So the probe searches the inherited PATH plus the three
+# places a user's binaries actually live. Same list as
+# ``transcription_tools.COMMON_LOCAL_BIN_DIRS``, plus the pip/uv user bin.
+_COMMAND_SEARCH_EXTRA_DIRS = (
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "~/.local/bin",
+)
+
+
+def _resolve_required_command(command: str) -> Optional[str]:
+    """Absolute path of ``command``, or None when this machine lacks it."""
+    import shutil
+
+    # `.strip()` is load-bearing, not tidiness: `shutil.which(" sh ")` is
+    # None while `shutil.which("sh")` is /bin/sh, so one stray space in a
+    # skill's frontmatter would report a present binary as missing and block
+    # the job. A blank name needs no guard of its own — which("") is already
+    # None — and a guard that cannot change an outcome is one more check that
+    # cannot fail.
+    name = str(command or "").strip()
+    parts = [p for p in (os.environ.get("PATH") or "").split(os.pathsep) if p]
+    for extra in _COMMAND_SEARCH_EXTRA_DIRS:
+        expanded = os.path.expanduser(extra)
+        if expanded not in parts:
+            parts.append(expanded)
+    return shutil.which(name, path=os.pathsep.join(parts))
+
+
+def _missing_required_commands(commands: List[str]) -> List[str]:
+    """The subset of ``commands`` this machine cannot run, order preserved."""
+    return [c for c in commands if _resolve_required_command(c) is None]
 
 
 def _normalize_setup_metadata(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
@@ -1708,7 +1753,9 @@ def skill_view(
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )
-        legacy_env_vars, _ = _collect_prerequisite_values(frontmatter)
+        legacy_env_vars, required_commands = _collect_prerequisite_values(
+            frontmatter
+        )
         required_env_vars = _get_required_environment_variables(
             frontmatter, legacy_env_vars
         )
@@ -1773,6 +1820,31 @@ def skill_view(
                     skill_name,
                     exc_info=True,
                 )
+
+        # A skill that shells out to a binary this machine does not have
+        # cannot work — and until now nothing ever checked. Both
+        # ``required_commands`` and ``missing_required_commands`` were
+        # hard-coded to ``[]`` in the result below, while
+        # ``cron/scheduler.py::_preflight_check_skills`` was already written
+        # to read them and name the missing command in its refusal. So the
+        # consumer existed, the producer always said "nothing missing", and
+        # the check could not fail: a job attached to such a skill was
+        # dispatched, spent an LLM call, and died at the shell.
+        #
+        # Measured on one real install: 14 skills declare a required command,
+        # 11 of those commands are absent, and 7 of those skills are enabled.
+        #
+        # Reported, NOT gated — deliberately, and unlike the missing
+        # credential-file check below. Setting ``setup_needed`` here relabels
+        # the skill for every consumer of this payload, and a declared command
+        # is not always the blocker its absence looks like: `agentmail`
+        # declares one and keeps its API key optional precisely so the CLI
+        # self-signup path stays open. The refusal belongs where the cost is
+        # real and irreversible — `cron/scheduler.py::_preflight_check_skills`,
+        # which now blocks a scheduled job on a missing command directly
+        # rather than only when some OTHER requirement already said
+        # setup_needed.
+        missing_required_commands = _missing_required_commands(required_commands)
 
         rendered_content = content
         if preprocess:
@@ -1871,10 +1943,10 @@ def skill_view(
             if linked_files
             else None,
             "required_environment_variables": required_env_vars,
-            "required_commands": [],
+            "required_commands": required_commands,
             "missing_required_environment_variables": remaining_missing_required_envs,
             "missing_credential_files": missing_cred_files,
-            "missing_required_commands": [],
+            "missing_required_commands": missing_required_commands,
             "setup_needed": setup_needed,
             "setup_skipped": capture_result["setup_skipped"],
             "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value
@@ -1908,6 +1980,8 @@ def skill_view(
                 f"env ${env_name}" for env_name in remaining_missing_required_envs
             ] + [
                 f"file {path}" for path in missing_cred_files
+            ] + [
+                f"command '{name}'" for name in missing_required_commands
             ]
             setup_note = _build_setup_note(
                 SkillReadinessStatus.SETUP_NEEDED,
