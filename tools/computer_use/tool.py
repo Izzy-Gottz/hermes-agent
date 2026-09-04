@@ -91,12 +91,21 @@ def set_approval_callback(cb) -> None:
 # Actions that read, not mutate. Always allowed.
 _SAFE_ACTIONS = frozenset({
     "capture", "wait", "list_apps", "list_windows", "focused_element",
+    # verify_state only reads accessibility state and window geometry. It is
+    # the answer to "did that work?", and putting an approval prompt in front
+    # of checking your own work would train the user to click through the
+    # prompts that matter.
+    "verify_state",
 })
 
 # Actions that mutate user-visible state. Go through approval.
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
     "drag", "scroll", "type", "key", "set_value", "focus_app",
+    # invoke_menu is a real invocation — "Delete" and "Quit" are menu items
+    # like any other. It is safer than a click in every way except this one,
+    # so it earns the same gate rather than a lighter one.
+    "invoke_menu",
 })
 
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
@@ -630,6 +639,35 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             "code": "bring_to_front_requires_foreground",
         })
 
+    # Argument validation before the dialog, for the same reason the blocked
+    # key/type patterns are checked above it: a malformed path should not cost
+    # the user an approval prompt and then error anyway.
+    if action == "invoke_menu":
+        _path = args.get("path")
+        if not (isinstance(_path, list) and _path
+                and all(isinstance(p, str) and p.strip() for p in _path)):
+            return json.dumps({
+                "error": "invoke_menu requires path=['Menu', 'Item'] — a "
+                         "non-empty list of exact menu labels",
+                "code": "bad_menu_path",
+            })
+    if action == "verify_state":
+        _expect = args.get("expect")
+        if not (isinstance(_expect, list) and 1 <= len(_expect) <= 8
+                and all(isinstance(e, dict) for e in _expect)):
+            return json.dumps({
+                "error": "verify_state requires expect=[{...}] — 1 to 8 "
+                         "predicate objects, ANDed together",
+                "code": "bad_predicate",
+            })
+        for _knob in ("timeout_ms", "stable_samples"):
+            _v = args.get(_knob)
+            if _v is not None and (isinstance(_v, bool) or not isinstance(_v, int)):
+                return json.dumps({
+                    "error": f"verify_state {_knob} must be an integer",
+                    "code": "bad_predicate",
+                })
+
     # Stall check first: every input action is destructive, so leaving this
     # below the approval gate showed the user a dialog on their Mac, took
     # their approval, and only then refused the call.
@@ -742,6 +780,15 @@ def _request_approval(action: str, args: Dict[str, Any],
     """
     is_foreground = args.get("delivery_mode") == "foreground"
     scope_key = (action, "foreground" if is_foreground else "background")
+    # A click needs a capture and coordinates, and each one is a separate
+    # visible decision. A menu path is one opaque approval that would
+    # otherwise cover every future menu item in the session — approving
+    # "Terminal › Quit Terminal" once would silently authorise
+    # "File › Delete Everything" later. Scope it by the path itself.
+    if action == "invoke_menu":
+        path = args.get("path")
+        if isinstance(path, list):
+            scope_key = scope_key + tuple(str(p) for p in path)
     with _approval_lock:
         if _session_auto_approve.get(session_id):
             return None
@@ -800,6 +847,11 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
         return f"key {args.get('keys', '')!r}{fg}"
     if action == "focus_app":
         return f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")
+    if action == "invoke_menu":
+        path = args.get("path")
+        if isinstance(path, list) and path:
+            return "menu " + " › ".join(str(p) for p in path)
+        return "menu (no path)"
     return action + fg
 
 
@@ -860,6 +912,47 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
     if action == "list_apps":
         apps = backend.list_apps()
         return json.dumps({"apps": apps, "count": len(apps)})
+
+    if action == "invoke_menu":
+        path = args.get("path")
+        if not (isinstance(path, list) and path
+                and all(isinstance(p, str) and p.strip() for p in path)):
+            return json.dumps({
+                "error": "invoke_menu requires path=['Menu', 'Item'] — a "
+                         "non-empty list of exact menu labels",
+                "code": "bad_menu_path",
+            })
+        fn = getattr(backend, "invoke_menu", None)
+        if fn is None:
+            return json.dumps({
+                "error": "invoke_menu is not supported by this backend",
+                "hint": "The macOS-native fallback backend has no menu API; "
+                        "cua-driver does. Run `hermes computer-use doctor`.",
+            })
+        res = fn(path, pid=args.get("pid"), window_id=args.get("window_id"))
+        return _text_response(res)
+
+    if action == "verify_state":
+        expect = args.get("expect")
+        if not (isinstance(expect, list) and 1 <= len(expect) <= 8
+                and all(isinstance(e, dict) for e in expect)):
+            return json.dumps({
+                "error": "verify_state requires expect=[{...}] — 1 to 8 "
+                         "predicate objects, ANDed together",
+                "code": "bad_predicate",
+            })
+        fn = getattr(backend, "verify_state", None)
+        if fn is None:
+            return json.dumps({
+                "error": "verify_state is not supported by this backend",
+                "hint": "The macOS-native fallback backend cannot evaluate "
+                        "predicates; cua-driver can. Re-capture and read the "
+                        "result instead.",
+            })
+        res = fn(expect, pid=args.get("pid"), window_id=args.get("window_id"),
+                 timeout_ms=args.get("timeout_ms"),
+                 stable_samples=args.get("stable_samples"))
+        return json.dumps(_verify_payload(res))
 
     if action == "list_windows":
         windows = backend.list_windows()
@@ -1056,6 +1149,65 @@ def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
     }
 
 
+def _verify_payload(res: ActionResult) -> Dict[str, Any]:
+    """A predicate verdict, in its own vocabulary.
+
+    `verify_state` sent no input, so the input-delivery ladder does not apply
+    to it. Routing it through the shared payload mapped `unsatisfied` onto
+    `suspected_noop`, whose hint tells the model "the input likely did not
+    land — re-issue by coordinate, or with delivery_mode='foreground'". For a
+    read-only check that answered "no", that is an instruction to click
+    somewhere and to pull the user's desktop to another Space, for an action
+    that never happened.
+
+    The three values stay three, and `verified` is emitted explicitly —
+    including as `null` — because "I could not tell" and "this driver does not
+    report it" are different answers and an absent key cannot distinguish them.
+    """
+    meta = res.meta if isinstance(res.meta, dict) else {}
+    status = meta.get("status")
+    if not isinstance(status, str):
+        status = "unknown"
+
+    decision, hint = {
+        "satisfied": (
+            "confirmed",
+            "The predicate holds. This is proof; you do not need a screenshot "
+            "to confirm it again.",
+        ),
+        "unsatisfied": (
+            "not_yet",
+            "The predicate does not hold. The world is not in the state you "
+            "expected — decide whether to wait longer (raise timeout_ms), act "
+            "differently, or tell the user. Do NOT re-issue input on the "
+            "strength of this alone: nothing was sent.",
+        ),
+    }.get(status, (
+        "cannot_tell",
+        "The driver could not establish the predicate. UNKNOWN IS NOT "
+        "SUCCESS and it is not failure either — absence of an element is not "
+        "proof of absence unless the search was exhaustive. Try a different "
+        "selector, a longer timeout_ms, or capture and look.",
+    ))
+
+    payload: Dict[str, Any] = {
+        "ok": res.ok,
+        "action": "verify_state",
+        "status": status,
+        # Explicitly present, explicitly nullable.
+        "verified": {"satisfied": True, "unsatisfied": False}.get(status),
+        "verdict": {"decision": decision, "hint": hint},
+    }
+    if res.message:
+        payload["message"] = res.message
+    for key in ("predicates", "elapsed_ms", "samples", "stable"):
+        if key in meta:
+            payload[key] = meta[key]
+    if res.code:
+        payload["code"] = res.code
+    return payload
+
+
 def _action_payload(res: ActionResult) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"ok": res.ok, "action": res.action}
     if res.message:
@@ -1083,7 +1235,8 @@ def _action_payload(res: ActionResult) -> Dict[str, Any]:
         payload["meta"] = res.meta
         # Landing info is hoisted to the top level so it is impossible to
         # miss: where the input went matters more than that it was sent.
-        for k in ("front_app", "focused", "front_app_changed", "front_app_before"):
+        for k in ("front_app", "focused", "front_app_changed",
+                  "front_app_before", "target"):
             if k in res.meta:
                 payload[k] = res.meta[k]
     payload["verdict"] = _classify_action_result(res)

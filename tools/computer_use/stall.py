@@ -87,6 +87,10 @@ def call_fingerprint(action: str, args: Dict[str, Any]) -> str:
             "app", "pid", "window_id", "element", "coordinate", "mode",
             "direction", "amount", "keys", "region", "from_element",
             "to_element", "from_coordinate", "to_coordinate",
+            # Without these, five DIFFERENT menu items in one window look like
+            # one call repeated five times, and the fifth is refused with a
+            # message ("these exact arguments") that is simply false.
+            "path", "expect",
         )
         if args.get(k) is not None
     }

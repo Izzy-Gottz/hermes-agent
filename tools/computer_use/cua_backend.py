@@ -2659,6 +2659,38 @@ def _degraded_reason_from(out: Any) -> Optional[str]:
     return None
 
 
+def _apply_driver_status(res: ActionResult, *, refusal_effect: str = "suspected_noop") -> ActionResult:
+    """Make a structured refusal read as a failure.
+
+    Measured against cua-driver 0.23.2 over raw MCP: a refused `invoke_menu`
+    already comes back with ``isError: true``, so ``_action`` has set
+    ``ok=False`` before this runs. This is belt-and-braces, not the load-bearing
+    check — an earlier draft of this comment claimed otherwise, and a
+    justification a future reader trusts had better be true.
+
+    What it adds is the *vocabulary*: lifting the refusal's `code` and giving
+    the result an `effect` the model already knows how to read, so a refusal
+    is not left as a bare failure with no verdict.
+
+    It deliberately does NOT synthesise ``verified``. That field means "the
+    driver read the effect back"; manufacturing it from a status word made
+    ``_classify_action_result`` return ``done`` for a result whose own effect
+    said ``unverifiable``.
+    """
+    meta = res.meta if isinstance(res.meta, dict) else {}
+    status = meta.get("status")
+    refusal = meta.get("refusal")
+    if isinstance(refusal, dict) or status in ("refused", "failed", "error"):
+        res.ok = False
+        res.effect = res.effect or refusal_effect
+        if isinstance(refusal, dict):
+            res.code = res.code or (refusal.get("code")
+                                    if isinstance(refusal.get("code"), str) else None)
+            if not res.message and isinstance(refusal.get("message"), str):
+                res.message = refusal["message"]
+    return res
+
+
 def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalise cua-driver ``list_windows`` entries, dropping unusable ones.
 
@@ -4018,6 +4050,104 @@ class CuaDriverBackend(ComputerUseBackend):
 
         locatable.sort(key=lambda w: (_rank(w), -w["z_index"]))
         return locatable
+
+    def invoke_menu(self, path: List[str], *, pid: Optional[int] = None,
+                    window_id: Optional[int] = None) -> ActionResult:
+        """Invoke an application menu item by its exact path, through AX.
+
+        This is the rung of the ladder that was missing. Clicking a menu means
+        a screenshot, a grounding decision, a click to open the menu, another
+        screenshot because the menu did not exist a moment ago, and another
+        click — five fragile steps, each able to land somewhere else. The
+        driver resolves the path one live native level at a time and invokes
+        the final item through the accessibility API, and its own contract is
+        that missing, ambiguous, disabled or structurally mismatched segments
+        **fail closed: it never falls back to pixels**.
+
+        It also reaches where pixels barely do. A DAW, a CAD app or a 3D tool
+        draws its canvas as one custom surface that exposes no AX tree at all,
+        but its menu bar is standard AppKit and fully enumerable — so "bounce
+        the track" is a menu path even when nothing else in the window can be
+        addressed.
+        """
+        target_pid = pid if pid is not None else self._active_pid
+        target_window = window_id if window_id is not None else self._active_window_id
+        if not target_pid or not target_window:
+            return ActionResult(
+                ok=False, action="invoke_menu",
+                message="invoke_menu needs a target: capture(app=...) first, "
+                        "or pass pid and window_id from list_windows.",
+                code="no_target",
+            )
+        res = self._action("invoke_menu", {
+            "pid": int(target_pid),
+            "window_id": int(target_window),
+            "path": [str(p) for p in path],
+        })
+        res = _apply_driver_status(res)
+        # Say which app this actually reached. Both targets default to
+        # whatever the last capture selected, so capture(app='Mail') →
+        # capture(app='Notes') → invoke_menu(['File','Delete']) fires in
+        # Notes — and unlike a click there is no element token to catch a
+        # stale snapshot. Echoing the resolved target is what lets the model
+        # notice, and it costs nothing.
+        res.meta = dict(res.meta or {})
+        res.meta["target"] = {
+            "pid": int(target_pid),
+            "window_id": int(target_window),
+            "app": self._app_name_for_pid(int(target_pid)),
+            "path": [str(p) for p in path],
+        }
+        return res
+
+    def _app_name_for_pid(self, pid: int) -> str:
+        """Best-effort app name for a pid, for the record only."""
+        try:
+            for w in self._load_windows_all_spaces():
+                if w.get("pid") == pid and w.get("app_name"):
+                    return str(w["app_name"])
+        except Exception:
+            pass
+        return ""
+
+    def verify_state(self, expect: List[Dict[str, Any]], *,
+                     pid: Optional[int] = None,
+                     window_id: Optional[int] = None,
+                     timeout_ms: Optional[int] = None,
+                     stable_samples: Optional[int] = None) -> ActionResult:
+        """Ask the driver whether the world actually looks the way it should.
+
+        Every action already comes back with a verdict about the *input* — did
+        the event go out, was it confirmed. This is the other half: a
+        predicate about the *result*, evaluated against live accessibility
+        state, with a bounded wait and consecutive stable samples so a window
+        caught mid-redraw is not read as success.
+
+        The three-valued answer is the point. `unknown` never implies success,
+        and the driver is deliberately conservative — absence of an element
+        stays unknown unless the search domain is proven exhaustive. That is
+        the honest shape for "I could not tell", and it is what a retry
+        decision needs to be able to distinguish from "it did not work".
+        """
+        target_pid = pid if pid is not None else self._active_pid
+        target_window = window_id if window_id is not None else self._active_window_id
+        if not target_pid or not target_window:
+            return ActionResult(
+                ok=False, action="verify_state",
+                message="verify_state needs a target: capture(app=...) first, "
+                        "or pass pid and window_id from list_windows.",
+                code="no_target",
+            )
+        args: Dict[str, Any] = {
+            "pid": int(target_pid),
+            "window_id": int(target_window),
+            "expect": expect,
+        }
+        if timeout_ms is not None:
+            args["timeout_ms"] = max(0, min(10000, int(timeout_ms)))
+        if stable_samples is not None:
+            args["stable_samples"] = max(1, min(5, int(stable_samples)))
+        return self._action("verify_state", args)
 
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
         """Target an app, optionally invoking standalone foreground focus.
