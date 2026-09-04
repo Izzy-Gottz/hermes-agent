@@ -1163,6 +1163,42 @@ def _image_dimensions_from_b64(image_b64: str) -> Optional[Tuple[int, int]]:
     return None
 
 
+_DEGRADED_HINTS = {
+    "ax_window_unresolved": (
+        "the window is live but its accessibility surface could not be "
+        "resolved — usual causes are a window on another macOS Space, a "
+        "just-launched app whose tree is not built yet, or a canvas/Electron "
+        "surface that exposes none. Check list_windows for on_current_space; "
+        "if it is elsewhere, read it with mode='vision' rather than 'som'. "
+        "If the app only just launched, wait and re-capture once"
+    ),
+    "minimized_or_hidden_window": (
+        "the window is minimized or hidden, so it has no on-screen surface "
+        "to read or click. focus_app(raise_window=true) un-minimizes it"
+    ),
+}
+
+
+def _degraded_note(reason: Optional[str], total_elements: int) -> Optional[str]:
+    """One line explaining a thin capture, or None when there is nothing to say.
+
+    Only speaks up when the elements are actually missing: a full capture that
+    happens to carry a degraded flag needs no apology, and a note on every
+    successful call is a note nobody reads.
+    """
+    if not reason or total_elements:
+        return None
+    hint = _DEGRADED_HINTS.get(reason)
+    if hint:
+        return f"  (degraded: {reason} — {hint}.)"
+    # An unknown value is still worth surfacing verbatim; the driver may have
+    # added one, and "no elements, no reason" is the state this exists to end.
+    return (
+        f"  (degraded: {reason} — the driver returned no elements for this "
+        f"window. Try mode='vision', or a different window from list_windows.)"
+    )
+
+
 def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS) -> Any:
     total_elements = len(cap.elements)
     visible_elements = cap.elements[:max_elements]
@@ -1213,6 +1249,14 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         + (f" window={cap.window_title!r}" if cap.window_title else ""),
         f"{total_elements} interactable element(s):",
     ]
+    # An empty element list has to say why. "0 interactable element(s)" alone
+    # cannot distinguish an app with no accessibility tree from a window on
+    # another Space, and the two have different fixes — one needs pixels, the
+    # other needs a different window. The driver already knows; it just was
+    # never asked.
+    degraded = _degraded_note(cap.degraded_reason, total_elements)
+    if degraded:
+        summary_lines.append(degraded)
     if bounds_note:
         summary_lines.append(f"  ({bounds_note})")
     if screenshot_path:

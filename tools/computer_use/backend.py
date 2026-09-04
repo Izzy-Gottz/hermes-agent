@@ -59,6 +59,17 @@ class CaptureResult:
     window_title: str = ""
     # Raw bytes we sent to Anthropic, for token estimation.
     png_bytes_len: int = 0
+    # Why this capture is thinner than it looks, when the driver says so.
+    #
+    # cua-driver returns the screenshot but an EMPTY element list with
+    # `degraded_reason: ax_window_unresolved` when a window's accessibility
+    # surface cannot be resolved — which is exactly what happens to a window
+    # on another macOS Space. Hermes read none of that: `grep degraded_reason`
+    # over tools/computer_use/ returned nothing, so the model was handed a
+    # picture with `0 interactable elements` and no explanation, and had no way
+    # to tell "this app has no AX tree" from "this window is somewhere I cannot
+    # see it". Both look like an empty capture; only one has a fix.
+    degraded_reason: Optional[str] = None
     # Explicit MIME type for `png_b64` when the backend supplied it
     # (cua-driver-rs emits `mimeType` on every image part as of
     # trycua/cua#1961 — Surface 7 of NousResearch/hermes-agent#47072).

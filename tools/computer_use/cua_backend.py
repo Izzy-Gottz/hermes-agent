@@ -2640,6 +2640,25 @@ def _is_placeholder_id(value: Any) -> bool:
         return False
 
 
+def _degraded_reason_from(out: Any) -> Optional[str]:
+    """The driver's own word for why a capture came back thin.
+
+    Known values include ``ax_window_unresolved`` — "the window is live under
+    this pid but its accessibility surface can't be resolved", which is what a
+    window on another Space reports. Any string the driver sends is passed
+    through unchanged: this is a diagnostic, and inventing a taxonomy here
+    would go stale the first time the driver adds a value.
+    """
+    if not isinstance(out, dict):
+        return None
+    for source in (out.get("structuredContent"), out.get("data"), out):
+        if isinstance(source, dict):
+            value = source.get("degraded_reason")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
 def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalise cua-driver ``list_windows`` entries, dropping unusable ones.
 
@@ -3429,6 +3448,9 @@ class CuaDriverBackend(ComputerUseBackend):
         elements: List[UIElement] = []
         width = height = 0
         window_title = ""
+        # Only the get_window_state paths bind this; a pure vision capture
+        # never asks the driver for a tree and so has no reason to report.
+        gws_out: Optional[Dict[str, Any]] = None
 
         if mode == "vision":
             # Plain screenshot, no AX walk. cua-driver dropped the standalone
@@ -3627,6 +3649,7 @@ class CuaDriverBackend(ComputerUseBackend):
             window_title=window_title,
             png_bytes_len=png_bytes_len,
             image_mime_type=image_mime_type,
+            degraded_reason=_degraded_reason_from(gws_out),
         )
 
     # ── Pointer ────────────────────────────────────────────────────
