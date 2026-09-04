@@ -3094,7 +3094,9 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
 
     or_key = explicit_api_key or _scoped_key_env("OPENROUTER_API_KEY")
     if not or_key:
-        _mark_provider_unhealthy("openrouter", ttl=60)
+        # No env key, and the pool above had none usable either. That is an
+        # absent credential, not a refused payment.
+        _mark_provider_unhealthy("openrouter", reason="unconfigured")
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return _create_openai_client(api_key=or_key, base_url=OPENROUTER_BASE_URL,
@@ -3145,7 +3147,8 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
             "Auxiliary Nous client unavailable: no Nous authentication found "
             "(run: hermes auth)."
         )
-        _mark_provider_unhealthy("nous", ttl=60)
+        # No auth.json and no runtime: Nous was never set up here.
+        _mark_provider_unhealthy("nous", reason="unconfigured")
         return None, None
     if runtime is None and nous:
         logger.debug(
@@ -4281,21 +4284,72 @@ def _normalize_chain_label(provider: str) -> str:
     return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
 
-def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
-    """Mark ``provider`` as recently-402'd, hidden from chain iteration
-    until the TTL expires. Called from the payment-fallback branches in
-    ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+#: How long an UNCONFIGURED provider stays skipped. Deliberately far longer
+#: than the payment TTL: a provider with no credential cannot start working
+#: because sixty seconds passed. Nothing but a config change fixes it, and a
+#: config change means a restart, which clears this map anyway.
+_AUX_UNCONFIGURED_TTL_SECONDS = 3600
+
+#: Labels already reported as unconfigured, so the explanation is logged once
+#: per process instead of once per attempt. The state is still in
+#: ``_aux_unhealthy_until``; this only bounds the noise.
+_aux_unconfigured_reported = set()
+
+
+def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None,
+                             reason: str = "payment") -> None:
+    """Hide ``provider`` from chain iteration until the TTL expires.
+
+    ``reason`` is not decoration — it decides what the log says happened, and
+    saying the wrong thing here has a real cost. This function had one message
+    for every caller, *"payment / credit error"*, and two of its call sites
+    reach it when a provider has **no credential at all**: OpenRouter with no
+    ``OPENROUTER_API_KEY`` and an exhausted key pool, and Nous with no
+    ``auth.json``. On a machine where neither was ever configured that put
+
+        Auxiliary: marking nous unhealthy for 60s (payment / credit error)
+
+    in the gateway log every sixty seconds, three lines above Nous's own
+    *"no Nous authentication found (run: hermes auth)"* — sending anyone who
+    read it to check a bill for an account that does not exist. An error that
+    names the wrong cause is worse than one that says nothing, because it
+    spends the reader's time going somewhere there is nothing to find.
+
+    ``reason="unconfigured"`` also stops the retry loop being pointless: a
+    missing credential cannot resolve itself on a timer, so it is held for
+    :data:`_AUX_UNCONFIGURED_TTL_SECONDS` and explained once per process
+    rather than re-announced on every attempt.
     """
     label = _normalize_chain_label(provider)
     if not label:
         return
-    expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
+    unconfigured = reason == "unconfigured"
+    if ttl is None:
+        ttl = (_AUX_UNCONFIGURED_TTL_SECONDS if unconfigured
+               else _AUX_UNHEALTHY_TTL_SECONDS)
+    expires_at = time.time() + ttl
     _aux_unhealthy_until[label] = expires_at
+    if unconfigured:
+        if label in _aux_unconfigured_reported:
+            logger.debug(
+                "Auxiliary: %s still unconfigured; skipping it until %s.",
+                label, time.strftime("%H:%M:%S", time.localtime(expires_at)))
+            return
+        _aux_unconfigured_reported.add(label)
+        logger.warning(
+            "Auxiliary: skipping %s — it is NOT CONFIGURED on this machine "
+            "(no credential), which is not a billing problem and will not fix "
+            "itself. Configure it or set an auxiliary provider that this "
+            "machine can actually reach. Skipping it until %s.",
+            label,
+            time.strftime("%H:%M:%S", time.localtime(expires_at)),
+        )
+        return
     logger.warning(
         "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
         "Subsequent auxiliary calls will skip it until %s.",
         label,
-        int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
+        int(ttl),
         time.strftime("%H:%M:%S", time.localtime(expires_at)),
     )
 
