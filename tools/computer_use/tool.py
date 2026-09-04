@@ -65,6 +65,7 @@ from tools.computer_use.backend import (
     ComputerUseBackend,
     UIElement,
 )
+from tools.computer_use.stall import StallDetector
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +192,25 @@ _backend_lock = threading.Lock()
 # Backward-compatible empty-session injection hook used by older tests.
 # Process-scoped aux-vision routing cache: (provider, model) → bool.
 _AUX_VISION_ROUTE_CACHE: Dict[Tuple[str, str], bool] = {}
+
+# Per-session stall history. Keyed the same way as _backend_call_locks so a
+# second tenant can never inherit another session's streak — this module is
+# imported once per process and serves every session on it.
+_stall_detectors: Dict[str, StallDetector] = {}
+
+
+def _stall_detector(session_id: str) -> StallDetector:
+    """The session's detector, created on first use.
+
+    Deliberately not under ``_backend_lock``: that lock is held across
+    ``backend.start()``, a multi-second cua-driver spawn, and this needs none
+    of it. ``setdefault`` on a plain dict is atomic under the GIL, and the
+    detector guards its own history.
+    """
+    det = _stall_detectors.get(session_id)
+    if det is None:
+        det = _stall_detectors.setdefault(session_id, StallDetector())
+    return det
 _backend: Optional[ComputerUseBackend] = None
 _backends: Dict[str, ComputerUseBackend] = {}
 _backend_call_locks: Dict[str, threading.RLock] = {}
@@ -412,6 +432,10 @@ def release_computer_use_session(session_id: str) -> bool:
         backend = _backends.pop(sid, None)
         call_lock = _backend_call_locks.pop(sid, None)
         _backend_permission_modes.pop(sid, None)
+        # Otherwise a turn that ended on three identical captures leaves a
+        # live count behind, and the NEXT turn's first capture — different
+        # request, changed screen — arrives already at the advisory tier.
+        _stall_detectors.pop(sid, None)
         # Preserve the backward-compatible empty-session injection hook:
         # older callers/tests may populate only `_backend`.
         if sid == "" and backend is None:
@@ -474,6 +498,7 @@ def _shutdown_backend_atexit() -> None:
         _backends.clear()
         _backend_call_locks.clear()
         _backend_permission_modes.clear()
+        _stall_detectors.clear()
 
     with _approval_lock:
         _session_auto_approve.clear()
@@ -605,6 +630,15 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             "code": "bring_to_front_requires_foreground",
         })
 
+    # Stall check first: every input action is destructive, so leaving this
+    # below the approval gate showed the user a dialog on their Mac, took
+    # their approval, and only then refused the call.
+    detector = _stall_detector(session_id)
+    blocked = detector.block_reason(action, args)
+    if blocked is not None:
+        logger.warning("computer_use %s refused: repeated identical call", action)
+        return blocked
+
     # Approval gate (destructive actions only).
     if action in _DESTRUCTIVE_ACTIONS:
         err = _request_approval(action, args, session_id)
@@ -634,10 +668,63 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         with _backend_lock:
             call_lock = _backend_call_locks.setdefault(session_id, threading.RLock())
         with call_lock:
-            return _dispatch(backend, action, args)
+            result = _dispatch(backend, action, args)
     except Exception as e:
         logger.exception("computer_use %s failed", action)
-        return json.dumps({"error": f"{action} failed: {e}"})
+        failed = json.dumps({"error": f"{action} failed: {e}"})
+        detector.record(action, args, failed)
+        return failed
+
+    detector.record(action, args, result)
+    return _attach_stall_advisory(detector, action, args, result)
+
+
+def _attach_stall_advisory(
+    detector: StallDetector, action: str, args: Dict[str, Any], result: Any
+) -> Any:
+    """Fold the soft-tier warning into the channel the model actually reads.
+
+    A `stall` key on a multimodal envelope is dropped on the floor: the agent
+    loop hands the model only ``content`` (or ``text_summary``), so the soft
+    tier — the half that is supposed to change strategy *before* total failure
+    — was silently inert on exactly the screenshot-bearing captures it exists
+    for. `_maybe_follow_capture` already solved this; do what it does.
+
+    Kept alongside the existing ``verdict`` rather than replacing it: the
+    verdict says whether *this* action landed, the stall note says the
+    *strategy* is not working, and both are true at once.
+    """
+    note = detector.advisory(action, args)
+    if note is None:
+        return result
+    banner = f"[stall] {note['hint']}"
+
+    if isinstance(result, dict):
+        result = dict(result)
+        result["stall"] = note
+        if result.get("_multimodal"):
+            content = result.get("content")
+            if isinstance(content, list) and content:
+                head = content[0]
+                if isinstance(head, dict) and isinstance(head.get("text"), str):
+                    content = list(content)
+                    content[0] = dict(head, text=f"{banner}\n\n{head['text']}")
+                    result["content"] = content
+            summary = result.get("text_summary")
+            if isinstance(summary, str):
+                result["text_summary"] = f"{banner}\n\n{summary}"
+        return result
+
+    if isinstance(result, str):
+        try:
+            payload = json.loads(result)
+        except Exception:
+            return f"{banner}\n\n{result}"
+        if isinstance(payload, dict):
+            payload["stall"] = note
+            return json.dumps(payload)
+        return f"{banner}\n\n{result}"
+    return result
 
 
 def _request_approval(action: str, args: Dict[str, Any],
