@@ -6427,6 +6427,237 @@ def _ensure_healthy_or_recycle(server: Any, server_name: str) -> None:
         _signal_reconnect(server)
 
 
+# ---------------------------------------------------------------------------
+# Composio: the cheap default, for tools whose own default is the expensive one
+# ---------------------------------------------------------------------------
+#
+# Composio fronts ~500 toolkits whose tools were authored one at a time, and a
+# handful of them default to returning far more data than any question needs.
+# Measured 2026-09-04 against a real Gmail account, 40 messages, one query,
+# with the message-id set verified identical across every arm:
+#
+#     verbose omitted, include_payload omitted   1,674,724 B   41,868 B/msg
+#     verbose omitted, include_payload: false      354,090 B    8,852 B/msg
+#     verbose: false,  include_payload omitted     348,378 B    8,709 B/msg
+#     verbose: false,  include_payload: false       33,690 B      842 B/msg
+#
+# 49.7x between the corners, and the expensive corner is exactly what a model
+# that reads the schema and passes nothing gets: NEITHER description mentions
+# bytes. `verbose` describes speed ("~75% improvement"); `include_payload`
+# claims "metadata only" while in fact leaving the whole decoded body in.
+#
+# The cost is not the bytes. A result this size is spilled to a file and the
+# model is handed a path, so "who emailed me today" becomes grepping a file --
+# one such turn was measured at 103.7 s to first token.
+#
+# Four rules, each of which was learned the expensive way:
+#
+#   1. ONLY where the caller omitted the parameter. A default is a fallback,
+#      never an override; a model that asked for the body gets the body.
+#   2. ONLY on Composio's own servers, identified by the session URL. A tool
+#      called GMAIL_FETCH_EMAILS on somebody else's server is somebody else's
+#      tool, and inheriting a broker's identity by name alone is a bug this
+#      codebase has already shipped once.
+#   3. ONLY parameters the live schema still declares. If Composio renames
+#      `verbose`, the table stops applying rather than posting an unknown key.
+#      Unknown slug = no opinion (the multiplexer can reach tools that were
+#      never preloaded, so their schemas are not in `_tools`).
+#   4. SAY SO in the result -- INCLUDING when the call fails. A default that
+#      silently removes the answer is unrecoverable: the model cannot ask for
+#      what it does not know it lost. The failure case is the sharper one. If
+#      Composio ever rejects a key this table injected, the model sees an
+#      error naming a parameter IT DID NOT PASS, cannot remove it, and retries
+#      identically forever -- so every return path carries the note, not just
+#      the happy one. One line costs ~200 bytes against ~1.6 MB.
+#
+# Both invocation paths land here, which is the point of doing it in the
+# handler: the model calls these tools directly AND through
+# COMPOSIO_MULTI_EXECUTE_TOOL, and the byte behaviour differs per path (the
+# list fetch is 167,231 B direct against 49,218 B muxed; the by-id fetch
+# differs only by a ~150 B envelope). A default that landed on one path only
+# would make the cost depend on which wrapper the model happened to pick.
+#
+# What is deliberately NOT in the table:
+#
+#   GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID. `format: "metadata"` is a real 8.9x
+#   and Composio's own description recommends it -- but this tool's entire job
+#   is "what does this message say", so defaulting it away deletes the answer
+#   to the question that was asked. Lists are for finding; fetches are for
+#   reading, and the reading tool is left alone.
+#
+#   GOOGLEDRIVE_GET_ABOUT. Its `fields` default is expensive, but no cheap
+#   value has been measured to be VALID here, and on the neighbouring
+#   GOOGLEDRIVE_FIND_FILE an unrecognised selector does not error -- it falls
+#   back to everything, costing 4x what omitting the parameter costs. A guess
+#   would be a well-formed value that resolves to nothing, which is worse than
+#   no value at all. Measure a real selector first, then add it.
+_COMPOSIO_HOSTS = ("composio.dev",)
+
+_COMPOSIO_MULTIPLEXER = "COMPOSIO_MULTI_EXECUTE_TOOL"
+
+# slug -> {parameter: cheap value}. Uppercase keys; slugs are matched folded.
+_COMPOSIO_CHEAP_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    # The survey tool. Both flags together leave ids, labels, timestamps,
+    # subject, sender, to and a preview snippet -- 842 B/message, which is the
+    # metadata-only answer neither flag's description offers.
+    "GMAIL_FETCH_EMAILS": {"verbose": False, "include_payload": False},
+}
+
+# What to tell the model it can do about it, per slug.
+_COMPOSIO_DEFAULT_HINTS: Dict[str, str] = {
+    "GMAIL_FETCH_EMAILS": (
+        "message bodies are omitted; pass verbose=true for full text (naming "
+        "either flag yourself turns this off entirely), or fetch one message "
+        "by id"
+    ),
+}
+
+
+def _is_composio_server(server: Any) -> bool:
+    """True when this server is a Composio session, by URL not by name.
+
+    The config key is whatever the user called the server, so the name proves
+    nothing. The URL is the thing Composio actually owns.
+    """
+    try:
+        url = str((getattr(server, "_config", None) or {}).get("url") or "")
+    except Exception:
+        return False
+    if not url:
+        return False  # stdio servers have no url; nothing to match.
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    # Parsed, not substring-matched. `composio.dev.example.com`,
+    # `notcomposio.dev` and `https://x/?ref=composio.dev` all contain the
+    # string and are all somebody else.
+    return any(host == h or host.endswith("." + h) for h in _COMPOSIO_HOSTS)
+
+
+def _composio_declares(server: Any, slug: str, param: str) -> Optional[bool]:
+    """Does the live schema for ``slug`` declare ``param``?
+
+    True / False when the tool is known to this server, None when it is not --
+    the multiplexer can reach tools that were never preloaded, and "I have no
+    schema" must not read as "the parameter is gone".
+    """
+    try:
+        tools = getattr(server, "_tools", None) or []
+    except Exception:
+        return None
+    for t in tools:
+        if str(getattr(t, "name", "") or "").upper() != slug:
+            continue
+        schema = mcp_field(t, "input_schema", "inputSchema") or {}
+        if not isinstance(schema, dict):
+            return None
+        props = schema.get("properties")
+        if not isinstance(props, dict):
+            return None
+        return param in props
+    return None
+
+
+def _composio_default_one(server: Any, slug: Any, arguments: Any):
+    """Fill omitted cheap defaults for one Composio tool call.
+
+    Returns ``(arguments, ["k=v", ...])`` -- the same object and an empty list
+    when nothing applied, so callers can test for change by the list alone.
+    """
+    key = str(slug or "").upper()
+    table = _COMPOSIO_CHEAP_DEFAULTS.get(key)
+    if not table:
+        return arguments, []
+    # A mux entry may carry no `arguments` at all -- `{"tool_slug": "..."}`
+    # with nothing else is the CHEAPEST call to write and the MOST expensive
+    # to answer, so it is exactly the one that must not be skipped. Anything
+    # that is neither absent nor a dict (a JSON string, a list) is left alone:
+    # it is the server's job to reject it, not ours to reinterpret it.
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return arguments, []
+    # Rule 1, and it is stronger than "per parameter". These tables are all
+    # about one thing -- how much this tool returns -- so a caller who sets
+    # ANY of a slug's levers is steering that, and the rest of the table
+    # stands down for the call. Per-parameter filling looked equivalent and
+    # was not: the note tells a model "pass verbose=true for full text", and
+    # if `include_payload: false` were still injected on the retry the model
+    # would be handed the same advice a second time over a result it had
+    # already tried to widen. A default the caller cannot get out of in one
+    # move is not a default.
+    if any(param in arguments for param in table):
+        return arguments, []
+    filled = {}
+    for param, value in table.items():
+        if _composio_declares(server, key, param) is False:
+            continue  # rule 3: the schema dropped it; do not post it.
+        filled[param] = value
+    if not filled:
+        return arguments, []
+    out = dict(arguments)
+    out.update(filled)
+    return out, ["%s=%s" % (k, json.dumps(v)) for k, v in sorted(filled.items())]
+
+
+def _composio_defaults_note(applied) -> str:
+    bits = []
+    for slug, kvs in applied:
+        bit = "%s: %s" % (slug, ", ".join(kvs))
+        hint = _COMPOSIO_DEFAULT_HINTS.get(slug)
+        if hint:
+            bit += " (%s)" % hint
+        bits.append(bit)
+    return (
+        "Hermes filled in cheaper values for parameters you omitted, because "
+        "this tool's own defaults return up to 50x more data than the question "
+        "usually needs. " + "; ".join(bits)
+    )
+
+
+def _apply_composio_defaults(server: Any, tool_name: str, args: Any):
+    """Return ``(args, note_or_None)`` for one outbound MCP call.
+
+    Covers both invocation paths: the tool called directly, and the same tool
+    reached through ``COMPOSIO_MULTI_EXECUTE_TOOL``.
+    """
+    if not isinstance(args, dict) or not _is_composio_server(server):
+        return args, None
+
+    if str(tool_name or "").upper() == _COMPOSIO_MULTIPLEXER:
+        calls = args.get("tools")
+        if not isinstance(calls, list):
+            return args, None
+        applied = []
+        new_calls = []
+        for entry in calls:
+            if not isinstance(entry, dict):
+                new_calls.append(entry)
+                continue
+            slug = entry.get("tool_slug")
+            new_arguments, kvs = _composio_default_one(
+                server, slug, entry.get("arguments"),
+            )
+            if not kvs:
+                new_calls.append(entry)
+                continue
+            replacement = dict(entry)
+            replacement["arguments"] = new_arguments
+            new_calls.append(replacement)
+            applied.append((str(slug).upper(), kvs))
+        if not applied:
+            return args, None
+        out = dict(args)
+        out["tools"] = new_calls
+        return out, _composio_defaults_note(applied)
+
+    new_args, kvs = _composio_default_one(server, tool_name, args)
+    if not kvs:
+        return args, None
+    return new_args, _composio_defaults_note([(str(tool_name).upper(), kvs)])
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -6501,6 +6732,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         f"immediately — give it a few seconds to come back."
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
+
+        # Composio's expensive defaults, filled in only where the caller left
+        # the parameter out. This is the one seam both invocation paths cross:
+        # `args` is read exactly once below, at session.call_tool().
+        args, _defaults_note = _apply_composio_defaults(server, tool_name, args)
 
         async def _call():
             _mark_server_call_started(server)
@@ -6619,7 +6855,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         error_text += str(res_text)
                 return tool_error(_sanitize_error(
                     _truncate_mcp_text_result(
-                        error_text or "MCP tool returned an error"
+                        (error_text or "MCP tool returned an error")
+                        + (("\n\n" + _defaults_note) if _defaults_note else "")
                     )
                 ))
 
@@ -6706,7 +6943,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if _structured_json is not None and len(_structured_json) > _MCP_HARD_RESULT_CAP_CHARS:
                     structured = _truncate_mcp_text_result(_structured_json)
             meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
-            if structured is not None or meta is not None:
+            # `_defaults_note` joins the same branch: a silently cheapened
+            # result the model cannot recover from is worse than an expensive
+            # one, so whenever a default was filled in, the result says which.
+            if structured is not None or meta is not None or _defaults_note:
                 payload: Dict[str, Any] = {}
                 if text_result:
                     payload["result"] = text_result
@@ -6717,14 +6957,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         payload["result"] = structured
                 if meta is not None:
                     payload["_meta"] = meta
+                if _defaults_note:
+                    payload["_hermes"] = _defaults_note
                 if "result" not in payload:
                     payload["result"] = text_result
                 try:
                     return json.dumps(payload, ensure_ascii=False)
                 except (TypeError, ValueError):
                     # Non-serializable metadata: drop the extras rather than
-                    # failing the whole tool call.
-                    return json.dumps({"result": text_result}, ensure_ascii=False)
+                    # failing the whole tool call. The defaults note is a
+                    # plain string and always survives this fallback.
+                    _fallback: Dict[str, Any] = {"result": text_result}
+                    if _defaults_note:
+                        _fallback["_hermes"] = _defaults_note
+                    return json.dumps(_fallback, ensure_ascii=False)
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():
@@ -6772,6 +7018,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             )
             return tool_error(_sanitize_error(
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                + (("\n\n" + _defaults_note) if _defaults_note else "")
             ))
 
     return _handler
