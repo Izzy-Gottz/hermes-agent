@@ -42,6 +42,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
         "now ends with the typed text) and `front_app_changed` — check "
         "them in every result before continuing; a click may have fronted a "
         "different app (e.g. Finder) and taken the keystrokes. "
+        "`steps` runs up to 8 actions in ONE call, halting at the first failure — use it whenever you already know the next few moves, because model round-trips, not clicking, are what make a task slow. Each step is the same object you would pass alone (`{'action': 'invoke_menu', 'path': [...]}`) and gets the same checks and approvals; steps cannot nest. A failed step stops the rest and tells you which, because the screen is then part-way through what you planned. A capture inside a batch returns its summary without the image. "
         "`invoke_menu` invokes an app menu item by exact path (e.g. path=['File','Export','Bounce…']) through the accessibility API — no screenshot, no coordinates, and it fails closed rather than falling back to pixels. PREFER IT over clicking a menu, and reach for it in apps whose canvas exposes no AX tree at all (DAWs, CAD, 3D, games): the canvas may be opaque while the menu bar is standard and fully addressable. `verify_state` asks whether the result actually happened — bounded predicates (element exists/enabled/selected/value_equals, or window exists/bounds) evaluated against live AX state with consecutive stable samples, answering satisfied / unsatisfied / unknown. UNKNOWN IS NOT SUCCESS. Use it instead of re-capturing and eyeballing a screenshot whenever you can state what should now be true. "
         "`list_windows` lists every window z-ordered, INCLUDING minimized ones and windows on other macOS Spaces, each marked `on_current_space` and `off_screen`. READING and CLICKING have different reach: you can capture any listed window, but input is refused for a window that is off-Space or minimized. So `on_current_space: false` does NOT mean the app is missing or misnamed — it is running, one desktop away; read it with capture(window_id=..., pid=..., mode='vision') (an off-Space window often cannot resolve its AX surface, so 'som' returns an empty element list), and only focus_app(raise_window=true) when you must click, since that moves the user's desktop mid-work. An empty capture is far more often another Space than a wrong app name, so check this before re-spelling the app. "
         "`focused_element` reports the focus without acting. `type` refuses "
@@ -51,6 +52,18 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
+            "steps": {
+                "type": "array",
+                "items": {"type": "object"},
+                "minItems": 1, "maxItems": 8,
+                "description": (
+                    "steps: the actions to run in order, each shaped exactly "
+                    "as a standalone call. Example: "
+                    "[{'action':'focus_app','app':'Notes'},"
+                    " {'action':'invoke_menu','path':['File','New Note']},"
+                    " {'action':'verify_state','expect':[{'window':{'exists':true}}]}]"
+                ),
+            },
             "path": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1, "maxLength": 200},
@@ -115,6 +128,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "list_windows",
                     "invoke_menu",
                     "verify_state",
+                    "steps",
                     "focused_element",
                     "focus_app",
                 ],

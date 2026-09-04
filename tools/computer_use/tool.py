@@ -600,6 +600,57 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
 # Dispatch
 # ---------------------------------------------------------------------------
 
+# A batch is a round-trip saver, not a macro language: small enough that the
+# approval summary stays readable and a failure is easy to locate.
+_MAX_STEPS = 8
+
+
+def _as_jsonable(out: Any) -> Any:
+    """One step's result, flattened for the batch payload.
+
+    A capture returns a `_multimodal` dict whose image cannot ride inside a
+    JSON string; keep its summary and drop the picture rather than corrupt the
+    payload. A model that needs the image should capture on its own.
+    """
+    if isinstance(out, dict):
+        if out.get("_multimodal"):
+            return {"summary": out.get("text_summary", ""),
+                    "meta": out.get("meta", {}),
+                    "note": "image omitted inside a batch; capture alone to see it"}
+        return out
+    if isinstance(out, str):
+        try:
+            return json.loads(out)
+        except Exception:
+            return {"text": out[:2000]}
+    return {"text": str(out)[:2000]}
+
+
+def _step_failed(out: Any) -> bool:
+    """Whether a step's result should halt the batch.
+
+    Deliberately conservative: anything that is not clearly a success stops
+    the run. A batch that continues past an ambiguous result is exactly the
+    "assume it worked" failure this whole area keeps paying for.
+    """
+    payload = _as_jsonable(out)
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("error") is not None:
+        return True
+    if payload.get("ok") is False:
+        return True
+    verdict = payload.get("verdict")
+    if isinstance(verdict, dict):
+        if verdict.get("decision") in ("stop_and_report", "escalate"):
+            return True
+    # verify_state answering "no" or "cannot tell" is a reason to stop and
+    # look, not to run the next three actions anyway.
+    if payload.get("action") == "verify_state" and payload.get("verified") is not True:
+        return True
+    return False
+
+
 def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     """Main entry point — dispatched by tools.registry.
 
@@ -612,6 +663,73 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     # Per-run key for approval-state and daemon-mode isolation across
     # concurrent sessions.
     session_id = str(kwargs.get("session_id") or "")
+
+    # ── steps: several actions, one round-trip ────────────────────────────
+    #
+    # Measured elsewhere (OSWorld-Human): planning and reflection are 75-94%
+    # of a computer-use task's wall clock and grounding is 2-4%. The win is
+    # fewer model round-trips, not faster clicking — which is what Astra's
+    # code-execution mode and Anthropic's batched computer tool both buy.
+    #
+    # Each step RE-ENTERS this function rather than reaching the backend
+    # directly. That is the whole safety argument: blocked type/key patterns,
+    # argument validation, the approval gate and the stall detector all apply
+    # to every step exactly as they would to a single call, so batching adds
+    # no new bypass surface inside Hermes. (Moe's own pre-tool hook sits
+    # outside this and must iterate `steps` itself — a batch would otherwise
+    # be a way to smuggle a gated Return past a guard that keys on the
+    # outer action name.)
+    if action == "steps":
+        steps = args.get("steps")
+        if not (isinstance(steps, list) and 1 <= len(steps) <= _MAX_STEPS
+                and all(isinstance(st, dict) for st in steps)):
+            return json.dumps({
+                "error": f"steps requires a list of 1-{_MAX_STEPS} action "
+                         f"objects, e.g. [{{'action':'invoke_menu','path':[…]}}]",
+                "code": "bad_steps",
+            })
+        names = [str(st.get("action") or "").strip().lower() for st in steps]
+        if "steps" in names:
+            # Nesting would multiply the cap and make the approval summary
+            # lie about what is being authorised.
+            return json.dumps({"error": "steps cannot contain steps",
+                               "code": "bad_steps"})
+        if any(not n for n in names):
+            return json.dumps({"error": "every step needs an `action`",
+                               "code": "bad_steps"})
+
+        results: List[Any] = []
+        for index, step in enumerate(steps):
+            out = handle_computer_use(dict(step), **kwargs)
+            results.append(out)
+            if _step_failed(out):
+                # Halt. A later step assumes the earlier one landed, and
+                # running the rest against a screen that is not what was
+                # planned for is how a batch does damage a single call could
+                # not. Anthropic's batched tool halts the same way.
+                return json.dumps({
+                    "ok": False,
+                    "action": "steps",
+                    "completed": index,
+                    "of": len(steps),
+                    "failed_step": {"index": index, "action": names[index]},
+                    "results": [_as_jsonable(r) for r in results],
+                    "verdict": {
+                        "decision": "stop_and_report",
+                        "hint": (f"Step {index + 1} of {len(steps)} "
+                                 f"({names[index]}) failed, so the remaining "
+                                 f"{len(steps) - index - 1} were not run. The "
+                                 f"screen is part-way through what you "
+                                 f"planned: look before you continue."),
+                    },
+                })
+        return json.dumps({
+            "ok": True,
+            "action": "steps",
+            "completed": len(steps),
+            "of": len(steps),
+            "results": [_as_jsonable(r) for r in results],
+        })
 
     # Safety: validate actions before approval prompt.
     if action == "type":
