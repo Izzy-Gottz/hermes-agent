@@ -2682,6 +2682,33 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # cua-driver 0.6.x on Linux may return JSON null here.
             # Only explicit False means off-screen; null means unknown.
             "off_screen": w.get("is_on_screen") is False,
+            # macOS Spaces: a window on another Space is a real, targetable
+            # window that simply is not on the active desktop. Only explicit
+            # False means "not here"; null/absent means the driver did not say
+            # (Linux/Windows), and must not be read as off-Space.
+            "on_current_space": (
+                None if w.get("on_current_space") is None
+                else bool(w.get("on_current_space"))
+            ),
+            # Keep every id the driver gave, in the form it gave it: this
+            # value exists to be printed back to the model, and silently
+            # dropping a string id turned "space_ids=[4]" into
+            # "space_ids=[unknown]". `isinstance(True, int)` is True, so bools
+            # are excluded explicitly rather than becoming Space 1.
+            "space_ids": [
+                x for x in (w.get("space_ids") or [])
+                if isinstance(x, (int, str)) and not isinstance(x, bool)
+            ],
+            # "the active Space on that window's display" — without it a bare
+            # space_ids=[4] is unanchored; the reader cannot tell which Space
+            # is the current one, which matters on multi-display setups where
+            # each display carries its own active Space.
+            "current_space_id": (
+                w.get("current_space_id")
+                if isinstance(w.get("current_space_id"), (int, str))
+                and not isinstance(w.get("current_space_id"), bool)
+                else None
+            ),
             "title": title if isinstance(title, str) else "",
             "z_index": z_index,
         })
@@ -2981,6 +3008,103 @@ class CuaDriverBackend(ComputerUseBackend):
         windows.sort(key=lambda w: w["z_index"], reverse=True)
         return windows
 
+    def _no_match_reason(self, app: str) -> str:
+        """Explain why ``app=`` matched nothing, distinguishing the causes.
+
+        There are two very different reasons a filter comes back empty, and
+        conflating them cost a real user an hour on 2026-09-03: the app is not
+        running / is named something else, or the app IS running with its
+        window one Space away. The old text only ever described the first,
+        pointing at localized names, so the agent kept re-spelling "Calendar"
+        while the window sat on the next desktop.
+
+        Off-Space is reported first because it is both the more common macOS
+        case and the one with a specific fix the caller can act on.
+        """
+        try:
+            elsewhere = self._match_windows_for_app(
+                self._load_windows_all_spaces(), app
+            )
+        except Exception as exc:  # a diagnostic must never mask the failure
+            logger.debug("cua-driver off-Space diagnosis failed: %s", exc)
+            elsewhere = []
+
+        off_space = [w for w in elsewhere if w.get("on_current_space") is False]
+        if off_space:
+            w = off_space[0]
+            spaces = ", ".join(str(x) for x in w.get("space_ids") or []) or "unknown"
+            return (
+                f"<app={app!r} IS running, on another macOS Space "
+                f"(window_id={w['window_id']}, pid={w['pid']}, "
+                f"space_ids=[{spaces}]). This is NOT a naming problem; do not "
+                f"retry with a different spelling. You can still READ it where "
+                f"it is — cua-driver keeps observation available off-Space — "
+                f"with capture(window_id={w['window_id']}, pid={w['pid']}, "
+                f"mode='vision'); use 'vision' because an off-Space window "
+                f"often cannot resolve its accessibility surface and 'som' "
+                f"then returns a picture with an EMPTY element list. What you "
+                f"CANNOT do is send it input: background input to a window "
+                f"outside the process's current AXWindows is refused. To click "
+                f"it, focus_app(app={app!r}, raise_window=true) first — that "
+                f"switches the user's desktop to another Space mid-work, so "
+                f"read in place unless you actually need to click. "
+                f"{len(off_space)} window(s) of this app are off-Space.>"
+            )
+
+        if elsewhere:
+            return (
+                f"<app={app!r} is running but none of its {len(elsewhere)} "
+                f"window(s) are on-screen (minimized or hidden). Input to a "
+                f"minimized window is refused (minimized_or_hidden_window). "
+                f"Un-minimize with focus_app(app={app!r}, raise_window=true), "
+                f"or target one directly by window_id to read it.>"
+            )
+
+        return (
+            f"<no window matched app={app!r} on any Space. Either it is not "
+            f"running, or it is named something else here, or window discovery "
+            f"itself came back empty this call. Call list_apps to see available "
+            f"app names or bundle IDs (macOS reports localized names, e.g. "
+            f"'計算機' instead of 'Calculator'; some Linux/Qt apps only resolve "
+            f"via list_apps metadata). If the app should be running, launch it "
+            f"first.>"
+        )
+
+    def _load_windows_all_spaces(self) -> List[Dict[str, Any]]:
+        """Every layer-0 window WindowServer knows, including other Spaces.
+
+        ``_load_windows`` passes ``on_screen_only: True``, which cua-driver
+        documents as "drop windows not on the current Space". That is the right
+        default for *picking a target* — you cannot click what is not on the
+        active desktop — but it makes an app sitting one Space away
+        indistinguishable from an app that is not running, and the caller then
+        gets told to check its localized name.
+
+        This is the diagnostic counterpart: it never chooses a target, it only
+        answers "does this window exist somewhere else?". Failures return an
+        empty list so a diagnostic can never mask the original error.
+        """
+        return self._load_windows_all_spaces_checked()[0]
+
+    def _load_windows_all_spaces_checked(
+        self,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """As above, plus whether the fetch itself failed.
+
+        An empty desktop and a dropped MCP session both look like ``[]``, and
+        only the second is worth a fallback: retrying an honest empty costs a
+        spurious warning and a 20 s CLI round-trip.
+        """
+        try:
+            out = self._call_capture_tool(
+                "list_windows",
+                {"on_screen_only": False, "session": self._session_id},
+            )
+        except Exception as exc:
+            logger.debug("cua-driver all-Spaces list_windows failed: %s", exc)
+            return [], True
+        return _ingest_windows(_windows_from_tool_result(out)), False
+
     def _match_windows_for_app(
         self, windows: List[Dict[str, Any]], app: str
     ) -> List[Dict[str, Any]]:
@@ -3272,16 +3396,7 @@ class CuaDriverBackend(ComputerUseBackend):
         elif pid is None and window_id is None and app:
             filtered = self._match_windows_for_app(windows, app)
             if not filtered:
-                return self._failed_capture(
-                    mode,
-                    (
-                        f"<no on-screen window matched app={app!r}; "
-                        f"call list_apps to see available app names or bundle IDs "
-                        f"(macOS reports localized names, e.g. '計算機' "
-                        f"instead of 'Calculator'; some Linux/Qt apps only "
-                        f"resolve via list_apps metadata)>"
-                    ),
-                )
+                return self._failed_capture(mode, self._no_match_reason(app))
             windows = filtered
 
         # Pick first on-screen window (sorted by z_index / z-order above).
@@ -3828,7 +3943,58 @@ class CuaDriverBackend(ComputerUseBackend):
         return []
 
     def list_windows(self) -> List[Dict[str, Any]]:
-        return self._load_windows()
+        """Every window, including the ones on other macOS Spaces.
+
+        Deliberately *not* ``_load_windows()``. That helper narrows to the
+        active Space because it exists to choose a click target, and you cannot
+        click across a Space. But ``list_windows`` is the model's discovery
+        tool — the one it reaches for when a capture came back empty — and
+        hiding the very windows that explain the emptiness is what turned a
+        one-step recovery into a two-minute grope on 2026-09-03.
+
+        cua-driver's own contract for this tool is "Includes off-screen windows
+        (minimized, on another Space, hidden-launched)". We now match it, and
+        mark each record so the caller can tell reachable from merely existing.
+        Current-Space windows sort first so the frontmost stays at index 0.
+        """
+        windows, fetch_failed = self._load_windows_all_spaces_checked()
+        if fetch_failed:
+            # Only a real transport failure earns the fallback. Falling back on
+            # a legitimately empty desktop costs a second MCP call, a spurious
+            # "returned no windows over MCP" warning, and a 20 s CLI re-fetch.
+            return self._load_windows()
+        if not windows:
+            return []
+
+        # Measured on macOS 26.5 with 5 Spaces: 137 layer-0 windows, of which
+        # 3 were on_current_space=True, 16 False, and 118 None — and every one
+        # of those 118 was is_on_screen=False. They are hidden backing windows
+        # (apps launched-but-never-shown, closed document shells). Handing the
+        # model all 137 would bury the one window it is looking for under two
+        # orders of magnitude of noise, which is a different way to lose the
+        # same information. Keep what is locatable: anything on screen, plus
+        # anything the driver can place on a named Space.
+        def _locatable(w: Dict[str, Any]) -> bool:
+            return not w["off_screen"] or w.get("on_current_space") is not None
+
+        locatable = [w for w in windows if _locatable(w)]
+        if not locatable:
+            return []
+
+        # Three tiers, because "on this Space" and "can receive a click" are
+        # not the same claim. A minimized window is on the current Space and
+        # still refuses input (`minimized_or_hidden_window`), so ranking it
+        # beside a live window would teach the model the wrong reachability
+        # test — which is the same class of mistake this whole change fixes.
+        def _rank(w: Dict[str, Any]) -> int:
+            if w.get("on_current_space") is False:
+                return 2          # elsewhere: readable, not clickable
+            if w["off_screen"]:
+                return 1          # here but minimized/hidden: not clickable
+            return 0              # live on this Space: clickable now
+
+        locatable.sort(key=lambda w: (_rank(w), -w["z_index"]))
+        return locatable
 
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
         """Target an app, optionally invoking standalone foreground focus.

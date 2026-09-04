@@ -42,7 +42,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
         "now ends with the typed text) and `front_app_changed` — check "
         "them in every result before continuing; a click may have fronted a "
         "different app (e.g. Finder) and taken the keystrokes. "
-        "`list_windows` lists every on-screen window z-ordered; "
+        "`list_windows` lists every window z-ordered, INCLUDING minimized ones and windows on other macOS Spaces, each marked `on_current_space` and `off_screen`. READING and CLICKING have different reach: you can capture any listed window, but input is refused for a window that is off-Space or minimized. So `on_current_space: false` does NOT mean the app is missing or misnamed — it is running, one desktop away; read it with capture(window_id=..., pid=..., mode='vision') (an off-Space window often cannot resolve its AX surface, so 'som' returns an empty element list), and only focus_app(raise_window=true) when you must click, since that moves the user's desktop mid-work. An empty capture is far more often another Space than a wrong app name, so check this before re-spelling the app. "
         "`focused_element` reports the focus without acting. `type` refuses "
         "when the focus is not a text field (`code=focus_not_editable`) "
         "unless force=true."

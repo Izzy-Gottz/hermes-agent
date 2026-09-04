@@ -785,8 +785,12 @@ function run() {
 }
 """
 
-    LIST_WINDOWS_NOTE = ("z-ordered front → back, on-screen windows of the current Space only "
-                         "(minimized windows and other Spaces are not listed); "
+    LIST_WINDOWS_NOTE = ("BACKEND DIFFERENCE: this is the macOS-native fallback backend, and "
+                         "unlike the cua-driver backend it lists on-screen windows of the "
+                         "CURRENT SPACE ONLY — minimized windows and other Spaces are not "
+                         "listed here, and records carry no `on_current_space` field. An app "
+                         "missing from this list may still be running one Space away; that "
+                         "cannot be distinguished from here. z-ordered front → back; "
                          "`frontmost` marks the active app's top window")
 
     def list_windows(self) -> List[Dict[str, Any]]:
