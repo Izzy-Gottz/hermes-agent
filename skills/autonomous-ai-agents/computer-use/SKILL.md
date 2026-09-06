@@ -93,7 +93,10 @@ type              text="…"
 key               keys="<save shortcut>" | "return" | "escape" | "<modifier>+t"
 wait              seconds=0.5
 list_apps
+list_windows                          (every window, incl. other Spaces)
 focus_app         app="<app name>"   raise_window=false   (default: don't raise)
+invoke_menu       path=["File", "Export…"]              (see below — prefer this)
+verify_state      expect=[{…}]  timeout_ms=5000  stable_samples=2
 ```
 
 All actions accept optional `capture_after=True` to get a follow-up
@@ -104,6 +107,98 @@ The input actions (`click`, `double_click`, `right_click`, `middle_click`,
 `drag`, `scroll`, `type`, `key`) also accept `delivery_mode`. The optional
 `bring_to_front=True` request invokes a separately approved standalone focus
 tool before foreground input; it is never an input-action property.
+
+## Reach for the cheap rungs first
+
+Clicking is the LAST rung, not the first. In order:
+
+1. **Data you already have.** A meeting's join URL is a field on the calendar
+   event, not something to find on screen. A file path, an address, a track
+   name — if a connector or a CLI already holds it, read it.
+2. **The app's own scripting.** `osascript`, and whatever the app exposes.
+3. **`invoke_menu`.** Fires a menu item by exact path through the
+   accessibility API — no screenshot, no coordinates. Clicking a menu instead
+   is five steps that can each go wrong: capture, find it, click to open,
+   capture again because the menu did not exist a moment ago, click again.
+4. **A keyboard shortcut**, when the menu shows one.
+5. **`click`**, by `element` index.
+6. **`click` by coordinate** — only for canvas/video/WebGL surfaces with no
+   AX tree.
+
+### invoke_menu, and how to learn the paths
+
+```
+invoke_menu  path=["Format", "Font", "Bold"]   pid=…  window_id=…
+```
+
+Labels match **case-sensitively after trimming**, and must include the
+ellipsis character when the menu shows one (`"Export…"`, not `"Export..."`).
+Missing, ambiguous or disabled segments **fail closed** — it never falls back
+to pixels, so a refusal means the path is wrong, not that the click missed.
+
+To discover paths on macOS, run in the terminal:
+
+```
+~/.moe/tools/mac.sh menus <app> [search]
+```
+
+It prints every item with its keyboard shortcut, in exactly the form
+`invoke_menu` takes — `File > Bounce > Project or Section…  [⌘B]`. Disabled
+items are listed and marked, which is how you tell "greyed out right now"
+from "no such item". It reads the accessibility tree directly: no screenshot,
+no driver, ~60–300 ms warm.
+
+Two things the listing tells you that matter. It names the app it actually
+read, and it warns when the read was **partial** — a partial list is not proof
+an item is absent, so do not conclude "no such command" from one. And when the
+app is not frontmost most items read as disabled even though they would work
+once it is focused, so treat the flag as provisional until then.
+
+`invoke_menu` needs a **window**, not just an app: `capture(app='…')` first so
+it has a pid and a window_id, then invoke. Listing needs neither. The order is
+list → capture → invoke.
+
+**This is the route into software the screen cannot help you with.** A DAW, a
+CAD or 3D app, a game — the canvas is one custom surface with no accessibility
+tree at all, so there are no elements and pixels are guesswork. The menu bar
+is ordinary and completely readable. In an app you do not know, list its menus
+before you take a screenshot.
+
+### verify_state — ask, do not eyeball
+
+```
+verify_state  expect=[{"element": {"selector": {"role": "AXButton",
+                                                "label_contains": "Join"},
+                                   "exists": true}}]
+verify_state  expect=[{"window": {"exists": false}}]      (did it close?)
+```
+
+Bounded predicates (1–8, ANDed) against live accessibility state, with a
+bounded wait and consecutive stable samples so a window caught mid-redraw is
+not read as success. Answers `satisfied` / `unsatisfied` / `unknown`, and
+**`unknown` is not success** — absence of an element is not proof of absence
+unless the search was exhaustive.
+
+Use it whenever you can state what should now be true. It is faster and far
+more reliable than another screenshot: a predicate answers in tens of
+milliseconds, a capture costs hundreds of KB and seconds. `unsatisfied` means
+the world is not as you expected — wait longer, act differently, or say so. It
+does **not** mean re-send input; nothing was sent.
+
+On an ELEMENT predicate `exists: false` is rejected (absence cannot be
+proven). On a WINDOW predicate it is accepted, and is the right way to check
+that something closed.
+
+## An empty capture is usually another Space
+
+On macOS, `capture(app='X')` only reaches a window on the **active** desktop.
+An app one Space away comes back empty and is running perfectly.
+`list_windows` marks every window with `on_current_space`; check it before
+concluding the app is missing or the name is wrong. You can still READ an
+off-Space window with `capture(window_id=…, pid=…, mode='vision')` — `som`
+often returns no elements there. You cannot send it input.
+`focus_app(raise_window=true)` would move the user's desktop out from under
+them, so read in place unless you must click.
 
 ## The verify → escalate ladder (background-first)
 
