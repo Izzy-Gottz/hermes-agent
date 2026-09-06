@@ -603,6 +603,33 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
 # A batch is a round-trip saver, not a macro language: small enough that the
 # approval summary stays readable and a failure is easy to locate.
 _MAX_STEPS = 8
+# Rounds of a `steps` batch under an `until`. Eight steps × ten rounds is
+# eighty actions in one round-trip, which is already far past anything a
+# person would sit through; the point is to remove the round-trip, not to
+# hand over the afternoon.
+_MAX_ROUNDS = 10
+
+# What may be repeated.
+#
+# The approval gate sees a `steps` call ONCE. It flattens the batch and judges
+# each action, the person answers, and the call runs — so under `max_rounds` a
+# single "yes" would authorise up to ten of everything in it. A Return inside
+# a looping batch is ten messages sent on one approval, which is precisely the
+# hole the gate exists to close.
+#
+# So looping is confined to navigation: the actions whose whole purpose is
+# repetition and which send nothing. `key` is allowed only for keys that move
+# a view — return/enter is what SENDS in mail, messages and chat windows, and
+# it is not on this list on purpose. Anything else, run as a normal batch and
+# decide for yourself between rounds.
+_REPEATABLE = frozenset({
+    "scroll", "wait", "capture", "verify_state", "move", "zoom",
+    "list_windows", "key",
+})
+_REPEATABLE_KEYS = frozenset({
+    "up", "down", "left", "right", "pageup", "page_up", "pagedown",
+    "page_down", "home", "end", "tab", "space",
+})
 
 
 def _as_jsonable(out: Any) -> Any:
@@ -651,7 +678,57 @@ def _step_failed(out: Any) -> bool:
     return False
 
 
-def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
+
+def _run_steps_once(steps, names, kwargs):
+    """One pass over the batch. Returns the results list, or a JSON string
+    when a step failed and the whole call is already shaped as a refusal.
+
+    Split out of the round loop so that halt-on-first-failure keeps meaning
+    exactly what it did before `until` existed: a later step assumes the
+    earlier one landed, and that is as true on round four as on round one.
+    """
+    results = []
+    for index, step in enumerate(steps):
+        out = handle_computer_use(dict(step), _nested=True, **kwargs)
+        results.append(out)
+        if _step_failed(out):
+            return json.dumps({
+                "ok": False,
+                "action": "steps",
+                "completed": index,
+                "of": len(steps),
+                "failed_step": {"index": index, "action": names[index]},
+                "results": [_as_jsonable(r) for r in results],
+                "verdict": {
+                    "decision": "stop_and_report",
+                    "hint": (f"Step {index + 1} of {len(steps)} "
+                             f"({names[index]}) failed, so the remaining "
+                             f"{len(steps) - index - 1} were not run. The "
+                             f"screen is part-way through what you "
+                             f"planned: look before you continue."),
+                },
+            })
+    return results
+
+
+def _until_met(until, kwargs) -> bool:
+    """Ask verify_state whether the batch can stop.
+
+    Reuses the predicate machinery rather than growing a second one — and
+    `unknown` is not success here for the same reason it is not there: the
+    absence of evidence that something appeared is not evidence that it did.
+    """
+    raw = handle_computer_use(
+        {"action": "verify_state", "expect": until}, _nested=True, **kwargs)
+    try:
+        body = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return False
+    return isinstance(body, dict) and body.get("verified") is True
+
+
+def handle_computer_use(args: Dict[str, Any], _nested: bool = False,
+                        **kwargs) -> Any:
     """Main entry point — dispatched by tools.registry.
 
     Returns either a JSON string (text-only) or a dict marked `_multimodal`
@@ -698,36 +775,103 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             return json.dumps({"error": "every step needs an `action`",
                                "code": "bad_steps"})
 
+        # `until` + `max_rounds`: the batch repeats until a predicate holds.
+        #
+        # This is the round-trip lever, and the reason it is DECLARATIVE
+        # rather than a script. Astra's equivalent is exec_py/exec_js — the
+        # model writes code with real loops — and that would be the wrong
+        # shape here for one specific reason: every control in this stack
+        # inspects what an action DOES, and a script is opaque to all of them.
+        # The send gate flattens `steps` and judges each one; it cannot judge
+        # a for-loop. Three times this month a new verb walked past a guard
+        # that enumerated the old ones, and an arbitrary code executor over
+        # somebody's screen is that mistake with the volume turned up.
+        #
+        # So: the same actions, repeated, with a predicate deciding when to
+        # stop. "Scroll until the Join button exists" is one round-trip
+        # instead of eight, and every individual step is still a step the
+        # gate, the approval prompt and both stall detectors can read.
+        until = args.get("until")
+        if until is not None and not (isinstance(until, list) and until):
+            return json.dumps({
+                "error": "until must be a non-empty list of verify_state "
+                         "predicates, e.g. [{'element': {...}}]",
+                "code": "bad_steps"})
+        try:
+            max_rounds = int(args.get("max_rounds", 1))
+        except (TypeError, ValueError):
+            max_rounds = -1
+        if max_rounds < 1 or max_rounds > _MAX_ROUNDS:
+            return json.dumps({
+                "error": f"max_rounds must be 1..{_MAX_ROUNDS}",
+                "code": "bad_steps"})
+        if max_rounds > 1:
+            for name, step in zip(names, steps):
+                if name not in _REPEATABLE:
+                    return json.dumps({
+                        "error": (f"`{name}` cannot be repeated: a looping "
+                                  f"batch is approved once and would run it "
+                                  f"up to {max_rounds} times. Repeatable: "
+                                  + ", ".join(sorted(_REPEATABLE))),
+                        "code": "bad_steps"})
+                if name == "key":
+                    keys = str(step.get("keys") or "").lower()
+                    parts = [k for k in re.split(r"[+\-\s]+", keys) if k]
+                    if not parts or any(k not in _REPEATABLE_KEYS for k in parts):
+                        return json.dumps({
+                            "error": (f"`key` may only be repeated for keys "
+                                      f"that move a view ("
+                                      + ", ".join(sorted(_REPEATABLE_KEYS))
+                                      + "); return/enter is what sends."),
+                            "code": "bad_steps"})
+        if until is None and max_rounds > 1:
+            return json.dumps({
+                "error": "max_rounds needs an `until` — repeating a fixed "
+                         "batch with no stopping condition is a loop with no "
+                         "exit",
+                "code": "bad_steps"})
+
         results: List[Any] = []
-        for index, step in enumerate(steps):
-            out = handle_computer_use(dict(step), **kwargs)
-            results.append(out)
-            if _step_failed(out):
-                # Halt. A later step assumes the earlier one landed, and
-                # running the rest against a screen that is not what was
-                # planned for is how a batch does damage a single call could
-                # not. Anthropic's batched tool halts the same way.
+        rounds = 0
+        for _round in range(max_rounds):
+            rounds += 1
+            round_results = _run_steps_once(steps, names, kwargs)
+            if isinstance(round_results, str):
+                return round_results          # a step failed; already shaped
+            results = round_results
+            if until is None:
+                break
+            met = _until_met(until, kwargs)
+            if met:
                 return json.dumps({
-                    "ok": False,
-                    "action": "steps",
-                    "completed": index,
-                    "of": len(steps),
-                    "failed_step": {"index": index, "action": names[index]},
+                    "ok": True, "action": "steps",
+                    "completed": len(steps), "of": len(steps),
+                    "rounds": rounds, "until_met": True,
                     "results": [_as_jsonable(r) for r in results],
-                    "verdict": {
-                        "decision": "stop_and_report",
-                        "hint": (f"Step {index + 1} of {len(steps)} "
-                                 f"({names[index]}) failed, so the remaining "
-                                 f"{len(steps) - index - 1} were not run. The "
-                                 f"screen is part-way through what you "
-                                 f"planned: look before you continue."),
-                    },
                 })
+        if until is not None:
+            return json.dumps({
+                "ok": False, "action": "steps",
+                "completed": len(steps), "of": len(steps),
+                "rounds": rounds, "until_met": False,
+                "code": "until_unmet",
+                "results": [_as_jsonable(r) for r in results],
+                "verdict": {
+                    "decision": "stop_and_report",
+                    "hint": (f"Ran the batch {rounds} time(s) and the "
+                             f"condition never held. Do not simply raise "
+                             f"max_rounds — look at the screen and say what "
+                             f"is actually there, because the predicate may "
+                             f"be describing something that is not going to "
+                             f"appear."),
+                },
+            })
         return json.dumps({
             "ok": True,
             "action": "steps",
             "completed": len(steps),
             "of": len(steps),
+            "rounds": rounds,
             "results": [_as_jsonable(r) for r in results],
         })
 
@@ -798,7 +942,7 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     #
     # Ahead of the approval gate for the same reason everything else here is:
     # refusing after showing the user a dialog is the worst order.
-    over_budget = detector.budget_reason(action)
+    over_budget = None if _nested else detector.budget_reason(action)
     if over_budget is not None:
         logger.warning("computer_use %s refused: budget spent (%d)",
                        action, detector.spent())

@@ -451,6 +451,37 @@ in your conversation context.
   moves) is YOUR run's cursor. It's a visual cue for the user that
   YOU are acting. The real OS cursor never moves.
 
+## Repeat a batch instead of a round-trip
+
+`steps` takes `until` — the same predicates `verify_state` uses — and
+`max_rounds` (1-10). The batch runs, the predicate is checked, and it repeats
+until the predicate holds:
+
+```
+computer_use(action="steps",
+             steps=[{"action": "scroll", "direction": "down", "amount": 6}],
+             until=[{"element": {"selector": {"label_contains": "Join"},
+                                 "exists": true}}],
+             max_rounds=8)
+```
+
+One round-trip instead of eight. **This is the single biggest thing you can do
+to make a task faster** — measured on this Mac, 86% of a ten-minute session
+was the model thinking between calls, and 14% was the tools doing anything.
+The lever is the number of calls, not the speed of clicking.
+
+**Only navigation may repeat**: `scroll`, `wait`, `capture`, `verify_state`,
+`move`, `zoom`, `list_windows`, and `key` for keys that move a view (arrows,
+page up/down, home, end, tab, space). Everything else runs as an ordinary
+single-round batch. The reason is not caution for its own sake: an approval
+is given ONCE for the whole call, so a Return inside a looping batch would be
+ten messages sent on one yes.
+
+**Running out of rounds is a failure, not a hint to raise the number.**
+`until_unmet` means the thing you described did not appear. Look, and say what
+is actually there — the predicate may be describing something that is never
+going to arrive.
+
 ## When to stop, and when to ask
 
 The failure table below is eight rows of how to keep trying, and for a long
