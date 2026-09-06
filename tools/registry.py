@@ -311,6 +311,17 @@ def check_fn_cache_scope() -> Optional[str]:
     is consumed by both layers. This prevents one Browser session's live tools
     from leaking into any unrelated session.
 
+    That bypass is gated on the browser-control feature flag. The api_server
+    binds a session id, a server-derived principal and a transport family for
+    EVERY request (``_bind_api_server_session``), whether or not any browser
+    controller exists — so an unconditional bypass made every API turn
+    rebuild the full tool surface twice (agent init + the between-turns MCP
+    refresh), ~120 ms each with ~2000 lazy MCP tools registered, and left
+    both caches permanently empty. With ``browser.extension_control.enabled``
+    off, ``extension_controller_available`` returns False before it looks at
+    the bound identity, so nothing request-bound can change between turns and
+    the ordinary process-wide cache is exactly as correct as it is for the CLI.
+
     Single-profile processes intentionally keep the historical process-wide
     cache. A multiplex gateway installs a Hermes-home override for every
     profile turn, so the canonical profile key is the stable isolation
@@ -325,7 +336,17 @@ def check_fn_cache_scope() -> Optional[str]:
             get_session_env("HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY", ""),
         )
         if all(str(value or "").strip() for value in browser_identity):
-            return CHECK_FN_CACHE_BYPASS
+            # Identity is bound; only a live browser-control deployment can
+            # make availability differ per request. Fail closed (bypass) if
+            # the flag cannot be read.
+            try:
+                from gateway.browser_control_broker import browser_control_enabled
+
+                bound_controller_possible = browser_control_enabled()
+            except Exception:
+                bound_controller_possible = True
+            if bound_controller_possible:
+                return CHECK_FN_CACHE_BYPASS
     except Exception:
         pass
 

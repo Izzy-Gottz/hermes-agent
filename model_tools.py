@@ -386,8 +386,21 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
+    _assemble_started = time.perf_counter()
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
+    if quiet_mode:
+        # One line per full assembly. A healthy gateway logs this once per
+        # distinct (toolsets, registry generation, config) key, not once per
+        # turn; seeing it on every turn means the key is churning or the
+        # cache is bypassed — the two failure modes that cost ~120 ms per
+        # rebuild with a large lazy-MCP catalog (measured 2026-09-06).
+        logger.info(
+            "tool definitions assembled in %.0f ms (%d tools, cache %s)",
+            (time.perf_counter() - _assemble_started) * 1000.0,
+            len(result),
+            "miss" if cache_key is not None else "bypassed",
+        )
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
