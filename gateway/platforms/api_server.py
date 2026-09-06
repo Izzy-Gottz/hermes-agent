@@ -884,6 +884,191 @@ _TURN_PROCESS_EPOCH_LOCK = threading.Lock()
 _TURN_PROCESS_EPOCH_COUNTER = itertools.count(1)
 
 
+async def _abandon_agent_turn(
+    agent_ref: Any,
+    agent_task: "asyncio.Future",
+    *,
+    reason: str,
+    source: str,
+    wait: bool,
+) -> None:
+    """Interrupt, reap and cancel the agent behind an SSE turn nobody will read.
+
+    The one sequence every abandonment path in the SSE writers shares:
+    ``request_hard_interrupt`` so the agent stops issuing upstream calls at
+    its next loop iteration, ``_reap_disconnected_agent_processes`` for the
+    background processes the turn spawned (#76115), then cancel the asyncio
+    wrapper task. ``wait`` awaits the cancelled wrapper (client-disconnect
+    paths, which swallow the cancellation) or leaves it (the server-side
+    ``CancelledError`` path, which must re-raise promptly).
+    """
+    agent = agent_ref[0] if agent_ref else None
+    if agent is not None:
+        try:
+            request_hard_interrupt(agent, reason)
+        except Exception:
+            pass
+        _reap_disconnected_agent_processes(agent, source=source)
+    if not agent_task.done():
+        agent_task.cancel()
+        if wait:
+            try:
+                await agent_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+# How often the SSE disconnect watcher reads the transport. aiohttp 3.14
+# offers no disconnect callback for a request handler (``BaseRequest`` has
+# no ``wait_for_disconnection``; ``RequestHandler.connection_lost`` only
+# sets an exception on the already-consumed request payload, and cancelling
+# the handler task on disconnect is opt-in at the server level), so a poll
+# is the least invasive signal. 100 ms is the same order as the ~65 ms the
+# write path already takes to notice a dropped client while text is
+# flowing, and one attribute read per tick per live stream costs nothing.
+SSE_DISCONNECT_POLL_SECONDS = 0.1
+
+# Queue sentinel the watcher pushes to wake a writer blocked in
+# ``stream_q.get()``; distinct from ``None`` (end of stream) and never
+# emitted. Identity-compared, so it cannot collide with agent output.
+_SSE_CLIENT_GONE = object()
+
+
+class _SSEClientGone(ConnectionResetError):
+    """Raised inside an SSE writer once the watcher saw the client leave.
+
+    A ``ConnectionResetError`` subclass so it lands in the very same
+    ``except`` block a failed ``response.write`` does — the writer's
+    disconnect handling stays one code path whichever side noticed first.
+    """
+
+
+def _sse_transport_closed(request: Any) -> bool:
+    """True once the request's transport is gone or closing.
+
+    ``Request.transport`` is ``None`` after ``connection_lost``; before that,
+    the socket transport reports ``is_closing()`` as soon as it reads the
+    peer's EOF. Only a literal ``True`` counts: a transport that answers
+    with anything else is not a transport we understand (a test double,
+    an exotic server), and the safe failure mode for a watcher whose
+    action is to kill a live turn is to stay quiet and leave detection to
+    the write path, exactly as before the watcher existed.
+    """
+    try:
+        transport = getattr(request, "transport", None)
+        if transport is None:
+            return True
+        return transport.is_closing() is True
+    except Exception:
+        return False
+
+
+class _SSEDisconnectWatcher:
+    """Notice an SSE client leaving while the writer has nothing to write.
+
+    The SSE writers learn of a dropped client from ``response.write``
+    raising — which is prompt (~65 ms) while text is streaming and never
+    while the agent sits in a long tool call, because nothing is written.
+    Measured 2026-09-06: a client closed at 12:35:35 during a 14-step
+    ``computer_use`` run and the disconnect was logged at 12:35:38.452,
+    with the user's next turn queued behind the abandoned one ("Another
+    Hermes process is using this session") — 8.2 s to first token instead
+    of ~3 s.
+
+    ``start()`` runs a task that polls the transport every
+    ``SSE_DISCONNECT_POLL_SECONDS`` while the agent task is live. When the
+    transport goes away it runs the shared abandonment sequence
+    (``_abandon_agent_turn``) at once — that is the urgent part, and it does
+    not wait for the writer — and wakes the writer by pushing
+    ``_SSE_CLIENT_GONE`` into the stream queue; the writer raises
+    ``_SSEClientGone`` and lands in its existing disconnect ``except``, which
+    calls ``fire()`` again and gets a no-op. ``fire()`` runs at most once
+    per turn, whichever side wins the race.
+
+    It cannot fire after the response completed: the poll stops on its own
+    once ``agent_task`` is done (the writer only finishes after that), and
+    ``stop()`` in the writer's ``finally`` cancels it regardless.
+    """
+
+    def __init__(
+        self,
+        request: Any,
+        stream_q: "asyncio.Queue",
+        agent_task: "asyncio.Future",
+        agent_ref: Any,
+        label: str,
+        *,
+        poll_seconds: float = None,
+    ) -> None:
+        self._request = request
+        self._stream_q = stream_q
+        self._agent_task = agent_task
+        self._agent_ref = agent_ref
+        self._label = label
+        self._poll = SSE_DISCONNECT_POLL_SECONDS if poll_seconds is None else poll_seconds
+        self._task: Optional["asyncio.Task"] = None
+        self._fire_task: Optional["asyncio.Task"] = None
+
+    @property
+    def fired(self) -> bool:
+        """True once the abandonment sequence has been started (by either side)."""
+        return self._fire_task is not None
+
+    def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.ensure_future(self._watch())
+
+    def stop(self) -> None:
+        """Stop polling. An abandonment already under way still completes."""
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _watch(self) -> None:
+        try:
+            while not self._agent_task.done():
+                await asyncio.sleep(self._poll)
+                if self._agent_task.done():
+                    return
+                if _sse_transport_closed(self._request):
+                    # Wake the writer first (synchronous, instant) so it
+                    # runs its own disconnect path concurrently with the
+                    # interrupt below rather than after it.
+                    if not self.fired:
+                        self._stream_q.put_nowait(_SSE_CLIENT_GONE)
+                    await self.fire()
+                    return
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 — a watcher must never take the turn down
+            logger.debug("SSE disconnect watcher for %s stopped: %s", self._label, exc)
+
+    async def fire(self) -> bool:
+        """Run the abandonment sequence exactly once and wait for it.
+
+        The first caller starts it and gets ``True``; any later caller
+        (the writer landing in its disconnect ``except`` after the watcher
+        already acted, or vice versa) waits for the same run to finish and
+        gets ``False``. The run is its own task and awaited through
+        ``shield`` so ``stop()`` cancelling the poll cannot cut the
+        interrupt or its log line short.
+        """
+        first = self._fire_task is None
+        if first:
+            self._fire_task = asyncio.ensure_future(self._abandon())
+        await asyncio.shield(self._fire_task)
+        return first
+
+    async def _abandon(self) -> None:
+        await _abandon_agent_turn(
+            self._agent_ref, self._agent_task,
+            reason="SSE client disconnected",
+            source="api_server_sse_disconnect",
+            wait=True,
+        )
+        logger.info("SSE client disconnected; interrupted agent task %s", self._label)
+
+
 def _publish_turn_process_ownership(agent: Any, task_id: str) -> None:
     """Snapshot the process baseline and claim the task_id's current epoch.
 
@@ -5482,6 +5667,11 @@ class APIServerAdapter(BasePlatformAdapter):
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
+        # Notices the client leaving while the agent is inside a tool call
+        # and nothing is being written (see _SSEDisconnectWatcher).
+        watcher = _SSEDisconnectWatcher(request, stream_q, agent_task, agent_ref, completion_id)
+        watcher.start()
+
         try:
             last_activity = time.monotonic()
 
@@ -5535,6 +5725,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 delta = stream_q.get_nowait()
                                 if delta is None:
                                     break
+                                if delta is _SSE_CLIENT_GONE:
+                                    raise _SSEClientGone("SSE client disconnected")
                                 last_activity = await _emit(delta)
                             except asyncio.QueueEmpty:
                                 break
@@ -5546,6 +5738,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 if delta is None:  # End of stream sentinel
                     break
+                if delta is _SSE_CLIENT_GONE:
+                    # The watcher saw the transport close; take the same
+                    # path a failed write would.
+                    raise _SSEClientGone("SSE client disconnected")
 
                 last_activity = await _emit(delta)
 
@@ -5563,6 +5759,12 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+            except asyncio.CancelledError:
+                if watcher.fired:
+                    # The watcher cancelled the agent task under us: this
+                    # is the client leaving, not the server cancelling.
+                    raise _SSEClientGone("SSE client disconnected")
+                raise
             except Exception as exc:
                 agent_error = exc
                 logger.error(
@@ -5615,23 +5817,11 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            # Client disconnected mid-stream.  Interrupt the agent so it
-            # stops making LLM API calls at the next loop iteration, then
-            # cancel the asyncio task wrapper.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    request_hard_interrupt(agent, "SSE client disconnected")
-                except Exception:
-                    pass
-                _reap_disconnected_agent_processes(agent)
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+            # Client disconnected mid-stream — noticed either by a failed
+            # write or by the watcher. Interrupt the agent so it stops
+            # making LLM API calls at the next loop iteration, reap its
+            # processes and cancel the asyncio task wrapper; once only.
+            await watcher.fire()
         except Exception as _exc:
             # Agent crashed mid-stream.  Try to emit an error chunk
             # so the client gets a proper response instead of a
@@ -5648,6 +5838,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 await response.write(b"data: [DONE]\n\n")
             except Exception:
                 pass
+        finally:
+            watcher.stop()
 
         return response
 
@@ -5711,6 +5903,11 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
+
+        # Notices the client leaving while the agent is inside a tool call
+        # and nothing is being written (see _SSEDisconnectWatcher).
+        watcher = _SSEDisconnectWatcher(request, stream_q, agent_task, agent_ref, response_id)
+        watcher.start()
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -6026,6 +6223,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 item = stream_q.get_nowait()
                                 if item is None:
                                     break
+                                if item is _SSE_CLIENT_GONE:
+                                    raise _SSEClientGone("SSE client disconnected")
                                 await _dispatch(item)
                                 last_activity = time.monotonic()
                             except asyncio.QueueEmpty:
@@ -6035,6 +6234,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         await response.write(b": keepalive\n\n")
                         last_activity = time.monotonic()
                     continue
+
+                if item is _SSE_CLIENT_GONE:
+                    # The watcher saw the transport close; take the same
+                    # path a failed write would.
+                    raise _SSEClientGone("SSE client disconnected")
 
                 if item is None:  # EOS sentinel
                     # Cancel pending timer and flush remaining batched text
@@ -6054,7 +6258,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Pick up agent result + usage from the completed task
             try:
-                result, agent_usage = await agent_task
+                try:
+                    result, agent_usage = await agent_task
+                except asyncio.CancelledError:
+                    if watcher.fired:
+                        # The watcher cancelled the agent task under us:
+                        # the client left; this is not a server cancel.
+                        raise _SSEClientGone("SSE client disconnected")
+                    raise
                 usage = agent_usage or usage
                 # If the agent produced a final_response but no text
                 # deltas were streamed (e.g. some providers only emit
@@ -6192,43 +6403,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             _persist_incomplete_if_needed()
-            # Client disconnected — interrupt the agent so it stops
-            # making upstream LLM calls, then cancel the task.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    request_hard_interrupt(agent, "SSE client disconnected")
-                except Exception:
-                    pass
-                _reap_disconnected_agent_processes(agent)
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", response_id)
+            # Client disconnected — noticed either by a failed write or by
+            # the watcher. Interrupt the agent so it stops making upstream
+            # LLM calls, reap its processes and cancel the task; once only.
+            await watcher.fire()
         except asyncio.CancelledError:
             # Server-side cancellation (e.g. shutdown, request timeout) —
             # persist an incomplete snapshot so GET /v1/responses/{id} and
             # previous_response_id chaining still work, then re-raise so the
-            # runtime's cancellation semantics are respected.
+            # runtime's cancellation semantics are respected. Same
+            # abandonment as a client disconnect: the run will never be
+            # resumed, so reap the background processes it created (#76115;
+            # epoch-gated, a no-op when the turn already finished) — but
+            # without waiting on the cancelled task, so the re-raise is prompt.
             _persist_incomplete_if_needed()
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    request_hard_interrupt(agent, "SSE task cancelled")
-                except Exception:
-                    pass
-                # Same abandonment as a client disconnect: the run will never
-                # be resumed, so reap the background processes it created
-                # (#76115). Epoch-gated; no-op when the turn already
-                # finished and cleared its markers.
-                _reap_disconnected_agent_processes(
-                    agent, source="api_server_sse_cancelled"
-                )
-            if not agent_task.done():
-                agent_task.cancel()
+            await _abandon_agent_turn(
+                agent_ref, agent_task,
+                reason="SSE task cancelled",
+                source="api_server_sse_cancelled",
+                wait=False,
+            )
             logger.info("SSE task cancelled; persisted incomplete snapshot for %s", response_id)
             raise
         except Exception as _exc:
@@ -6255,6 +6449,8 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             logger.error("Agent crashed mid-stream for %s: %s", response_id, str(agent_error)[:300])
+        finally:
+            watcher.stop()
 
         return response
 

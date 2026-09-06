@@ -480,3 +480,242 @@ class TestThreadSafeAsyncQueueCrossThreadBoundary:
 
         loop.run_until_complete(consumer())
         loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Disconnect watcher: the client leaves while nothing is being written
+# ---------------------------------------------------------------------------
+
+def _make_connected_request():
+    """A mock request whose transport says the client is still there.
+
+    Flip ``request.transport.is_closing.return_value`` to ``True`` to
+    simulate the client closing the socket — that is what aiohttp's
+    transport reports once it has read the peer's EOF.
+    """
+    req = _make_request()
+    req.transport.is_closing.return_value = False
+    return req
+
+
+def _quiet_stream_response():
+    """A StreamResponse double whose writes always succeed.
+
+    The point of the watcher tests is that detection must not depend on a
+    write failing, so this double never raises.
+    """
+    from aiohttp import web
+
+    resp = AsyncMock(spec=web.StreamResponse)
+    resp.write = AsyncMock()
+    resp.prepare = AsyncMock()
+    return resp
+
+
+class TestSSEDisconnectWatcher:
+    """gateway/platforms/api_server.py — _SSEDisconnectWatcher
+
+    Measured 2026-09-06: a client closed its /v1/chat/completions stream
+    while the agent was inside a 14-step computer_use run. Nothing was
+    being written, so the only detector — ``response.write`` raising —
+    never fired; the disconnect was logged ~3 s later, and the user's next
+    turn queued behind the abandoned one (8.2 s to first token instead of
+    ~3 s). While text is flowing the same detection takes ~65 ms.
+    """
+
+    def test_disconnect_noticed_while_agent_blocked_in_tool_call(self, caplog):
+        """The agent sits in a "tool call" (an awaitable that never writes);
+        the client closes the connection; the agent is interrupted, reaped
+        and cancelled well under a second later — with no write involved,
+        the helper running once, and the log line present."""
+        import logging
+        import gateway.platforms.api_server as api_mod
+
+        caplog.set_level(logging.INFO, logger="gateway.platforms.api_server")
+        adapter = _make_adapter()
+
+        tool_call_finished = asyncio.Event()  # never set
+
+        async def fake_agent():
+            # One delta, then a long tool call that produces no output.
+            await tool_call_finished.wait()
+            return {"final_response": "never"}, {}
+
+        mock_agent = MagicMock()
+        mock_agent.interrupt = MagicMock()
+
+        async def run():
+            stream_q = ThreadSafeAsyncQueue()
+            stream_q.put_nowait("Looking at the screen… ")
+            agent_task = asyncio.ensure_future(fake_agent())
+            agent_ref = [mock_agent]
+            request = _make_connected_request()
+            response = _quiet_stream_response()
+
+            real_abandon = api_mod._abandon_agent_turn
+            with patch("gateway.platforms.api_server.web.StreamResponse", return_value=response), \
+                 patch("gateway.platforms.api_server._abandon_agent_turn", wraps=real_abandon) as abandon_spy:
+                writer = asyncio.ensure_future(adapter._write_sse_chat_completion(
+                    request, "cmpl-toolcall", "gpt-4", 1234567890,
+                    stream_q, agent_task, agent_ref,
+                ))
+                # Let the writer drain the one delta and settle into
+                # ``stream_q.get()`` with nothing more to write.
+                await asyncio.sleep(0.3)
+                assert not writer.done(), "writer must still be streaming"
+                assert not agent_task.done(), "agent must still be in its tool call"
+                mock_agent.interrupt.assert_not_called()
+                writes_before = response.write.call_count
+
+                # The client closes its socket.
+                request.transport.is_closing.return_value = True
+                t0 = time.monotonic()
+                await asyncio.wait_for(writer, timeout=1.0)
+                elapsed = time.monotonic() - t0
+
+            # Prompt: the poll is 100 ms; a second would mean the watcher
+            # did nothing and something else ended the turn.
+            assert elapsed < 0.5, f"disconnect took {elapsed:.3f}s to act on"
+            # Nothing was written after the client left — detection did
+            # not depend on a write failing.
+            assert response.write.call_count == writes_before
+            # Exactly the write-exception path's sequence, once.
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert abandon_spy.call_count == 1
+            assert agent_task.cancelled()
+            hits = [r for r in caplog.records
+                    if r.getMessage() == "SSE client disconnected; interrupted agent task cmpl-toolcall"]
+            assert len(hits) == 1, [r.getMessage() for r in caplog.records]
+
+        asyncio.run(run())
+
+    def test_disconnect_noticed_for_responses_stream_in_tool_call(self, caplog):
+        """Same for POST /v1/responses, whose writer has the same shape."""
+        import logging
+        import gateway.platforms.api_server as api_mod
+
+        caplog.set_level(logging.INFO, logger="gateway.platforms.api_server")
+        adapter = _make_adapter()
+        tool_call_finished = asyncio.Event()  # never set
+
+        async def fake_agent():
+            await tool_call_finished.wait()
+            return {"final_response": "never"}, {}
+
+        mock_agent = MagicMock()
+        mock_agent.interrupt = MagicMock()
+
+        async def run():
+            stream_q = ThreadSafeAsyncQueue()
+            stream_q.put_nowait("partial ")
+            agent_task = asyncio.ensure_future(fake_agent())
+            request = _make_connected_request()
+            response = _quiet_stream_response()
+
+            real_abandon = api_mod._abandon_agent_turn
+            with patch("gateway.platforms.api_server.web.StreamResponse", return_value=response), \
+                 patch("gateway.platforms.api_server._abandon_agent_turn", wraps=real_abandon) as abandon_spy:
+                writer = asyncio.ensure_future(adapter._write_sse_responses(
+                    request=request, response_id="resp_toolcall", model="hermes-agent",
+                    created_at=1234567890, stream_q=stream_q, agent_task=agent_task,
+                    agent_ref=[mock_agent], conversation_history=[], user_message="go",
+                    instructions=None, conversation=None, store=False, session_id=None,
+                ))
+                await asyncio.sleep(0.3)
+                assert not writer.done() and not agent_task.done()
+                request.transport.is_closing.return_value = True
+                t0 = time.monotonic()
+                await asyncio.wait_for(writer, timeout=1.0)
+                elapsed = time.monotonic() - t0
+
+            assert elapsed < 0.5, f"disconnect took {elapsed:.3f}s to act on"
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert abandon_spy.call_count == 1
+            assert agent_task.cancelled()
+            assert sum(
+                1 for r in caplog.records
+                if r.getMessage() == "SSE client disconnected; interrupted agent task resp_toolcall"
+            ) == 1
+
+        asyncio.run(run())
+
+    def test_watcher_does_not_fire_after_normal_completion(self):
+        """A client that closes its socket once the turn is over is not a
+        disconnect: the watcher must be stopped with the writer and never
+        interrupt a finished agent."""
+        adapter = _make_adapter()
+
+        async def fake_agent():
+            return {"final_response": "done"}, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+
+        mock_agent = MagicMock()
+        mock_agent.interrupt = MagicMock()
+
+        async def run():
+            stream_q = ThreadSafeAsyncQueue()
+            stream_q.put_nowait("hello")
+            stream_q.put_nowait(None)
+            agent_task = asyncio.ensure_future(fake_agent())
+            await asyncio.sleep(0)
+            request = _make_connected_request()
+            response = _quiet_stream_response()
+
+            with patch("gateway.platforms.api_server.web.StreamResponse", return_value=response):
+                await adapter._write_sse_chat_completion(
+                    request, "cmpl-finished", "gpt-4", 1234567890,
+                    stream_q, agent_task, [mock_agent],
+                )
+            # Turn is over; now the client goes away, and enough time
+            # passes for several polls.
+            request.transport.is_closing.return_value = True
+            await asyncio.sleep(0.35)
+
+            mock_agent.interrupt.assert_not_called()
+            assert agent_task.done() and not agent_task.cancelled()
+            assert len([t for t in asyncio.all_tasks() if not t.done()]) == 1, "watcher task left running"
+
+        asyncio.run(run())
+
+    def test_write_failure_and_watcher_share_one_sequence(self):
+        """When a write fails *and* the transport reports closed, the
+        interrupt/reap/cancel sequence still runs exactly once."""
+        import gateway.platforms.api_server as api_mod
+
+        adapter = _make_adapter()
+        agent_done = asyncio.Event()
+
+        async def fake_agent():
+            await agent_done.wait()
+            return {}, {}
+
+        mock_agent = MagicMock()
+        mock_agent.interrupt = MagicMock()
+
+        async def run():
+            from aiohttp import web
+
+            stream_q = ThreadSafeAsyncQueue()
+            stream_q.put_nowait("hello ")
+            agent_task = asyncio.ensure_future(fake_agent())
+            request = _make_connected_request()
+            # The transport is already gone; the first write also fails.
+            request.transport.is_closing.return_value = True
+            response = AsyncMock(spec=web.StreamResponse)
+            response.write = AsyncMock(side_effect=ConnectionResetError("gone"))
+            response.prepare = AsyncMock()
+
+            real_abandon = api_mod._abandon_agent_turn
+            with patch("gateway.platforms.api_server.web.StreamResponse", return_value=response), \
+                 patch("gateway.platforms.api_server._abandon_agent_turn", wraps=real_abandon) as abandon_spy:
+                await adapter._write_sse_chat_completion(
+                    request, "cmpl-both", "gpt-4", 1234567890,
+                    stream_q, agent_task, [mock_agent],
+                )
+                await asyncio.sleep(0.35)  # give a stray watcher every chance to fire again
+
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert abandon_spy.call_count == 1
+            assert agent_task.cancelled()
+            agent_done.set()
+
+        asyncio.run(run())
