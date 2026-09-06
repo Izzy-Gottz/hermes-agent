@@ -39,9 +39,9 @@ def _env(tmp_path: Path, monkeypatch):
     with rt._REGISTRY_LOCK:
         rt._REGISTRY.clear()
     yield home
-    # A refill runs on a daemon thread and can land after the test that
-    # started it; wait for it before dropping, or the next test inherits a
-    # spare built for someone else's settings.
+    # Refills run on daemon threads and can land after the test that started
+    # them; wait until no profile is still building before dropping the pool,
+    # or the next test inherits a spare built for someone else's settings.
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         with rt._SPARE_LOCK:
@@ -49,6 +49,8 @@ def _env(tmp_path: Path, monkeypatch):
                 break
         time.sleep(0.05)
     rt.drop_spare()
+    with rt._SPARE_LOCK:
+        assert not rt._SPARES, "drop_spare() left a spare in the pool"
     for key in list(rt._REGISTRY):
         rt.evict_session(key)
 
@@ -657,14 +659,34 @@ class TestPreWarmedSpare:
     spawn, so the whole process can be booted before the conversation exists.
     """
 
-    def _wait_for_spare(self, timeout=25.0):
+    def _wait_for_spare(self, agent=None, timeout=25.0):
+        """The spare for ``agent``'s profile (or, with no agent, whichever
+        lands first), waiting for the background build to finish."""
+        key = rt._spare_key(agent) if agent is not None else None
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with rt._SPARE_LOCK:
-                if rt._SPARE is not None:
-                    return rt._SPARE
+                if key is not None:
+                    if key in rt._SPARES:
+                        return rt._SPARES[key]
+                elif rt._SPARES:
+                    return next(iter(rt._SPARES.values()))
             time.sleep(0.05)
         return None
+
+    def _wait_until_idle(self, timeout=25.0):
+        """Block until no profile has a build in flight."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with rt._SPARE_LOCK:
+                if not rt._SPARE_BUILDING:
+                    return True
+            time.sleep(0.05)
+        return False
+
+    def _pool_keys(self):
+        with rt._SPARE_LOCK:
+            return list(rt._SPARES)
 
     def test_a_turn_leaves_a_spare_warm_for_the_next_conversation(self):
         first = _agent("conv-1")
@@ -692,25 +714,177 @@ class TestPreWarmedSpare:
         mapped = load_session_map(second._claude_code_session.config_dir)
         assert mapped.get("conv-2") == second._claude_code_session.requested_session_id
 
-    def test_a_caller_it_does_not_fit_leaves_it_warm_for_the_next_one(self):
-        """Every delegated subagent is its own session and asks here, and its
-        bridged tool set is deliberately narrower than its parent's — so its
-        signature never matches. Closing on mismatch would mean every
-        delegation threw away the process the user's next conversation was
-        going to start in."""
-        _turn(_agent("conv-1"))
-        spare = self._wait_for_spare()
+    def test_a_caller_it_does_not_fit_neither_takes_nor_evicts_it(self):
+        """A caller whose profile has no spare gets ``None`` and leaves every
+        other profile's spare exactly where it was: a narrowed tool surface
+        (every delegated leaf), a different prompt, a different model — none
+        of them may close or displace the process the user's next
+        conversation is going to start in."""
+        first = _agent("conv-1")
+        _turn(first)
+        spare = self._wait_for_spare(first)
         assert spare is not None
         warm_pid = spare.session.pid
 
-        subagent = _agent("child-1")
-        subagent.valid_tool_names = {"todo"}      # a leaf's narrowed surface
-        assert rt.take_spare(subagent) is None
+        narrowed = _agent("child-1")
+        narrowed.valid_tool_names = {"todo"}      # a leaf's narrowed surface
+        assert rt.take_spare(narrowed) is None
+        other_prompt = _agent("conv-x", ephemeral="SOMETHING-ELSE")
+        assert rt.take_spare(other_prompt) is None
         with rt._SPARE_LOCK:
-            assert rt._SPARE is not None and rt._SPARE.session.pid == warm_pid
+            assert list(rt._SPARES) == [rt._spare_key(first)]
+            assert rt._SPARES[rt._spare_key(first)].session.pid == warm_pid
+        assert spare.session.is_alive()
 
         # ...and the conversation it WAS meant for still gets it.
-        assert rt.take_spare(_agent("conv-2")) is not None
+        taken = rt.take_spare(_agent("conv-2"))
+        assert taken is not None and taken.pid == warm_pid
+
+    def test_a_second_profile_gets_its_own_spare_alongside_the_first(self):
+        """The bug this replaces: one slot, minted in the image of whichever
+        turn ended first. Moe opens two fresh-session profiles per launch
+        (the voice brain and a one-word probe with a different prompt); the
+        probe's turn ends first, so the slot was the probe's forever and the
+        brain took a spare 7 times in 314 sessions. Each profile must hold
+        its own."""
+        brain = _agent("brain-1", ephemeral="BRAIN-PROMPT")
+        probe = _agent("probe-1", ephemeral="Answer with one word.")
+        _turn(probe)
+        assert self._wait_for_spare(probe) is not None
+        _turn(brain)
+        assert self._wait_for_spare(brain) is not None, (
+            "the brain's profile never got a spare: the pool is still one slot"
+        )
+        keys = self._pool_keys()
+        assert set(keys) == {rt._spare_key(probe), rt._spare_key(brain)}
+        assert len(keys) == 2
+
+        # Each conversation takes ITS profile's spare, not the other's.
+        probe_pid = self._wait_for_spare(probe).session.pid
+        brain_pid = self._wait_for_spare(brain).session.pid
+        assert probe_pid != brain_pid
+        brain2 = _agent("brain-2", ephemeral="BRAIN-PROMPT")
+        _turn(brain2)
+        assert brain2._claude_code_session.pid == brain_pid
+        probe2 = _agent("probe-2", ephemeral="Answer with one word.")
+        _turn(probe2)
+        assert probe2._claude_code_session.pid == probe_pid
+
+    def test_a_third_profile_replaces_the_oldest_at_pool_size_two(self):
+        """``prewarm_spares`` bounds the pool (each spare is a whole CLI plus
+        its MCP servers); over the limit, the spare minted longest ago goes."""
+        assert rt._prewarm_spares_from_config() == 2
+        one = _agent("conv-1", ephemeral="PROMPT-ONE")
+        two = _agent("conv-2", ephemeral="PROMPT-TWO")
+        three = _agent("conv-3", ephemeral="PROMPT-THREE")
+        _turn(one)
+        spare_one = self._wait_for_spare(one)
+        assert spare_one is not None
+        _turn(two)
+        spare_two = self._wait_for_spare(two)
+        assert spare_two is not None
+        assert self._pool_keys() == [rt._spare_key(one), rt._spare_key(two)]
+
+        _turn(three)
+        spare_three = self._wait_for_spare(three)
+        assert spare_three is not None
+        assert self._wait_until_idle()
+        assert self._pool_keys() == [rt._spare_key(two), rt._spare_key(three)], (
+            "the oldest profile's spare should have been the one replaced"
+        )
+        assert not spare_one.session.is_alive(), "the evicted spare was left running"
+        assert spare_two.session.is_alive()
+        assert spare_three.session.is_alive()
+
+    def test_the_pool_size_is_configurable(self, monkeypatch):
+        cfg = rt._claude_code_config()
+        monkeypatch.setattr(rt, "_claude_code_config", lambda: {**cfg, "prewarm_spares": 1})
+        one = _agent("conv-1", ephemeral="PROMPT-ONE")
+        two = _agent("conv-2", ephemeral="PROMPT-TWO")
+        _turn(one)
+        spare_one = self._wait_for_spare(one)
+        assert spare_one is not None
+        _turn(two)
+        assert self._wait_for_spare(two) is not None
+        assert self._wait_until_idle()
+        assert self._pool_keys() == [rt._spare_key(two)]
+        assert not spare_one.session.is_alive()
+
+    def test_a_spare_is_built_on_a_fresh_cli_session_not_the_builders_transcript(self):
+        """The spare is minted by whichever agent's turn just ended, and it
+        used to be handed that agent's deterministic CLI session id. With a
+        transcript for that id on disk, ``ensure_started`` spawns
+        ``claude -p --resume <builder's id>`` — one claimed spare ran inside a
+        9.2 MB transcript of another conversation. A spare must start on an
+        id nobody has a transcript for."""
+        first = _agent("conv-1")
+        _turn(first)
+        builder = first._claude_code_session
+        assert self._wait_for_spare(first) is not None
+        rt.drop_spare()
+        assert self._wait_until_idle()
+
+        # The builder's transcript exists on disk (the fake CLI writes none).
+        transcript_dir = Path(builder.config_dir) / "projects" / "some-cwd-slug"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        (transcript_dir / f"{builder.requested_session_id}.jsonl").write_text("{}\n")
+        from agent.transports.claude_code_session import resume_transcript_exists
+        assert resume_transcript_exists(builder.config_dir, builder.requested_session_id)
+
+        rt.refill_spare(first)
+        spare = self._wait_for_spare(first)
+        assert spare is not None
+        assert spare.session.requested_session_id != builder.requested_session_id, (
+            "the spare was given the builder's CLI session id"
+        )
+        assert spare.session.resumed is False, (
+            "the spare was spawned with --resume on somebody's transcript"
+        )
+
+    def test_a_subagent_never_mints_a_spare(self):
+        """Every delegation is its own short-lived session with its own
+        narrowed prompt; a spare in its image would only displace one a
+        conversation is going to want."""
+        by_platform = _agent("child-1", ephemeral="LEAF-PROMPT-A")
+        by_platform.platform = "subagent"
+        _turn(by_platform)
+        rt.refill_spare(by_platform)
+        by_parent = _agent("child-2", ephemeral="LEAF-PROMPT-B")
+        by_parent.platform = "cli"
+        by_parent._parent_session_id = "parent-1"
+        _turn(by_parent)
+        rt.refill_spare(by_parent)
+        assert self._wait_until_idle()
+        time.sleep(0.3)
+        assert self._pool_keys() == [], "a subagent minted a spare"
+
+        # And a subagent never takes one meant for a conversation, either.
+        parent = _agent("conv-1")
+        _turn(parent)
+        spare = self._wait_for_spare(parent)
+        assert spare is not None
+        child = _agent("child-3")
+        child.platform = "subagent"           # same profile as the parent
+        assert rt.take_spare(child) is None
+        assert self._pool_keys() == [rt._spare_key(parent)]
+
+    def test_each_stale_spare_is_reaped_on_its_own(self):
+        one = _agent("conv-1", ephemeral="PROMPT-ONE")
+        two = _agent("conv-2", ephemeral="PROMPT-TWO")
+        _turn(one)
+        spare_one = self._wait_for_spare(one)
+        assert spare_one is not None
+        _turn(two)
+        spare_two = self._wait_for_spare(two)
+        assert spare_two is not None
+        assert self._wait_until_idle()
+        # Age only the first past the timeout.
+        with rt._SPARE_LOCK:
+            spare_one.minted_at -= 100.0
+        rt.sweep_idle_sessions(50.0)
+        assert self._pool_keys() == [rt._spare_key(two)]
+        assert not spare_one.session.is_alive()
+        assert spare_two.session.is_alive()
 
     def test_a_spare_with_a_different_system_prompt_is_not_used(self):
         """The prompt is baked in at spawn (--append-system-prompt-file), so a
@@ -741,7 +915,7 @@ class TestPreWarmedSpare:
         _turn(_agent("conv-1"))
         time.sleep(0.3)
         with rt._SPARE_LOCK:
-            assert rt._SPARE is None
+            assert not rt._SPARES
         assert rt.take_spare(_agent("conv-2")) is None
 
     def test_the_spare_is_closed_at_shutdown(self):
@@ -752,7 +926,7 @@ class TestPreWarmedSpare:
         rt._shutdown_registry()
         assert not session.is_alive()
         with rt._SPARE_LOCK:
-            assert rt._SPARE is None
+            assert not rt._SPARES
 
     def test_a_spare_nobody_came_for_is_reaped(self):
         """It costs as much resident memory as any other warm child; a spare
@@ -763,7 +937,7 @@ class TestPreWarmedSpare:
         session = spare.session
         rt.sweep_idle_sessions(0.0)
         with rt._SPARE_LOCK:
-            assert rt._SPARE is None
+            assert not rt._SPARES
         assert not session.is_alive()
 
 

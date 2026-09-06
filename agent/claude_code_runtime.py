@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import atexit
 import glob
+import hashlib
 import logging
 import os
 import shutil
@@ -99,6 +100,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -206,17 +208,23 @@ def sweep_idle_sessions(idle_seconds: float, *, now: Optional[float] = None) -> 
     """Close and drop every registered session idle for ``idle_seconds``.
     Sessions with a turn in flight are never evicted. Returns the count.
 
-    The unclaimed spare ages out on the same clock. It costs about as much
-    resident memory as any other warm child (~370 MB here, CLI plus its MCP
-    server), and a spare nobody has come for in hours is a bet that has
-    already lost — the next turn re-mints one at the end of the turn anyway.
+    Unclaimed spares age out on the same clock, each on its own. A spare costs
+    about as much resident memory as any other warm child (~370 MB here, CLI
+    plus its MCP server), and one nobody has come for in hours is a bet that
+    has already lost — the next turn of its profile re-mints it anyway.
     """
     now = time.monotonic() if now is None else now
     with _SPARE_LOCK:
-        stale = _SPARE is not None and (now - _SPARE.minted_at) >= idle_seconds
-    if stale:
-        logger.info("claude-code: dropping a spare nobody came for")
-        drop_spare()
+        stale = [
+            (key, spare) for key, spare in _SPARES.items()
+            if (now - spare.minted_at) >= idle_seconds
+        ]
+    for key, spare in stale:
+        logger.info(
+            "claude-code: dropping a spare nobody came for (profile %s, pid %s, warm for %.0fs)",
+            _profile_label(key), spare.session.pid, now - spare.minted_at,
+        )
+        drop_spare(key)
     victims: list[tuple[str, _RegistryEntry]] = []
     with _REGISTRY_LOCK:
         for key, entry in list(_REGISTRY.items()):
@@ -388,23 +396,40 @@ class TurnInFlightError(RuntimeError):
 # whichever conversation turns up. `--input-format stream-json` is what makes
 # it wait: a plain `-p` child reads EOF on empty stdin and exits.
 #
-# One spare, not a pool: each holds a full CLI plus its MCP servers, and the
-# claim rate here is one per conversation, not one per turn. It is reaped by
-# the same idle sweep as everything else and closed at exit — Claude Code's
-# own daemon leaked 64 processes and 7 GB over six weeks by not doing that.
-#
 # A spare is only usable by an agent whose spawn-time settings match it: the
 # system prompt is baked in with --append-system-prompt-file, the mcp-config
 # (and so the bridged tool set) is read at spawn, and cwd/model/permission
-# mode cannot change afterwards. A mismatch is not a bug — the spare is
-# dropped and the session built the old way, which is exactly today's cost.
+# mode cannot change afterwards. A mismatch is not a bug — the spare is left
+# for whoever it fits and the session built the old way, today's cost.
+#
+# A small pool keyed by PROFILE — (spawn signature, sha256 of the system
+# prompt) — not one slot. One slot was minted in the image of whichever turn
+# ended first, and a host that opens more than one fresh-session profile per
+# launch never got to use it: Moe opens two (a voice brain with a 52,012-byte
+# prompt and a one-word probe with a 28 KB one, "Answer with one word."), the
+# probe's turn ends first, the slot is the probe's for the rest of the
+# process, and the brain — the conversation the spare exists for — went cold
+# every time. Measured in agent.log: 7 takes in 314 sessions. Each spare
+# holds a full CLI plus its MCP servers (~370 MB), so the pool is bounded by
+# ``claude_code.prewarm_spares`` (default 2), the oldest is replaced when a
+# new profile pushes it over, the idle sweep reaps each stale one and every
+# one is closed at exit — Claude Code's own daemon leaked 64 processes and
+# 7 GB over six weeks by not doing that. Subagents never mint: every
+# delegation is its own short-lived session with its own narrowed prompt and
+# a spare in its image would only ever displace a conversation's.
 # ---------------------------------------------------------------------------
 
 _UNSET = object()
 
 _SPARE_LOCK = threading.Lock()
-_SPARE: Optional["_Spare"] = None
-_SPARE_BUILDING = False
+# Profile key -> spare, in mint order (oldest first). ``OrderedDict`` so the
+# eviction victim is simply the first item.
+_SPARES: "OrderedDict[tuple, _Spare]" = OrderedDict()
+# Profile keys with a build in flight. A set, not a flag: two profiles may
+# legitimately be booting at once, and a second request for the SAME profile
+# must not start a second child.
+_SPARE_BUILDING: set = set()
+DEFAULT_PREWARM_SPARES = 2
 
 
 @dataclass
@@ -412,6 +437,7 @@ class _Spare:
     session: Any
     system_prompt: str
     signature: tuple
+    key: tuple = ()
     minted_at: float = field(default_factory=time.monotonic)
 
 
@@ -421,6 +447,25 @@ def _spare_enabled() -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"0", "false", "no", "off", ""}
     return bool(value)
+
+
+def _prewarm_spares_from_config() -> int:
+    """``claude_code.prewarm_spares`` (default 2): how many profiles may have
+    a warm spare at once. 0 disables minting without touching ``prewarm``."""
+    try:
+        value = int(_claude_code_config().get("prewarm_spares", DEFAULT_PREWARM_SPARES))
+    except (TypeError, ValueError):
+        value = DEFAULT_PREWARM_SPARES
+    return max(0, value)
+
+
+def _is_subagent(agent) -> bool:
+    """A delegated child: its own session, its own narrowed prompt, gone in
+    a minute. It neither mints a spare nor takes one meant for a
+    conversation."""
+    if str(getattr(agent, "platform", "") or "") == "subagent":
+        return True
+    return bool(getattr(agent, "_parent_session_id", None))
 
 
 def _spare_signature(agent) -> tuple:
@@ -442,75 +487,139 @@ def _spare_signature(agent) -> tuple:
     )
 
 
+def _prompt_digest(prompt: str) -> str:
+    return hashlib.sha256((prompt or "").encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _spare_key(agent, prompt: Optional[str] = None) -> tuple:
+    """The pool key for ``agent``'s profile: spawn signature plus the digest
+    of the system prompt that will be baked into the child. Two agents with
+    the same key can use each other's spare; nothing else can."""
+    if prompt is None:
+        prompt = combined_system_prompt(agent)
+    return (_spare_signature(agent), _prompt_digest(prompt))
+
+
+def _profile_label(key: tuple) -> str:
+    """Short, log-friendly name for a profile key: prompt digest prefix."""
+    try:
+        return str(key[1])[:10]
+    except (IndexError, TypeError):
+        return "?"
+
+
 def take_spare(agent) -> Optional[Any]:
-    """A warm session for ``agent``, or ``None`` to build one the usual way."""
-    if not _spare_enabled():
+    """A warm session for ``agent``'s profile, or ``None`` to build one the
+    usual way. Spares belonging to other profiles are never touched."""
+    if not _spare_enabled() or _is_subagent(agent):
         return None
     wanted_prompt = combined_system_prompt(agent)
-    wanted_signature = _spare_signature(agent)
+    key = _spare_key(agent, wanted_prompt)
     with _SPARE_LOCK:
-        spare, globals()["_SPARE"] = _SPARE, None
+        spare = _SPARES.pop(key, None)
+        others = len(_SPARES)
     if spare is None:
+        logger.debug(
+            "claude-code: no spare for profile %s (%d warm for other profiles)",
+            _profile_label(key), others,
+        )
         return None
     session = spare.session
     if not session.is_alive() or getattr(session, "_closed", False):
-        logger.debug("claude-code: spare was not alive; building fresh")
+        logger.info(
+            "claude-code: the spare for profile %s had died; building fresh",
+            _profile_label(key),
+        )
+        try:
+            session.close()
+        except Exception:
+            pass
         return None
-    if spare.signature != wanted_signature or spare.system_prompt != wanted_prompt:
-        # Not for this caller — put it back. A SUBAGENT is the common case:
-        # every delegated child is its own session and asks here, and its
-        # bridged tool set is deliberately narrower than its parent's, so its
-        # signature never matches. Closing on mismatch would mean every
-        # delegation threw away the warm process the user's next conversation
-        # was going to start in.
+    if spare.signature != _spare_signature(agent) or spare.system_prompt != wanted_prompt:
+        # Only reachable through a sha256 collision or a signature that
+        # changed under a stable digest; keep the byte-equal check because it
+        # is cheap and the alternative is a child answering with the wrong
+        # prompt. Put it back for whoever it does fit.
         with _SPARE_LOCK:
-            if _SPARE is None:
-                globals()["_SPARE"] = spare
+            if key not in _SPARES:
+                _SPARES[key] = spare
                 spare = None
         if spare is not None:
             try:
                 spare.session.close()
             except Exception:
                 logger.debug("claude-code: closing a surplus spare failed", exc_info=True)
-        logger.debug("claude-code: the spare is not for this caller; left warm")
+        logger.debug("claude-code: the spare keyed for this caller does not match; left warm")
         return None
+    logger.info(
+        "claude-code: this conversation took the warm spare for profile %s "
+        "(pid %s, warm for %.0fs; %d spare(s) left for other profiles)",
+        _profile_label(key), session.pid, time.monotonic() - spare.minted_at, others,
+    )
     return session
 
 
 def refill_spare(agent) -> None:
-    """Boot the next spare in the background, if there isn't one.
+    """Boot a spare for ``agent``'s profile in the background, if there isn't
+    one and none is being built.
 
     Called after a claim and at the end of a turn: by the time the user starts
     their NEXT conversation, the process it will run in is already answering.
+    When the pool is over ``prewarm_spares`` after the new one lands, the
+    oldest spare is closed to make room — a profile that has not been asked
+    for since before the others is the one least likely to be asked for next.
     """
-    if not _spare_enabled():
+    if not _spare_enabled() or _is_subagent(agent):
         return
-    global _SPARE_BUILDING
+    limit = _prewarm_spares_from_config()
+    if limit <= 0:
+        return
     prompt = combined_system_prompt(agent)
     signature = _spare_signature(agent)
+    key = (signature, _prompt_digest(prompt))
     with _SPARE_LOCK:
-        if _SPARE is not None or _SPARE_BUILDING:
+        if key in _SPARES or key in _SPARE_BUILDING:
             return
-        _SPARE_BUILDING = True
+        _SPARE_BUILDING.add(key)
 
     def _build() -> None:
-        global _SPARE_BUILDING
         session = None
+        evicted: list[_Spare] = []
         try:
             session = _build_session(agent, session_key=None)
             session.ensure_started()
+            pid = session.pid
             with _SPARE_LOCK:
-                if _SPARE is None:
-                    globals()["_SPARE"] = _Spare(session, prompt, signature)
+                if key not in _SPARES:
+                    _SPARES[key] = _Spare(session, prompt, signature, key)
                     session = None
+                    while len(_SPARES) > limit:
+                        _, oldest = _SPARES.popitem(last=False)
+                        evicted.append(oldest)
+                warm = len(_SPARES)
             if session is not None:      # someone else won the race
                 session.close()
             else:
-                logger.info("claude-code: a spare session is warm and waiting")
+                logger.info(
+                    "claude-code: a spare session is warm and waiting for profile %s "
+                    "(pid %s; %d/%d spare(s) warm)",
+                    _profile_label(key), pid, warm, limit,
+                )
+            for old in evicted:
+                logger.info(
+                    "claude-code: spare pool full (prewarm_spares=%d); replacing the "
+                    "oldest spare, profile %s (pid %s, warm for %.0fs), with profile %s",
+                    limit, _profile_label(old.key), old.session.pid,
+                    time.monotonic() - old.minted_at, _profile_label(key),
+                )
+                try:
+                    old.session.close()
+                except Exception:
+                    logger.debug("claude-code: closing an evicted spare failed", exc_info=True)
         except Exception:
             logger.info(
-                "claude-code: could not pre-warm a spare; conversations will "
-                "start cold", exc_info=True,
+                "claude-code: could not pre-warm a spare for profile %s; conversations "
+                "will start cold", _profile_label(key), exc_info=True,
             )
             if session is not None:
                 try:
@@ -519,16 +628,22 @@ def refill_spare(agent) -> None:
                     pass
         finally:
             with _SPARE_LOCK:
-                _SPARE_BUILDING = False
+                _SPARE_BUILDING.discard(key)
 
     threading.Thread(target=_build, name="claude-code-prewarm", daemon=True).start()
 
 
-def drop_spare() -> None:
-    """Close the spare, if any. Idle sweep, shutdown, and tests."""
+def drop_spare(key: Optional[tuple] = None) -> None:
+    """Close one spare (by profile key) or, with no key, every spare. Idle
+    sweep, shutdown, and tests."""
     with _SPARE_LOCK:
-        spare, globals()["_SPARE"] = _SPARE, None
-    if spare is not None:
+        if key is None:
+            doomed = list(_SPARES.values())
+            _SPARES.clear()
+        else:
+            spare = _SPARES.pop(key, None)
+            doomed = [spare] if spare is not None else []
+    for spare in doomed:
         try:
             spare.session.close()
         except Exception:
@@ -625,10 +740,9 @@ def _acquire_entry(agent) -> tuple[_RegistryEntry, bool]:
             pass
     if created:
         try:
-            session = take_spare(agent)
+            session = take_spare(agent)      # logs the take at INFO itself
             if session is not None:
                 session.claim(key)
-                logger.info("claude-code: this conversation took the warm spare")
                 refill_spare(agent)
             else:
                 session = _build_session(agent)
@@ -696,6 +810,9 @@ def _claude_code_config() -> Dict[str, Any]:
           silence_timeout: 300      # max silence between two CLI events inside a turn
           idle_timeout: 600         # evict a warm `claude` process idle this long (registry)
           max_sessions: 8           # warm processes kept at once (LRU eviction beyond this)
+          prewarm: true             # boot the next conversation's process before it arrives
+          prewarm_spares: 2         # profiles (signature + system prompt) kept warm at once;
+                                    # the oldest is replaced when a new profile exceeds it
     """
     try:
         from hermes_cli.config import load_config
@@ -1010,16 +1127,24 @@ def _build_session(agent, *, session_key: Optional[str] = _UNSET):
     approval_callback = _approval_callback()
     if session_key is _UNSET:
         hermes_sid = str(getattr(agent, "session_id", "") or "").strip() or None
+        cli_session_id = _claude_session_id_for(agent)
     else:
-        # A spare belongs to no conversation yet: no session_key means no
-        # id-map lookup, so it spawns with a fresh --session-id rather than
-        # resuming somebody's transcript.
+        # A spare belongs to no conversation yet, so it must spawn with a CLI
+        # session id nobody has a transcript for. Skipping the id-map lookup
+        # (no session_key) was never enough on its own: the id passed here
+        # used to be derived from the BUILDING agent's Hermes session, and
+        # ``ensure_started`` finds that agent's transcript on disk and spawns
+        # ``claude -p --resume <builder's id>``. One such spare, claimed by
+        # a new conversation, ran inside a 9.2 MB transcript of somebody
+        # else's. A fresh uuid has no transcript, so it is always
+        # ``--session-id``, and ``claim`` maps it to its owner later.
         hermes_sid = session_key
+        cli_session_id = str(uuid.uuid4())
     return ClaudeCodeSession(
         cwd=cwd,
         oauth_token_env=str(cfg.get("oauth_token_env") or DEFAULT_OAUTH_TOKEN_ENV),
         deny_rules=[str(r) for r in deny] if isinstance(deny, list) and deny else None,
-        session_id=_claude_session_id_for(agent),
+        session_id=cli_session_id,
         session_key=hermes_sid,
         resume=bool(cfg.get("resume", True)),
         approval_callback=approval_callback,
