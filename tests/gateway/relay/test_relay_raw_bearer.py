@@ -100,6 +100,37 @@ def test_broken_config_yaml_is_token_not_an_exception(monkeypatch):
     assert relay.relay_upgrade_auth_mode() == "token"
 
 
+# ─────────── the reader that feeds the header ───────────
+
+def test_the_reader_hands_over_a_secret_with_no_gateway_id(monkeypatch):
+    """``relay_connection_auth`` returns ``(None, secret)`` when only the
+    secret is configured, so ``raw`` — which sends no gatewayId — gets a
+    credential to present.
+
+    Written after mis-reading this function as dropping the secret unless both
+    were set: the ``if not (gateway_id and secret)`` there guards only the
+    *config.yaml fallback*, not the return. The guard that actually dropped a
+    raw credential was in ``_upgrade_headers``, and it is fixed above. Kept as
+    a test because the wiring between the two is the half no header test can
+    see, and the next reader will make the same mistake.
+    """
+    monkeypatch.setenv("GATEWAY_RELAY_AUTH_MODE", "raw")
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", SECRET)
+    monkeypatch.delenv("GATEWAY_RELAY_ID", raising=False)
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {}, raising=False)
+    gateway_id, secret = relay.relay_connection_auth()
+    assert (gateway_id, secret) == (None, SECRET)
+    # ...and that pair, handed to the transport, produces the raw header.
+    assert _bearer(gateway_id=gateway_id, upgrade_secret=secret,
+                   upgrade_auth_mode="raw") == f"Bearer {SECRET}"
+
+
+def test_the_same_pair_in_token_mode_sends_nothing(monkeypatch):
+    """The negative control, and the reason the mode exists: an unindexable
+    token is not a credential, so token mode declines to send one."""
+    assert _bearer(gateway_id=None, upgrade_secret=SECRET) is None
+
+
 # ───────────────────────── the header bytes ─────────────────────────
 
 def test_token_mode_is_unchanged_and_verifies():
