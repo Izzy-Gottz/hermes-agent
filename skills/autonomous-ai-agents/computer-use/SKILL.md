@@ -158,6 +158,20 @@ once it is focused, so treat the flag as provisional until then.
 it has a pid and a window_id, then invoke. Listing needs neither. The order is
 list → capture → invoke.
 
+**It is the one rung that is not background-first, and capturing first is not
+enough.** The driver raises the target (`AXRaise`, `AXMain`, `AXFocused`) and
+refuses with *"target window N did not become stably key and frontmost"* if it
+cannot — because macOS gives the menu bar to whichever app is active. It takes
+no `delivery_mode` and, unlike `click`/`type`/`key` in foreground mode, it does
+not put the previous app back afterwards. So invoking a menu item moves the
+person's screen, and where they have asked Moe to stay in the background it is
+refused outright.
+
+When that matters, use the **shortcut instead of the item**: `mac.sh menus`
+prints it beside every entry, and a `key` chord is ordinary background input.
+Reading the menus is never affected — it needs no focus, no window and no
+Space of its own.
+
 **This is the route into software the screen cannot help you with.** A DAW, a
 CAD or 3D app, a game — the canvas is one custom surface with no accessibility
 tree at all, so there are no elements and pixels are guesswork. The menu bar
