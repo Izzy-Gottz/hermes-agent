@@ -94,3 +94,9 @@ class _FakeServer:
         self.tool_timeout = 30.0
         self._config = {"url": "https://x/mcp"}
         self.initialize_result = None
+        # The profile that owns this server. Registration is profile-scoped,
+        # and the real MCPServerTask carries this in __slots__ from
+        # construction — a double without it is the double being wrong, not
+        # an optional field. _ROOT_PROFILE_KEY is what every non-multiplexed
+        # process answers, which is what this test is.
+        self._profile_key = mcp_tool._ROOT_PROFILE_KEY
