@@ -651,15 +651,40 @@ and everything above is unchanged under it.
 Two consequences worth stating rather than discovering:
 
 - **`raw` sends no `gatewayId`.** The credential identifies the instance by
-  itself, so `GATEWAY_RELAY_ID` is neither required nor read; a connector in
-  this mode indexes by the credential it received. Requiring one would be a
-  configured value nothing reads.
-- **`raw` has no token expiry.** A captured `token` bearer is useless after
-  300 s; a captured `raw` bearer is the secret. That is a real difference, and
-  it is only acceptable where the same secret already authenticates the
-  gateway's other calls to that connector — i.e. where `raw` reveals nothing a
-  captured request did not already reveal. Where it is *not* already true,
-  use `token`.
+  itself, so nothing about `GATEWAY_RELAY_ID` reaches the connector and a
+  connector in this mode indexes by the credential it received. The gateway
+  still *reads* the variable — `relay_connection_auth()` is shared with `token`
+  mode — it simply has nowhere to put it, so setting it changes nothing and
+  leaving it unset costs nothing. (An earlier draft of this line said it was
+  "neither required nor read", which was wrong about the gateway half.)
+- **`raw` has no token expiry, and that is the whole of its cost.** A captured
+  `token` bearer is useless after 300 s; a captured `raw` bearer is the secret,
+  for as long as the secret lives. It is only acceptable where that same secret
+  already authenticates the gateway's other calls to that connector — i.e.
+  where `raw` reveals nothing a captured request did not already reveal. Where
+  that is not already true, use `token`.
+
+  Two consequences follow from *permanent* rather than from *raw*, and both are
+  measured rather than reasoned:
+
+  - **A cleartext dial is refused.** `_ws_dial_url` maps `http://` to `ws://`
+    silently, so one character in `GATEWAY_RELAY_URL` is the difference between
+    a TLS dial and a permanent credential in the clear. In `raw` mode the
+    transport raises rather than sending one, unless the host is loopback.
+    `token` mode is deliberately unchanged: a five-minute bearer is worth much
+    less, and refusing it too would alter behaviour for every existing
+    deployment.
+  - **A redirect still forwards the header, and that is upstream's behaviour,
+    not this mode's.** Measured on `websockets` 15.0.1: `process_redirect`
+    follows 301/302/303/307/308 across hosts — it refuses only a TLS
+    *downgrade* — and re-sends `additional_headers` verbatim, so a redirected
+    upgrade hands the bearer to the new origin. `urllib.request`, which this
+    gateway already uses for `/relay/provision`, does the same, so `raw` opens
+    no channel the gateway's other calls do not already have. What it changes
+    is the consequence: a permanent credential instead of a 300-second one.
+    Exploiting it requires an attacker who can already answer the upgrade, so
+    it is recorded here rather than worked around — a connector that cannot
+    accept that should use `token`.
 
 Both modes are still the **channel** authenticator; neither gives the gateway a
 platform secret, and the relay path sheds platform crypto under both.

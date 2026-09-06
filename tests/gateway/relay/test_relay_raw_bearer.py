@@ -36,9 +36,16 @@ if WEBSOCKETS_AVAILABLE:
 SECRET = "c2VjcmV0LXRoaXJ0eS10d28tYnl0ZXMtb2Yta2V5IQ=="
 
 
-def _bearer(**kw) -> str | None:
+#: `wss://`, not `ws://`. Raw mode refuses a cleartext dial to anywhere but
+#: loopback (see `test_raw_mode_refuses_a_cleartext_dial`), so a helper that
+#: used `ws://unused` would be asserting the header of a dial the transport
+#: would not make.
+DIAL = "wss://edge.example/relay"
+
+
+def _bearer(url: str = DIAL, **kw) -> str | None:
     """The Authorization value a transport built with ``kw`` would present."""
-    t = WebSocketRelayTransport("ws://unused", "discord", "bot1", **kw)
+    t = WebSocketRelayTransport(url, "discord", "bot1", **kw)
     return t._upgrade_headers().get("Authorization")
 
 
@@ -181,10 +188,143 @@ def test_no_secret_sends_no_header_in_either_mode():
 
 
 def test_unknown_mode_on_the_transport_is_token():
-    """The transport normalises too, not only the config reader — a caller that
-    passes a mode straight through must not get an un-normalised third state."""
+    """An unrecognised mode reaches the token path.
+
+    The transport does NOT normalise — a normaliser here was deleted for
+    killing no test — so what this pins is the `== "raw"` comparison: every
+    value but the exact string takes the default. (An earlier version of this
+    docstring claimed the transport normalises, contradicting the commit that
+    removed it.)"""
     bearer = _bearer(gateway_id="gw-1", upgrade_secret=SECRET, upgrade_auth_mode="RAW")
     assert verify_token(bearer.removeprefix("Bearer "), [SECRET]) == "gw-1"
+
+
+# ───────── cleartext, which raw mode makes permanent ─────────
+#
+# A `token` bearer expires in 300 s. A `raw` one IS the secret and never
+# expires, so a cleartext dial leaks a permanent credential for every route it
+# opens rather than a five-minute one for this socket. `_ws_dial_url` maps
+# `http://` to `ws://` silently, so one character in GATEWAY_RELAY_URL is the
+# whole distance between "fine" and that. Loopback stays allowed: nothing
+# leaves the machine, and the real-socket test below dials it.
+
+@pytest.mark.parametrize("url", [
+    "ws://edge.example/relay",
+    "ws://10.0.0.5:8080/relay",
+    "ws://[2001:db8::1]/relay",
+])
+def test_raw_mode_refuses_a_cleartext_dial(url):
+    with pytest.raises(RuntimeError) as caught:
+        _bearer(url, upgrade_secret=SECRET, upgrade_auth_mode="raw")
+    assert "wss://" in str(caught.value)
+
+
+@pytest.mark.parametrize("url", [
+    "ws://localhost:9/relay",
+    "ws://127.0.0.1:9/relay",
+    "ws://[::1]:9/relay",
+])
+def test_raw_mode_allows_a_cleartext_dial_to_loopback(url):
+    assert _bearer(url, upgrade_secret=SECRET,
+                   upgrade_auth_mode="raw") == f"Bearer {SECRET}"
+
+
+def test_token_mode_is_not_refused_over_cleartext():
+    """The negative control, and it is a deliberate asymmetry rather than an
+    oversight: a signed token is worth far less to whoever picks it up, and
+    refusing it too would change behaviour for every existing deployment,
+    which this change promised not to do."""
+    bearer = _bearer("ws://edge.example/relay", gateway_id="gw-1", upgrade_secret=SECRET)
+    assert verify_token(bearer.removeprefix("Bearer "), [SECRET]) == "gw-1"
+
+
+def test_an_unparseable_url_fails_closed_in_raw_mode():
+    """Not-loopback is the default for anything the parser cannot read. The
+    cost of guessing wrong is a permanent credential in the clear."""
+    with pytest.raises(RuntimeError):
+        _bearer("ws://[not-an-address/relay", upgrade_secret=SECRET,
+                upgrade_auth_mode="raw")
+
+
+# ───────── the wiring: registration, not the constructor ─────────
+#
+# **This is the guard a review found nothing covering, and it was the one that
+# mattered.** Deleting `upgrade_auth_mode=upgrade_auth_mode` from
+# `register_relay_adapter` left every test above green — all 310, plus the
+# edge's 563, plus the two end-to-end falsifiers that drive the fork's real
+# transport — because every one of them either builds the transport by hand or
+# calls `_upgrade_headers` directly. `register_relay_adapter` is the ONLY
+# production constructor of `WebSocketRelayTransport` (all 19 other call sites
+# are tests), so with that line gone every real gateway silently falls back to
+# `token`, every upgrade gets a 403, and the feature is dead while the suite
+# says otherwise.
+#
+# The commit that added the mode said a header test cannot see the wiring
+# between the reader and the header, and wrote a test for `relay_connection_auth`
+# on exactly that reasoning. It did not write this one. So the shape was
+# understood and applied one function short of where it was needed.
+
+def _adapter_transport(tmp_path, monkeypatch, **env):
+    """Build the relay adapter the way production does, and hand back its
+    transport. Nothing here constructs the transport itself — that is the whole
+    point of the test."""
+    from gateway.config import Platform, load_gateway_config
+    from gateway.platform_registry import platform_registry
+    from gateway.relay import register_relay_adapter
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir(exist_ok=True)
+    (hermes_home / "config.yaml").write_text("gateway: {}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("GATEWAY_RELAY_URL", "wss://edge.example/relay")
+    for name in ("GATEWAY_RELAY_AUTH_MODE", "GATEWAY_RELAY_SECRET", "GATEWAY_RELAY_ID"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    platform_registry.unregister("relay")
+    assert register_relay_adapter() is True
+    config = load_gateway_config()
+    adapter = platform_registry.create_adapter("relay", config.platforms[Platform.RELAY])
+    transport = adapter._transport
+    assert transport is not None, "a URL-configured registration builds a live transport"
+    return transport
+
+
+def test_registration_carries_raw_all_the_way_to_the_header(tmp_path, monkeypatch):
+    """The artefact is the header bytes the *registered* transport would send.
+
+    Asserted on the header rather than on ``_upgrade_auth_mode`` deliberately:
+    an attribute check would still pass if the transport stopped acting on it,
+    and this is the one assertion in the fork that spans reader → registration
+    → header.
+    """
+    transport = _adapter_transport(tmp_path, monkeypatch,
+                                   GATEWAY_RELAY_AUTH_MODE="raw",
+                                   GATEWAY_RELAY_SECRET=SECRET,
+                                   GATEWAY_RELAY_ID="gw-1")
+    assert transport._upgrade_headers() == {"Authorization": f"Bearer {SECRET}"}
+
+
+def test_registration_leaves_the_default_signing(tmp_path, monkeypatch):
+    """The negative control. Without it, the test above would pass just as well
+    on a transport that had been hard-wired to raw."""
+    transport = _adapter_transport(tmp_path, monkeypatch,
+                                   GATEWAY_RELAY_SECRET=SECRET,
+                                   GATEWAY_RELAY_ID="gw-1")
+    bearer = transport._upgrade_headers()["Authorization"]
+    assert verify_token(bearer.removeprefix("Bearer "), [SECRET]) == "gw-1"
+    assert SECRET not in bearer
+
+
+# There is deliberately no registration-level test of the config.yaml source.
+# `gateway/run.py`'s config home is resolved into a module global at import
+# (`_hermes_home`, read through `_gateway_config_home`), so a test that sets
+# HERMES_HOME after the fact fights a cache that is not this change's to
+# reset — and the resulting test would be measuring import order. The two
+# sources are covered where each one is real: config.yaml at the reader
+# (`test_mode_falls_back_to_config_yaml`), and the environment here, which is
+# also what `~/.hermes/.env` becomes — the gateway loads it into os.environ at
+# boot, so the documented configuration location arrives as env either way.
 
 
 # ──────────────── it arrives, on a real socket ────────────────
