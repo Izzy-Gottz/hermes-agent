@@ -99,6 +99,32 @@ Frames (connector → gateway, over the WS):
 - `{"type":"interrupt_inbound", "session_key", "chat_id"}` (§5)
 - `{"type":"passthrough_forward", "forward": <PassthroughForward>, "bufferId"?}` (§5.1)
 
+**Sealed inbound (optional, additive).** A connector that does not keep the
+plaintext of the messages it relays MAY attach a `sealed` object to the inbound
+`MessageEvent`, holding the same words encrypted to the **device** this gateway
+is enrolled as. It is additive: a connector that does not seal sends nothing,
+and a gateway that is not configured to open one ignores it and reads `text`.
+
+- `sealed.ciphertext` — base64 of `nonce ‖ ciphertext ‖ tag` (AES-GCM combined form)
+- `sealed.ephemeralPublic` — base64, 32 raw bytes, the sender's ephemeral X25519 public key
+- `sealed.scheme` — names the whole derivation; a gateway that does not know it must refuse, never substitute its own
+- `sealed.channel`, `sealed.messageId`, `sealed.toDevice` — bound into the key derivation
+
+The last three are on the block **because the opener needs them and must not
+reconstruct them**: `source.message_id` on the same frame is the *platform's*
+message id, which is a different string, and deriving from it produces a key
+that fails with a tag error naming no suspect.
+
+The gateway opens it only when both `GATEWAY_RELAY_INBOUND_OPENER` (a file
+exposing `open_sealed(...)`) and `GATEWAY_RELAY_INBOUND_KEYS` (this device's
+identity JSON) are set; see `gateway/relay/inbound_seal.py`, which also
+documents why the derivation is loaded from the connector's own payload rather
+than written a second time here. **While a connector sends `sealed` and `text`
+together, a seal that will not open is logged and `text` is used** — the
+ordinary shape of a two-sided rollout. Once `text` goes away, the same failure
+drops the frame, loudly, which is the correct failure: a message that cannot be
+opened must not become a message that was silently downgraded.
+
 **Channel context on inbound (design relay-channel-context).** When the source
 platform's descriptor advertised `supports_context` (§2) and the chat is
 multi-party (`chat_type` ∈ group/channel/thread/forum, never `dm`), the

@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
+from gateway.relay import inbound_seal
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.transport import InboundHandler
 
@@ -345,7 +346,14 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
     except ValueError:
         msg_type = MessageType.TEXT
 
-    text = raw.get("text", "")
+    # A connector that seals its inbound sends `sealed` beside `text`; this
+    # returns the opened words when there is a seal this gateway is configured
+    # to open, and `text` otherwise. Unconfigured — every deployment but Moe's
+    # — it is `raw.get("text", "")` and nothing else. It raises only when a
+    # frame is sealed and carries no plaintext to fall back on, which is a
+    # frame that cannot be delivered; `_on_frame` logs and drops that one
+    # rather than handing the model an empty message.
+    text = inbound_seal.resolve_text(raw)
     if platform_enum == Platform.SLACK:
         # Team Gateway carries Slack slash text over the authenticated message
         # relay, bypassing Hermes' native Slack command callback. Normalize at
@@ -1137,7 +1145,28 @@ class WebSocketRelayTransport:
                 self._descriptor_ready.set_result(descriptor)
         elif ftype == "inbound":
             if self._inbound is not None:
-                event = _event_from_wire(frame.get("event", {}))
+                try:
+                    event = _event_from_wire(frame.get("event", {}))
+                except inbound_seal.SealError as exc:
+                    # Sealed, unopenable, and no plaintext: there is nothing to
+                    # deliver. Dropped LOUDLY and the reason named — never a
+                    # blank MessageEvent, which would reach the model as a
+                    # person having said nothing.
+                    #
+                    # No `inbound_ack` is sent, deliberately and narrowly. A
+                    # frame that will not open will not open on redelivery
+                    # either, so acking it (advancing the buffer cursor past a
+                    # message nobody read) and not acking it (replaying a
+                    # message nobody can read) are both defensible, and the
+                    # only connector that seals sends no `bufferId` at all —
+                    # so neither behaviour is reachable today. Choosing one
+                    # here would be a policy invented for a case that cannot
+                    # be tested. Leaving the ack where it already is keeps the
+                    # buffered path exactly as it was.
+                    logger.error(
+                        "relay inbound: dropping a frame that cannot be "
+                        "opened (%s)", exc)
+                    return
                 await self._inbound(event)
                 # Phase 5 §5.3: a buffered delivery (replayed on reconnect) carries
                 # a bufferId; ack it after the handler has durably taken it so the
