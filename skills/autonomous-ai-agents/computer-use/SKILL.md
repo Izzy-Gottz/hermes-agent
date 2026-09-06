@@ -48,6 +48,11 @@ screen. Do NOT capture to confirm something you can state as a predicate — ask
 `verify_state`. Do NOT capture again straight after acting unless the action
 came back `unverifiable`; the verdict already told you.
 
+And in a Chromium browser, often do not capture at all: `browser_read` with
+a `query` answers "where is the Send button" for ~950 tokens and gives you the
+ref to act on, against ~1,570 image tokens and ~2.2 s for a screenshot you
+then have to look at. Both numbers measured, on this machine.
+
 Everything below still holds for the capture you do take.
 
 ## The canonical workflow
@@ -139,8 +144,12 @@ Clicking is the LAST rung, not the first. In order:
    is five steps that can each go wrong: capture, find it, click to open,
    capture again because the menu did not exist a moment ago, click again.
 4. **A keyboard shortcut**, when the menu shows one.
-5. **`click`**, by `element` index.
-6. **`click` by coordinate** — only for canvas/video/WebGL surfaces with no
+5. **`browser_read`**, when the target is a page in Chrome / Edge / Brave /
+   Arc. It returns exact refs over the DevTools protocol, so there is no
+   screenshot in the loop at all. See the browser section below — and ask it
+   for the one thing you want, not for the page.
+6. **`click`**, by `element` index.
+7. **`click` by coordinate** — only for canvas/video/WebGL surfaces with no
    AX tree.
 
 ### Opening an app, or a page in an app
@@ -324,62 +333,69 @@ NOT conclude "cua-driver can't drive this app" — climb the ladder. If
 action schema lacks that property; choose another verified rung without
 inferring support from the executable's reported version.
 
-## Typed browser page rung
+## In a Chromium browser, read the page — do not photograph it
 
-For page content in a supported GUI browser, the same `computer_use` tool
-exposes namespaced `cua_browser_*` actions. They do not collide with other
-browser tools. The contract is capability-based:
+`computer_use(action="browser_read")` reads a Chrome / Edge / Brave / Arc tab
+through the DevTools protocol. You get a text outline and typed refs like
+`p3:17`, and you click a ref — there is nothing to locate in a picture, no
+coordinate to guess, and the read never touches the screen, so a tab on
+another Space or behind other windows reads exactly the same.
 
-1. Discover the exact native browser `(pid, window_id)` with `list_windows` or
-   native capture, then call `cua_browser_state` with both values.
-2. Continue only when it returns `status:"ok"`, `binding_quality:"exact"`, and
-   `mutation_allowed:true`. Select an opaque `tab_id` from that response.
-3. Call `cua_browser_state` with the `tab_id` for a fresh `semantic_v2`
-   snapshot. Use only refs from that newest snapshot and only for their
-   declared actions.
-4. Use the matching namespaced action (`cua_browser_click`,
-   `cua_browser_type`, `cua_browser_navigate`, or `cua_browser_pointer`).
-   Trusted input is the default. `input_route="dom_event"` is an explicit
-   trust downgrade; never choose it silently after a refusal.
-5. Every mutation invalidates refs. Take a fresh state snapshot before another
-   typed action. Never chain actions from remembered refs.
+**Ask for what you need. Do not read whole pages.** Measured on a real
+article, through this tool:
 
-`cua_browser_prepare` is a separate approved setup action. Driver-owned
-`isolated_new`/`isolated_named` profiles require explicit `allow_launch=true`.
-An `existing_profile` is decided by cua-driver's immutable permission mode.
-Prefer `isolated_new` unless the task genuinely needs the user's signed-in
-session — attaching to an existing profile exposes its live pages, cookies,
-and storage over the browser protocol.
+| call | tokens | |
+|---|---|---|
+| `browser_read(query="Send")` | ~950 | the normal way |
+| `browser_read()` | ~2,300 | outline + the refs in view |
+| `browser_read(full=true)` | ~15,800 | ten times a screenshot |
+| a `som` capture of the same window | ~1,570 | for comparison |
 
-Authorization paths for `existing_profile`:
+So this beats a screenshot when you want to ACT on something specific, and
+loses badly when you use it to browse. `query` matches role, accessible name
+and visible text. `scope_ref` opens one panel or row from a previous read.
+A read that comes back `complete: false` carries a `continuation`.
 
-1. **Config grant (standard and unrestricted modes).** When
-   `computer_use.grant_existing_profile: true` is set, the runtime is
-   launched pre-authorized in standard mode (`--grant existing-profile`) and
-   Hermes applies the same host-side floor in unrestricted mode. If it is not
-   set, both modes fail closed. Tell the user to flip that config key and
-   restart the session if they want this; do not retry or work around it.
-2. **Bounded manifest.** When `computer_use.permission_mode: bounded` is
-   configured with a reviewed `capability_manifest`, prepares inside the
-   manifest's scope succeed without prompts and everything else fails closed.
+The binding is remembered between calls. Pass `rebind: true` after the person
+changes tab or window. `include_text: true` adds the page's prose, which is
+about a third of its tokens and none of it clickable — leave it off unless
+you are reading rather than acting.
 
-Explicit Hermes YOLO (`--yolo`, `/yolo`, or `approvals.mode: off`) launches an
-unrestricted runtime with no runtime Cua approval prompts, but it does not
-substitute for `grant_existing_profile: true`.
+Safari is not a DevTools target. Capture and click it as usual, and use the
+normal ladder for browser chrome, permission prompts, native dialogs and
+extension surfaces — `browser_read` sees the page, not the window around it.
 
-These settings belong to runtime launch. The agent cannot add or change them
-after the runtime starts. Without the applicable grant or bounded manifest,
-`existing_profile` fails closed. Report the refusal and name the config key;
-do not retry, downgrade trust, or work around it.
+### Acting on the page is not wired yet
 
-Every MCP transport owns a private lifecycle session inside the runtime. The
-public session name only labels cursor identity and session-scoped state. It
-does not select, share, or keep a runtime alive.
+Only reading is exposed today. Once you have the ref, act with the ordinary
+rungs (`click` by element, `key`, `type`), or with `open -a` and a URL, which
+is still rung 1 for "go to this page". Earlier versions of this file described
+`cua_browser_click`, `cua_browser_type`, `cua_browser_navigate`,
+`cua_browser_pointer`, `cua_browser_dialog` and `cua_browser_prepare` — none
+of those ever existed in Hermes. They are removed rather than left to be
+tried, because a well-formed name that resolves to nothing is worse than an
+absent one: absence is honest, and a plausible name costs a failed call and a
+retry before anyone learns it was never real.
 
-Use the native capture/AX/pixel/foreground ladder for browser chrome, browser
-permission UI, OS prompts, native dialogs, extension surfaces, unsupported
-engines, and any typed route that cannot prove exact binding or mutation
-permission. `cua_browser_dialog` covers page JavaScript dialogs only.
+### Reading someone's signed-in browser needs their say-so, once
+
+Attaching to the profile the person is actually logged into exposes its live
+pages, cookies and storage, so cua-driver refuses until the owner turns it on.
+The refusal comes back as `browser_consent_required`, and the answer is a
+config key, not a workaround:
+
+    computer_use:
+      grant_existing_profile: true
+
+in `~/.hermes/config.yaml`, then restart the session. It is a launch-time
+grant — nothing the agent does after startup can supply it. Tell the user the
+key by name and carry on with capture and click; do not retry, do not
+downgrade trust, and do not go looking for another route in.
+
+(`computer_use.permission_mode: bounded` with a reviewed capability manifest
+is the other accepted path. Hermes YOLO — `--yolo`, `/yolo`,
+`approvals.mode: off` — is NOT: skipping approval prompts is not consent to
+read a logged-in browser profile, and the host-side floor still applies.)
 
 ### Key shortcuts vary per platform
 

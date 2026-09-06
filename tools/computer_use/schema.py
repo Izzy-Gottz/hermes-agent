@@ -110,6 +110,59 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "as success."
                 ),
             },
+            # ── browser_read ───────────────────────────────────────
+            "query": {
+                "type": "string",
+                "description": (
+                    "browser_read: read-only match over role, accessible name "
+                    "and visible text — the normal way to use this. A whole "
+                    "page is ~15,700 tokens (measured); a query is ~1,900. "
+                    "Ask for what you need (\"search\", \"Send\", \"password\") "
+                    "rather than reading everything and looking through it."
+                ),
+            },
+            "scope_ref": {
+                "type": "string",
+                "description": (
+                    "browser_read: a ref from an earlier read whose subtree "
+                    "to read. Cheaper than re-reading the page and the right "
+                    "way to open up one panel, row or dialog."
+                ),
+            },
+            "continuation": {
+                "type": "string",
+                "description": (
+                    "browser_read: opaque token from a previous read that "
+                    "came back with `complete: false`. Continues it."
+                ),
+            },
+            "include_text": {
+                "type": "boolean",
+                "description": (
+                    "browser_read: also return the page's readable content "
+                    "(default false). Leave it off when you mean to click "
+                    "something — content is about a third of a page's tokens "
+                    "and none of it is actionable."
+                ),
+            },
+            "full": {
+                "type": "boolean",
+                "description": (
+                    "browser_read: return every action ref and all content, "
+                    "unscoped (default false). This is the expensive shape — "
+                    "measured at ten times the tokens of a screenshot of the "
+                    "same window — so reach for `query` or `scope_ref` first "
+                    "and use this only when you genuinely need the whole page."
+                ),
+            },
+            "rebind": {
+                "type": "boolean",
+                "description": (
+                    "browser_read: re-resolve which browser window and tab "
+                    "this is (default false — the last one is remembered). "
+                    "Needed after the person switches tab or window."
+                ),
+            },
             "action": {
                 "type": "string",
                 "enum": [
@@ -133,13 +186,20 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "steps",
                     "focused_element",
                     "focus_app",
+                    "browser_read",
                 ],
                 "description": (
-                    "Which action to perform. `capture` and `zoom` are free (no side "
+                    "Which action to perform. `capture`, `zoom` and "
+                    "`browser_read` are free (no side "
                     "effects); `move` only moves the pointer. All other actions require approval unless "
                     "auto-approved. Use `set_value` for select/popup elements "
                     "and sliders — it selects the matching option directly "
-                    "without opening the native menu (no focus steal)."
+                    "without opening the native menu (no focus steal). "
+                    "In a Chromium browser (Chrome, Edge, Brave, Arc) prefer "
+                    "`browser_read` over `capture`: it reads the page over "
+                    "the DevTools protocol and gives exact element refs, so "
+                    "there is nothing to locate in a picture. Safari is not a "
+                    "CDP target — capture and click it as usual."
                 ),
             },
             # ── capture ────────────────────────────────────────────
