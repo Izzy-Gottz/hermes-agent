@@ -105,5 +105,53 @@ def test_the_field_defaults_to_none_so_every_other_backend_still_builds():
     assert CaptureResult(mode="ax", width=0, height=0).degraded_reason is None
 
 
+# --------------------------------------------- the advice knows its own mode
+#
+# `mode='vision'` returns "png_b64 only" by contract, so an empty element list
+# there is the documented shape, not a fault — and the som/ax hint telling the
+# model to "read it with mode='vision'" is a circle: do the thing you have just
+# done. Advice whose precondition is already satisfied still reads as
+# actionable, which is what makes it expensive.
+
+def test_vision_is_never_told_to_try_vision():
+    for reason in ("ax_window_unresolved", "minimized_or_hidden_window",
+                   "some_reason_the_driver_added_later"):
+        note = _degraded_note(reason, 0, "vision")
+        assert note, reason
+        assert "mode='vision'" not in note, reason
+
+def test_som_still_gets_the_vision_advice():
+    note = _degraded_note("ax_window_unresolved", 0, "som")
+    assert "mode='vision'" in note
+
+def test_vision_says_som_would_not_have_helped_either():
+    """The point of the rewrite: name what WOULD change the answer. An
+    unresolved AX surface is unresolved at every mode, so the honest next move
+    is coordinates off this image, or getting the window onto this Space."""
+    note = _degraded_note("ax_window_unresolved", 0, "vision")
+    assert "coordinates" in note
+    assert "current Space" in note
+    assert "Do not re-capture in vision" in note
+
+def test_the_mode_travels_from_the_capture_result():
+    """Not a separate argument the caller has to remember: CaptureResult
+    already carries the mode it was taken in."""
+    cap = CaptureResult(mode="vision", width=1456, height=931, png_b64=None,
+                        elements=[], app="Calendar", window_title="Calendar",
+                        degraded_reason="ax_window_unresolved")
+    text = _summary(_capture_response(cap))
+    assert "degraded: ax_window_unresolved" in text
+    assert "mode='vision'" not in text
+
+def test_an_unknown_reason_in_som_keeps_the_old_escape_hatch():
+    note = _degraded_note("brand_new_driver_reason", 0, "som")
+    assert "brand_new_driver_reason" in note and "mode='vision'" in note
+
+def test_no_mode_given_behaves_like_before():
+    """Callers that predate the argument must not change behaviour."""
+    assert _degraded_note("ax_window_unresolved", 0) == \
+        _degraded_note("ax_window_unresolved", 0, "som")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

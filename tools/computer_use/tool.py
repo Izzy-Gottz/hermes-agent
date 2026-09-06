@@ -1467,20 +1467,57 @@ _DEGRADED_HINTS = {
 }
 
 
-def _degraded_note(reason: Optional[str], total_elements: int) -> Optional[str]:
+# The same reasons, read from inside mode='vision'.
+#
+# In vision mode an empty element list is the CONTRACT, not a symptom:
+# CaptureResult documents "vision → png_b64 only". So the som/ax advice — "read
+# it with mode='vision'" — arrives as a circle, telling the model to do the
+# thing it has just done. That is the failure mode from §3.2 of Moe's
+# docs/COMPUTER-USE.md wearing a friendlier face: not a wrong identifier, but
+# advice whose precondition is already met, which reads as actionable and is
+# not. Say instead what would actually change the answer.
+_DEGRADED_HINTS_VISION = {
+    "ax_window_unresolved": (
+        "expected in this mode — a vision capture returns the picture and no "
+        "element list. But the accessibility surface could not be resolved "
+        "either, so 'som' would not have found elements here: the window is "
+        "on another macOS Space, only just launched, or is a canvas/Electron "
+        "surface with no tree at all. Work from this image with coordinates, "
+        "or get the window onto the current Space if you need addressable "
+        "elements. Do not re-capture in vision hoping for a list"
+    ),
+    "minimized_or_hidden_window": (
+        "the window is minimized or hidden, so this picture is of nothing "
+        "that is on screen. focus_app(raise_window=true) un-minimizes it"
+    ),
+}
+
+
+def _degraded_note(reason: Optional[str], total_elements: int,
+                   mode: Optional[str] = None) -> Optional[str]:
     """One line explaining a thin capture, or None when there is nothing to say.
 
     Only speaks up when the elements are actually missing: a full capture that
     happens to carry a degraded flag needs no apology, and a note on every
     successful call is a note nobody reads.
+
+    `mode` matters because the advice does. See _DEGRADED_HINTS_VISION.
     """
     if not reason or total_elements:
         return None
-    hint = _DEGRADED_HINTS.get(reason)
+    vision = str(mode or "").strip().lower() == "vision"
+    table = _DEGRADED_HINTS_VISION if vision else _DEGRADED_HINTS
+    hint = table.get(reason)
     if hint:
         return f"  (degraded: {reason} — {hint}.)"
     # An unknown value is still worth surfacing verbatim; the driver may have
     # added one, and "no elements, no reason" is the state this exists to end.
+    if vision:
+        return (
+            f"  (degraded: {reason} — the driver returned no elements for "
+            f"this window. This is already a vision capture, so read the "
+            f"image; for elements try another window from list_windows.)"
+        )
     return (
         f"  (degraded: {reason} — the driver returned no elements for this "
         f"window. Try mode='vision', or a different window from list_windows.)"
@@ -1542,7 +1579,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
     # another Space, and the two have different fixes — one needs pixels, the
     # other needs a different window. The driver already knows; it just was
     # never asked.
-    degraded = _degraded_note(cap.degraded_reason, total_elements)
+    degraded = _degraded_note(cap.degraded_reason, total_elements, cap.mode)
     if degraded:
         summary_lines.append(degraded)
     if bounds_note:
