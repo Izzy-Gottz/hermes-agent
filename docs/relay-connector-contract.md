@@ -628,8 +628,41 @@ upgrade. It is an HMAC-SHA256 scheme with a multi-secret rotation verify list
 
 | Leg | Credential | Mechanism |
 |-----|-----------|-----------|
-| Gateway → connector WS upgrade | per-gateway secret | An `Authorization` bearer header on the `/relay` upgrade. The token is `base64url(payload:exp:sig)` where `payload = gatewayId` and `sig = HMAC(payload:exp, secret)`. Connector verifies and rejects the upgrade (**close 4401**) on mismatch/absence/revocation. The authenticated tenant comes from the connector's store, never the `hello` frame. |
+| Gateway → connector WS upgrade | per-gateway secret | An `Authorization` bearer header on the `/relay` upgrade. The token is `base64url(payload:exp:sig)` where `payload = gatewayId` and `sig = HMAC(payload:exp, secret)`. Connector verifies and rejects the upgrade (**close 4401**) on mismatch/absence/revocation. The authenticated tenant comes from the connector's store, never the `hello` frame. **`GATEWAY_RELAY_AUTH_MODE=raw` replaces this token with the secret itself — §6.1a.** |
 | Connector → gateway inbound (`inbound` / `interrupt_inbound` frames) | — (rides the authenticated WS) | Inbound is pushed down the gateway's already-authenticated outbound socket (§3), so no per-message signature is needed. A **per-tenant delivery key** is still issued at enroll/provision and retained for forward-compat, but is no longer used to sign inbound. |
+
+#### 6.1a `GATEWAY_RELAY_AUTH_MODE` — when the connector *cannot* hold the secret
+
+The token above is an HMAC, and checking an HMAC needs the key. That is fine for
+a connector that stores its per-gateway secrets in plaintext, and impossible for
+one that deliberately stores only a **one-way digest** of them so that a dump of
+its store yields nothing that can act. Such a connector cannot verify the token
+at any point in its lifetime — not a configuration problem, a property of the
+scheme.
+
+`GATEWAY_RELAY_AUTH_MODE` selects between the two shapes. `token` is the default
+and everything above is unchanged under it.
+
+| mode | `Authorization: Bearer …` | the connector | expiry |
+|---|---|---|---|
+| `token` (default) | `base64url(gatewayId:exp:sig)` | holds the secret in plaintext and calls `verifyToken` | 300 s, in the token |
+| `raw` | `GATEWAY_RELAY_SECRET` verbatim | digests what arrives and compares against its stored digest | none — the secret is the credential |
+
+Two consequences worth stating rather than discovering:
+
+- **`raw` sends no `gatewayId`.** The credential identifies the instance by
+  itself, so `GATEWAY_RELAY_ID` is neither required nor read; a connector in
+  this mode indexes by the credential it received. Requiring one would be a
+  configured value nothing reads.
+- **`raw` has no token expiry.** A captured `token` bearer is useless after
+  300 s; a captured `raw` bearer is the secret. That is a real difference, and
+  it is only acceptable where the same secret already authenticates the
+  gateway's other calls to that connector — i.e. where `raw` reveals nothing a
+  captured request did not already reveal. Where it is *not* already true,
+  use `token`.
+
+Both modes are still the **channel** authenticator; neither gives the gateway a
+platform secret, and the relay path sheds platform crypto under both.
 
 This is the **channel** authenticator — distinct from platform crypto, which the
 relay path still sheds entirely (§6). The gateway holds zero platform secrets;

@@ -448,6 +448,7 @@ class WebSocketRelayTransport:
         outbound_timeout_s: float = _OUTBOUND_TIMEOUT_S,
         gateway_id: Optional[str] = None,
         upgrade_secret: Optional[str] = None,
+        upgrade_auth_mode: str = "token",
         reconnect: bool = False,
         reconnect_backoff_s: float = 1.0,
         reconnect_max_backoff_s: float = 30.0,
@@ -477,6 +478,15 @@ class WebSocketRelayTransport:
         # (dev/test, or a connector that doesn't enforce auth).
         self._gateway_id = gateway_id
         self._upgrade_secret = upgrade_secret
+        # "raw" presents the secret itself instead of the signed token, for a
+        # connector that stores only a one-way digest of it and therefore
+        # cannot check a signature. Stored verbatim and compared against "raw"
+        # below: normalising here to "token" first was decoration — a mutation
+        # round killed no test with it removed, because `== "raw"` already
+        # sends every other value down the token path. See
+        # relay_upgrade_auth_mode(), which is where the config-level
+        # normalisation belongs and where a test does kill it.
+        self._upgrade_auth_mode = upgrade_auth_mode
 
         # Phase 5 §5.3: a NET-NEW reconnect supervisor. The base transport's
         # _read_loop just ends on socket close ("reconnection is caller policy");
@@ -606,8 +616,20 @@ class WebSocketRelayTransport:
         index its verify list. The connector rejects the upgrade (close 4401)
         when this is missing/invalid/revoked; an unauthenticated connector
         ignores it.
+
+        Under ``upgrade_auth_mode="raw"`` the secret is presented directly
+        instead, for a connector that stores only a one-way digest of it and so
+        cannot check a signature at all. See ``relay_upgrade_auth_mode()``.
         """
-        if not (self._upgrade_secret and self._gateway_id):
+        if not self._upgrade_secret:
+            return {}
+        if self._upgrade_auth_mode == "raw":
+            # The secret IS the bearer. No gateway_id is required or sent: in
+            # this mode the credential identifies the instance by itself, and a
+            # gateway_id the connector never reads would be a configured value
+            # that resolves to nothing.
+            return {"Authorization": f"Bearer {self._upgrade_secret}"}
+        if not self._gateway_id:
             return {}
         from gateway.relay.auth import make_upgrade_token
 
