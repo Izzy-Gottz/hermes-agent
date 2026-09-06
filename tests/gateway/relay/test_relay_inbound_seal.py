@@ -186,22 +186,25 @@ def test_the_derivation_fields_reach_the_rule_unchanged(monkeypatch, tmp_path):
     assert kw["scheme"] == "x25519-hkdf-sha256.aes-gcm-256.inbound.v1"
 
 
-def test_a_missing_scheme_is_not_defaulted_to_ours(monkeypatch, tmp_path):
-    """It is passed through absent so the RULE decides, because the scheme
-    names the derivation and substituting ours for an unknown one is how a
-    future scheme gets opened as this one."""
-    _configure(monkeypatch, tmp_path, '''
-        seen = {}
+@pytest.mark.parametrize("bad", [None, "", 7, ["v1"]])
+def test_a_seal_that_names_no_scheme_is_REFUSED(monkeypatch, tmp_path, bad):
+    """Refused, not omitted, and the difference was measured.
 
-        def open_sealed(sealed, **kw):
-            seen.clear()
-            seen.update(kw)
-            return "opened"
-    ''')
-    frame = _sealed_frame()
-    del frame["sealed"]["scheme"]
-    inbound_seal.resolve_text(frame)
-    assert "scheme" not in inbound_seal.rule().seen
+    This used to leave `scheme` out of the kwargs "so the rule decides" — but
+    the rule's signature is `scheme: str = SCHEME`, so omitting it IS
+    substituting ours. A review drove a real edge seal with the field deleted
+    through the real opener and it opened. The contract says a gateway that
+    does not know the scheme must refuse and never substitute its own; a block
+    that does not name one is the same case.
+    """
+    _configure(monkeypatch, tmp_path)
+    frame = _sealed_frame(text=None)
+    if bad is None:
+        del frame["sealed"]["scheme"]
+    else:
+        frame["sealed"]["scheme"] = bad
+    with pytest.raises(inbound_seal.SealError):
+        inbound_seal.resolve_text(frame)
 
 
 def test_a_foreign_scheme_is_handed_over_verbatim_not_dropped(monkeypatch, tmp_path):
@@ -304,14 +307,158 @@ def test_an_identity_with_a_short_key_is_refused(monkeypatch, tmp_path):
 
 
 def test_an_identity_that_is_not_json_is_refused(monkeypatch, tmp_path):
+    """`SealError`, not `JSONDecodeError`. This assertion used to say
+    `pytest.raises(ValueError)`, which passed on the raw `JSONDecodeError` and
+    so CERTIFIED the escape that finding 1 below is about."""
     path = tmp_path / "bad.json"
     path.write_text("not json")
     monkeypatch.setenv(inbound_seal.KEYS_ENV, str(path))
-    with pytest.raises(ValueError):
+    with pytest.raises(inbound_seal.SealError):
         inbound_seal.keys()
 
 
+# ── every way a misconfiguration can fail, and NONE of them may escape ──
+#
+# A hostile review on 2026-09-06 drove these five through `resolve_text` with
+# `text` present — where the table promises "a warning, then `text`" — and
+# every one came out as its own exception type instead: `FileNotFoundError`,
+# `JSONDecodeError`, `SyntaxError`, whatever the module raised at import. Past
+# the fallback, past `_handle_frame`'s `except SealError`, into `_read_loop`'s
+# broad handler, which ENDS THE READER TASK. One absent file turned every
+# message into a socket teardown logged as "[Errno 2]".
+#
+# `scripts/install.sh` in the connector's repo is `rm -rf` then `cp -R` over
+# the payload, so "absent, then half-written" is a window on a real machine.
+
+BROKEN = {
+    "the opener file is not there": ("missing-opener", None),
+    "the opener is half-written": ("syntax", "def open_sealed(sealed, **kw)\n"),
+    "the opener raises at import": ("import-boom", "raise RuntimeError('boom')\n"),
+    "the opener is not a module at all": ("binary", "\x00\x01\x02 not python\n"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(BROKEN))
+def test_a_broken_opener_is_a_sealerror_and_never_escapes(monkeypatch, tmp_path, case):
+    name, body = BROKEN[case]
+    path = tmp_path / (name + ".py")
+    if body is not None:
+        path.write_text(body)
+    monkeypatch.setenv(inbound_seal.OPENER_ENV, str(path))
+    monkeypatch.setenv(inbound_seal.KEYS_ENV, str(_identity(tmp_path)))
+    with pytest.raises(inbound_seal.SealError):
+        inbound_seal.resolve_text(_sealed_frame(text=None))
+
+
+@pytest.mark.parametrize("case", sorted(BROKEN))
+def test_a_broken_opener_still_falls_back_to_the_plaintext(
+        monkeypatch, tmp_path, caplog, case):
+    """The row of the table these used to skip straight past."""
+    name, body = BROKEN[case]
+    path = tmp_path / (name + ".py")
+    if body is not None:
+        path.write_text(body)
+    monkeypatch.setenv(inbound_seal.OPENER_ENV, str(path))
+    monkeypatch.setenv(inbound_seal.KEYS_ENV, str(_identity(tmp_path)))
+    with caplog.at_level(logging.WARNING, logger=inbound_seal.__name__):
+        assert inbound_seal.resolve_text(_sealed_frame()) == FALLBACK
+    assert any("would not open" in r.getMessage() for r in caplog.records)
+
+
+def test_a_missing_identity_file_is_a_sealerror_not_a_filenotfound(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv(inbound_seal.OPENER_ENV, str(_opener(tmp_path, RETURNS_PLAINTEXT)))
+    monkeypatch.setenv(inbound_seal.KEYS_ENV, str(tmp_path / "not-there.json"))
+    with pytest.raises(inbound_seal.SealError):
+        inbound_seal.resolve_text(_sealed_frame(text=None))
+
+
+def test_an_opener_that_exits_the_process_at_import_cannot(monkeypatch, tmp_path):
+    """`SystemExit` is a `BaseException`, so `except Exception` would let it
+    through and this gateway would simply stop. It runs arbitrary code from
+    another repository's tree; the width of that handler is the point."""
+    monkeypatch.setenv(inbound_seal.OPENER_ENV,
+                       str(_opener(tmp_path, "raise SystemExit(3)\n")))
+    monkeypatch.setenv(inbound_seal.KEYS_ENV, str(_identity(tmp_path)))
+    with pytest.raises(inbound_seal.SealError):
+        inbound_seal.resolve_text(_sealed_frame(text=None))
+
+
+def test_the_reader_task_survives_a_broken_opener(monkeypatch, tmp_path, caplog):
+    """The assertion at the level where the damage was: `_handle_frame` catches
+    it, so `_read_loop`'s broad handler never sees it and the socket stays up."""
+    import asyncio
+
+    from gateway.relay.ws_transport import WebSocketRelayTransport
+
+    monkeypatch.setenv(inbound_seal.OPENER_ENV, str(tmp_path / "not-there.py"))
+    monkeypatch.setenv(inbound_seal.KEYS_ENV, str(_identity(tmp_path)))
+    delivered = []
+    transport = WebSocketRelayTransport("wss://edge.example/relay", "telegram", "bot1")
+    transport.set_inbound_handler(lambda event: delivered.append(event))
+    frame = json.dumps({"type": "inbound", "event": _sealed_frame(text=None)})
+    with caplog.at_level(logging.ERROR):
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            transport._handle_frame(frame))
+    assert delivered == []
+    assert any("cannot be opened" in r.getMessage() for r in caplog.records)
+
+
+# ── a `sealed` that is present but is not a seal ──
+
+@pytest.mark.parametrize("junk", [{}, "a string", [1, 2], 7])
+def test_a_sealed_that_is_not_a_seal_falls_back_LOUDLY(caplog, tmp_path,
+                                                       monkeypatch, junk):
+    """It used to fall back in silence, which defeated the reason the refusal
+    path is loud: a connector shipping `"sealed": {}` would produce no signal
+    at all until `text` was removed, and then every message would die at once
+    with nothing having warned."""
+    _configure(monkeypatch, tmp_path)
+    frame = _sealed_frame()
+    frame["sealed"] = junk
+    with caplog.at_level(logging.WARNING, logger=inbound_seal.__name__):
+        assert inbound_seal.resolve_text(frame) == FALLBACK
+    assert any("not a seal" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("junk", [{}, "a string", [1, 2], 7])
+def test_a_sealed_that_is_not_a_seal_and_no_text_is_refused(junk):
+    with pytest.raises(inbound_seal.SealError):
+        inbound_seal.resolve_text({"sealed": junk})
+
+
 # ─────────────────── the payload is upgraded underneath us ───────────────────
+
+def test_a_replacement_that_preserves_mtime_and_size_is_still_seen(
+        monkeypatch, tmp_path):
+    """`cp -p`, `rsync -a`, `tar -x` and a container image layer all restore
+    the source's mtime. Under a `(mtime, size)` cache this served the previous
+    rule for ever; the same shape on the identity file would serve the OLD
+    private key after a rotation and fail every message."""
+    path = _opener(tmp_path, "def open_sealed(sealed, **kw):\n    return 'AAAA'\n")
+    monkeypatch.setenv(inbound_seal.OPENER_ENV, str(path))
+    monkeypatch.setenv(inbound_seal.KEYS_ENV, str(_identity(tmp_path)))
+    assert inbound_seal.resolve_text(_sealed_frame()) == "AAAA"
+    before = path.stat()
+    path.write_text("def open_sealed(sealed, **kw):\n    return 'BBBB'\n")
+    os.utime(path, (before.st_atime, before.st_mtime))
+    assert path.stat().st_size == before.st_size, "the mutation must be same-size"
+    assert path.stat().st_mtime == before.st_mtime, "the mutation must keep mtime"
+    assert inbound_seal.resolve_text(_sealed_frame()) == "BBBB"
+
+
+def test_an_unsealed_frame_is_passed_through_verbatim_even_when_malformed():
+    """`raw.get("text", "")` byte for byte, including shapes that are not text.
+
+    This is what makes "a frame with no seal behaves exactly as before" a true
+    sentence. An earlier version coerced a non-string `text` to `""`, which was
+    a behaviour change for every deployment that never sends a seal — the
+    population the claim was specifically about.
+    """
+    for raw, want in (({"text": 42}, 42), ({"text": None}, None),
+                      ({"text": ["a"]}, ["a"]), ({}, ""), ({"source": {}}, "")):
+        assert inbound_seal.resolve_text(raw) == want
+
 
 def test_the_rule_is_reread_when_its_file_changes(monkeypatch, tmp_path):
     """A long-running gateway outlives the connector payload it loaded from.

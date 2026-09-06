@@ -102,12 +102,15 @@ Frames (connector → gateway, over the WS):
 **Sealed inbound (optional, additive).** A connector that does not keep the
 plaintext of the messages it relays MAY attach a `sealed` object to the inbound
 `MessageEvent`, holding the same words encrypted to the **device** this gateway
-is enrolled as. It is additive: a connector that does not seal sends nothing,
-and a gateway that is not configured to open one ignores it and reads `text`.
+is enrolled as. It is additive **for a connector that does not seal**: send no `sealed` and
+the gateway reads `text` exactly as it always did, including for a non-string
+`text`. A connector that DOES send one takes on an obligation — see the
+delivery rules below — because a gateway that cannot open a seal and has no
+plaintext beside it will drop the frame rather than deliver an empty message.
 
 - `sealed.ciphertext` — base64 of `nonce ‖ ciphertext ‖ tag` (AES-GCM combined form)
 - `sealed.ephemeralPublic` — base64, 32 raw bytes, the sender's ephemeral X25519 public key
-- `sealed.scheme` — names the whole derivation; a gateway that does not know it must refuse, never substitute its own
+- `sealed.scheme` — REQUIRED, a non-empty string. It names the whole derivation, so a gateway that does not know it must refuse, and a gateway that is not told one must also refuse rather than assume the one it happens to implement
 - `sealed.channel`, `sealed.messageId`, `sealed.toDevice` — bound into the key derivation
 
 The last three are on the block **because the opener needs them and must not
@@ -119,11 +122,25 @@ The gateway opens it only when both `GATEWAY_RELAY_INBOUND_OPENER` (a file
 exposing `open_sealed(...)`) and `GATEWAY_RELAY_INBOUND_KEYS` (this device's
 identity JSON) are set; see `gateway/relay/inbound_seal.py`, which also
 documents why the derivation is loaded from the connector's own payload rather
-than written a second time here. **While a connector sends `sealed` and `text`
-together, a seal that will not open is logged and `text` is used** — the
-ordinary shape of a two-sided rollout. Once `text` goes away, the same failure
-drops the frame, loudly, which is the correct failure: a message that cannot be
-opened must not become a message that was silently downgraded.
+than written a second time here.
+
+Delivery rules, exactly:
+
+| the frame | the gateway |
+|---|---|
+| no `sealed` | `text` verbatim — unchanged from before this existed |
+| `sealed` present but not an object, or `{}` | a WARNING naming the shape, then `text`; refused if there is no `text` |
+| `sealed` opens | the opened words; `text` is ignored, and a disagreement is logged as two lengths (never as either version) |
+| `sealed` will not open, `text` present | a WARNING naming the reason, then `text` |
+| `sealed` will not open, no `text` | **the frame is dropped**, logged at ERROR |
+
+**While a connector sends `sealed` and `text` together, a seal that will not
+open is logged and `text` is used** — the ordinary shape of a two-sided
+rollout, and every one of those warnings is a message that will be dropped the
+day `text` goes away. That is why an unusable `sealed` warns rather than
+falling back in silence: a connector shipping `"sealed": {}` would otherwise
+produce no signal at all until the plaintext was removed, and then every
+message would die at once.
 
 **Channel context on inbound (design relay-channel-context).** When the source
 platform's descriptor advertised `supports_context` (§2) and the chat is
