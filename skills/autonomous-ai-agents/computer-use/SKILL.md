@@ -139,7 +139,7 @@ to pixels, so a refusal means the path is wrong, not that the click missed.
 To discover paths on macOS, run in the terminal:
 
 ```
-~/.moe/tools/mac.sh menus <app> [search]
+bash ~/.moe/tools/mac.sh menus <app> [search]
 ```
 
 It prints every item with its keyboard shortcut, in exactly the form
