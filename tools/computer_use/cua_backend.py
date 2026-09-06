@@ -3890,6 +3890,7 @@ class CuaDriverBackend(ComputerUseBackend):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        window_id: Optional[int] = None,
     ) -> ActionResult:
         pid = self._active_pid
         if pid is None:
@@ -3900,6 +3901,20 @@ class CuaDriverBackend(ComputerUseBackend):
             "direction": direction,
             "amount": max(1, min(50, amount)),
         }
+        # A plain scroll used to send the pid and NOTHING else, so on any app
+        # owning more than one window the driver refused with
+        # "pid N owns more than one eligible top-level window; provide
+        # window_id" — and there was no way to provide it. `scroll` took no
+        # window_id, and the dispatcher passed none, so the model was told to
+        # do the one thing the tool could not express. It then passed
+        # window_id anyway, got the identical refusal, and gave up.
+        #
+        # Measured 2026-09-06 in Chrome, which owns a fistful of offscreen
+        # helper windows and so hits this on the first try. The id was known
+        # the whole time: capture() sets _active_window_id.
+        wid = window_id if window_id is not None else self._active_window_id
+        if wid is not None:
+            args["window_id"] = wid
         if element is not None and self._active_window_id is not None:
             args["element_index"] = element
             args["window_id"] = self._active_window_id

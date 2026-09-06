@@ -1197,6 +1197,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             y=coord[1] if coord and coord[1] is not None else None,
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+            window_id=args.get("window_id"),
         )
         return _maybe_follow_capture(backend, res, capture_after)
 
