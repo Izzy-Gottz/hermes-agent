@@ -44,6 +44,7 @@ _SCOPED_REGISTRY_NAMES = [
     "_server_trust_levels",
     "_tool_read_only_hints",
     "_parallel_safe_servers",
+    "_mcp_tool_server_names",
 ]
 
 
@@ -433,3 +434,38 @@ def test_server_task_profile_key_is_root_without_multiplexing(homes):
         task = mcp.MCPServerTask("github")
 
     assert task._profile_key == mcp._ROOT_PROFILE_KEY
+
+
+def test_every_partitioned_registry_is_listed():
+    """The list above must name every profile-partitioned module registry.
+
+    This is the sweep the list's own comment has claimed since the
+    partitioning landed, and it did not exist: the comment said "a newly
+    added registry is caught by the sweep test below" while nothing below
+    looked. The list was therefore a check that could not fail, and it
+    already had a hole — ``_mcp_tool_server_names`` was partitioned without
+    being added, so the autouse fixture neither wiped nor restored it and one
+    test's provenance leaked into the next.
+
+    Asks the module what is partitioned rather than restating it, so the
+    next registry to be partitioned fails HERE, once, instead of as an
+    order-dependent failure somewhere else.
+    """
+    partitioned = {
+        attr
+        for attr in dir(mcp)
+        if isinstance(
+            getattr(mcp, attr), (mcp._ProfileScopedDict, mcp._ProfileScopedSet)
+        )
+    }
+    assert partitioned, "no partitioned registries found — did they move?"
+    missing = sorted(partitioned - set(_SCOPED_REGISTRY_NAMES))
+    assert not missing, (
+        "profile-partitioned registries missing from _SCOPED_REGISTRY_NAMES "
+        f"(the autouse fixture will not isolate them): {missing}"
+    )
+    stale = sorted(set(_SCOPED_REGISTRY_NAMES) - partitioned)
+    assert not stale, (
+        "_SCOPED_REGISTRY_NAMES names things that are no longer partitioned: "
+        f"{stale}"
+    )

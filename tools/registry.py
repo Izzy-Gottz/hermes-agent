@@ -469,6 +469,13 @@ class ToolRegistry:
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
+        # Aliases owned by one profile, overlaid on the global ones exactly
+        # as ``_scoped_tools`` is. An MCP server's raw name is registered as
+        # an alias for its ``mcp-{name}`` toolset, so leaving this global
+        # would keep leaking WHICH SERVERS another tenant has connected even
+        # once their tools are scoped — the alias resolves, and the name is
+        # the disclosure.
+        self._scoped_toolset_aliases: Dict[str, Dict[str, str]] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
@@ -481,6 +488,26 @@ class ToolRegistry:
         self._generation: int = 0
 
     @staticmethod
+    def _normalize_scope(scope: Optional[str]) -> Optional[str]:
+        """Collapse an empty scope to ``None`` (process-global).
+
+        Writes (``register``, ``deregister``) select their partition with
+        ``scope is not None`` while reads (``_merged_tools``,
+        ``_merged_aliases``) fall back with ``scope or current_scope_key()``.
+        An empty string therefore used to be a real partition for writes and
+        ambient for reads — a slot that could not read back what it had just
+        written, and ``get_entry(name, scope="")`` returned None too.
+
+        ``_ROOT_PROFILE_KEY`` in ``tools.mcp_tool`` IS the empty string, and
+        ``_mcp_profile_key()`` returns it on every non-multiplexed process.
+        One helper translates it to ``None`` before it arrives here — but a
+        guard living one call away from the thing it guards is how tools
+        vanish silently on an ordinary Mac while the failure reads as a
+        broken MCP server. Normalize at the door instead.
+        """
+        return None if scope == "" else scope
+
+    @staticmethod
     def current_scope_key() -> str:
         """Return the active profile's canonical registry scope."""
         return hermes_home_key()
@@ -491,6 +518,39 @@ class ToolRegistry:
         merged = dict(self._tools)
         merged.update(self._scoped_tools.get(active_scope, {}))
         return merged
+
+    def _merged_aliases(self, scope: Optional[str] = None) -> Dict[str, str]:
+        """Return global toolset aliases overlaid with one profile's."""
+        active_scope = scope or self.current_scope_key()
+        merged = dict(self._toolset_aliases)
+        merged.update(self._scoped_toolset_aliases.get(active_scope, {}))
+        return merged
+
+    def _drop_aliases_for_toolset(
+        self,
+        toolset: str,
+        scope: Optional[str],
+    ) -> None:
+        """Remove aliases pointing at *toolset*, from one partition only."""
+        if scope is None:
+            self._toolset_aliases = {
+                alias: target
+                for alias, target in self._toolset_aliases.items()
+                if target != toolset
+            }
+            return
+        part = self._scoped_toolset_aliases.get(scope)
+        if not part:
+            return
+        remaining = {
+            alias: target
+            for alias, target in part.items()
+            if target != toolset
+        }
+        if remaining:
+            self._scoped_toolset_aliases[scope] = remaining
+        else:
+            self._scoped_toolset_aliases.pop(scope, None)
 
     def _snapshot_state(
         self,
@@ -569,27 +629,61 @@ class ToolRegistry:
             if entry.toolset == toolset
         )
 
-    def register_toolset_alias(self, alias: str, toolset: str) -> None:
-        """Register an explicit alias for a canonical toolset name."""
+    def register_toolset_alias(
+        self,
+        alias: str,
+        toolset: str,
+        *,
+        scope: Optional[str] = None,
+    ) -> None:
+        """Register an explicit alias for a canonical toolset name.
+
+        ``scope=None`` keeps the alias process-global, which is what every
+        built-in and plugin registration wants. MCP passes the owning
+        profile so one tenant's server names do not become resolvable
+        toolsets in another's.
+        """
         with self._lock:
-            existing = self._toolset_aliases.get(alias)
+            scope = self._normalize_scope(scope)
+            target = (
+                self._toolset_aliases
+                if scope is None
+                else self._scoped_toolset_aliases.setdefault(scope, {})
+            )
+            # Compare against the partition being WRITTEN, not a merged view.
+            # ``_merged_aliases(None)`` falls back to the ambient profile's
+            # overlay, so a global registration would report a collision
+            # against whichever tenant happened to be on the thread — naming
+            # another person's MCP server in a shared log, and claiming an
+            # overwrite that does not happen (the scoped entry still wins the
+            # merged read afterwards).
+            existing = target.get(alias)
             if existing and existing != toolset:
                 logger.warning(
                     "Toolset alias collision: '%s' (%s) overwritten by %s",
                     alias, existing, toolset,
                 )
-            self._toolset_aliases[alias] = toolset
+            target[alias] = toolset
             self._generation += 1
 
-    def get_registered_toolset_aliases(self) -> Dict[str, str]:
+    def get_registered_toolset_aliases(
+        self,
+        *,
+        scope: Optional[str] = None,
+    ) -> Dict[str, str]:
         """Return a snapshot of ``{alias: canonical_toolset}`` mappings."""
         with self._lock:
-            return dict(self._toolset_aliases)
+            return self._merged_aliases(scope)
 
-    def get_toolset_alias_target(self, alias: str) -> Optional[str]:
+    def get_toolset_alias_target(
+        self,
+        alias: str,
+        *,
+        scope: Optional[str] = None,
+    ) -> Optional[str]:
         """Return the canonical toolset name for an alias, or None."""
         with self._lock:
-            return self._toolset_aliases.get(alias)
+            return self._merged_aliases(scope).get(alias)
 
     # ------------------------------------------------------------------
     # Registration
@@ -784,6 +878,7 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        scope = self._normalize_scope(scope)
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
         owner = caller_owner or handler_owner
@@ -881,7 +976,7 @@ class ToolRegistry:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
 
-    def deregister(self, name: str) -> None:
+    def deregister(self, name: str, *, scope: Optional[str] = None) -> None:
         """Remove a tool from the registry.
 
         Also cleans up the toolset check if no other tools remain in the
@@ -896,6 +991,25 @@ class ToolRegistry:
         first skips the check altogether. MCP toolsets (``mcp-*``) are exempt:
         dynamic tool discovery legitimately nukes-and-repaves its own tools on
         every refresh and has no plugin-override concept.
+
+        ``scope`` names the partition to remove FROM, for callers that hold a
+        profile identity explicitly rather than by being a plugin module (MCP
+        server teardown).
+
+        **A plugin may only name its own scope.** Saying "the ownership
+        checks still run" is not enough on its own, because those checks are
+        skipped wholesale for ``mcp-*`` toolsets — dynamic discovery
+        legitimately nukes and repaves its own tools. Without the guard
+        below, one profile's plugin could pass another profile's key and
+        delete every MCP tool that tenant was advertising, silently, with
+        the *first* profile's ``allow_tool_override`` opt-in governing the
+        deletion. ``tools.mcp_tool`` is not a plugin module, so the MCP
+        paths that need this parameter are unaffected.
+
+        Without it, scoping MCP registration would be a one-way door — the
+        tools would land in a profile partition while every teardown path
+        looked for them in ``_tools``, found nothing, and returned silently,
+        leaving a dead server's tools advertised forever.
         """
         with self._lock:
             caller_mod = self._caller_module()
@@ -905,9 +1019,21 @@ class ToolRegistry:
                 if caller_owner is not None
                 else None
             )
+            scope = self._normalize_scope(scope)
+            if (
+                scope is not None
+                and caller_owner is not None
+                and scope != caller_scope
+            ):
+                raise PermissionError(
+                    f"Plugin module {caller_mod!r} (scope {caller_scope!r}) "
+                    f"cannot deregister from another profile's scope "
+                    f"{scope!r}."
+                )
+            effective_scope = scope if scope is not None else caller_scope
             target = (
-                self._scoped_tools.get(caller_scope, {})
-                if caller_scope is not None
+                self._scoped_tools.get(effective_scope, {})
+                if effective_scope is not None
                 else self._tools
             )
             entry = target.get(name)
@@ -952,21 +1078,22 @@ class ToolRegistry:
                         f"opt-in (allow_tool_override)."
                     )
             del target[name]
-            if caller_scope is not None and not target:
-                self._scoped_tools.pop(caller_scope, None)
+            if effective_scope is not None and not target:
+                self._scoped_tools.pop(effective_scope, None)
             # Drop the toolset check and aliases if this was the last tool in
             # that toolset.
             toolset_still_exists = any(
                 e.toolset == entry.toolset
-                for e in self._merged_tools(caller_scope).values()
+                for e in self._merged_tools(effective_scope).values()
             )
             if not toolset_still_exists:
-                self._toolset_checks.pop(entry.toolset, None)
-                self._toolset_aliases = {
-                    alias: target
-                    for alias, target in self._toolset_aliases.items()
-                    if target != entry.toolset
-                }
+                # The toolset check is process-global, so only a global
+                # teardown may drop it — otherwise one profile's shutdown
+                # silently changes another's toolset availability.
+                # ``restore_registration`` already gates on the same test.
+                if effective_scope is None:
+                    self._toolset_checks.pop(entry.toolset, None)
+                self._drop_aliases_for_toolset(entry.toolset, effective_scope)
             self._generation += 1
         logger.debug("Deregistered tool: %s", name)
 
@@ -1028,11 +1155,17 @@ class ToolRegistry:
                     for entries in self._scoped_tools.values()
                     for entry in entries.values()
                 ):
-                    self._toolset_aliases = {
-                        alias: target
-                        for alias, target in self._toolset_aliases.items()
-                        if target != toolset
-                    }
+                    # The guard above established that NO entry survives in
+                    # any partition, so the alias is orphaned everywhere.
+                    # Dropping only ``scope`` left a plugin's alias behind
+                    # forever: plugins register aliases globally while their
+                    # tools are always scoped (PluginManager's scope_key is
+                    # never None), so the partition-local drop found nothing
+                    # and ``validate_toolset`` kept answering True for a
+                    # toolset with zero tools.
+                    self._drop_aliases_for_toolset(toolset, None)
+                    if scope is not None:
+                        self._drop_aliases_for_toolset(toolset, scope)
             self._generation += 1
         logger.debug("Restored tool registration: %s", name)
         return True
@@ -1194,9 +1327,20 @@ class ToolRegistry:
         entry = self.get_entry(name)
         return entry.schema if entry else None
 
-    def get_toolset_for_tool(self, name: str) -> Optional[str]:
-        """Return the toolset a tool belongs to, or None."""
-        entry = self.get_entry(name)
+    def get_toolset_for_tool(
+        self,
+        name: str,
+        *,
+        scope: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the toolset a tool belongs to, or None.
+
+        ``scope`` is for callers that must NAME the profile rather than read
+        it from the ambient context. MCP registration runs partly on the MCP
+        event-loop thread, which carries no copy of the caller's contextvars,
+        so ``current_scope_key()`` there answers for the wrong profile.
+        """
+        entry = self.get_entry(name, scope=scope)
         return entry.toolset if entry else None
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:
