@@ -4143,7 +4143,20 @@ class PluginManager:
                 else:
                     for tool_name in preledger_tools:
                         try:
-                            tool_registry.deregister(tool_name)
+                            # ``scope=`` or this sweep does nothing at all.
+                            # deregister() picks its partition from the
+                            # CALLING module's plugin ownership, and
+                            # ``hermes_cli.plugins`` is not itself a plugin —
+                            # so the caller-derived scope is None and the
+                            # lookup lands in the process-global map. Plugin
+                            # tools are never there: PluginManager.scope_key
+                            # is never None, even single-profile. The
+                            # zombie-entry sweep this loop exists to be
+                            # (#60050) has therefore always been a silent
+                            # no-op.
+                            tool_registry.deregister(
+                                tool_name, scope=self.scope_key
+                            )
                         except Exception as exc:
                             logger.debug(
                                 "unload: tool deregister %s failed: %s",

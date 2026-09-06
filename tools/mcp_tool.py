@@ -2825,6 +2825,7 @@ class MCPServerTask:
             # notifications. Tools absent from the fresh list are no longer
             # callable, so remove only those stale registry entries first.
             toolset_name = f"mcp-{self.name}"
+            refresh_scope = _mcp_registry_scope(self._profile_key)
             stale_tool_names = old_tool_names - {
                 mcp_prefixed_tool_name(self.name, tool.name)
                 for tool in new_mcp_tools
@@ -2832,10 +2833,12 @@ class MCPServerTask:
             for tool_name in stale_tool_names:
                 # Never let one server's refresh remove a colliding name that
                 # is currently owned by another server.
-                if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                if registry.get_toolset_for_tool(
+                    tool_name, scope=refresh_scope
+                ) != toolset_name:
                     continue
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
+                registry.deregister(tool_name, scope=refresh_scope)
+                _forget_mcp_tool_server(tool_name, self._profile_key)
 
             # 3. Re-register with the fresh list. The helper may skip names that
             # are ambiguous after normalization.
@@ -2850,10 +2853,12 @@ class MCPServerTask:
             # collision-checked registration set no longer owns.
             registered_name_set = set(registered_names)
             for tool_name in old_tool_names - registered_name_set:
-                if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                if registry.get_toolset_for_tool(
+                    tool_name, scope=refresh_scope
+                ) != toolset_name:
                     continue
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
+                registry.deregister(tool_name, scope=refresh_scope)
+                _forget_mcp_tool_server(tool_name, self._profile_key)
             self._registered_tool_names = registered_names
 
             # 4. Log what changed (user-visible notification)
@@ -4476,7 +4481,7 @@ class MCPServerTask:
         self.session = None
 
     def _deregister_tools(self) -> None:
-        """Drop this server's tools from the global registry (idempotent).
+        """Drop this server's tools from ITS PROFILE's registry (idempotent).
 
         Pulls the server's tool schemas out of the registry so the agent
         stops advertising them to the model. Called on shutdown AND when the
@@ -4486,9 +4491,16 @@ class MCPServerTask:
         """
         from tools.registry import registry
 
+        # ``self._profile_key``, never the ambient one. Shutdown is reached
+        # from the server's own long-lived task (reconnect budget exhausted,
+        # loop teardown) as well as from a caller's thread, and a deregister
+        # aimed at the wrong partition is a SILENT no-op — it leaves a dead
+        # server's tools advertised for the life of the process, which is the
+        # exact phantom-tool failure this method exists to prevent.
+        scope = _mcp_registry_scope(self._profile_key)
         for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            registry.deregister(tool_name)
-            _forget_mcp_tool_server(tool_name)
+            registry.deregister(tool_name, scope=scope)
+            _forget_mcp_tool_server(tool_name, self._profile_key)
         self._registered_tool_names = []
 
     async def _wait_for_lazy_reconnect(self) -> None:
@@ -4604,6 +4616,53 @@ def _mcp_profile_key() -> str:
     except Exception:
         logger.debug("Could not resolve MCP profile key", exc_info=True)
         return _UNSCOPED_PROFILE_KEY
+
+
+def _mcp_registry_scope(profile_key: Optional[str] = None) -> Optional[str]:
+    """Translate an MCP partition key into a ``tools.registry`` scope.
+
+    These are two different notions of "who is this" and mapping one onto
+    the other wrongly makes tools VANISH rather than leak — a failure that
+    reads as a broken server, which is why it is done in one place:
+
+    * ``ToolRegistry.current_scope_key()`` is ``hermes_home_key()``
+      **ungated** — it answers with the active home whether or not the
+      process multiplexes.
+    * :func:`_mcp_profile_key` is gated: it returns
+      :data:`_ROOT_PROFILE_KEY` (``""``) whenever multiplexing is off, so
+      that the many single-profile paths which install a HERMES_HOME
+      override do not each strand a server behind its own key.
+
+    So ``""`` must become ``None`` (process-global registration), not the
+    scope ``""`` — nothing ever reads a ``""`` partition, and registering
+    there would advertise no tools at all on every ordinary Mac. Under
+    multiplexing the key already IS ``hermes_home_key`` of the profile home,
+    which is exactly what ``current_scope_key()`` returns for a turn running
+    inside that profile's ``_profile_runtime_scope``.
+
+    :data:`_UNSCOPED_PROFILE_KEY` is passed through deliberately. It is a
+    partition no reader can name, so tools registered under it are invisible
+    — the fail-closed direction. Registering them globally instead would
+    hand one tenant's tool list to every other, which is the bug this
+    partitioning exists to prevent.
+    """
+    key = _mcp_profile_key() if profile_key is None else profile_key
+    if key == _ROOT_PROFILE_KEY:
+        return None
+    if key == _UNSCOPED_PROFILE_KEY:
+        # Reached, and loudly, because the consequence is total: no reader
+        # can name this partition, so every tool registered here is
+        # advertised to nobody. That is the right direction to fail — the
+        # alternative hands one tenant's list to every other — but it must
+        # never be the quiet answer to "why does this gateway show no MCP
+        # tools". Fix the CALLER: run discovery inside a profile scope.
+        logger.error(
+            "MCP registration has no profile scope while multiplexing is "
+            "active. These tools will be registered into an isolated "
+            "partition and advertised to NO profile. Run discovery inside "
+            "a profile scope (see gateway.run._profile_runtime_scope)."
+        )
+    return key
 
 
 class _ProfileScopedDict(MutableMapping[str, _VT]):
@@ -4966,14 +5025,33 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
 
 
 def _record_tool_trust_metadata(
-    server_name: str, config: dict, tools: List[Any]
+    server_name: str,
+    config: dict,
+    tools: List[Any],
+    profile_key: Optional[str] = None,
 ) -> None:
-    """Capture per-server trust and per-tool readOnlyHint at discovery."""
+    """Capture per-server trust and per-tool readOnlyHint at discovery.
+
+    *profile_key* must be the profile the tools are being REGISTERED into.
+    These two maps are read at call time by ``_trust_gate_check`` under the
+    turn's own key, and that read fails OPEN: an absent entry resolves to
+    ``_TRUST_FULL``. So writing them under a different key than the
+    registration does not merely mislay metadata — it silently downgrades an
+    ``untrusted`` server's write-capable tools to no elicitation prompt at
+    all, with nothing logged. Registration takes its key from the server;
+    this must not be the one that takes it from the thread.
+    """
     with _lock:
-        _server_trust_levels[server_name] = _normalize_server_trust(
+        if profile_key is None:
+            trust_levels = _server_trust_levels
+            read_only_hints = _tool_read_only_hints
+        else:
+            trust_levels = _server_trust_levels.for_key(profile_key)
+            read_only_hints = _tool_read_only_hints.for_key(profile_key)
+        trust_levels[server_name] = _normalize_server_trust(
             (config or {}).get("trust")
         )
-        hints = _tool_read_only_hints.setdefault(server_name, {})
+        hints = read_only_hints.setdefault(server_name, {})
         for tool in tools:
             name = getattr(tool, "name", None)
             if name:
@@ -5564,7 +5642,13 @@ _parallel_safe_servers: _ProfileScopedSet = _ProfileScopedSet()
 # provider-safe normalization maps punctuation to ``_``. Keep the raw server
 # name captured at registration time so policy and capability checks never rely
 # on parsing or re-sanitizing the generated name.
-_mcp_tool_server_names: Dict[str, str] = {}
+#
+# Partitioned by profile for the same reason ``_servers`` is: the registry
+# name is the only thing two profiles are guaranteed to collide on. A shared
+# map let profile B's registration silently retarget profile A's provenance,
+# and provenance is what ``_supports_parallel_tool_calls`` and the
+# capability-aware prompt read.
+_mcp_tool_server_names: _ProfileScopedDict = _ProfileScopedDict()
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -6328,8 +6412,9 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     if phantom_names:
         from tools.registry import registry
 
+        phantom_scope = _mcp_registry_scope()
         for tool_name in phantom_names:
-            registry.deregister(tool_name)
+            registry.deregister(tool_name, scope=phantom_scope)
             _forget_mcp_tool_server(tool_name)
         logger.info(
             "MCP server '%s': deregistered %d phantom cached tool(s) not "
@@ -7670,16 +7755,34 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
-    """Remember the exact raw MCP server that registered *tool_name*."""
+def _track_mcp_tool_server(
+    tool_name: str,
+    server_name: str,
+    profile_key: Optional[str] = None,
+) -> None:
+    """Remember the exact raw MCP server that registered *tool_name*.
+
+    *profile_key* is required wherever the write can happen off the owning
+    profile's context — registration runs on the MCP event loop, which
+    ``run_coroutine_threadsafe`` hands no copy of the caller's contextvars.
+    """
     with _lock:
-        _mcp_tool_server_names[tool_name] = server_name
+        if profile_key is None:
+            _mcp_tool_server_names[tool_name] = server_name
+        else:
+            _mcp_tool_server_names.for_key(profile_key)[tool_name] = server_name
 
 
-def _forget_mcp_tool_server(tool_name: str) -> None:
+def _forget_mcp_tool_server(
+    tool_name: str,
+    profile_key: Optional[str] = None,
+) -> None:
     """Forget MCP server provenance for a deregistered tool."""
     with _lock:
-        _mcp_tool_server_names.pop(tool_name, None)
+        if profile_key is None:
+            _mcp_tool_server_names.pop(tool_name, None)
+        else:
+            _mcp_tool_server_names.for_key(profile_key).pop(tool_name, None)
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -7783,6 +7886,15 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
+    # The owning profile, taken from the SERVER rather than the ambient
+    # context. ``_run_on_mcp_loop`` does wrap a scheduled coroutine with the
+    # caller's override, so ambient is usually right — but this also runs
+    # from ``MCPServerTask.run()``, a long-lived task that publishes tools
+    # again after every reconnect, carrying the context it was CREATED in.
+    # ``_profile_key`` is the identity that task already addresses its other
+    # registries with; registration must not be the one that disagrees.
+    profile_key = server._profile_key
+    scope = _mcp_registry_scope(profile_key)
 
     # Selective tool loading: honour include/exclude lists from config.
     # Rules (matching issue #690 spec, extended with glob support):
@@ -7817,7 +7929,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     # configured trust tier and each tool's readOnlyHint annotation NOW,
     # at discovery, so the call-time gate in _make_tool_handler classifies
     # from data we control rather than re-reading server-supplied state.
-    _record_tool_trust_metadata(name, config, server._tools)
+    _record_tool_trust_metadata(name, config, server._tools, profile_key)
 
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
@@ -7939,7 +8051,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         if (registry_name, candidate["origin"]) in shadowed_utilities:
             continue
 
-        existing_toolset = registry.get_toolset_for_tool(registry_name)
+        existing_toolset = registry.get_toolset_for_tool(
+            registry_name, scope=scope
+        )
         if existing_toolset and existing_toolset != toolset_name:
             if existing_toolset.startswith("mcp-"):
                 logger.error(
@@ -7969,11 +8083,14 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=candidate["check_fn"],
             is_async=False,
             description=candidate["schema"]["description"],
+            scope=scope,
         )
 
         # The pre-check above is advisory only. Multiple servers connect in
         # parallel, so ToolRegistry.register() is the atomic ownership gate.
-        if registry.get_toolset_for_tool(registry_name) != toolset_name:
+        if registry.get_toolset_for_tool(
+            registry_name, scope=scope
+        ) != toolset_name:
             logger.error(
                 "MCP server '%s': registration of %s as '%s' was rejected by "
                 "the registry; skipping provenance/count updates",
@@ -7983,11 +8100,11 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(registry_name, name, profile_key)
         registered_names.append(registry_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        registry.register_toolset_alias(name, toolset_name, scope=scope)
         # Write-through (#56832): refresh the on-disk schema cache after a
         # live connect so the next startup can lazily register this server
         # without spawning it. Cache failures never break registration.
@@ -8071,6 +8188,12 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
+    # No MCPServerTask exists on this path — nothing was spawned — so the
+    # owning profile is the ambient one. Correct here: the caller
+    # (``refresh_agent_mcp_tools``) runs on the turn's own thread, inside the
+    # profile scope, and reads ``_servers`` ambiently three lines earlier.
+    profile_key = _mcp_profile_key()
+    scope = _mcp_registry_scope(profile_key)
     fingerprint = config_fingerprint(config)
     tool_timeout = _resolve_tool_timeout(config)
     tools_filter = config.get("tools") or {}
@@ -8126,7 +8249,9 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
         schema = _convert_mcp_schema(name, mcp_tool)
         registry_name = schema["name"]
-        existing_toolset = registry.get_toolset_for_tool(registry_name)
+        existing_toolset = registry.get_toolset_for_tool(
+            registry_name, scope=scope
+        )
         if existing_toolset and existing_toolset != toolset_name:
             logger.warning(
                 "MCP server '%s' (lazy): cached tool '%s' collides with "
@@ -8142,10 +8267,13 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            scope=scope,
         )
-        if registry.get_toolset_for_tool(registry_name) != toolset_name:
+        if registry.get_toolset_for_tool(
+            registry_name, scope=scope
+        ) != toolset_name:
             continue
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(registry_name, name, profile_key)
         registered_names.append(registry_name)
 
     handler_factories = {
@@ -8164,7 +8292,9 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         util_name = schema.get("name") or ""
         if not util_name:
             continue
-        existing_toolset = registry.get_toolset_for_tool(util_name)
+        existing_toolset = registry.get_toolset_for_tool(
+            util_name, scope=scope
+        )
         if existing_toolset and existing_toolset != toolset_name:
             continue
         registry.register(
@@ -8175,14 +8305,15 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema.get("description") or "",
+            scope=scope,
         )
-        if registry.get_toolset_for_tool(util_name) != toolset_name:
+        if registry.get_toolset_for_tool(util_name, scope=scope) != toolset_name:
             continue
-        _track_mcp_tool_server(util_name, name)
+        _track_mcp_tool_server(util_name, name, profile_key)
         registered_names.append(util_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        registry.register_toolset_alias(name, toolset_name, scope=scope)
         with _lock:
             _lazy_server_configs[name] = dict(config)
             _lazy_server_fingerprints[name] = fingerprint

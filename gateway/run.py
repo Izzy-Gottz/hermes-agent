@@ -32137,10 +32137,38 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # internally; calling it from the loop thread would freeze platform
     # heartbeats (Discord shard, Telegram polling) until it returned.
     # See #16856.
+    #
+    # Startup discovery must run inside a profile scope. MCP tools are
+    # registered into tools/registry.py under the profile that owns them,
+    # and the key comes from the context-local HERMES_HOME override. With
+    # multiplex_profiles on, GatewayRunner.__init__ has already flipped
+    # set_multiplex_active(True) by this point, so running this bare would
+    # register every tool into the "no scope installed" partition, which no
+    # reader can name — the gateway would advertise ZERO MCP tools until
+    # somebody ran /reload-mcp (which is careful to scope, see the
+    # _in_scope() call on the reload path).
+    #
+    # The home named here is the one whose config.yaml this discovery just
+    # read: _load_mcp_config() resolves through get_hermes_home(), and with
+    # no override installed that is the process home. So this names the
+    # profile the servers already belong to rather than guessing one.
     try:
         from tools.mcp_tool import discover_mcp_tools
+        from hermes_constants import (
+            get_process_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        def _discover_under_process_home():
+            token = set_hermes_home_override(str(get_process_hermes_home()))
+            try:
+                return discover_mcp_tools()
+            finally:
+                reset_hermes_home_override(token)
+
         _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
+        await _loop.run_in_executor(None, _discover_under_process_home)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 

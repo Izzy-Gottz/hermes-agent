@@ -970,14 +970,28 @@ class TestForceReloadSymmetry:
         assert mgr._discovered is True
 
     def test_unload_all_sweeps_preledger_tool_names(self, monkeypatch):
-        """Tool names without ledger entries are deregistered globally (#60050)."""
+        """Tool names without ledger entries are deregistered (#60050).
+
+        The sweep must name the manager's own scope. It used to call
+        ``deregister(name)`` bare, and "deregistered globally" — the word
+        this docstring carried — was the bug: ``deregister`` derives its
+        partition from the CALLING module's plugin ownership, and
+        ``hermes_cli.plugins`` is not itself a plugin, so the lookup landed
+        in the process-global map. Plugin tools are never there
+        (``PluginManager.scope_key`` is never None, even single-profile), so
+        the sweep removed nothing, ever.
+
+        The scope is asserted, not just the call. A double that accepts any
+        arguments would keep passing against the bare form — which is what
+        the previous one-argument stub did.
+        """
         deregistered = []
         import tools.registry as tools_registry_mod
 
         monkeypatch.setattr(
             tools_registry_mod.registry,
             "deregister",
-            lambda name: deregistered.append(name),
+            lambda name, *, scope=None: deregistered.append((name, scope)),
         )
 
         mgr = PluginManager()
@@ -986,7 +1000,7 @@ class TestForceReloadSymmetry:
         mgr._discovered = True
 
         mgr.unload()
-        assert deregistered == ["zombie_tool"]
+        assert deregistered == [("zombie_tool", mgr.scope_key)]
         assert not mgr._plugin_tool_names
         assert mgr._discovered is False
 

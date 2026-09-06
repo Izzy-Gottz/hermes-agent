@@ -310,6 +310,11 @@ class TestResolveToolsetMemo:
 
         registry_id = id(registry)
         generation = registry._generation
+        # The key carries the active registry SCOPE too: the value memoized
+        # is registry-derived toolset membership read under the ambient
+        # profile, so without this axis one profile's answer was served to
+        # another whenever the generation happened to be unchanged.
+        scope_key = registry.current_scope_key()
 
         first = resolve_toolset("hermes-cli")
         second = resolve_toolset("hermes-cli")
@@ -320,7 +325,7 @@ class TestResolveToolsetMemo:
             f"got {get_toolset_calls['n']} calls"
         )
         assert (
-            "hermes-cli", True, registry_id, generation
+            "hermes-cli", True, registry_id, generation, scope_key
         ) in toolsets_mod._resolve_toolset_memo
 
     def test_generation_bump_invalidates_memo(self, monkeypatch):
