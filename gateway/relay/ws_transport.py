@@ -135,6 +135,27 @@ def _ws_dial_url(url: str) -> str:
     return raw
 
 
+#: Hosts a cleartext dial may still reach. Everything else is somebody's
+#: network. Kept a plain tuple rather than an `ipaddress.is_loopback` call
+#: because the URL is a string, the set is small and fixed, and a parser here
+#: would be a third place that has to agree about what this URL means.
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "[::1]", "::1")
+
+
+def _is_locally_addressed(url: str) -> bool:
+    """True when ``url``'s host is loopback — the only cleartext dial allowed
+    while carrying a non-expiring bearer. Anything unparseable is NOT local:
+    the guard fails closed, because the cost of being wrong is a permanent
+    credential in the clear."""
+    try:
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(url).hostname or "").lower()
+    except Exception:  # noqa: BLE001 - an unparseable URL is not loopback
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
 def _render_relay_context(context: Any) -> Optional[str]:
     """Render the connector's read-only surrounding-context array into the string
     ``MessageEvent.channel_context`` field.
@@ -628,6 +649,22 @@ class WebSocketRelayTransport:
             # this mode the credential identifies the instance by itself, and a
             # gateway_id the connector never reads would be a configured value
             # that resolves to nothing.
+            #
+            # **Refused over cleartext to anywhere but loopback.** A `token`
+            # bearer expires in 300 s, so a plaintext dial leaks something with
+            # a deadline. A `raw` bearer IS the secret and does not expire, so
+            # the same typo — `GATEWAY_RELAY_URL=http://…`, which
+            # `_ws_dial_url` silently maps to `ws://` — puts a permanent
+            # credential on the wire in the clear, for every route it opens and
+            # not just this socket. Loopback stays allowed because the tests
+            # and a local connector dial it and nothing leaves the machine.
+            if not _is_locally_addressed(self._url) and self._url.startswith("ws://"):
+                raise RuntimeError(
+                    "GATEWAY_RELAY_AUTH_MODE=raw presents the per-gateway secret "
+                    "itself and it does not expire, so it will not be sent over "
+                    f"cleartext to {self._url!r} — use wss://. (A `token` bearer "
+                    "would have been survivable here; that is the difference the "
+                    "mode makes.)")
             return {"Authorization": f"Bearer {self._upgrade_secret}"}
         if not self._gateway_id:
             return {}
