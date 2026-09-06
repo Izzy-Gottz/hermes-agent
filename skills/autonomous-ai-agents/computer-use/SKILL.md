@@ -143,6 +143,33 @@ Clicking is the LAST rung, not the first. In order:
 6. **`click` by coordinate** — only for canvas/video/WebGL surfaces with no
    AX tree.
 
+### Opening an app, or a page in an app
+
+**`open` does this, and it is rung 1. Do not drive the screen for it.**
+
+```
+open -a "Google Chrome" https://mail.google.com
+```
+
+That launches Chrome if it is not running, brings it forward if it is,
+switches to whatever desktop it is on, and loads the page — one command, no
+capture, no click, no Space problem. `open -a "App"` on its own just opens the
+app.
+
+Measured 2026-09-06: asked to "open Chrome and open Gmail", the answer given
+was "Can't switch Spaces automatically to bring Chrome forward - you'll need
+to switch to that desktop yourself, then I can open Gmail for you." Chrome was
+running, one desktop away, and the whole task was a single `open -a`. Reaching
+for the screen at all was the mistake.
+
+**And on Spaces: if the person asked you to act in an app, going to it is what
+they asked for.** The rule elsewhere in this file - do not move someone's
+desktop out from under them - is about Moe wandering off on its own while they
+work. It is not a reason to refuse the thing they just requested. When they
+have named the app, bring it forward; the "stay in the background" setting
+still decides whether you may, and refuses you on its own if not. Ask only
+when they did not name it and you would be guessing.
+
 ### invoke_menu, and how to learn the paths
 
 ```
