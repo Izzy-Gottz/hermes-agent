@@ -106,6 +106,25 @@ def _env_disconnect_budget_s() -> float:
 # revoked (opt-out / deprovision), which the transport treats as terminal.
 _RELAY_UNAUTHORIZED_CLOSE_CODE = 4401
 
+# The same fact in a different shape: a connector that authenticates the
+# upgrade itself refuses a dead credential BEFORE any WebSocket exists, as an
+# HTTP status on the handshake response — there is no socket for a Close frame
+# to travel on, so the 4401 latch above cannot fire for a device that was
+# revoked WHILE ITS SOCKET WAS DOWN. Such a connector says *revoked* with
+# **HTTP 410 Gone** on the upgrade response, and says it only to a bearer that
+# matches a credential which has been revoked (contract §3.1; Moe's edge,
+# `moe_edge/relay.py`). One sighting is terminal: the connector has told this
+# gateway, on evidence only the holder of that secret could present, that the
+# secret is dead. Every OTHER refusal — 401/403 for a credential the connector
+# does not know or cannot read, a proxy's 502/503 while the connector is
+# down, connection refused, a timeout — is "not now" or "not like that", never
+# "not you", and stays retryable for ever. An earlier draft counted three
+# consecutive 403s instead; a review showed that latching a gateway whose
+# `.env` had merely lost `GATEWAY_RELAY_AUTH_MODE`, permanently, while never
+# reaching three on the real gateway (which builds a fresh transport per
+# attempt). The signal has to be the connector's, not a count of ours.
+_UPGRADE_REVOKED_STATUS = 410
+
 
 def _ws_dial_url(url: str) -> str:
     """Normalize a connector URL to the ``ws(s)://…/relay`` dial target.
@@ -601,19 +620,18 @@ class WebSocketRelayTransport:
         # transient latency / event-loop stalls (Coatue incident 2026-08-18).
         # ping_timeout=60 tolerates such stalls while still detecting a dead
         # link within ~90s worst case (30s interval + 60s pong deadline).
+        dial_kwargs: Dict[str, Any] = {"ping_interval": 30, "ping_timeout": 60}
         if headers:
+            dial_kwargs["additional_headers"] = headers
+        try:
             self._ws = await websockets.connect(  # type: ignore[union-attr]
-                self._url,
-                additional_headers=headers,
-                ping_interval=30,
-                ping_timeout=60,
+                self._url, **dial_kwargs
             )
-        else:
-            self._ws = await websockets.connect(  # type: ignore[union-attr]
-                self._url,
-                ping_interval=30,
-                ping_timeout=60,
-            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - classified and re-raised unchanged
+            self._note_dial_failure(exc)
+            raise
         self._reader = asyncio.create_task(self._read_loop(), name="relay-ws-reader")
         # Send one hello PER fronted identity (Phase 1.5 Shape A). The connector
         # accumulates them into its advertised set (the first sets the session
@@ -766,11 +784,61 @@ class WebSocketRelayTransport:
 
     @property
     def auth_revoked(self) -> bool:
-        """True once the connector closed the socket with 4401 AFTER a prior
-        successful handshake — i.e. the per-gateway secret was revoked (the
-        operator opted this instance out of the relay). Terminal: the transport
-        stops reconnecting, and the adapter surfaces a clean "disabled" state."""
+        """True once the connector has told this transport its credential is
+        dead, by either of the two shapes that fact arrives in: a 4401 close
+        AFTER a prior successful handshake (the connector revoked a live
+        socket), or HTTP _UPGRADE_REVOKED_STATUS on the upgrade response (the
+        connector refused a device that was revoked while its socket was
+        down). Terminal: the transport stops reconnecting, and the adapter
+        surfaces a clean "disabled" state — from connect() too, so a gateway
+        that builds a fresh transport per attempt stops after one."""
         return self._auth_revoked
+
+    def _note_dial_failure(self, exc: BaseException) -> None:
+        """Latch when the connector said *revoked* on the upgrade response.
+
+        Called with every exception `websockets.connect` raised, before it is
+        re-raised, so both routes to a dial — `connect()` and the reconnect
+        supervisor — read the one signal. Nothing else here latches: a 401/403
+        is a credential the connector does not know or cannot read, which is a
+        configuration to fix while the transport keeps trying, not a
+        revocation to give up on.
+
+        Exactly one log line when it latches, and it says why: the supervisor
+        suppresses its own "reconnect failed" line for the attempt that
+        latched, so a person reading the log finds one sentence."""
+        if self._auth_revoked or self._upgrade_status_of(exc) != _UPGRADE_REVOKED_STATUS:
+            return
+        self._auth_revoked = True
+        # What the line may promise, checked against the connector this was
+        # written for: a revoked device cannot rejoin its tenant (Moe's edge
+        # refuses its id on sign-in and on enrolment alike), so "re-enrol" is
+        # somewhere the person cannot go. What actually stops the dialling is
+        # removing the credential; until then every gateway restart re-dials
+        # once, is refused once, and writes this line once.
+        logger.warning(
+            "relay ws upgrade refused HTTP %d: the connector says this gateway's relay "
+            "credential has been revoked, so re-dialling cannot succeed; not "
+            "reconnecting. A revoked device cannot rejoin its tenant. Remove the relay "
+            "credential (GATEWAY_RELAY_SECRET; on a Moe Mac, Settings > Away > Leave) to "
+            "stop this gateway re-dialling once per restart.",
+            _UPGRADE_REVOKED_STATUS,
+        )
+
+    @staticmethod
+    def _upgrade_status_of(exc: BaseException) -> Optional[int]:
+        """The HTTP status a failed upgrade was refused with, or None.
+
+        websockets >= 13 raises `InvalidStatus` carrying `.response.status_code`;
+        earlier releases raised `InvalidStatusCode` with `.status_code`. Duck-
+        typed like `_close_code_of`, for the same reason: the library's own
+        class names have moved under this module once already."""
+        response = getattr(exc, "response", None)
+        code = getattr(response, "status_code", None)
+        if isinstance(code, int):
+            return code
+        code = getattr(exc, "status_code", None)
+        return code if isinstance(code, int) else None
 
     def set_inbound_handler(self, handler: InboundHandler) -> None:
         self._inbound = handler
@@ -1111,6 +1179,13 @@ class WebSocketRelayTransport:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep retrying on dial failure
+                if self._auth_revoked:
+                    # _dial_and_start counted this refusal and it was the one
+                    # that latched; the line saying so has been written. A
+                    # dead credential is not coming back on the next backoff,
+                    # so the supervisor ends here — the same terminal state a
+                    # post-handshake 4401 reaches, by the other route.
+                    return
                 logger.warning("relay ws reconnect failed: %s", exc)
                 backoff = min(backoff * 2, self._reconnect_max_backoff_s)
 

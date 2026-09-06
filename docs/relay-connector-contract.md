@@ -302,6 +302,26 @@ terminal revocation: it stops reconnecting and reports the relay platform as
 **disabled** (not a retryable error). A 4401 *before* any successful handshake
 stays retryable (a cold-start / not-yet-provisioned race, not a revocation).
 
+**A revocation seen at the HTTP upgrade.** A connector that authenticates the
+upgrade itself (one in `raw` mode, §6.1a) refuses a dead credential *before* it
+accepts the socket — as an HTTP status on the handshake response, with no Close
+frame at all, because there is no socket for one to travel on. So a gateway
+whose credential was revoked *while its socket was down* never sees a 4401.
+Such a connector says **revoked** distinctly: **HTTP 410 Gone** on the upgrade
+response, sent **only** to a bearer that matches a credential the connector
+has revoked. That is a match, not an enumeration — the caller has just
+presented the very secret in question — and a bearer the connector does not
+know, cannot read, or was given in the wrong mode gets the ordinary 401/403
+and learns nothing. A gateway treats **one** 410 on the upgrade as a terminal
+revocation, exactly like the post-handshake 4401: it stops reconnecting, writes
+one log line saying so, and reports the relay platform **disabled** — from its
+very first dial too, so a gateway that restarts (and so builds a fresh
+transport) finds out on attempt one. **No other upgrade refusal is terminal.**
+401/403 is a configuration to fix while the gateway keeps trying; 5xx,
+connection refused and timeouts are the connector being away. Nothing is
+counted: three transient refusals in a row must never disable a gateway whose
+credential is perfectly good.
+
 ### 3.2 Going-idle / buffered-flip primitive (§5.3)
 
 A scale-to-zero PRIMITIVE (not the behaviour — nothing here decides to sleep or
