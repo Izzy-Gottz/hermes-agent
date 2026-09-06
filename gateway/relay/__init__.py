@@ -173,6 +173,41 @@ def relay_connection_auth() -> tuple[Optional[str], Optional[str]]:
     return (gateway_id or None, secret or None)
 
 
+def relay_upgrade_auth_mode() -> str:
+    """How this gateway presents ``GATEWAY_RELAY_SECRET`` on the WS upgrade.
+
+    ``"token"`` — the default, and the only shape upstream has — sends
+    ``make_upgrade_token(gateway_id, secret)`` from ``gateway/relay/auth.py``:
+    a signed, expiring bearer the connector checks with ``verify_token``. That
+    requires the connector to hold the secret **in plaintext**, because
+    checking that signature needs the key.
+
+    ``"raw"`` sends the configured secret itself as the bearer, for a connector
+    that deliberately stores only a one-way digest of it and so *cannot* check
+    a signature, ever — it digests what arrives and compares. The wire exposure
+    is the same class as every other bearer this gateway already presents over
+    TLS; what changes is which side is able to hold the plaintext, and "the
+    connector cannot" is a stronger position than "the connector must".
+
+    Any other value is treated as ``"token"`` rather than raising: an unknown
+    mode must not stop a gateway booting, and the connector rejects an unusable
+    upgrade with 4401 anyway.
+
+    Env first (Docker), then ``gateway.relay_auth_mode`` in config.yaml — the
+    same two-source order ``relay_connection_auth`` and ``relay_endpoint`` use.
+    """
+    mode = os.environ.get("GATEWAY_RELAY_AUTH_MODE", "").strip().lower()
+    if not mode:
+        try:
+            from gateway.run import _load_gateway_config  # late import to avoid cycle
+
+            cfg = (_load_gateway_config().get("gateway") or {})
+            mode = str(cfg.get("relay_auth_mode", "") or "").strip().lower()
+        except Exception:  # noqa: BLE001 - config absence/parse must never crash boot
+            mode = ""
+    return "raw" if mode == "raw" else "token"
+
+
 def relay_endpoint() -> Optional[str]:
     """The gateway's own PUBLIC inbound URL, asserted to the connector at provision.
 
@@ -934,6 +969,7 @@ def register_relay_adapter(force: bool = False, url: Optional[str] = None) -> bo
             from gateway.relay.ws_transport import WebSocketRelayTransport
 
             gateway_id, upgrade_secret = relay_connection_auth()
+            upgrade_auth_mode = relay_upgrade_auth_mode()
             transport = WebSocketRelayTransport(
                 resolved_url,
                 platform,
@@ -946,6 +982,11 @@ def register_relay_adapter(force: bool = False, url: Optional[str] = None) -> bo
                 identities=relay_platform_identities(),
                 gateway_id=gateway_id,
                 upgrade_secret=upgrade_secret,
+                # "token" unless the operator asked for "raw" — see
+                # relay_upgrade_auth_mode(). Passed explicitly so this call site
+                # reads as the configured value rather than relying on the
+                # transport's default staying what it is.
+                upgrade_auth_mode=upgrade_auth_mode,
                 # Phase 5 §5.3: re-dial + re-handshake after an unexpected socket
                 # close so a gateway that went idle/suspended re-establishes its
                 # relay socket — which triggers the connector's buffered-flip drain
