@@ -32,9 +32,27 @@ skill installed by `cua-driver skills install`. Hermes autodetection is a
 planned cua-driver follow-up, so currently point Hermes at the resulting
 `~/.cua-driver/skills/cua-driver` directory or symlink it into your skill space.
 
+## Capture when you do not know, not by default
+
+**A screenshot is what you reach for when the state of the screen is unknown
+to you — not the thing every task opens with.** This section used to say
+"Capture first. Almost every task starts with…", and the sessions that came
+out of it were 22 captures to 5 actions, 17 of them consecutive, with 86% of
+ten minutes spent thinking rather than acting. A SOM capture costs ~2.5 s and
+~600 KB and answers a vague question; `verify_state` costs ~18 ms and answers
+a sharp one.
+
+So: capture when you are arriving somewhere new, when something you did not
+predict may have happened, or when you genuinely cannot say what is on
+screen. Do NOT capture to confirm something you can state as a predicate — ask
+`verify_state`. Do NOT capture again straight after acting unless the action
+came back `unverifiable`; the verdict already told you.
+
+Everything below still holds for the capture you do take.
+
 ## The canonical workflow
 
-**Step 1 — Capture first.** Almost every task starts with:
+**Step 1 — When the state is unknown, capture.**
 
 ```
 computer_use(action="capture", mode="som", app="<the app you're driving>")
@@ -432,6 +450,48 @@ in your conversation context.
 - The agent cursor you see on screen (a tinted overlay following your
   moves) is YOUR run's cursor. It's a visual cue for the user that
   YOU are acting. The real OS cursor never moves.
+
+## When to stop, and when to ask
+
+The failure table below is eight rows of how to keep trying, and for a long
+time this file said nothing at all about when not to. That gap has a measured
+cost: asked to draw something on 2026-09-06, five minutes went into hunting
+for image-generation API keys, probing twice for `rsvg-convert`, writing an
+HTML page and an AppleScript, launching Chrome on it and screenshotting the
+result — before noticing the target tab was on another Space and none of it
+could have worked. Every step was different and every step was defensible.
+The person watched "still running" for five minutes.
+
+**You have about twenty screen actions per task.** Past that the tool refuses
+and tells you to report. It is a count, not a judgement — it will fire on work
+that feels productive, because that is exactly the case it exists for. Treat
+the advisory at fourteen as the signal to wrap up rather than start something
+new.
+
+**Say what is in the way, by name.** "It didn't work" is worthless. "Freeform
+draws its canvas as one custom surface with no accessibility tree, so there
+are no elements to click and freehand strokes are not something I can do" is
+an answer a person can act on — they can pick a different tool, or a different
+app, or do it themselves.
+
+**Finish the authorised work before asking anything.** Do not stop halfway to
+ask a question you could answer by looking. Do the reversible parts, then come
+back with what you found and one specific question. Ask early only when the
+answer would change the whole approach — which app, which document, which
+account — because that is the question whose wrong answer wastes the other
+nineteen actions.
+
+**Two rungs down and still nothing means stop, not improvise.** If the data
+route, the app's own scripting and the menus have all failed, the answer is
+usually that the thing cannot be done this way — not that a fourth route
+exists three steps further out. Building a pipeline to work around a UI is
+how five minutes disappear.
+
+**Check the Space before you plan, not after.** `list_windows` marks every
+window `on_current_space`. Input to a window on another desktop is refused by
+macOS, so if the target is elsewhere that is the first thing to resolve —
+ask, or work somewhere else. Finding it out at the end wastes everything
+before it.
 
 ## Failure modes — what to do when things go sideways
 

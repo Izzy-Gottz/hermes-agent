@@ -790,6 +790,20 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     # below the approval gate showed the user a dialog on their Mac, took
     # their approval, and only then refused the call.
     detector = _stall_detector(session_id)
+
+    # The budget, first, because it is the only check that fires on work which
+    # looks fine. The two below it read the shape of what has been tried; this
+    # one only counts, which is why it catches the case they cannot — varied,
+    # plausible, and going nowhere for five minutes. See stall.BUDGET_HARD.
+    #
+    # Ahead of the approval gate for the same reason everything else here is:
+    # refusing after showing the user a dialog is the worst order.
+    over_budget = detector.budget_reason(action)
+    if over_budget is not None:
+        logger.warning("computer_use %s refused: budget spent (%d)",
+                       action, detector.spent())
+        return over_budget
+
     blocked = detector.block_reason(action, args)
     if blocked is not None:
         logger.warning("computer_use %s refused: repeated identical call", action)
@@ -869,7 +883,13 @@ def _attach_stall_advisory(
     """
     note = detector.advisory(action, args) or detector.looking_loop(action)
     if note is None:
-        return result
+        # Nothing is wrong with the strategy, but the road may still be
+        # running out. Said late rather than early: "six left" is useful, and
+        # "nineteen left" is noise on every call.
+        budget = detector.budget_advisory()
+        if budget is None:
+            return result
+        note = {"hint": budget["budget"]["note"]}
     banner = f"[stall] {note['hint']}"
 
     if isinstance(result, dict):

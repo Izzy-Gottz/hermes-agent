@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections import deque
 from typing import Any, Deque, Dict, Optional, Tuple
 
@@ -84,6 +85,45 @@ _READ_ONLY = frozenset({
 # prompted this was seventeen.
 LOOK_SOFT_LIMIT = 6
 LOOK_HARD_LIMIT = 10
+
+# ---------------------------------------------------------------- the budget
+#
+# The third tier, and the one that catches what the other two cannot.
+#
+# Repeated-identical-call catches thrashing. Looking-loop catches an agent
+# short of nerve rather than pixels. Neither fires on work that is varied and
+# plausible at every step — and that is the shape of the worst failure we have
+# measured. 2026-09-06, asked to draw something: five minutes and seventeen
+# calls in which the model hunted for image-generation API keys, read a skill,
+# probed for `rsvg-convert` twice, wrote an HTML page and an AppleScript,
+# launched Chrome on it, and screenshotted the result — before concluding that
+# the target tab was on another Space anyway. Every call different, every call
+# defensible, no repetition to detect. The owner watched "still running" for
+# five minutes.
+#
+# So the budget does not judge. It counts. Astra's computer-use loop does the
+# same thing and says so plainly — it stops at twenty turns with "The task
+# reached the 20-response limit" — and the number is the point: a limit that
+# only fires on obviously-bad work would not have fired here.
+#
+# 20 matches theirs. 14 leaves room to say "six left" while six are still
+# useful.
+BUDGET_SOFT = 14
+BUDGET_HARD = 20
+
+# When the count goes back to zero.
+#
+# The honest version of this would reset when the model hands back to the
+# person, and the tool cannot see turn boundaries — it sees calls. An idle gap
+# is the proxy: long enough that retrying inside the same breath is still
+# refused (which is the point — the refusal has to make the model stop and
+# speak), short enough that a real exchange with the person clears it.
+#
+# It is a proxy and it is imperfect: two quick tasks in ninety seconds share
+# one allowance. That error runs in the safe direction — the failure being
+# fixed is running too long, not stopping too early — and the refusal says
+# what to do about it.
+BUDGET_IDLE_RESET = 90.0
 
 # Actions that send input somewhere. Repeating one of these unverified is how
 # a message goes twice; repeating a read only costs time.
@@ -167,6 +207,10 @@ class StallDetector:
         self._lock = threading.Lock()
         # Consecutive read-only calls since anything last changed the screen.
         self._looks = 0
+        # Non-exempt calls spent on the task in hand, and when the last one
+        # was — see BUDGET_* above.
+        self._spent = 0
+        self._last_call_at: float = 0.0
 
     def _occurrences(self, call_fp: str) -> int:
         """How many times this call produced its own most recent result.
@@ -182,6 +226,74 @@ class StallDetector:
 
     def _limit(self, action: str) -> int:
         return INPUT_HARD_LIMIT if action in _INPUT else HARD_LIMIT
+
+    def _spend(self, now: float) -> int:
+        """Count this call against the budget, resetting after an idle gap.
+
+        Returns the running total INCLUDING the call being considered, so a
+        caller can compare it against BUDGET_HARD directly.
+        """
+        with self._lock:
+            if self._last_call_at and now - self._last_call_at > BUDGET_IDLE_RESET:
+                self._spent = 0
+            self._last_call_at = now
+            self._spent += 1
+            return self._spent
+
+    def spent(self) -> int:
+        with self._lock:
+            return self._spent
+
+    def budget_reason(self, action: str,
+                      now: Optional[float] = None) -> Optional[str]:
+        """A JSON error string when the task has run out of road, else None.
+
+        Deliberately not a judgement about whether the work is going well.
+        The case this exists for looked like good work at every single step.
+        """
+        if action in _EXEMPT:
+            return None
+        total = self._spend(time.monotonic() if now is None else now)
+        if total <= BUDGET_HARD:
+            return None
+        return json.dumps({
+            "ok": False,
+            "action": action,
+            "code": "budget_spent",
+            "error": (
+                f"Stop. That is {total - 1} screen actions on this one task, "
+                f"which is the limit ({BUDGET_HARD})."
+            ),
+            "verdict": {
+                "decision": "stop_and_report",
+                "hint": (
+                    "Do not try another approach. Tell the user plainly what "
+                    "you were trying to do, what you actually managed, and "
+                    "what is in the way — naming the specific obstacle, not "
+                    "'it didn't work'. Then ask whether to keep going. The "
+                    "allowance refills once you have handed back and they "
+                    "have answered; retrying straight away is refused again, "
+                    "which is the point."
+                ),
+            },
+        })
+
+    def budget_advisory(self) -> Optional[Dict[str, Any]]:
+        """The soft tier: say how much road is left, while it is still useful."""
+        total = self.spent()
+        if total < BUDGET_SOFT:
+            return None
+        return {
+            "budget": {
+                "spent": total,
+                "of": BUDGET_HARD,
+                "note": (
+                    f"{BUDGET_HARD - total} screen action(s) left on this "
+                    "task. If it is not nearly done, say where you are now "
+                    "rather than being cut off mid-way."
+                ),
+            }
+        }
 
     def block_reason(self, action: str, args: Dict[str, Any]) -> Optional[str]:
         """A JSON error string when this call must not run, else None.
