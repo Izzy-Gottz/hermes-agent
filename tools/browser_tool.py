@@ -5698,12 +5698,15 @@ def _chromium_search_roots() -> List[str]:
     3. ``~/Library/Caches/ms-playwright`` — Playwright's default on macOS.
     4. ``%USERPROFILE%\\AppData\\Local\\ms-playwright`` — Playwright's default
        on Windows.
+    5. ``~/.agent-browser/browsers`` — where agent-browser puts its OWN
+       download, which is where it actually goes now. See ``_chromium_installed``.
     """
     roots: List[str] = []
     env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
     if env_path and env_path != "0":
         roots.append(env_path)
     home = os.path.expanduser("~")
+    roots.append(os.path.join(home, ".agent-browser", "browsers"))
     roots.append(os.path.join(home, ".cache", "ms-playwright"))
     if sys.platform == "darwin":
         roots.append(os.path.join(home, "Library", "Caches", "ms-playwright"))
@@ -5727,9 +5730,26 @@ def _chromium_installed() -> bool:
     3. Playwright's browser cache (current logic) — directories containing
        ``chromium-*`` or ``chromium_headless_shell-*``.
 
-    agent-browser (0.26+) downloads Playwright's chromium / headless-shell
-    builds into ``PLAYWRIGHT_BROWSERS_PATH`` and won't start without at least
-    one of the three above being present.  Without a browser binary the CLI
+    It does NOT do this any more, and the sentence that stood here said it
+    did: "agent-browser (0.26+) downloads Playwright's chromium /
+    headless-shell builds into PLAYWRIGHT_BROWSERS_PATH". Measured on macOS
+    with agent-browser 0.26 and 0.36, ``agent-browser install`` prints
+
+        Downloading Chrome 152.0.7977.82 for mac-arm64
+        Location: ~/.agent-browser/browsers/chrome-152.0.7977.82
+
+    — Chrome for Testing, named ``chrome-*`` rather than ``chromium-*``, in
+    agent-browser's own directory rather than Playwright's. So a correct,
+    working install was reported as "Chromium browser is missing" and the
+    browser toolset was advertised-and-dead on every Mac that had one: the
+    same CLI opened a Wikipedia page in 12 s from the same shell where this
+    returned False.
+
+    A guard built for an old layout refusing the current one. Match on what
+    is THERE, not on the name a previous version used.
+
+    agent-browser won't start without at least one of the checks below being
+    satisfied.  Without a browser binary the CLI
     hangs on first use until the command timeout fires (often ~30s).  Guarding
     the tool behind this check prevents advertising a capability that will
     fail at runtime.
@@ -5765,10 +5785,14 @@ def _chromium_installed() -> bool:
         except OSError:
             continue
         # Playwright names them ``chromium-<build>`` and
-        # ``chromium_headless_shell-<build>``; agent-browser accepts either.
+        # ``chromium_headless_shell-<build>``; agent-browser's own download is
+        # ``chrome-<build>`` (Chrome for Testing). All three drive the same
+        # CDP, and agent-browser accepts any of them.
         for entry in entries:
-            if entry.startswith("chromium-") or entry.startswith(
-                "chromium_headless_shell-"
+            if (
+                entry.startswith("chromium-")
+                or entry.startswith("chromium_headless_shell-")
+                or entry.startswith("chrome-")
             ):
                 _cached_chromium_installed = True
                 return True
