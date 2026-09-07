@@ -300,15 +300,59 @@ def test_explicit_pid_and_window_skip_the_search(monkeypatch):
 def test_a_window_on_another_space_is_still_readable(monkeypatch):
     """Input to another Space is refused by macOS. A CDP read is not — it
     never touches WindowServer — so an off-Space browser must not be skipped
-    the way `capture` has to skip it."""
+    the way `capture` has to skip it.
+
+    THE SHAPE HERE IS COPIED FROM THE MACHINE, and the first version of this
+    test was not. It said `off_screen: False` and passed against code that
+    filtered on `off_screen`, while the real thing returned "no browser window
+    matched" against a running, signed-in Chrome. What a Chrome one desktop
+    away actually reports, measured:
+
+        {'app_name': 'Google Chrome', 'pid': 773, 'window_id': 175,
+         'off_screen': True, 'on_current_space': False, 'z_index': 46,
+         'title': 'Feed | LinkedIn'}
+
+    `off_screen` means WindowServer is not compositing it. It says nothing
+    about the tab.
+    """
     b = FakeBackend(windows=[
-        {"pid": 3, "window_id": 3, "app_name": "Google Chrome",
-         "on_current_space": False, "z_index": 0, "off_screen": False},
+        {"pid": 773, "window_id": 175, "app_name": "Google Chrome",
+         "on_current_space": False, "z_index": 46, "off_screen": True,
+         "title": "Feed | LinkedIn"},
     ])
     monkeypatch.setattr(t, "_get_backend", lambda **kw: b)
     out = _read()
     assert out["status"] == "ok"
-    assert b.binds == [(3, 3)]
+    assert b.binds == [(773, 175)]
+
+
+def test_an_all_offscreen_browser_is_still_found(monkeypatch):
+    """The exact failure, end to end: every window off-screen, as a Chrome on
+    another desktop reports. This must not be `no_browser_window`."""
+    b = FakeBackend(windows=[
+        {"pid": 773, "window_id": wid, "app_name": "Google Chrome",
+         "off_screen": True, "on_current_space": False, "z_index": z,
+         "title": title}
+        for wid, z, title in ((186, 57, ""), (179, 51, ""), (175, 46, "Feed | LinkedIn"))
+    ])
+    monkeypatch.setattr(t, "_get_backend", lambda **kw: b)
+    out = _read()
+    assert "error" not in out, out
+    assert b.binds and b.binds[0][0] == 773
+
+
+def test_a_window_in_front_wins_over_one_on_another_space(monkeypatch):
+    """Off-Space is readable, but if the person is looking at a browser
+    window, that is the one they mean."""
+    b = FakeBackend(windows=[
+        {"pid": 1, "window_id": 1, "app_name": "Google Chrome",
+         "off_screen": True, "on_current_space": False, "z_index": 90},
+        {"pid": 1, "window_id": 2, "app_name": "Google Chrome",
+         "off_screen": False, "on_current_space": True, "z_index": 3},
+    ])
+    monkeypatch.setattr(t, "_get_backend", lambda **kw: b)
+    _read()
+    assert b.binds == [(1, 2)]
 
 
 # ── the guard that a new verb walks past ──────────────────────────────────

@@ -775,7 +775,22 @@ def _browser_window(backend, args):
         if want:
             return want in name or name in want
         return any(name.startswith(b) for b in _BROWSER_APPS)
-    cands = [w for w in windows if _is_browser(w) and not w.get("off_screen")]
+    # NOT filtered on `off_screen`, and this is the whole point of the tool.
+    #
+    # It was, in the first draft, and the unit test that was supposed to prove
+    # off-Space windows still work passed anyway — because the fake said
+    # `off_screen: False` while the real thing does not. Measured on the
+    # owner's Mac: every window of a Chrome sitting one desktop away reports
+    #
+    #     {'app_name': 'Google Chrome', 'off_screen': True,
+    #      'on_current_space': False, 'title': 'Feed | LinkedIn'}
+    #
+    # so the filter excluded exactly the case `browser_read` exists for, and
+    # `browser_read` returned "no browser window matched" against a running,
+    # signed-in Chrome. `off_screen` says WindowServer is not compositing the
+    # window; it says nothing about the tab, and CDP never asks WindowServer
+    # anything. A minimised window reads the same way.
+    cands = [w for w in windows if _is_browser(w)]
     if pid is not None:
         cands = [w for w in cands if w.get("pid") == int(pid)]
     if not cands:
@@ -788,9 +803,12 @@ def _browser_window(backend, args):
                      "(`open -a \"Google Chrome\"`). Safari is not a CDP "
                      "target — use capture/click for it."),
         })
-    # A window on another Space can still be read over CDP — unlike input,
-    # which macOS refuses. Prefer the current Space only as a tiebreak.
-    cands.sort(key=lambda w: (not w.get("on_current_space"), w.get("z_index", 0)))
+    # Prefer a window that is actually in front of the person, then the
+    # topmost — but only as a tiebreak between readable windows, never as a
+    # filter. Reading a background tab is a feature here, not a fallback.
+    cands.sort(key=lambda w: (not w.get("on_current_space"),
+                              bool(w.get("off_screen")),
+                              -int(w.get("z_index") or 0)))
     top = cands[0]
     return top.get("pid"), top.get("window_id"), None
 
