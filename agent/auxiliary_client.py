@@ -9742,6 +9742,100 @@ async def _acreate_with_stream(
 
 
 @_relay_auxiliary_call
+def _try_claude_code_cli_vision(
+    task, provider, model, messages, timeout, main_runtime,
+):
+    """Serve a vision task from the Claude Code CLI, or return None.
+
+    A Claude Code subscription is an OAuth login to a CLI, not an API key, so
+    `claude-code-cli` cannot serve step 1 of either chain in this module's
+    header — there is no HTTP client to build the call on. Measured on a real
+    Mac (2026-09-07): every computer_use screenshot fell through to a
+    third-party auxiliary provider whose balance was empty, and capture
+    returned `402 Insufficient Balance`. The assistant could not see the
+    screen at all, and the error named a service the owner never chose.
+
+    The CLI itself can read an image, so try it first for that provider and
+    only for it: every other provider has a working chain and keeps it.
+
+    Returns None for every "does not apply" and every failure, so the chain
+    below runs exactly as it did before. Deliberately total — a raise here
+    would break every auxiliary call rather than one lane.
+    """
+    if task != "vision":
+        return None
+    try:
+        from agent import claude_code_vision as _ccv
+    except Exception:
+        return None
+    if provider and str(provider).strip().lower() not in {"", "auto"}:
+        # An explicit per-call provider is the caller's choice, honoured over
+        # this the same way the rest of the router honours it.
+        if not _ccv.serves_vision_for(provider):
+            return None
+        chosen = provider
+    else:
+        runtime = main_runtime if isinstance(main_runtime, dict) else {}
+        chosen = str(runtime.get("provider") or "") or _read_main_provider()
+        if not _ccv.serves_vision_for(chosen):
+            return None
+        # `auxiliary.vision` pinned to something reachable is a real answer and
+        # must win. The CLI lane is for when nothing else can serve.
+        try:
+            pinned, _pm, pinned_base, _pk, _am = _resolve_task_provider_model(
+                "vision", None, None, None, None)
+        except Exception:
+            pinned, pinned_base = None, None
+        pinned_name = str(pinned or "").strip().lower()
+        if pinned_base:
+            return None
+        if pinned_name and pinned_name != "auto" and not _ccv.serves_vision_for(pinned_name):
+            return None
+    return _ccv.try_vision_call(
+        chosen, messages,
+        model=model if model else None,
+        timeout=float(timeout) if timeout else 120.0,
+    )
+
+
+def _rescue_vision_with_cli(
+    exc, task, provider, model, messages, timeout, main_runtime,
+):
+    """After a vision call failed on payment, try the Claude Code CLI.
+
+    Returns a response, or None to let the original exception stand. Only
+    payment/credit failures are rescued: a genuine bad-request must still
+    surface as itself rather than being quietly answered by a different lane.
+    """
+    if task != "vision":
+        return None
+    try:
+        if not _is_payment_error(exc):
+            return None
+    except Exception:
+        return None
+    try:
+        from agent import claude_code_vision as _ccv
+    except Exception:
+        return None
+    runtime = main_runtime if isinstance(main_runtime, dict) else {}
+    chosen = str(runtime.get("provider") or "") or _read_main_provider()
+    if not _ccv.serves_vision_for(chosen):
+        return None
+    rescued = _ccv.try_vision_call(
+        chosen, messages, model=None,
+        timeout=float(timeout) if timeout else 120.0,
+    )
+    if rescued is not None:
+        logger.warning(
+            "auxiliary vision lane could not pay (%s); served from the "
+            "Claude Code CLI instead. Point auxiliary.vision at a lane that "
+            "works, or remove the pin to use the CLI directly.",
+            type(exc).__name__,
+        )
+    return rescued
+
+
 def call_llm(
     task: str = None,
     *,
@@ -9765,6 +9859,10 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    cli_vision = _try_claude_code_cli_vision(
+        task, provider, model, messages, timeout, main_runtime)
+    if cli_vision is not None:
+        return cli_vision
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -9823,6 +9921,20 @@ def call_llm(
             semaphore = None
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         return response
+    except Exception as exc:
+        # A PINNED lane that cannot pay is the cliff this whole change is
+        # about. `auxiliary.vision.provider` set to a real provider wins over
+        # the CLI above — correctly, it is an explicit answer — but when that
+        # provider returns 402 the fallback chain does not contain the CLI,
+        # because the CLI is not an HTTP provider. So the user's own
+        # subscription, sitting right there, was never tried and capture died.
+        # Measured: `402 Insufficient Balance` reached the model as the tool
+        # result for every screenshot.
+        rescued = _rescue_vision_with_cli(
+            exc, task, provider, model, messages, timeout, main_runtime)
+        if rescued is not None:
+            return rescued
+        raise
     finally:
         if latency_info is not None:
             latency_info["summary_generation_ms"] = max(
@@ -10711,6 +10823,20 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    # The async entry is the one `vision_analyze` and the computer_use capture
+    # path actually call, so the CLI lane has to be here too — wiring only the
+    # sync twin would have fixed nothing a user can see. Run off-thread: the
+    # CLI is a subprocess taking several seconds, and blocking the event loop
+    # would stall every other task sharing it.
+    if task == "vision":
+        import asyncio  # local, matching this module's convention
+
+        cli_vision = await asyncio.to_thread(
+            _try_claude_code_cli_vision,
+            task, provider, model, messages, timeout, main_runtime,
+        )
+        if cli_vision is not None:
+            return cli_vision
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
@@ -10731,6 +10857,20 @@ async def async_call_llm(
             reasoning_config=reasoning_config,
             route_info=route_info,
         )
+    except Exception as exc:
+        # Same rescue as the sync twin: a pinned vision lane that cannot pay
+        # must not be the end of the road when the user's own subscription can
+        # serve. Off-thread, because the CLI is a subprocess and the event loop
+        # is shared.
+        import asyncio  # local, matching this module's convention
+
+        rescued = await asyncio.to_thread(
+            _rescue_vision_with_cli,
+            exc, task, provider, model, messages, timeout, main_runtime,
+        )
+        if rescued is not None:
+            return rescued
+        raise
     finally:
         if semaphore is not None:
             semaphore.release()

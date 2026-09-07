@@ -170,9 +170,145 @@ def describe_image(
     return answer
 
 
+
+
+# ── the call_llm seam ─────────────────────────────────────────────────────
+#
+# Everything vision funnels through `call_llm(task="vision", messages=[...])`,
+# and every caller reads the answer as `response.choices[0].message.content`
+# (see auxiliary_client.extract_content_or_reasoning). So the lane plugs in by
+# returning that shape, and nothing downstream needs to know a CLI served it.
+
+
+class _Message:
+    __slots__ = ("content", "role", "reasoning", "reasoning_content",
+                 "tool_calls", "refusal")
+
+    def __init__(self, content: str):
+        self.content = content
+        self.role = "assistant"
+        # extract_content_or_reasoning reads these when content is empty.
+        # Present and None, so a getattr() probe behaves like a real message
+        # rather than raising.
+        self.reasoning = None
+        self.reasoning_content = None
+        self.tool_calls = None
+        self.refusal = None
+
+
+class _Choice:
+    __slots__ = ("message", "finish_reason", "index")
+
+    def __init__(self, content: str):
+        self.message = _Message(content)
+        self.finish_reason = "stop"
+        self.index = 0
+
+
+class CLIVisionResponse:
+    """An OpenAI-shaped response carrying one CLI answer.
+
+    Usage is reported as zero rather than guessed: the subscription is not
+    metered per token here, and inventing numbers would put fiction into cost
+    accounting. A caller that sums usage sees zero, which is true.
+    """
+
+    __slots__ = ("choices", "model", "usage", "id", "object", "created")
+
+    def __init__(self, content: str, model: str):
+        self.choices = [_Choice(content)]
+        self.model = model
+        self.usage = None
+        self.id = "claude-code-cli-vision"
+        self.object = "chat.completion"
+        self.created = 0
+
+
+def image_and_question_from_messages(messages) -> "tuple[Optional[str], str]":
+    """Pull the image and the asked question out of OpenAI-style messages.
+
+    Returns ``(image, question)``; ``image`` is None when the messages carry
+    none, which is the signal that this lane does not apply.
+    """
+    image: Optional[str] = None
+    texts: list = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if message.get("role") != "system":
+                texts.append(content)
+            continue
+        for part in content or []:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text" and message.get("role") != "system":
+                texts.append(str(part.get("text") or ""))
+            elif kind == "image_url":
+                url = (part.get("image_url") or {})
+                if isinstance(url, dict):
+                    url = url.get("url")
+                # LAST image wins: the caller may retry a downscaled copy in
+                # the same message list, and the newest is the one meant.
+                if url:
+                    image = str(url)
+    question = "\n\n".join(t.strip() for t in texts if t and t.strip())
+    return image, question
+
+
+def serves_vision_for(provider: str) -> bool:
+    """True when this lane should be tried for *provider*.
+
+    Only for the CLI-backed brain, because that is the one the auxiliary
+    client cannot serve at all. A provider with an HTTP client has a working
+    chain already and must keep using it.
+    """
+    return str(provider or "").strip().lower() in {
+        "claude-code-cli", "claude-code", "claude_code",
+    }
+
+
+def try_vision_call(
+    provider: str,
+    messages,
+    *,
+    model: Optional[str] = None,
+    timeout: float = 120.0,
+) -> Optional[CLIVisionResponse]:
+    """Serve a vision call from the CLI, or return None to fall through.
+
+    None — never an exception — for every "not applicable" and every failure,
+    so a caller wraps this in nothing and loses no existing behaviour.
+    """
+    if not serves_vision_for(provider):
+        return None
+    try:
+        image, question = image_and_question_from_messages(messages)
+    except Exception:
+        return None
+    if not image:
+        return None
+    try:
+        answer = describe_image(
+            image, question, model=model, timeout=timeout)
+    except ClaudeCodeVisionUnavailable as exc:
+        logger.info("claude-code CLI vision unavailable, falling through: %s", exc)
+        return None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("claude-code CLI vision raised unexpectedly: %s", exc)
+        return None
+    return CLIVisionResponse(answer, model or DEFAULT_MODEL)
+
+
 __all__ = [
+    "CLIVisionResponse",
     "ClaudeCodeVisionUnavailable",
     "DEFAULT_MODEL",
     "cli_available",
     "describe_image",
+    "image_and_question_from_messages",
+    "serves_vision_for",
+    "try_vision_call",
 ]
