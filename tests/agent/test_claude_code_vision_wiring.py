@@ -159,8 +159,28 @@ def test_a_non_payment_error_still_raises(cli, brain_is_claude_code, monkeypatch
     assert not cli
 
 
-def test_a_402_on_a_non_vision_task_still_raises(cli, brain_is_claude_code,
-                                                 monkeypatch):
+def test_a_402_on_a_text_side_task_is_also_rescued(brain_is_claude_code,
+                                                   monkeypatch):
+    """The same empty balance took compression, session_search and
+    title_generation down with vision — the gateway logged it once per turn.
+    This test asserted the opposite until the text lane existed; it is kept,
+    inverted, rather than deleted, because the contract it guards is which
+    tasks the CLI may serve."""
+    monkeypatch.setattr(V, "answer_text", lambda prompt, **kw: "a title")
+    monkeypatch.setattr(A, "_is_payment_error", lambda exc: isinstance(exc, _Paid))
+
+    def broke(**kw):
+        raise _Paid("402")
+
+    monkeypatch.setattr(A, "_call_llm_impl", broke)
+    out = A.call_llm(task="compression", messages=MESSAGES)
+    assert out.choices[0].message.content == "a title"
+
+
+def test_a_402_on_an_unlisted_task_still_raises(cli, brain_is_claude_code,
+                                                monkeypatch):
+    """TEXT_TASKS is a small named set, not "anything not vision". A task
+    added upstream later must not silently inherit a lane nobody chose."""
     monkeypatch.setattr(A, "_is_payment_error", lambda exc: isinstance(exc, _Paid))
 
     def broke(**kw):
@@ -168,7 +188,7 @@ def test_a_402_on_a_non_vision_task_still_raises(cli, brain_is_claude_code,
 
     monkeypatch.setattr(A, "_call_llm_impl", broke)
     with pytest.raises(_Paid):
-        A.call_llm(task="compression", messages=MESSAGES)
+        A.call_llm(task="embedding", messages=MESSAGES)
     assert not cli
 
 

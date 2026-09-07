@@ -9801,14 +9801,16 @@ def _try_claude_code_cli_vision(
 def _rescue_vision_with_cli(
     exc, task, provider, model, messages, timeout, main_runtime,
 ):
-    """After a vision call failed on payment, try the Claude Code CLI.
+    """After an auxiliary call failed on payment, try the Claude Code CLI.
+
+    Covers vision and the text side tasks (compression, session_search,
+    title_generation, reflection) — one empty balance took all of them down
+    together on the owner's Mac, and only vision was loud about it.
 
     Returns a response, or None to let the original exception stand. Only
     payment/credit failures are rescued: a genuine bad-request must still
     surface as itself rather than being quietly answered by a different lane.
     """
-    if task != "vision":
-        return None
     try:
         if not _is_payment_error(exc):
             return None
@@ -9818,14 +9820,23 @@ def _rescue_vision_with_cli(
         from agent import claude_code_vision as _ccv
     except Exception:
         return None
+    if task != "vision" and str(task or "") not in _ccv.TEXT_TASKS:
+        return None
     runtime = main_runtime if isinstance(main_runtime, dict) else {}
     chosen = str(runtime.get("provider") or "") or _read_main_provider()
     if not _ccv.serves_vision_for(chosen):
         return None
-    rescued = _ccv.try_vision_call(
-        chosen, messages, model=None,
-        timeout=float(timeout) if timeout else 120.0,
-    )
+    seconds = float(timeout) if timeout else 120.0
+    if task == "vision":
+        rescued = _ccv.try_vision_call(
+            chosen, messages, model=None, timeout=seconds)
+    else:
+        # The same empty balance that blinded capture also took compression,
+        # session_search and title_generation with it — measured on the
+        # owner's Mac, once per turn: "Auxiliary title_generation: payment
+        # error on deepseek". Text lanes need no image handling, only the CLI.
+        rescued = _ccv.try_text_call(
+            chosen, task, messages, model=None, timeout=seconds)
     if rescued is not None:
         logger.warning(
             "auxiliary vision lane could not pay (%s); served from the "
@@ -10858,10 +10869,10 @@ async def async_call_llm(
             route_info=route_info,
         )
     except Exception as exc:
-        # Same rescue as the sync twin: a pinned vision lane that cannot pay
-        # must not be the end of the road when the user's own subscription can
-        # serve. Off-thread, because the CLI is a subprocess and the event loop
-        # is shared.
+        # Same rescue as the sync twin, for vision and the text side tasks: a
+        # lane that cannot pay must not be the end of the road when the user's
+        # own subscription can serve. Off-thread, because the CLI is a
+        # subprocess and the event loop is shared.
         import asyncio  # local, matching this module's convention
 
         rescued = await asyncio.to_thread(
