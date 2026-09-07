@@ -1,0 +1,72 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: github
+description: 'GitHub: repositories, issues, pull requests, releases, and code search.'
+source: https://github.com/settings/tokens
+
+# Official vendor-hosted remote MCP (URL-only — Hermes never spawns a local
+# process for this entry).
+#
+# api_key, NOT oauth, and that is a measurement rather than a preference.
+# GitHub publishes RFC 9728 protected-resource metadata pointing at
+# https://github.com/login/oauth, but that authorization server advertises
+# NO `registration_endpoint` — there is no Dynamic Client Registration, so
+# the path gitlab and linear take (discover -> register -> PKCE) dead-ends
+# here. Native MCP OAuth would need a GitHub OAuth App registered ahead of
+# time and its client_id shipped, which is a credential to hold forever.
+#
+# The server accepts a plain GitHub token as the bearer instead — verified
+# live on 2026-09-06: initialize returned 200 and tools/list returned 44
+# tools against a token with `repo, read:org, workflow, gist`.
+#
+# The env var is spelled out rather than left to be derived: mcp_catalog.py
+# REFUSES an http+api_key entry whose auth.env does not declare exactly the
+# key the Authorization header references (`MCP_GITHUB_API_KEY`, from
+# _env_key_for_server), because an entry that skips it installs cleanly and
+# then sends a literal-placeholder header that 401s forever.
+
+transport:
+  type: http
+  url: https://api.githubcopilot.com/mcp/
+
+auth:
+  type: api_key
+  env:
+    - name: MCP_GITHUB_API_KEY
+      prompt: "GitHub token — github.com/settings/tokens"
+      required: true
+      secret: true
+
+# No `tools:` block. GitHub annotates all 44 of its tools — 27 readOnlyHint
+# true, 17 false, `delete_file` additionally destructiveHint — so the tool
+# surface is honestly self-describing and a curated subset here would only go
+# stale. Pruning is the install-time checklist's job, and any host that gates
+# on annotations (Moe's send gate does) already gets the truth from the
+# server.
+
+# Composer-suggestion triggers (desktop brand pills).
+suggest:
+  keywords:
+    - github
+    - pull request
+    - repo
+  hosts:
+    - github.com
+
+post_install: |
+  Paste a GitHub token when asked. Fine-grained or classic both work; the
+  scopes decide what the tools can reach — `repo` and `read:org` cover
+  reading repositories, issues and pull requests.
+
+    https://github.com/settings/tokens
+
+  If the `gh` CLI is already signed in on this machine, `gh auth token`
+  prints a token you can paste straight in.
+
+  17 of the 44 tools write — they open pull requests, push files, merge, and
+  `delete_file` deletes. The server marks each one, so a host that reads
+  those annotations can ask before any of them run.
+
+  Start a new Hermes session to load the tools.
