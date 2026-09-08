@@ -77,14 +77,23 @@ def test_the_cli_serves_a_vision_call(cli, brain_is_claude_code, nothing_pinned,
     assert cli[0]["question"] == "what is on screen?"
 
 
-def test_a_non_vision_task_is_untouched(cli, brain_is_claude_code, monkeypatch):
-    """Compression and session search must keep their own chain."""
+def test_a_pinned_text_lane_is_untouched(cli, brain_is_claude_code, monkeypatch):
+    """A text lane the user pinned keeps its own chain.
+
+    This asserted that compression ALWAYS kept the HTTP chain, and went red
+    when the text lane landed — the second of my own tests to catch a contract
+    change rather than a bug. Inverted rather than deleted: what still matters
+    is that an explicit pin wins over the CLI, exactly as it does for vision.
+    """
     seen = {}
 
     def impl(**kw):
         seen["ran"] = True
         return "http response"
 
+    monkeypatch.setattr(
+        A, "_resolve_task_provider_model",
+        lambda *a, **k: ("openai", "gpt-4o-mini", None, None, None))
     monkeypatch.setattr(A, "_call_llm_impl", impl)
     assert A.call_llm(task="compression", messages=MESSAGES) == "http response"
     assert seen["ran"] and not cli
@@ -309,3 +318,45 @@ def test_the_system_prompt_is_not_the_question():
     ]
     _, question = V.image_and_question_from_messages(msgs)
     assert question == "what is this?"
+
+
+def test_a_text_task_is_served_when_no_lane_is_configured(brain_is_claude_code,
+                                                          nothing_pinned,
+                                                          monkeypatch):
+    """The gap the live Mac exposed after the pin was removed.
+
+    With `auxiliary` on `auto` and nothing in the chain configured, the
+    gateway logged
+
+        No LLM provider configured for task=title_generation provider=auto
+
+    which is NOT a payment error, so the rescue never fired — and the first
+    seam only served vision. The rescue is for a lane that breaks; this is for
+    a lane that was never there.
+    """
+    monkeypatch.setattr(V, "answer_text", lambda prompt, **kw: "a title")
+
+    def must_not_run(**kw):
+        raise AssertionError("the HTTP chain ran; the CLI should have served")
+
+    monkeypatch.setattr(A, "_call_llm_impl", must_not_run)
+    out = A.call_llm(task="title_generation", messages=MESSAGES)
+    assert out.choices[0].message.content == "a title"
+
+
+def test_the_async_path_serves_a_text_task_too(brain_is_claude_code,
+                                               nothing_pinned, monkeypatch):
+    monkeypatch.setattr(V, "answer_text", lambda prompt, **kw: "a summary")
+
+    async def must_not_run(**kw):
+        raise AssertionError("the HTTP chain ran")
+
+    monkeypatch.setattr(A, "_async_call_llm_impl", must_not_run)
+    out = asyncio.run(A.async_call_llm(task="compression", messages=MESSAGES))
+    assert out.choices[0].message.content == "a summary"
+
+
+def test_an_unlisted_task_still_uses_the_chain(cli, brain_is_claude_code,
+                                               nothing_pinned, monkeypatch):
+    monkeypatch.setattr(A, "_call_llm_impl", lambda **kw: "http response")
+    assert A.call_llm(task="embedding", messages=MESSAGES) == "http response"
