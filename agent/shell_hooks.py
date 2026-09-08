@@ -621,6 +621,16 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     return result
 
 
+# Slack between the subprocess timeout a shell hook enforces on itself and the
+# wall-clock bound the plugin manager puts around the callback. Covers spawning
+# the process, serialising the payload, and — on the timeout path — killing the
+# process tree and reaping it (``communicate(timeout=1)``). It exists so the
+# INNER bound always fires first: the inner one produces the hook's own
+# fail-closed message, which names the script; the outer one produces a generic
+# "callback timed out" the agent cannot act on.
+CALLBACK_TIMEOUT_MARGIN_SECONDS = 15
+
+
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]]]:
     """Build the closure that ``invoke_hook()`` will call per firing."""
 
@@ -635,6 +645,29 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
+    # DECLARE the bound this callback already enforces on itself, so the plugin
+    # manager honours it instead of applying its default to a callback that
+    # does not need one (hermes_cli.plugins._callback_timeout).
+    #
+    # This attribute exists because the default was silently overriding a
+    # configured one. `plugins.hook_callback_timeout` defaults to 30s and
+    # `_hook_uses_callback_timeout` keys on the HOOK NAME, so every
+    # pre_tool_call callback was bounded at 30s — shell hooks included, even
+    # though plugins.py's own comment reads "Shell hooks already enforce their
+    # own subprocess timeout." A `timeout: 300` in config.yaml was dead text.
+    #
+    # What that cost, reported by a user on 2026-09-08: an approve-before-send
+    # dialog is a shell hook that waits for a person to read a message. At 30
+    # seconds the manager abandoned the callback — WITHOUT killing it, so the
+    # dialog stayed on screen — failed the tool closed, and then blocked every
+    # later tool call in the turn on the still-running guard. The person
+    # pressed Send on a dialog whose answer no longer went anywhere; the agent
+    # was told only "pre_tool_call plugin callback timed out or is still
+    # running" and could not say why; and the retry raised a second dialog.
+    #
+    # A hook that waits for a human is not a hung hook, and a bound the
+    # callback enforces itself is the one that should win.
+    _callback.__hermes_hook_timeout__ = spec.timeout + CALLBACK_TIMEOUT_MARGIN_SECONDS
     return _callback
 
 
