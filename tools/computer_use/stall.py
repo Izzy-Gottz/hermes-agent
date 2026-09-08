@@ -78,14 +78,6 @@ _EXEMPT = frozenset({"wait", "scroll", "key"})
 _READ_ONLY = frozenset({
     "capture", "zoom", "list_windows", "list_apps", "focused_element",
     "verify_state",
-    # A CDP page read is a look like any other. Leaving it out would not
-    # merely make the looking-loop detector blind to it — `record()` treats
-    # anything not in this set as an ACT and zeroes the counter, so
-    # capture/browser_read/capture/browser_read would reset the count every
-    # other call and the detector would never fire at all. Fourth time in
-    # this codebase that a new verb walked past a guard enumerating the old
-    # ones; this one is closed at the same commit that adds the verb.
-    "browser_read",
 })
 
 # Six looks with nothing done is worth a word; ten is worth stopping.
@@ -162,14 +154,6 @@ def call_fingerprint(action: str, args: Dict[str, Any]) -> str:
             # one call repeated five times, and the fifth is refused with a
             # message ("these exact arguments") that is simply false.
             "path", "expect",
-            # Same shape again, for `browser_read`: without these, reading a
-            # page and then reading one panel of it (`scope_ref`), or asking
-            # for a different thing (`query`), or widening to `full` after the
-            # trimmed default was not enough, are all one call repeated — and
-            # the second is refused. Measured: the live sizes script escalated
-            # from `include_text` to `full` and was told it had already made
-            # that exact call.
-            "query", "scope_ref", "continuation", "full", "include_text",
         )
         if args.get(k) is not None
     }

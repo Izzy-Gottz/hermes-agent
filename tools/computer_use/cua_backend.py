@@ -2857,10 +2857,6 @@ class CuaDriverBackend(ComputerUseBackend):
         # snapshot context.
         self._snapshot_tokens: Dict[int, str] = {}
         self._snapshot_id: Optional[str] = None
-        # Sticky browser binding — set by browser_bind(), used so the
-        # model does not have to carry two opaque ids through every call.
-        self._browser_target_id: Optional[str] = None
-        self._browser_tab_id: Optional[str] = None
         # Per-instance public cua-driver session label. The MCP transport owns
         # the private lifecycle and releases it when the connection closes.
         # start_session/end_session attach this stable label to cursor,
@@ -4506,74 +4502,6 @@ class CuaDriverBackend(ComputerUseBackend):
         }
         args.update(page_args)
         return self._session.call_tool("page", args)
-
-    # ── Browser (CDP) ───────────────────────────────────────────────
-    #
-    # cua-driver ships nine browser_* tools that drive Chromium through the
-    # DevTools protocol: exact element refs instead of coordinates, and
-    # `trusted` input that "refuses rather than foregrounding a standalone
-    # browser" — so a click lands in a background tab without taking the
-    # screen. Hermes named none of them anywhere, while already passing
-    # `--grant existing-profile` for exactly this. The door was built; nothing
-    # went through it.
-    #
-    # The flow the driver requires, and the reason these are three methods
-    # rather than one:
-    #   browser_bind(pid, window_id)    -> target_id + tab_id  (exact-or-refuse)
-    #   browser_snapshot(target, tab)   -> outline + typed action refs
-    #   ...act on a ref...
-    # Every browser tool needs the explicit `session` label; without it the
-    # driver refuses with `protected_resource_scope_invalid`, measured.
-
-    def browser_bind(self, *, pid: int, window_id: int,
-                     timeout: float = 30.0) -> Dict[str, Any]:
-        """Classify a native browser window and mint a target/tab id.
-
-        Returns the driver's structuredContent verbatim. A window whose
-        profile has not been authorised comes back as a `refusal` with code
-        `browser_consent_required` — that is a real consent boundary (the
-        endpoint exposes the person's live pages, cookies and storage), so it
-        is surfaced, never worked around.
-        """
-        out = self.call_tool("get_browser_state", {
-            "pid": int(pid), "window_id": int(window_id),
-        }, timeout=timeout)
-        body = out.get("structuredContent") or {}
-        if body.get("status") == "ok":
-            self._browser_target_id = body.get("target_id")
-            tabs = body.get("tabs") or []
-            active = next((t for t in tabs if isinstance(t, dict) and t.get("active")),
-                          tabs[0] if tabs and isinstance(tabs[0], dict) else None)
-            self._browser_tab_id = (active or {}).get("tab_id")
-        return body
-
-    def browser_snapshot(self, *, target_id: Optional[str] = None,
-                         tab_id: Optional[str] = None,
-                         query: Optional[str] = None,
-                         scope_ref: Optional[str] = None,
-                         continuation: Optional[str] = None,
-                         snapshot_format: str = "semantic_v2",
-                         timeout: float = 45.0) -> Dict[str, Any]:
-        """Read one bound tab. `query`/`scope_ref` narrow it — and they are
-        not a nicety, they are the whole point; see the note on sizes in
-        tool.py's `browser_read`."""
-        args: Dict[str, Any] = {
-            "target_id": target_id or self._browser_target_id,
-            "tab_id": tab_id or self._browser_tab_id,
-            "snapshot_format": snapshot_format,
-        }
-        if query:
-            args["query"] = query
-        if scope_ref:
-            args["scope_ref"] = scope_ref
-        if continuation:
-            args["continuation"] = continuation
-        out = self.call_tool("get_browser_state", args, timeout=timeout)
-        return out.get("structuredContent") or {}
-
-    def browser_targets(self) -> Tuple[Optional[str], Optional[str]]:
-        """The sticky (target_id, tab_id) from the last successful bind."""
-        return self._browser_target_id, self._browser_tab_id
 
     # ── Generic escape hatch ────────────────────────────────────────
 
