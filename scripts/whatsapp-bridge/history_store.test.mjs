@@ -275,6 +275,13 @@ import {
     store.nameChat('120363@g.us', '');
     assert.equal(ro.prepare('SELECT name FROM chats WHERE jid = ?').get('120363@g.us').name, 'Family (2026)', 'an empty subject changes nothing');
 
+    // A history sync hands contacts first, then chats: a chat nobody has
+    // written in yet still takes the name saved for it.
+    store.recordContacts([{ id: '447700900003@s.whatsapp.net', name: 'Dan' }]);
+    store.recordChats([{ id: '447700900003@s.whatsapp.net', conversationTimestamp: 1700000350 }]);
+    assert.equal(ro.prepare('SELECT name FROM chats WHERE jid = ?').get('447700900003@s.whatsapp.net').name, 'Dan',
+      'a chat recorded after its contact is named by it');
+
     // Media: what a download needs comes back whole; a text message has none.
     store.recordMessages([{
       key: { remoteJid: '447700900001@s.whatsapp.net', fromMe: false, id: 'V1' },
@@ -310,7 +317,7 @@ import {
     store.close();
     // Reopening keeps everything: the schema is CREATE IF NOT EXISTS.
     const again = openHistoryStore(file);
-    assert.deepEqual(again.counts(), { messages: 6, chats: 3 });
+    assert.deepEqual(again.counts(), { messages: 6, chats: 4 });
     again.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });

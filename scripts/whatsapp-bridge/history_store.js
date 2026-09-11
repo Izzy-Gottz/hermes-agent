@@ -353,7 +353,15 @@ export function openHistoryStore(dbPath) {
       const rows = chatRowsFromHistory(chats, opts);
       if (!rows.length) return 0;
       return inTransaction(() => {
-        for (const r of rows) upsertChat.run(r.jid, r.name, r.last_message_time);
+        // A chat with no name of its own takes its saved contact's. A history
+        // sync hands contacts BEFORE chats (bridge.js records them in that
+        // order), and recordContacts only renames chats that already exist,
+        // so a one-to-one chat with nothing said in it yet stayed nameless
+        // for good — two chats with "Dan" both read as bare numbers.
+        for (const r of rows) {
+          const name = r.name || contactName.get(r.jid)?.name || '';
+          upsertChat.run(r.jid, name, r.last_message_time);
+        }
         return rows.length;
       });
     },
