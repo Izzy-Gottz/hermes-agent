@@ -195,3 +195,68 @@ def test_an_empty_image_is_unavailable(spy):
 def test_the_answer_is_returned_stripped(spy):
     spy["result"] = _Result(out="  a login page\n\n")
     assert V.describe_image(DATA_URL, "q") == "a login page"
+
+
+# ── the text lanes ────────────────────────────────────────────────────────
+#
+# Vision was the loudest failure, not the only one. The same empty balance
+# took compression, session_search and title_generation down with it, and the
+# gateway logged it once per turn on the owner's Mac:
+#
+#     Auxiliary title_generation: payment error on deepseek
+#     credential pool: marking DEEPSEEK_API_KEY exhausted (status=402)
+
+class TestTextLane:
+    def test_a_text_task_is_served(self, spy):
+        out = V.answer_text("summarise this")
+        assert out == "a screenshot of a web page"
+        assert "summarise this" in spy["input"]
+
+    def test_no_tools_are_allowed_for_text(self, spy):
+        """A summarising side task must not be able to read files or run
+        anything. The vision lane needs Read; this one needs nothing."""
+        V.answer_text("summarise this")
+        assert "--allowedTools" not in spy["argv"]
+
+    def test_the_conversational_tail_is_suppressed(self, spy):
+        """Measured: a compression request came back with the summary and then
+        "What would you like me to help with?" — which would land inside a
+        stored summary or a conversation title."""
+        V.answer_text("summarise this")
+        assert "no closing question" in spy["input"]
+
+    def test_roles_are_labelled_not_dropped(self):
+        """A compression task's system message carries the instruction and the
+        user message carries the text; concatenating them unlabelled turns two
+        things into one ambiguous blob."""
+        prompt = V.prompt_from_messages([
+            {"role": "system", "content": "Summarise."},
+            {"role": "user", "content": "a long transcript"},
+        ])
+        assert "[instructions]" in prompt
+        assert "Summarise." in prompt and "a long transcript" in prompt
+
+    def test_only_the_named_tasks_are_served(self, spy):
+        """A small named set, not "anything not vision": a task added upstream
+        later should have to be considered here rather than silently inherit a
+        lane nobody chose for it."""
+        msgs = [{"role": "user", "content": "hello"}]
+        assert V.try_text_call("claude-code-cli", "compression", msgs) is not None
+        assert V.try_text_call("claude-code-cli", "title_generation", msgs) is not None
+        assert V.try_text_call("claude-code-cli", "embedding", msgs) is None
+        assert V.try_text_call("claude-code-cli", "vision", msgs) is None
+
+    def test_another_provider_is_declined(self, spy):
+        msgs = [{"role": "user", "content": "hello"}]
+        assert V.try_text_call("openai", "compression", msgs) is None
+
+    def test_empty_messages_are_declined(self, spy):
+        assert V.try_text_call("claude-code-cli", "compression", []) is None
+        assert V.try_text_call(
+            "claude-code-cli", "compression",
+            [{"role": "user", "content": "   "}]) is None
+
+    def test_a_failure_falls_through(self, spy):
+        spy["result"] = _Result(code=1, err="not logged in")
+        msgs = [{"role": "user", "content": "hello"}]
+        assert V.try_text_call("claude-code-cli", "compression", msgs) is None

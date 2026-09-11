@@ -570,6 +570,7 @@ def _action_create(a: Dict[str, Any]) -> str:
             script=_normalize_optional_job_value(script), context_from=context_from,
             enabled_toolsets=a["enabled_toolsets"] or None, workdir=_normalize_optional_job_value(a["workdir"]),
             no_agent=_no_agent, attach_to_session=a["attach_to_session"],
+            light_context=bool(a["light_context"]) if a["light_context"] is not None else None,
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
@@ -775,6 +776,8 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
         updates["enabled_toolsets"] = a["enabled_toolsets"] or None
     if a["attach_to_session"] is not None:
         updates["attach_to_session"] = bool(a["attach_to_session"])
+    if a["light_context"] is not None:
+        updates["light_context"] = bool(a["light_context"])
     if a["workdir"] is not None:
         # Empty string clears; otherwise update_job() validates/normalizes.
         updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
@@ -877,6 +880,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
+    light_context: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
     paused: bool = False,
@@ -987,6 +991,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "boolean",
                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), a user-written bare platform target (deliver='slack' — that platform's home channel), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
             },
+            "light_context": {
+                "type": "boolean",
+                "description": "True = run the job with a light system prompt: no MEMORY.md/USER.md and no AGENTS.md/CLAUDE.md context files (SOUL.md and the skills index still load). For small clockwork jobs (a check, a classifier, a ping) that must not spend the context budget on the user's whole memory every tick. Leave unset for jobs that should know the user. On update, false turns it off."
+            },
         },
         "required": ["action"]
     }
@@ -1011,7 +1019,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason")
+    "paused_reason", "light_context")
 
 
 def _cronjob_handler(args, **kw):

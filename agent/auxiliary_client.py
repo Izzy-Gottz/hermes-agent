@@ -7224,7 +7224,7 @@ def _stamp_latency_once(latency_info: Optional[Dict[str, int]], key: str, starte
 
 
 @_relay_auxiliary_call
-def _try_claude_code_cli_vision(
+def _try_claude_code_cli(
     task, provider, model, messages, timeout, main_runtime,
 ):
     """Serve a vision task from the Claude Code CLI, or return None.
@@ -7244,11 +7244,22 @@ def _try_claude_code_cli_vision(
     below runs exactly as it did before. Deliberately total — a raise here
     would break every auxiliary call rather than one lane.
     """
-    if task != "vision":
-        return None
     try:
         from agent import claude_code_vision as _ccv
     except Exception:
+        return None
+    # Vision AND the text side tasks. Serving only vision here was a real gap,
+    # found by watching the owner's Mac after the pin was removed: with the
+    # lane on `auto` and nothing in the chain configured, title_generation
+    # failed with
+    #
+    #     No LLM provider configured for task=title_generation provider=auto
+    #
+    # which is NOT a payment error, so the rescue below never fired. The
+    # rescue is for a lane that breaks; this is for a lane that was never
+    # there.
+    is_text = str(task or "").strip().lower() in _ccv.TEXT_TASKS
+    if task != "vision" and not is_text:
         return None
     if provider and str(provider).strip().lower() not in {"", "auto"}:
         # An explicit per-call provider is the caller's choice, honoured over
@@ -7265,7 +7276,7 @@ def _try_claude_code_cli_vision(
         # must win. The CLI lane is for when nothing else can serve.
         try:
             pinned, _pm, pinned_base, _pk, _am = _resolve_task_provider_model(
-                "vision", None, None, None, None)
+                task, None, None, None, None)
         except Exception:
             pinned, pinned_base = None, None
         pinned_name = str(pinned or "").strip().lower()
@@ -7273,24 +7284,28 @@ def _try_claude_code_cli_vision(
             return None
         if pinned_name and pinned_name != "auto" and not _ccv.serves_vision_for(pinned_name):
             return None
-    return _ccv.try_vision_call(
-        chosen, messages,
-        model=model if model else None,
-        timeout=float(timeout) if timeout else 120.0,
-    )
+    seconds = float(timeout) if timeout else 120.0
+    if task == "vision":
+        return _ccv.try_vision_call(
+            chosen, messages, model=model if model else None, timeout=seconds)
+    return _ccv.try_text_call(
+        chosen, task, messages,
+        model=model if model else None, timeout=seconds)
 
 
 def _rescue_vision_with_cli(
     exc, task, provider, model, messages, timeout, main_runtime,
 ):
-    """After a vision call failed on payment, try the Claude Code CLI.
+    """After an auxiliary call failed on payment, try the Claude Code CLI.
+
+    Covers vision and the text side tasks (compression, session_search,
+    title_generation, reflection) — one empty balance took all of them down
+    together on the owner's Mac, and only vision was loud about it.
 
     Returns a response, or None to let the original exception stand. Only
     payment/credit failures are rescued: a genuine bad-request must still
     surface as itself rather than being quietly answered by a different lane.
     """
-    if task != "vision":
-        return None
     try:
         if not _is_payment_error(exc):
             return None
@@ -7300,14 +7315,23 @@ def _rescue_vision_with_cli(
         from agent import claude_code_vision as _ccv
     except Exception:
         return None
+    if task != "vision" and str(task or "") not in _ccv.TEXT_TASKS:
+        return None
     runtime = main_runtime if isinstance(main_runtime, dict) else {}
     chosen = str(runtime.get("provider") or "") or _read_main_provider()
     if not _ccv.serves_vision_for(chosen):
         return None
-    rescued = _ccv.try_vision_call(
-        chosen, messages, model=None,
-        timeout=float(timeout) if timeout else 120.0,
-    )
+    seconds = float(timeout) if timeout else 120.0
+    if task == "vision":
+        rescued = _ccv.try_vision_call(
+            chosen, messages, model=None, timeout=seconds)
+    else:
+        # The same empty balance that blinded capture also took compression,
+        # session_search and title_generation with it — measured on the
+        # owner's Mac, once per turn: "Auxiliary title_generation: payment
+        # error on deepseek". Text lanes need no image handling, only the CLI.
+        rescued = _ccv.try_text_call(
+            chosen, task, messages, model=None, timeout=seconds)
     if rescued is not None:
         logger.warning(
             "auxiliary vision lane could not pay (%s); served from the "
@@ -7328,7 +7352,7 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
-    cli_vision = _try_claude_code_cli_vision(
+    cli_vision = _try_claude_code_cli(
         task, provider, model, messages, timeout, main_runtime)
     if cli_vision is not None:
         return cli_vision
@@ -7649,11 +7673,11 @@ async def async_call_llm(
     # sync twin would have fixed nothing a user can see. Run off-thread: the
     # CLI is a subprocess taking several seconds, and blocking the event loop
     # would stall every other task sharing it.
-    if task == "vision":
+    if task:
         import asyncio  # local, matching this module's convention
 
         cli_vision = await asyncio.to_thread(
-            _try_claude_code_cli_vision,
+            _try_claude_code_cli,
             task, provider, model, messages, timeout, main_runtime,
         )
         if cli_vision is not None:
@@ -7669,10 +7693,10 @@ async def async_call_llm(
             reasoning_config=reasoning_config, route_info=route_info,
         )
     except Exception as exc:
-        # Same rescue as the sync twin: a pinned vision lane that cannot pay
-        # must not be the end of the road when the user's own subscription can
-        # serve. Off-thread, because the CLI is a subprocess and the event loop
-        # is shared.
+        # Same rescue as the sync twin, for vision and the text side tasks: a
+        # lane that cannot pay must not be the end of the road when the user's
+        # own subscription can serve. Off-thread, because the CLI is a
+        # subprocess and the event loop is shared.
         import asyncio  # local, matching this module's convention
 
         rescued = await asyncio.to_thread(

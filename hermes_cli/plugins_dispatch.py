@@ -52,6 +52,66 @@ _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
+# A callback may DECLARE the wall-clock bound it already enforces on itself, by
+# setting this attribute to a number of seconds. The manager honours it in place
+# of ``plugins.hook_callback_timeout``.
+#
+# Set by ``agent.shell_hooks._make_callback``, which kills its own subprocess at
+# the ``timeout:`` from config.yaml. Before this existed, that configured value
+# was dead text: ``_hook_uses_callback_timeout`` keys on the hook NAME, so every
+# pre_tool_call callback got the 30s default — including a shell hook whose
+# whole job is to wait for a person to answer a dialog. See the long note in
+# ``_make_callback`` for what that cost a user on 2026-09-08.
+#
+# The declaration is honoured, not merely maxed with the default, in both
+# directions: a callback that bounds itself at 5s should not be given 30. It is
+# still clamped to ``_MAX_HOOK_CALLBACK_TIMEOUT_SECS`` — a declaration cannot
+# buy an unbounded callback — and a non-numeric or non-positive one falls back
+# to the default rather than disabling the bound.
+_HOOK_DECLARED_TIMEOUT_ATTR = "__hermes_hook_timeout__"
+
+
+def _callback_timeout(cb: Callable, default: float) -> float:
+    """The bound for one callback: its own declaration, else *default*."""
+    declared = getattr(cb, _HOOK_DECLARED_TIMEOUT_ATTR, None)
+    if declared is None:
+        return default
+    try:
+        declared = float(declared)
+    except (TypeError, ValueError):
+        logger.warning(
+            "callback %s declared a non-numeric %s (%r); using %gs",
+            getattr(cb, "__name__", repr(cb)), _HOOK_DECLARED_TIMEOUT_ATTR, declared, default)
+        return default
+    if declared <= 0:
+        return default
+    return min(declared, _MAX_HOOK_CALLBACK_TIMEOUT_SECS)
+
+
+def _pre_tool_call_timeout_block(callback_name: str = "", still_running: bool = False) -> Dict[str, str]:
+    """Fail-closed directive when a policy callback times out or is still running.
+
+    The message NAMES the callback. It used to be a bare
+    "pre_tool_call plugin callback timed out or is still running", and a user
+    hit the cost of that on 2026-09-08: the callback was an approve-before-send
+    dialog, the dialog was still on their screen, and the agent — told only
+    that something timed out — reported the send as failed while the person
+    was reading it. A model that is told WHICH gate is waiting can say so.
+
+    ``still_running`` distinguishes the two cases the old wording ran together:
+    a callback that is *still running* is usually a gate waiting for a person,
+    and the right thing is to wait for them, not to retry.
+    """
+    if still_running:
+        detail = ("%s is still running — it has not answered yet. If it is a confirmation gate, "
+                  "someone may still be reading the dialog. Wait for it; do not retry the call."
+                  % (callback_name or "a pre_tool_call callback"))
+    else:
+        detail = _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        if callback_name:
+            detail = "%s: %s" % (callback_name, detail)
+    return {"action": "block", "message": detail}
+
 # System-prompt sections are tightly bounded: they become high-trust prompt bytes charged every turn.
 SYSTEM_PROMPT_SECTION_POSITIONS = frozenset({"after_memory"})
 DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS = 4_000
@@ -138,6 +198,7 @@ class _QueuedPluginEvent:
 _HOOK_CALLBACK_TIMEOUT_SECS = 30.0
 _MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
 _HOOK_SKIPPED = object()  # returned by _run_hook_callback_bounded on skip/timeout
+_HOOK_STILL_RUNNING = object()  # …and when a previous call of it is still running (or suppressed)
 
 
 def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
@@ -184,10 +245,14 @@ class PluginDispatchMixin:
         for cb in self._hooks.get(hook_name, []):
             try:
                 if use_timeout:
-                    ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
-                    if ret is _HOOK_SKIPPED:
+                    # Per-callback: a callback that enforces its own bound (a shell
+                    # hook) gets that one, not the manager's default for the hook name.
+                    ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, _callback_timeout(cb, timeout))
+                    if ret is _HOOK_SKIPPED or ret is _HOOK_STILL_RUNNING:
                         if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                            results.append(_pre_tool_call_timeout_block(
+                                getattr(cb, "__name__", repr(cb)),
+                                still_running=ret is _HOOK_STILL_RUNNING))
                         continue
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
@@ -214,7 +279,7 @@ class PluginDispatchMixin:
                 logger.warning(
                     "Hook '%s' callback %s skipped after previous "
                     "timeout or while still running", hook_name, callback_name)
-                return _HOOK_SKIPPED
+                return _HOOK_STILL_RUNNING
             if suppressed_until is not None:
                 self._hook_timeout_suppressed_until.pop(callback_key, None)
             self._hook_running_callbacks[callback_key] = token

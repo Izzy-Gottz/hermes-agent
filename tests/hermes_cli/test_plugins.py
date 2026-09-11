@@ -1188,13 +1188,135 @@ class TestForceReloadSymmetry:
         msg = resolve_pre_tool_block("web_search", {"query": "x"})
         elapsed = time.monotonic() - t0
 
-        assert msg == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        # The message NAMES the callback (see _pre_tool_call_timeout_block):
+        # a model told only "a callback timed out" cannot tell the person which
+        # gate is holding the call, and one did exactly that on 2026-09-08.
+        assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in msg
+        assert "hung_policy" in msg
         assert elapsed < 5.0
 
-        # Still-running / suppression window must also fail closed.
+        # Still-running / suppression window must also fail closed — and say
+        # so in the words that fit that case, which is a gate still waiting.
         msg2 = resolve_pre_tool_block("web_search", {"query": "y"})
-        assert msg2 == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        assert "hung_policy" in msg2
+        assert "still running" in msg2
+        assert "do not retry" in msg2
         hold.set()
+
+    def test_declared_callback_bound_beats_the_manager_default(self, monkeypatch):
+        """A callback that enforces its own bound is given that bound.
+
+        THE BUG, reported by a user on 2026-09-08. An approve-before-send
+        dialog is a shell hook; ``hooks.pre_tool_call[].timeout`` in
+        config.yaml was 300 so a person had five minutes to read a message.
+        ``_hook_uses_callback_timeout`` keys on the HOOK NAME, so the manager
+        applied ``plugins.hook_callback_timeout`` (default 30s) to it anyway
+        and the configured 300 was dead text. At 30 seconds the callback was
+        abandoned — not killed, so the dialog stayed on screen — the tool was
+        failed closed, and every later tool call in the turn hit the
+        still-running guard. The person pressed Send on a dialog whose answer
+        went nowhere.
+
+        The falsifier is the elapsed time, not the verdict: with the
+        declaration ignored this callback is abandoned at 0.1s and the assert
+        on its return value fails.
+        """
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        def slow_gate(**_kwargs):
+            time.sleep(0.4)          # longer than the manager default
+            return {"action": "block", "message": "the human said no"}
+
+        slow_gate.__hermes_hook_timeout__ = 5.0   # what the callback enforces
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [slow_gate]
+
+        results = mgr.invoke_hook("pre_tool_call", tool_name="terminal", tool_input={})
+
+        assert results == [{"action": "block", "message": "the human said no"}], (
+            "a callback that declares its own bound was cut off at the "
+            "manager default anyway"
+        )
+
+    def test_declared_bound_does_not_rescue_an_undeclared_hung_callback(
+        self, monkeypatch,
+    ):
+        """The declaration narrows nothing for callbacks that do not make one."""
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        hold = threading.Event()
+
+        def hung_python_plugin(**_kwargs):
+            hold.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [hung_python_plugin]
+
+        t0 = time.monotonic()
+        results = mgr.invoke_hook("pre_tool_call", tool_name="terminal", tool_input={})
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 5.0
+        assert results and results[0]["action"] == "block"
+        hold.set()
+
+    def test_declared_bound_is_clamped_and_falls_back(self, monkeypatch):
+        """A declaration cannot buy an unbounded callback, or a broken one."""
+        from hermes_cli.plugins import (
+            _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
+            _callback_timeout,
+        )
+
+        def cb(**_kwargs):
+            return None
+
+        assert _callback_timeout(cb, 30.0) == 30.0          # no declaration
+        cb.__hermes_hook_timeout__ = 315                     # 300 + the margin
+        assert _callback_timeout(cb, 30.0) == 315.0
+        cb.__hermes_hook_timeout__ = 5.0                     # narrower than default
+        assert _callback_timeout(cb, 30.0) == 5.0
+        cb.__hermes_hook_timeout__ = 10 ** 9                 # clamped, not honoured
+        assert _callback_timeout(cb, 30.0) == _MAX_HOOK_CALLBACK_TIMEOUT_SECS
+        cb.__hermes_hook_timeout__ = "soon"                  # nonsense → default
+        assert _callback_timeout(cb, 30.0) == 30.0
+        cb.__hermes_hook_timeout__ = 0                       # not a way to opt out
+        assert _callback_timeout(cb, 30.0) == 30.0
+
+    def test_shell_hook_callback_declares_its_configured_timeout(self):
+        """The declaration is actually attached where it matters.
+
+        Without this, the two tests above pass against a mechanism nothing
+        uses — which is how a guard reports PASS forever.
+        """
+        from agent.shell_hooks import (
+            CALLBACK_TIMEOUT_MARGIN_SECONDS,
+            ShellHookSpec,
+            _make_callback,
+        )
+
+        spec = ShellHookSpec(
+            event="pre_tool_call",
+            command="~/.moe/hermes/hooks/confirm-send.sh",
+            matcher=".*",
+            timeout=300,
+            fail_closed=True,
+        )
+        cb = _make_callback(spec)
+        assert cb.__hermes_hook_timeout__ == 300 + CALLBACK_TIMEOUT_MARGIN_SECONDS
+        # Strictly greater than the subprocess bound, so the INNER timeout
+        # fires first and the agent gets the hook's own named message rather
+        # than a generic "callback timed out".
+        assert cb.__hermes_hook_timeout__ > spec.timeout
 
     def test_pre_tool_call_worker_start_failure_fails_closed_without_sticking(
         self, monkeypatch
@@ -1227,9 +1349,10 @@ class TestForceReloadSymmetry:
         mgr = PluginManager()
         mgr._hooks["pre_tool_call"] = [policy]
 
-        assert mgr.invoke_hook("pre_tool_call") == [
-            {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}
-        ]
+        first = mgr.invoke_hook("pre_tool_call")
+        # The block names the callback (fork: _pre_tool_call_timeout_block).
+        assert len(first) == 1 and first[0]["action"] == "block"
+        assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in first[0]["message"]
         assert mgr.invoke_hook("pre_tool_call") == []
         assert calls == [1]
 

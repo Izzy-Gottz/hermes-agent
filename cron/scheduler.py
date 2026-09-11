@@ -2150,6 +2150,9 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
+    # A `light_context` job does one small thing on a clock and must not spend its budget on
+    # the person's whole memory or a repo's instructions (cron/jobs.py create_job).
+    _light_context = bool(job.get("light_context"))
     return AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
@@ -2174,9 +2177,9 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
         quiet_mode=True,
         # Project context files only with a configured workdir; SOUL.md always.
-        skip_context_files=not bool(workdir),
+        skip_context_files=(not bool(workdir)) or _light_context,
         load_soul_identity=True,
-        skip_memory=False,
+        skip_memory=_light_context,
         skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
         platform="cron",
         session_id=session_id,

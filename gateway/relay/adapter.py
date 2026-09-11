@@ -765,7 +765,30 @@ class RelayAdapter(BasePlatformAdapter):
             setter = getattr(self._transport, setter_name, None)
             if callable(setter):
                 setter(handler)
-        if not await self._transport.connect():
+        try:
+            ok = await self._transport.connect()
+        except Exception:
+            # The transport latches `auth_revoked` when the connector answered
+            # the upgrade with its revoked signal (HTTP 410). That has to end
+            # the gateway's retry loop HERE, not only in the revocation monitor
+            # below: the monitor starts after a successful handshake, and the
+            # gateway's reconnect watcher builds a FRESH adapter and transport
+            # on every attempt (gateway/run.py), so a latch left on a raised
+            # connect() was thrown away with the transport and the next attempt
+            # dialled again with a clean one — for ever. A False return with a
+            # non-retryable fatal set is what run.py reads as "remove from the
+            # retry queue", at startup and in the watcher alike. Anything else
+            # the dial raised is re-raised unchanged: run.py treats it as
+            # transient, which for a connector that is down is right.
+            if getattr(self._transport, "auth_revoked", False):
+                self._set_fatal_error(
+                    "relay_disabled",
+                    "Relay disabled (opted out — recreate the instance to re-enable)",
+                    retryable=False,
+                )
+                return False
+            raise
+        if not ok:
             return False
         # Adopt the connector-advertised descriptor in place of the placeholder.
         try:

@@ -302,6 +302,145 @@ def try_vision_call(
     return CLIVisionResponse(answer, model or DEFAULT_MODEL)
 
 
+
+
+# ── the text lanes ────────────────────────────────────────────────────────
+#
+# Vision was the loudest failure but not the only one. The same empty balance
+# took compression, session_search and title_generation down with it, and on
+# the owner's Mac the gateway logged, every turn:
+#
+#     Auxiliary title_generation: payment error on deepseek
+#     credential pool: marking DEEPSEEK_API_KEY exhausted (status=402)
+#
+# Those lanes are text-only, so they need none of the image handling above —
+# just the CLI, a prompt, and an answer. Same subscription, same reasoning:
+# a brain that is a CLI login can serve its own side tasks.
+
+#: The auxiliary tasks this lane will serve. Deliberately a small, named set
+#: rather than "anything not vision": a task added upstream later should have
+#: to be considered here, not silently inherit a lane nobody chose for it.
+TEXT_TASKS = frozenset({
+    "compression", "session_search", "title_generation", "reflection",
+    # 2026-09-10: Moe's open-loop sweep (`classify`, moe-screen/sweep.py) and
+    # the cron monitor triage (`monitor`) — one small read over the person's
+    # own turns, no tools, JSON back. Both are the same shape as the four
+    # above: text in, text out, a subscription brain and no other lane.
+    "classify", "monitor",
+})
+
+
+def prompt_from_messages(messages) -> str:
+    """Flatten OpenAI-style messages into one prompt for the CLI.
+
+    Roles are labelled rather than dropped: a compression task's system
+    message carries the instruction and the user message carries the text, and
+    concatenating them unlabelled turns two things into one ambiguous blob.
+    """
+    parts = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "user").strip().lower()
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "\n".join(
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        text = str(content or "").strip()
+        if not text:
+            continue
+        if role == "system":
+            parts.append("[instructions]\n" + text)
+        else:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def answer_text(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    timeout: float = 120.0,
+    command: str = "claude",
+    env: Optional[dict] = None,
+) -> str:
+    """Answer a text-only prompt through the CLI."""
+    if not cli_available(command):
+        raise ClaudeCodeVisionUnavailable("the `%s` CLI is not on PATH" % command)
+    body = (prompt or "").strip()
+    if not body:
+        raise ClaudeCodeVisionUnavailable("nothing to ask")
+    # The CLI is a conversational assistant and answers like one. Measured, a
+    # compression request came back as
+    #
+    #     "DeepSeek's depleted balance broke the screenshot feature...
+    #
+    #      What would you like me to help with?"
+    #
+    # That trailing offer would land inside a stored summary or a conversation
+    # title. These lanes want the artefact and nothing else, so say so.
+    body = (
+        "You are performing an automated side task. Output ONLY the requested "
+        "result: no preamble, no explanation of what you did, and no closing "
+        "question or offer of further help.\n\n" + body
+    )
+    # No --allowedTools at all: these lanes summarise text that was handed to
+    # them. A side task must not be able to read files or run anything.
+    argv = [command, "-p", "--model", model or DEFAULT_MODEL]
+    try:
+        proc = subprocess.run(
+            argv, input=body, capture_output=True, text=True, timeout=timeout,
+            env=env if env is not None else os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired:
+        raise ClaudeCodeVisionUnavailable(
+            "the %s CLI did not answer within %.0fs" % (command, timeout))
+    except OSError as exc:
+        raise ClaudeCodeVisionUnavailable(
+            "could not run the %s CLI: %s" % (command, exc))
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise ClaudeCodeVisionUnavailable(
+            "the %s CLI exited %d: %s" % (command, proc.returncode, detail))
+    answer = (proc.stdout or "").strip()
+    if not answer:
+        raise ClaudeCodeVisionUnavailable("the %s CLI returned nothing" % command)
+    return answer
+
+
+def try_text_call(
+    provider: str,
+    task: str,
+    messages,
+    *,
+    model: Optional[str] = None,
+    timeout: float = 120.0,
+) -> Optional[CLIVisionResponse]:
+    """Serve a text side task from the CLI, or return None to fall through."""
+    if not serves_vision_for(provider):
+        return None
+    if str(task or "").strip().lower() not in TEXT_TASKS:
+        return None
+    try:
+        prompt = prompt_from_messages(messages)
+    except Exception:
+        return None
+    if not prompt:
+        return None
+    try:
+        answer = answer_text(prompt, model=model, timeout=timeout)
+    except ClaudeCodeVisionUnavailable as exc:
+        logger.info("claude-code CLI text lane unavailable: %s", exc)
+        return None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("claude-code CLI text lane raised: %s", exc)
+        return None
+    return CLIVisionResponse(answer, model or DEFAULT_MODEL)
+
+
 __all__ = [
     "CLIVisionResponse",
     "ClaudeCodeVisionUnavailable",
@@ -310,5 +449,9 @@ __all__ = [
     "describe_image",
     "image_and_question_from_messages",
     "serves_vision_for",
+    "TEXT_TASKS",
+    "answer_text",
+    "prompt_from_messages",
+    "try_text_call",
     "try_vision_call",
 ]

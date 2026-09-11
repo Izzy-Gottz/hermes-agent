@@ -1706,8 +1706,15 @@ def create_job(
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
+    light_context: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
+
+    light_context: when True the job's agent runs with a light system prompt — MEMORY.md /
+    USER.md are not loaded and no AGENTS.md / CLAUDE.md context files are injected even with a
+    workdir; SOUL.md and the skills index still load. For a job that does one small thing on a
+    clock and must not spend the person's context budget on their whole memory each tick.
+    Absent/False = pre-existing behaviour; only ever stored as True.
 
     deliver defaults to "origin" when ``origin`` is given, else "local"; repeat None = forever.
     script: stdout is injected as prompt context, or with ``no_agent=True`` IS the job (stdout
@@ -1802,6 +1809,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
+        ("light_context", True if light_context is True else None),
     ):
         if value is not None:
             job[key] = value
@@ -1970,8 +1978,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     def apply(jobs, i, job):
         _rederive_repeat_for_schedule_change(job, updates)
         _normalize_job_updates(job, updates)
+        # light_context is a plain flag: anything truthy turns it on, anything else turns it
+        # off, and an off job drops the key so it looks like one that never had it.
+        if "light_context" in updates:
+            updates["light_context"] = bool(updates["light_context"])
         previous_inference_axes = _normalized_inference_axes(job)
         updated = _apply_skill_fields({**job, **updates})
+        if "light_context" in updated and not updated["light_context"]:
+            updated.pop("light_context", None)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):

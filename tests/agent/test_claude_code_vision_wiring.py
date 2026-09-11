@@ -77,14 +77,23 @@ def test_the_cli_serves_a_vision_call(cli, brain_is_claude_code, nothing_pinned,
     assert cli[0]["question"] == "what is on screen?"
 
 
-def test_a_non_vision_task_is_untouched(cli, brain_is_claude_code, monkeypatch):
-    """Compression and session search must keep their own chain."""
+def test_a_pinned_text_lane_is_untouched(cli, brain_is_claude_code, monkeypatch):
+    """A text lane the user pinned keeps its own chain.
+
+    This asserted that compression ALWAYS kept the HTTP chain, and went red
+    when the text lane landed — the second of my own tests to catch a contract
+    change rather than a bug. Inverted rather than deleted: what still matters
+    is that an explicit pin wins over the CLI, exactly as it does for vision.
+    """
     seen = {}
 
     def impl(**kw):
         seen["ran"] = True
         return "http response"
 
+    monkeypatch.setattr(
+        A, "_resolve_task_provider_model",
+        lambda *a, **k: ("openai", "gpt-4o-mini", None, None, None))
     monkeypatch.setattr(A, "_call_llm_impl", impl)
     assert A.call_llm(task="compression", messages=MESSAGES) == "http response"
     assert seen["ran"] and not cli
@@ -159,8 +168,28 @@ def test_a_non_payment_error_still_raises(cli, brain_is_claude_code, monkeypatch
     assert not cli
 
 
-def test_a_402_on_a_non_vision_task_still_raises(cli, brain_is_claude_code,
-                                                 monkeypatch):
+def test_a_402_on_a_text_side_task_is_also_rescued(brain_is_claude_code,
+                                                   monkeypatch):
+    """The same empty balance took compression, session_search and
+    title_generation down with vision — the gateway logged it once per turn.
+    This test asserted the opposite until the text lane existed; it is kept,
+    inverted, rather than deleted, because the contract it guards is which
+    tasks the CLI may serve."""
+    monkeypatch.setattr(V, "answer_text", lambda prompt, **kw: "a title")
+    monkeypatch.setattr(A, "_is_payment_error", lambda exc: isinstance(exc, _Paid))
+
+    def broke(**kw):
+        raise _Paid("402")
+
+    monkeypatch.setattr(A, "_call_llm_impl", broke)
+    out = A.call_llm(task="compression", messages=MESSAGES)
+    assert out.choices[0].message.content == "a title"
+
+
+def test_a_402_on_an_unlisted_task_still_raises(cli, brain_is_claude_code,
+                                                monkeypatch):
+    """TEXT_TASKS is a small named set, not "anything not vision". A task
+    added upstream later must not silently inherit a lane nobody chose."""
     monkeypatch.setattr(A, "_is_payment_error", lambda exc: isinstance(exc, _Paid))
 
     def broke(**kw):
@@ -168,7 +197,7 @@ def test_a_402_on_a_non_vision_task_still_raises(cli, brain_is_claude_code,
 
     monkeypatch.setattr(A, "_call_llm_impl", broke)
     with pytest.raises(_Paid):
-        A.call_llm(task="compression", messages=MESSAGES)
+        A.call_llm(task="embedding", messages=MESSAGES)
     assert not cli
 
 
@@ -289,3 +318,62 @@ def test_the_system_prompt_is_not_the_question():
     ]
     _, question = V.image_and_question_from_messages(msgs)
     assert question == "what is this?"
+
+
+def test_a_text_task_is_served_when_no_lane_is_configured(brain_is_claude_code,
+                                                          nothing_pinned,
+                                                          monkeypatch):
+    """The gap the live Mac exposed after the pin was removed.
+
+    With `auxiliary` on `auto` and nothing in the chain configured, the
+    gateway logged
+
+        No LLM provider configured for task=title_generation provider=auto
+
+    which is NOT a payment error, so the rescue never fired — and the first
+    seam only served vision. The rescue is for a lane that breaks; this is for
+    a lane that was never there.
+    """
+    monkeypatch.setattr(V, "answer_text", lambda prompt, **kw: "a title")
+
+    def must_not_run(**kw):
+        raise AssertionError("the HTTP chain ran; the CLI should have served")
+
+    monkeypatch.setattr(A, "_call_llm_impl", must_not_run)
+    out = A.call_llm(task="title_generation", messages=MESSAGES)
+    assert out.choices[0].message.content == "a title"
+
+
+def test_moes_sweep_and_monitor_tasks_are_served_too(brain_is_claude_code,
+                                                     nothing_pinned, monkeypatch):
+    """`classify` is what moe-screen/sweep.py asks for at the end of a
+    conversation and `monitor` is the cron triage; both are text in, JSON
+    out, and both were falling through to a provider nobody configured."""
+    monkeypatch.setattr(V, "answer_text", lambda prompt, **kw: '[{"slug": "x"}]')
+
+    def must_not_run(**kw):
+        raise AssertionError("the HTTP chain ran; the CLI should have served")
+
+    monkeypatch.setattr(A, "_call_llm_impl", must_not_run)
+    for task in ("classify", "monitor"):
+        out = A.call_llm(task=task, messages=MESSAGES)
+        assert out.choices[0].message.content == '[{"slug": "x"}]'
+    assert {"classify", "monitor"} <= V.TEXT_TASKS
+
+
+def test_the_async_path_serves_a_text_task_too(brain_is_claude_code,
+                                               nothing_pinned, monkeypatch):
+    monkeypatch.setattr(V, "answer_text", lambda prompt, **kw: "a summary")
+
+    async def must_not_run(**kw):
+        raise AssertionError("the HTTP chain ran")
+
+    monkeypatch.setattr(A, "_async_call_llm_impl", must_not_run)
+    out = asyncio.run(A.async_call_llm(task="compression", messages=MESSAGES))
+    assert out.choices[0].message.content == "a summary"
+
+
+def test_an_unlisted_task_still_uses_the_chain(cli, brain_is_claude_code,
+                                               nothing_pinned, monkeypatch):
+    monkeypatch.setattr(A, "_call_llm_impl", lambda **kw: "http response")
+    assert A.call_llm(task="embedding", messages=MESSAGES) == "http response"
