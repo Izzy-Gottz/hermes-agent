@@ -271,11 +271,42 @@ class TestExternalMcpPassthrough:
         seen = {}
 
         def fake_defs(quiet_mode=True, **kw):
-            seen.update(kw)
+            # The FIRST read is the catalogue read this class pins; the second,
+            # raw one exists only to recover the profile's own deferred tools
+            # (see test_declared_tools_survive_upstream_deferral).
+            if not seen:
+                seen.update(kw or {"_first": True})
             return [{"type": "function", "function": {"name": n, "parameters": {}}} for n in defs]
 
         monkeypatch.setattr(model_tools, "get_tool_definitions", fake_defs)
         return m._build_server("claude-code"), seen
+
+    def test_declared_tools_survive_upstream_deferral(self, monkeypatch):
+        """Upstream 0.21 defers computer_use, cronjob_manage, process_manage,
+        todo_list, session_search and image_generate by default, so they are
+        absent from the assembled catalogue — and on 2026-09-11 the child ran
+        with no computer_use while every check said it was available. The
+        profile's declared list comes from the raw catalogue when the
+        assembled one deferred it; nothing else does — an external MCP name
+        that only the raw read knows stays deferred, so the prompt stays
+        affordable."""
+        import mcp.server as mcp_server
+        from agent.transports import hermes_tools_mcp_server as m
+        import model_tools
+        monkeypatch.setattr(mcp_server, "MCPServer", _RecordingServer)
+        monkeypatch.setattr(m, "discover_external_mcp_servers", lambda: [])
+        assembled = ["terminal", "web_search"]
+        raw = assembled + ["computer_use", "cronjob_manage", "mcp__pulse__run_sql"]
+
+        def fake_defs(quiet_mode=True, skip_tool_search_assembly=False, **kw):
+            names = raw if skip_tool_search_assembly else assembled
+            return [{"type": "function", "function": {"name": n, "parameters": {}}} for n in names]
+
+        monkeypatch.setattr(model_tools, "get_tool_definitions", fake_defs)
+        server = m._build_server("claude-code")
+        assert "computer_use" in server.tools
+        assert "cronjob_manage" in server.tools
+        assert "mcp__pulse__run_sql" not in server.tools
 
     def test_external_mcp_tools_are_exposed_without_being_allowlisted(self, monkeypatch):
         server, _ = self._build(monkeypatch, ["terminal", "mcp__pulse__run_sql"])

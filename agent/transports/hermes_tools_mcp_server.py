@@ -187,6 +187,11 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_create",
     "kanban_unblock",
     "kanban_link",
+    # Moe's own clock: "check in on me in five minutes" is a cronjob. Upstream
+    # 0.21 defers this tool by default, so it is named here to stay a direct
+    # tool of the child rather than a tool_search hop. Both names, one exists.
+    "cronjob",
+    "cronjob_manage",
 )
 
 
@@ -199,7 +204,8 @@ CLAUDE_CODE_OS_TOOLS: tuple[str, ...] = (
     "write_file",
     "patch",
     "search_files",
-    "process",
+    "process",          # pre-0.21 name
+    "process_manage",   # upstream renamed it; both listed, one exists
     # Eyes and hands. Screenshots come back as MCP image blocks (see
     # to_mcp_content); every mutating action still runs through
     # handle_function_call, so pre_tool_call hooks and guards apply. Only
@@ -624,6 +630,23 @@ def _build_server(profile: Optional[str] = None) -> Any:
         for td in (get_tool_definitions(quiet_mode=True) or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
+    # Upstream 0.21 defers a handful of CORE tools by default too
+    # (tool_search._DEFAULT_DEFERRED_TOOLS: computer_use, cronjob_manage,
+    # todo_list, process_manage, session_search, image_generate), so they
+    # are not in the assembled catalogue either — and on 2026-09-11 the
+    # claude-code child ran with no `computer_use` at all, while every
+    # check said it was available. The tools this profile DECLARES it
+    # serves (CLAUDE_CODE_OS_TOOLS + EXPOSED_TOOLS) are a short, fixed list;
+    # they come from the raw catalogue when the assembled one deferred them.
+    # The ~2000 external MCP names stay deferred — this adds nothing else.
+    declared = set(exposed_tools_for_profile(profile))
+    missing = declared - set(all_defs)
+    if missing:
+        for td in (get_tool_definitions(quiet_mode=True, skip_tool_search_assembly=True) or []):
+            if isinstance(td, dict) and td.get("type") == "function":
+                name = td["function"]["name"]
+                if name in missing:
+                    all_defs[name] = td["function"]
 
     # Everything Hermes has: its own tools, its plugins' tools (the Moe
     # connectors live here), and every external MCP server's tools — plus the
