@@ -37,6 +37,11 @@ WEBSOCKETS_AVAILABLE = websockets is not None
 
 _HANDSHAKE_TIMEOUT_S = 30.0
 _OUTBOUND_TIMEOUT_S = 30.0
+# How long a `link_request` handler (Moe slice E3: become a second Telegram or
+# WhatsApp device) may take before the connector is told it did not answer.
+# A Telegram login key is exported in a second; a WhatsApp bridge takes a few
+# seconds to open a socket and ask for a pairing code.
+_LINK_HANDLER_TIMEOUT_S = 60.0
 # Bound on each of the three sequential teardown awaits (supervisor, reader,
 # ws.close) so a wedged peer cannot stall adapter.disconnect past the runner's
 # default 5s budget.
@@ -422,6 +427,10 @@ class WebSocketRelayTransport:
         self._inbound: Optional[InboundHandler] = None
         self._interrupt_inbound_handler: Any = None
         self._passthrough_handler: Any = None
+        # `link_request` frames (Moe slice E3): the registered handler, and the
+        # tasks serving one so they are not collected mid-answer.
+        self._link_handler: Any = None
+        self._link_tasks: set[asyncio.Task[None]] = set()
         # `_descriptor` is the FIRST (primary-identity) descriptor; the map holds
         # one per hello'd identity, keyed by platform (descriptor_for_platform).
         self._descriptor: Optional[CapabilityDescriptor] = None
@@ -681,6 +690,23 @@ class WebSocketRelayTransport:
     def set_passthrough_handler(self, handler: Any) -> None:
         """Register ``handler(forward, buffer_id)`` for passthrough_forward frames (§5.1)."""
         self._passthrough_handler = handler
+
+    def set_link_handler(self, handler: Any) -> None:
+        """Register ``handler(link, body) -> dict`` for ``link_request`` frames.
+
+        The connector asks this gateway to become a second device of the
+        person's own Telegram or WhatsApp (Moe slice E3). ``link`` is the
+        kind (``"telegram"`` / ``"whatsapp"``), ``body`` what the asker sent
+        (a WhatsApp request carries the number). The handler answers a dict;
+        a dict carrying ``error`` is a refusal. It may be a coroutine
+        function or a plain one — a plain one runs in the loop's executor,
+        because the honest implementations block on a network for seconds.
+
+        A transport-level handler wins; ``gateway.relay.link_handler()`` is
+        consulted otherwise, so a plugin that loads after the adapter was
+        built still gets asked.
+        """
+        self._link_handler = handler
 
     # ── outbound ─────────────────────────────────────────────────────────
     async def send_outbound(
@@ -1125,6 +1151,53 @@ class WebSocketRelayTransport:
             fwd = _passthrough_from_wire(frame.get("forward", {}))
             await self._passthrough_handler(fwd, frame.get("bufferId"))
 
+    async def _on_link_request(self, frame: Dict[str, Any]) -> None:
+        # Moe slice E3: served off the reader so a slow handler cannot stall
+        # inbound delivery; the answer is a `link_result` on this socket.
+        request_id = frame.get("requestId")
+        if not isinstance(request_id, str) or not request_id:
+            logger.warning("relay: link_request without a requestId; dropped")
+            return
+        task = asyncio.create_task(self._serve_link_request(
+            request_id, str(frame.get("link") or ""), frame.get("body")))
+        self._link_tasks.add(task)
+        task.add_done_callback(self._link_tasks.discard)
+
+    def _resolve_link_handler(self) -> Any:
+        if self._link_handler is not None:
+            return self._link_handler
+        try:
+            from gateway import relay as _relay_module
+        except Exception:  # pragma: no cover - the package this file lives in
+            return None
+        return _relay_module.link_handler()
+
+    async def _serve_link_request(self, request_id: str, link: str, body: Any) -> None:
+        handler = self._resolve_link_handler()
+        body = body if isinstance(body, dict) else {}
+        result: Dict[str, Any]
+        if handler is None:
+            result = {"error": "this gateway has no link handler"}
+        else:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    outcome = await asyncio.wait_for(handler(link, body), _LINK_HANDLER_TIMEOUT_S)
+                else:
+                    loop = asyncio.get_running_loop()
+                    outcome = await asyncio.wait_for(
+                        loop.run_in_executor(None, handler, link, body), _LINK_HANDLER_TIMEOUT_S)
+                result = outcome if isinstance(outcome, dict) else {"error": "the link handler answered nothing"}
+            except asyncio.TimeoutError:
+                result = {"error": "the link handler did not answer in %ds" % int(_LINK_HANDLER_TIMEOUT_S)}
+            except Exception as exc:  # noqa: BLE001 - one bad handler must not kill the socket
+                logger.warning("relay: the link handler failed for %r: %s", link, exc)
+                result = {"error": "the link handler failed: %s" % type(exc).__name__}
+        try:
+            await self._send({"type": "link_result", "requestId": request_id,
+                              "ok": "error" not in result, "body": result})
+        except Exception:  # noqa: BLE001 - the socket went away while we worked
+            logger.info("relay: could not send link_result for %s (socket closed)", request_id)
+
     _FRAME_HANDLERS = {
         "descriptor": _on_descriptor,
         "inbound": _on_inbound,
@@ -1132,4 +1205,5 @@ class WebSocketRelayTransport:
         "outbound_result": _on_outbound_result,
         "interrupt_inbound": _on_interrupt_inbound,
         "passthrough_forward": _on_passthrough_forward,
+        "link_request": _on_link_request,
     }
