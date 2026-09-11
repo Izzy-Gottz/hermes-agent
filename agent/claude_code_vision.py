@@ -322,6 +322,11 @@ def try_vision_call(
 #: to be considered here, not silently inherit a lane nobody chose for it.
 TEXT_TASKS = frozenset({
     "compression", "session_search", "title_generation", "reflection",
+    # 2026-09-10: Moe's open-loop sweep (`classify`, moe-screen/sweep.py) and
+    # the cron monitor triage (`monitor`) — one small read over the person's
+    # own turns, no tools, JSON back. Both are the same shape as the four
+    # above: text in, text out, a subscription brain and no other lane.
+    "classify", "monitor",
 })
 
 

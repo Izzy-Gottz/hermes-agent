@@ -344,6 +344,23 @@ def test_a_text_task_is_served_when_no_lane_is_configured(brain_is_claude_code,
     assert out.choices[0].message.content == "a title"
 
 
+def test_moes_sweep_and_monitor_tasks_are_served_too(brain_is_claude_code,
+                                                     nothing_pinned, monkeypatch):
+    """`classify` is what moe-screen/sweep.py asks for at the end of a
+    conversation and `monitor` is the cron triage; both are text in, JSON
+    out, and both were falling through to a provider nobody configured."""
+    monkeypatch.setattr(V, "answer_text", lambda prompt, **kw: '[{"slug": "x"}]')
+
+    def must_not_run(**kw):
+        raise AssertionError("the HTTP chain ran; the CLI should have served")
+
+    monkeypatch.setattr(A, "_call_llm_impl", must_not_run)
+    for task in ("classify", "monitor"):
+        out = A.call_llm(task=task, messages=MESSAGES)
+        assert out.choices[0].message.content == '[{"slug": "x"}]'
+    assert {"classify", "monitor"} <= V.TEXT_TASKS
+
+
 def test_the_async_path_serves_a_text_task_too(brain_is_claude_code,
                                                nothing_pinned, monkeypatch):
     monkeypatch.setattr(V, "answer_text", lambda prompt, **kw: "a summary")
