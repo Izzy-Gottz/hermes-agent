@@ -3772,6 +3772,10 @@ def tick(
 from cron.scheduler_delivery import (  # noqa: E402
     _deliver_result, _delivery_lane_value, _normalize_deliver_value, _resolve_delivery_target,
     _resolve_delivery_targets,
+    # Re-exported: Moe's moe-screen plugin (followups.py, adapter.py) imports the
+    # home-chat lookup from here, and its tests monkeypatch it here. Upstream
+    # moved the bodies to scheduler_delivery in 0.21; the names stay reachable.
+    _get_home_target_chat_id, _iter_home_target_platforms,
 )
 from cron.scheduler_script import (  # noqa: E402
     _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
