@@ -376,6 +376,16 @@ def hermes_tool_name(wire_name: str) -> str:
     return wire_name or "tool"
 
 
+def _hermes_home_root() -> str:
+    """``$HERMES_HOME`` as a string, with the same fallback everywhere here."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home())
+    except Exception:  # pragma: no cover - defensive
+        return os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+
+
 def claude_code_home() -> str:
     """``$HERMES_HOME/claude-code`` — the Hermes-owned Claude Code config dir.
 
@@ -384,13 +394,83 @@ def claude_code_home() -> str:
     user's ``~/.claude``. Hermes turns must never fire the user's hooks, load
     their plugins, or write into their personal memory/transcripts.
     """
-    try:
-        from hermes_constants import get_hermes_home
+    return os.path.join(_hermes_home_root(), "claude-code")
 
-        root = str(get_hermes_home())
-    except Exception:  # pragma: no cover - defensive
-        root = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return os.path.join(root, "claude-code")
+
+#: Where the last rate-limit snapshot lands. A host that schedules work
+#: around the subscription's windows reads this rather than the stream.
+RATE_LIMIT_SNAPSHOT_NAME = "rate-limit.json"
+
+
+def rate_limit_snapshot_path() -> str:
+    return os.path.join(_hermes_home_root(), RATE_LIMIT_SNAPSHOT_NAME)
+
+
+def write_rate_limit_snapshot(
+    windows: dict,
+    *,
+    provider: str = "claude-code-cli",
+    path: Optional[str] = None,
+    now: Optional[float] = None,
+) -> Optional[str]:
+    """Persist the CLI's rate-limit headroom to ``$HERMES_HOME/rate-limit.json``.
+
+    The stream reports ``rate_limit_info.unifiedWindows`` on every turn and,
+    until now, Hermes only turned it into a status line at 90 %. Anything
+    that wants to *plan* around the headroom — a host pausing discretionary
+    background jobs above half of the five-hour window — had nothing to
+    read. This writes the whole thing::
+
+        {"at": <epoch seconds>, "provider": "claude-code-cli",
+         "windows": {"five_hour": {"utilization": 0.42, "resets_at": ...},
+                     "seven_day": {...}}}
+
+    Window names are kept exactly as Claude sends them. ``resets_at`` is
+    passed through from whichever spelling the event carries (``resetsAt``
+    or ``resets_at``) and is None when absent — no clock arithmetic here.
+
+    Atomic (temp file + rename) and 0600, because a reader may be mid-read
+    and the file names the person's account limits. Never raises: a failed
+    write is a log line, and the turn that produced the event is unaffected.
+    Returns the path written, or None.
+    """
+    try:
+        if not isinstance(windows, dict):
+            return None
+        snapshot_windows: dict = {}
+        for name, window in windows.items():
+            if not isinstance(window, dict):
+                continue
+            util = window.get("utilization")
+            snapshot_windows[str(name)] = {
+                "utilization": float(util) if isinstance(util, (int, float)) else None,
+                "resets_at": window.get("resets_at", window.get("resetsAt")),
+            }
+        payload = {
+            "at": int(now if now is not None else time.time()),
+            "provider": provider,
+            "windows": snapshot_windows,
+        }
+        target = path or rate_limit_snapshot_path()
+        directory = os.path.dirname(target) or "."
+        os.makedirs(directory, exist_ok=True)
+        tmp = "%s.tmp-%d" % (target, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return target
+    except Exception as exc:
+        logger.warning("could not write the rate-limit snapshot: %s", exc)
+        return None
 
 
 def default_workspace_dir() -> str:
@@ -2199,6 +2279,9 @@ class _TurnProjector:
         windows = info.get("unifiedWindows") if isinstance(info, dict) else None
         if not isinstance(windows, dict):
             return
+        # Persist first, and unconditionally: the 90 % status line below is
+        # for the person; the file is for whatever plans around the headroom.
+        write_rate_limit_snapshot(windows)
         worst, label = 0.0, ""
         for name, window in windows.items():
             if not isinstance(window, dict):
