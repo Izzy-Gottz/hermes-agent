@@ -73,6 +73,17 @@ _EXT_FOR_SUBTYPE = {
 }
 
 
+def _spawn_env() -> dict:
+    """The child's environment when the caller gave none.
+
+    Through the one factory Hermes has for child envs, so the guard in
+    tests/agent/test_subprocess_env_guard.py can see it; ``scrub_secrets=False``
+    keeps the exact inherited environment this lane always had — the CLI's
+    own login lives in it."""
+    from tools.environments.local import build_subprocess_env
+    return build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+
+
 class ClaudeCodeVisionUnavailable(RuntimeError):
     """The CLI is not usable for this call. Callers should fall through."""
 
@@ -150,7 +161,7 @@ def describe_image(
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env=env if env is not None else os.environ.copy(),
+                env=env if env is not None else _spawn_env(),
             )
         except subprocess.TimeoutExpired:
             raise ClaudeCodeVisionUnavailable(
@@ -393,7 +404,7 @@ def answer_text(
     try:
         proc = subprocess.run(
             argv, input=body, capture_output=True, text=True, timeout=timeout,
-            env=env if env is not None else os.environ.copy(),
+            env=env if env is not None else _spawn_env(),
         )
     except subprocess.TimeoutExpired:
         raise ClaudeCodeVisionUnavailable(
