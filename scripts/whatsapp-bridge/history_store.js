@@ -36,13 +36,16 @@
  * node:sqlite, not a native addon: the Node that ships beside this file is
  * signed with a hardened runtime, and a fresh .node binary from npm would
  * be refused by it ("different Team IDs"). Built-in, nothing to sign.
+ * Imported inside openHistoryStore, never at the top: bridge.js imports this
+ * module unconditionally, and a Node that has no node:sqlite (before 22.5)
+ * or hides it behind --experimental-sqlite (22.5–22.12) would otherwise
+ * fail the whole bridge at load — the bot with it — with history off.
  *
  * Pure helpers (rowFromMessage, historyTimestamp, chatRowsFromHistory,
  * contactRows) take plain objects and touch nothing, so they are tested
  * without Baileys or a socket.
  */
 
-import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { getMessageContent } from './bridge_helpers.js';
@@ -266,7 +269,13 @@ export function contactRows(contacts, { lidToPhone } = {}) {
  * nothing: a store that cannot be written throws, and the caller decides
  * whether the bridge should carry on without one.
  */
-export function openHistoryStore(dbPath) {
+export async function openHistoryStore(dbPath) {
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = await import('node:sqlite'));
+  } catch (err) {
+    throw new Error(`this Node (${process.version}) has no node:sqlite, so no history is kept: ${err?.code || err?.message || err}`);
+  }
   const file = path.resolve(String(dbPath));
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(file);

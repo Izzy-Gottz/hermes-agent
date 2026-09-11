@@ -216,7 +216,7 @@ import {
   const dir = mkdtempSync(path.join(tmpdir(), 'wa-history-'));
   const file = path.join(dir, 'store', 'messages.db');
   try {
-    const store = openHistoryStore(file);
+    const store = await openHistoryStore(file);
     assert.ok(existsSync(file), 'the file and its directory are created');
     assert.deepEqual(store.counts(), { messages: 0, chats: 0 });
 
@@ -316,7 +316,7 @@ import {
     ro.close();
     store.close();
     // Reopening keeps everything: the schema is CREATE IF NOT EXISTS.
-    const again = openHistoryStore(file);
+    const again = await openHistoryStore(file);
     assert.deepEqual(again.counts(), { messages: 6, chats: 4 });
     again.close();
   } finally {

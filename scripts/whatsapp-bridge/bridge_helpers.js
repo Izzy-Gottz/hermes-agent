@@ -660,6 +660,45 @@ export function resolveDeviceName(env = process.env) {
   return raw ? raw.slice(0, MAX_DEVICE_NAME_LENGTH) : DEFAULT_DEVICE_NAME;
 }
 
+/**
+ * Whether WHATSAPP_SYNC_FULL_HISTORY asks for the phone's whole history.
+ */
+export function fullHistoryRequested(env = process.env) {
+  const v = env && env.WHATSAPP_SYNC_FULL_HISTORY;
+  return typeof v === 'string' && ['1', 'true', 'yes', 'on'].includes(v.trim().toLowerCase());
+}
+
+/**
+ * The browser triple. The first slot is the name the phone shows; the second
+ * is the kind of device Baileys registers at pairing
+ * (validate-connection.js generateRegistrationNode: platformType from
+ * browser[1], 'Chrome' → CHROME, 'Desktop' → DESKTOP). Baileys' own recipe
+ * for full history is syncFullHistory plus a 'Desktop' second slot (README
+ * "Receive Full History": Browsers.macOS('Desktop')): the phone sends a web
+ * browser companion a recent slice and a desktop app more. So with full
+ * history on, the second slot is 'Desktop'. The first slot is never touched
+ * — the phone still lists the link as WHATSAPP_DEVICE_NAME ("Moe") — and it
+ * is why webSubPlatform stays WEB_BROWSER (getWebInfo only switches for
+ * 'Mac OS'/'Windows' there). platformType is sent only in the registration
+ * node, at pairing, so a link that already exists is not changed by this.
+ */
 export function browserDescription(env = process.env) {
-  return [resolveDeviceName(env), 'Chrome', '120.0'];
+  return [resolveDeviceName(env), fullHistoryRequested(env) ? 'Desktop' : 'Chrome', '120.0'];
+}
+
+/**
+ * The history half of the makeWASocket settings.
+ *
+ * syncFullHistory alone is not enough. Baileys' default
+ * shouldSyncHistoryMessage (Defaults/index.js) is
+ * `({ syncType }) => syncType !== FULL`: it asks the phone for everything
+ * (requireFullSync at pairing) and then drops every FULL chunk before
+ * messaging-history.set, so nothing older than the recent slice ever
+ * reached the store. With full history on, every history notification is
+ * processed; with it off the key is left out and Baileys' default stands.
+ * The signature is (msg: proto.Message.IHistorySyncNotification) => boolean.
+ */
+export function historySocketOptions(syncFullHistory) {
+  if (!syncFullHistory) return { syncFullHistory: false };
+  return { syncFullHistory: true, shouldSyncHistoryMessage: () => true };
 }

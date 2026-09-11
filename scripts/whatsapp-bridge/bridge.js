@@ -37,6 +37,8 @@ import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import { addLidMappings, openHistoryStore } from './history_store.js';
 import {
   browserDescription,
+  fullHistoryRequested,
+  historySocketOptions,
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
@@ -263,11 +265,13 @@ function envFlag(name) {
   return typeof v === 'string' && ['1', 'true', 'yes', 'on'].includes(v.trim().toLowerCase());
 }
 const HISTORY_DB = String(process.env.WHATSAPP_HISTORY_DB || '').trim();
-const SYNC_FULL_HISTORY = envFlag('WHATSAPP_SYNC_FULL_HISTORY');
+const SYNC_FULL_HISTORY = fullHistoryRequested(process.env);
 let history = null;
 if (HISTORY_DB) {
   try {
-    history = openHistoryStore(HISTORY_DB);
+    // Awaited: node:sqlite is loaded here, not at import, so a Node without
+    // it loses the store and keeps the channel.
+    history = await openHistoryStore(HISTORY_DB);
   } catch (err) {
     // The bot still works without a store; say so rather than dying, and
     // /health reports history: null so a reader can tell.
@@ -454,7 +458,9 @@ async function startSocket() {
     // What the phone lists this link as. WHATSAPP_DEVICE_NAME overrides the
     // first slot; the default is unchanged (bridge_helpers.browserDescription).
     browser: browserDescription(),
-    syncFullHistory: SYNC_FULL_HISTORY,
+    // syncFullHistory, and when it is on, keeping the FULL chunks it asks
+    // for (Baileys' default drops them): bridge_helpers.historySocketOptions.
+    ...historySocketOptions(SYNC_FULL_HISTORY),
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
