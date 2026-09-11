@@ -641,3 +641,43 @@ export function createVersionResolver(fetchVersionFn, {
     return cachedVersion;
   };
 }
+
+// ── Pairing by code (Moe slice E3) ─────────────────────────────────────────
+//
+// A linked device can be authorised two ways: the phone scans a QR the new
+// device shows, or the person types an 8-character code the new device asked
+// WhatsApp for (Linked Devices › Link with phone number). A machine in the
+// cloud has no screen for a QR that a phone could scan, so it takes the
+// second road: `bridge.js --pair-only --pair-json --phone <number>` asks for a
+// code and emits `{"event":"pairing_code","code":…}` instead of a QR.
+//
+// Both functions are pure so they can be tested without starting Baileys —
+// the rule at the top of every *.test.mjs beside this file.
+
+/** The number Baileys wants: digits with the country code, no `+`, no
+ *  spaces, brackets or dashes. Null when what was given cannot be one
+ *  (E.164 is 6 to 15 digits), so a caller refuses before opening a socket. */
+export function normalizePairingPhone(raw) {
+  if (raw === undefined || raw === null) return null;
+  const digits = String(raw).replace(/[^0-9]/g, '');
+  if (digits.length < 6 || digits.length > 15) return null;
+  return digits;
+}
+
+/** What to do with one `connection.update` in pairing-by-code mode.
+ *
+ *  - no phone: the QR path, untouched ('qr');
+ *  - already registered: this socket is a device, nothing to ask ('none');
+ *  - asked already: Baileys hands out one code per registration, and the
+ *    update that carries `qr` repeats every ~20 s ('none');
+ *  - the first update carrying `qr`: the socket is open enough to send the
+ *    registration iq, so ask now ('request'). `connecting` alone is not
+ *    enough — `sendNode` throws before the socket is up — which is why the
+ *    QR's arrival is the trigger rather than the connection state. */
+export function pairingCodeDecision({ phone, registered, requested, qr }) {
+  if (!phone) return 'qr';
+  if (registered) return 'none';
+  if (requested) return 'none';
+  if (qr) return 'request';
+  return 'wait';
+}

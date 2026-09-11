@@ -47,6 +47,8 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  normalizePairingPhone,
+  pairingCodeDecision,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -111,6 +113,19 @@ try {
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
+// Pairing by code (Moe slice E3): `--phone <number>` asks WhatsApp for the
+// 8-character code the person types under Linked Devices › Link with phone
+// number, instead of showing a QR. A machine with no screen a phone can scan
+// links this way. The number is digits with the country code; anything that
+// cannot be one is refused here, before a socket is opened.
+const PAIR_PHONE_RAW = getArg('phone', process.env.WHATSAPP_PAIR_PHONE || '');
+const PAIR_PHONE = normalizePairingPhone(PAIR_PHONE_RAW);
+if (PAIR_PHONE_RAW && !PAIR_PHONE) {
+  console.error(`--phone needs digits with the country code, like 447700900000 (got ${JSON.stringify(PAIR_PHONE_RAW)})`);
+  process.exit(2);
+}
+// Baileys hands out one code per registration; asked once per socket.
+let pairingCodeRequested = false;
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
@@ -379,6 +394,7 @@ const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  pairingCodeRequested = false;
   const version = await getWAVersion();
 
   sock = makeWASocket({
@@ -404,12 +420,39 @@ async function startSocket() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      if (PAIR_JSON) {
-        emitPairEvent({ event: 'qr', qr });
-      } else {
-        console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
-        qrcode.generate(qr, { small: true });
-        console.log('\nWaiting for scan...\n');
+      const decision = pairingCodeDecision({
+        phone: PAIR_PHONE,
+        registered: Boolean(sock?.authState?.creds?.registered),
+        requested: pairingCodeRequested,
+        qr,
+      });
+      if (decision === 'request') {
+        // The QR's arrival is the signal the socket can carry the
+        // registration iq; `connecting` alone comes too early. Ask once, and
+        // say the code the way the QR is said — as a JSON event for a
+        // program, or on the terminal for a person. The QR itself is not
+        // shown in this mode: a screen nobody can scan is noise.
+        pairingCodeRequested = true;
+        sock.requestPairingCode(PAIR_PHONE).then((code) => {
+          emitPairEvent({ event: 'pairing_code', code, phone: PAIR_PHONE });
+          if (!PAIR_JSON) {
+            console.log('\n🔢 In WhatsApp: Settings › Linked Devices › Link a Device › Link with phone number, then enter:\n');
+            console.log(`   ${code}\n`);
+            console.log('Waiting for the code to be entered...\n');
+          }
+        }).catch((err) => {
+          emitPairEvent({ event: 'error', error: `pairing_code: ${err?.message || String(err)}` });
+          if (!PAIR_JSON) console.error('Could not get a pairing code:', err?.message || err);
+          if (PAIR_ONLY) process.exit(1);
+        });
+      } else if (decision === 'qr') {
+        if (PAIR_JSON) {
+          emitPairEvent({ event: 'qr', qr });
+        } else {
+          console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
+          qrcode.generate(qr, { small: true });
+          console.log('\nWaiting for scan...\n');
+        }
       }
     }
 
@@ -1099,7 +1142,7 @@ if (PAIR_ONLY) {
   if (PAIR_JSON) {
     emitPairEvent({ event: 'started', session: SESSION_DIR });
   } else {
-    console.log('📱 WhatsApp pairing mode');
+    console.log(PAIR_PHONE ? '📱 WhatsApp pairing mode (by code)' : '📱 WhatsApp pairing mode');
     console.log(`📁 Session: ${SESSION_DIR}`);
     console.log();
   }
