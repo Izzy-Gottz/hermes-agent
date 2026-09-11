@@ -34,6 +34,7 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
+  browserDescription,
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
@@ -402,7 +403,9 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Agent', 'Chrome', '120.0'],
+    // What the phone lists this link as. WHATSAPP_DEVICE_NAME overrides the
+    // first slot; the default is unchanged (bridge_helpers.browserDescription).
+    browser: browserDescription(),
     syncFullHistory: false,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need

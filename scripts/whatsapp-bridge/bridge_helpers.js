@@ -681,3 +681,25 @@ export function pairingCodeDecision({ phone, registered, requested, qr }) {
   if (qr) return 'request';
   return 'wait';
 }
+
+/**
+ * The name the phone lists this link under (WhatsApp > Linked Devices).
+ * Baileys sends it as the first element of the `browser` triple; it used to
+ * be the literal 'Hermes Agent', so every product built on this bridge
+ * appeared on the person's phone under the engine's name. WHATSAPP_DEVICE_NAME
+ * overrides it; unset, empty or whitespace keeps the default, so an existing
+ * deployment is unchanged. Trimmed and capped: the phone shows a short label.
+ */
+export const DEFAULT_DEVICE_NAME = 'Hermes Agent';
+export const MAX_DEVICE_NAME_LENGTH = 64;
+
+export function resolveDeviceName(env = process.env) {
+  const raw = env && typeof env.WHATSAPP_DEVICE_NAME === 'string'
+    ? env.WHATSAPP_DEVICE_NAME.trim()
+    : '';
+  return raw ? raw.slice(0, MAX_DEVICE_NAME_LENGTH) : DEFAULT_DEVICE_NAME;
+}
+
+export function browserDescription(env = process.env) {
+  return [resolveDeviceName(env), 'Chrome', '120.0'];
+}
