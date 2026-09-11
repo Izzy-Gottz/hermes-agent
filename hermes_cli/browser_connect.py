@@ -406,10 +406,41 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
             # SQLite must coordinate both ends: immutable ignores committed source WAL,
             # while replacing only the destination file can replay its abandoned WAL.
             # Connection busy timeouts do not bound backup's retry loop; its callback does.
-            with contextlib.closing(sqlite3.connect(
-                    Path(src_file).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.0)) as source:
-                with contextlib.closing(sqlite3.connect(dst_file, timeout=0.0)) as out:
-                    source.backup(out, pages=256, progress=check_deadline, sleep=0.1)
+            src_uri = Path(src_file).resolve().as_uri()
+
+            def _backup(query: str) -> None:
+                with contextlib.closing(sqlite3.connect(src_uri + query, uri=True, timeout=0.0)) as source:
+                    with contextlib.closing(sqlite3.connect(dst_file, timeout=0.0)) as out:
+                        source.backup(out, pages=256, progress=check_deadline, sleep=0.1)
+
+            try:
+                _backup("?mode=ro")
+            except (TimeoutError, sqlite3.OperationalError) as first:
+                if isinstance(first, sqlite3.OperationalError) and not _is_lock_error(first):
+                    raise
+                # A running desktop Chrome keeps "Login Data", "Login Data For Account" and "Web
+                # Data" open in EXCLUSIVE locking mode (Cookies is not), so a locking read never
+                # gets in: measured on macOS 26 with Chrome 140, every backup of those three ran
+                # the five seconds out while Cookies copied in 2 ms, and real-profile browsing
+                # failed closed with "3 database(s) unavailable" for as long as Chrome was open —
+                # which for the person whose logins these are is always. `immutable=1` reads the
+                # file without taking a lock. The price is any commit still only in a WAL sidecar
+                # (Chrome keeps these three in rollback-journal mode, so on Chrome there is none);
+                # the alternative price was the whole feature.
+                # Only the SOURCE lock is the browser's. A locked destination is a copy-browser
+                # still using the snapshot, and that is never overwritten — say so instead.
+                if os.path.exists(dst_file):
+                    try:
+                        with contextlib.closing(sqlite3.connect(dst_file, timeout=0.0)) as probe:
+                            probe.execute("BEGIN IMMEDIATE")
+                            probe.rollback()
+                    except sqlite3.OperationalError:
+                        raise first
+                _discard_partial_db(dst_file)
+                logger.debug("real-profile: %s is locked by the running browser (%s); re-reading it immutable",
+                             src_file, first)
+                deadline = time.monotonic() + 5.0
+                _backup("?immutable=1")
         else:
             shutil.copy2(src_file, dst_file)
         return True
@@ -417,6 +448,21 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
         # A raw DB copy can lose committed WAL or overwrite a locked destination.
         logger.debug("real-profile: could not copy %s: %s", src_file, e)
         return False
+
+
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _discard_partial_db(dst_file: str) -> None:
+    """Drop a destination a failed backup may have half-written, sidecars included, so the retry
+    starts from nothing rather than replaying an abandoned journal."""
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        try:
+            os.unlink(dst_file + suffix)
+        except OSError:
+            pass
 
 
 def _mirror_profile_auth(src: str, dst: str, source_profile: str) -> int:
