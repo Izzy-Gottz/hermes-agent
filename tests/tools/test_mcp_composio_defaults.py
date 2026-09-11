@@ -37,6 +37,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tools import mcp_tool
+from tools import mcp_tool_handlers  # the handler moved here in the Sep 2026 upstream split
 
 
 COMPOSIO_URL = "https://backend.composio.dev/tool_router/sess_fake/mcp"
@@ -105,7 +106,7 @@ def composio():
     """A connected Composio session with GMAIL_FETCH_EMAILS discovered."""
     server = _server()
     with patch.dict(mcp_tool._servers, {"composio": server}), \
-         patch("tools.mcp_tool._run_on_mcp_loop",
+         patch("tools.mcp_tool_loop._run_on_mcp_loop",
                side_effect=_fake_run_on_mcp_loop), \
          patch.dict(mcp_tool._server_error_counts, {}, clear=True):
         yield server
@@ -118,7 +119,7 @@ def _sent(server):
 
 
 def _call(server, tool_name, args, name="composio"):
-    handler = mcp_tool._make_tool_handler(name, tool_name, 30.0)
+    handler = mcp_tool_handlers._make_tool_handler(name, tool_name, 30.0)
     return handler(args)
 
 
@@ -172,7 +173,7 @@ class TestForeignServer:
         """The bug this guards: one broker's rules applied to another's tool."""
         other = _server(url="https://mcp.example.com/v1")
         with patch.dict(mcp_tool._servers, {"other": other}), \
-             patch("tools.mcp_tool._run_on_mcp_loop",
+             patch("tools.mcp_tool_loop._run_on_mcp_loop",
                    side_effect=_fake_run_on_mcp_loop), \
              patch.dict(mcp_tool._server_error_counts, {}, clear=True):
             _call(other, "GMAIL_FETCH_EMAILS", {"query": "x"}, name="other")
@@ -188,7 +189,7 @@ class TestForeignServer:
         """Substring-matching a URL matches all four of these. Parsing does not."""
         other = _server(url=url)
         with patch.dict(mcp_tool._servers, {"other": other}), \
-             patch("tools.mcp_tool._run_on_mcp_loop",
+             patch("tools.mcp_tool_loop._run_on_mcp_loop",
                    side_effect=_fake_run_on_mcp_loop), \
              patch.dict(mcp_tool._server_error_counts, {}, clear=True):
             _call(other, "GMAIL_FETCH_EMAILS", {"query": "x"}, name="other")
@@ -203,7 +204,7 @@ class TestForeignServer:
         """The negative above must not have been bought by matching nothing."""
         srv = _server(url=url)
         with patch.dict(mcp_tool._servers, {"c": srv}), \
-             patch("tools.mcp_tool._run_on_mcp_loop",
+             patch("tools.mcp_tool_loop._run_on_mcp_loop",
                    side_effect=_fake_run_on_mcp_loop), \
              patch.dict(mcp_tool._server_error_counts, {}, clear=True):
             _call(srv, "GMAIL_FETCH_EMAILS", {"query": "x"}, name="c")
@@ -214,7 +215,7 @@ class TestForeignServer:
         stdio = _server(url=None)
         stdio._config = {"command": "npx", "args": ["some-server"]}
         with patch.dict(mcp_tool._servers, {"stdio": stdio}), \
-             patch("tools.mcp_tool._run_on_mcp_loop",
+             patch("tools.mcp_tool_loop._run_on_mcp_loop",
                    side_effect=_fake_run_on_mcp_loop), \
              patch.dict(mcp_tool._server_error_counts, {}, clear=True):
             _call(stdio, "GMAIL_FETCH_EMAILS", {"query": "x"}, name="stdio")
@@ -312,7 +313,7 @@ class TestSchemaGuard:
             "include_payload": {"type": "boolean"},
         })])
         with patch.dict(mcp_tool._servers, {"composio": server}), \
-             patch("tools.mcp_tool._run_on_mcp_loop",
+             patch("tools.mcp_tool_loop._run_on_mcp_loop",
                    side_effect=_fake_run_on_mcp_loop), \
              patch.dict(mcp_tool._server_error_counts, {}, clear=True):
             _call(server, "GMAIL_FETCH_EMAILS", {"query": "x"})
@@ -328,7 +329,7 @@ class TestSchemaGuard:
         """
         server = _server(tools=[])
         with patch.dict(mcp_tool._servers, {"composio": server}), \
-             patch("tools.mcp_tool._run_on_mcp_loop",
+             patch("tools.mcp_tool_loop._run_on_mcp_loop",
                    side_effect=_fake_run_on_mcp_loop), \
              patch.dict(mcp_tool._server_error_counts, {}, clear=True):
             _call(server, "COMPOSIO_MULTI_EXECUTE_TOOL", {
@@ -360,15 +361,18 @@ class TestDisclosure:
         assert json.loads(raw) == {"result": "ok"}
 
     def test_structured_content_survives_alongside_the_note(self, composio):
+        # Upstream renders ``content`` and ``structuredContent`` as ALTERNATIVES
+        # (kimi-code#3234): structured fills in only when the blocks rendered
+        # nothing usable. So the case where it must survive is exactly that one.
         composio.session.call_tool = AsyncMock(
             return_value=_FakeCallToolResult(
-                content=[_FakeContentBlock("ok")],
+                content=[],
                 structuredContent={"messages": []},
             )
         )
         raw = _call(composio, "GMAIL_FETCH_EMAILS", {"query": "x"})
         payload = json.loads(raw)
-        assert payload["structuredContent"] == {"messages": []}
+        assert payload["result"] == {"messages": []}
         assert "_hermes" in payload
 
 

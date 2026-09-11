@@ -233,7 +233,7 @@ def discover_external_mcp_servers() -> list[str]:
     being served.
     """
     try:
-        from tools.mcp_tool import discover_mcp_tools
+        from tools.mcp_tool_discovery import discover_mcp_tools
     except Exception:
         logger.debug("MCP client support unavailable — no external servers", exc_info=True)
         return []
@@ -254,7 +254,7 @@ def discover_external_mcp_servers() -> list[str]:
 #: owns the agent and dispatched there (agent/transports/hermes_tool_bridge.py).
 #: Without a bridge they are withheld, because offering one would be offering
 #: a tool that always fails.
-AGENT_LOOP_TOOLS: tuple[str, ...] = ("todo", "memory", "session_search", "delegate_task")
+AGENT_LOOP_TOOLS: tuple[str, ...] = ("todo_list", "memory", "session_search", "delegate_task")
 
 #: Toolsets that only work where a GUI renderer can answer them — the Hermes
 #: desktop app's own panes (annotate_preview, focus_pane, read_terminal, tip,
@@ -569,7 +569,7 @@ def _build_server(profile: Optional[str] = None) -> Any:
                 "the parent Hermes agent, so its children get the same model, "
                 "the same account and the same tools."
             )
-        persistent = [n for n in ("memory", "todo", "session_search") if n in bridged_names]
+        persistent = [n for n in ("memory", "todo_list", "session_search") if n in bridged_names]
         if persistent:
             instructions += (
                 f" {', '.join(persistent)} run on the parent agent too, and are "

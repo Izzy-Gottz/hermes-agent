@@ -32,6 +32,9 @@ PLUGINS = os.path.join(ROOT, "hermes_cli", "plugins.py")
 ISO_TEST = os.path.join(ROOT, "tests", "tools", "test_mcp_profile_isolation.py")
 
 SCOPE_TESTS = "tests/tools/test_mcp_registry_scope.py"
+# The partition-free registry rules (alias overlay, membership memo) moved here on the
+# 0.21.1 port; the MCP-side entries below still name SCOPE_TESTS and are superseded.
+ALIAS_TESTS = "tests/tools/test_registry_scoped_aliases.py"
 SCOPE_TEST_FILE = os.path.join(
     ROOT, "tests", "tools", "test_mcp_registry_scope.py"
 )
@@ -242,7 +245,7 @@ MUTATIONS = [
         return merged''',
         '''        merged = dict(self._toolset_aliases)
         return merged''',
-        SCOPE_TESTS,
+        ALIAS_TESTS,
     ),
     (
         "alias",
@@ -254,30 +257,20 @@ MUTATIONS = [
                 else self._scoped_toolset_aliases.setdefault(scope, {})
             )''',
         '''            target = self._toolset_aliases''',
-        SCOPE_TESTS,
+        ALIAS_TESTS,
     ),
     # -- the toolset-membership memo ----------------------------------
     (
         "memo",
         "the membership memo drops the scope from its lookup AND write key",
         TS,
-        '''generation, scope_key)''',
-        '''generation, None)''',
-        SCOPE_TESTS,
-        2,
+        '''*_registry_generation(), _registry_scope_key())''',
+        '''*_registry_generation(), None)''',
+        ALIAS_TESTS,
     ),
-    (
-        "memo",
-        "the memo write key disagrees with the lookup key (never hits)",
-        TS,
-        '''        _resolve_toolset_memo[
-            (name, include_registry, registry_id, generation, scope_key)
-        ] = list(result)''',
-        '''        _resolve_toolset_memo[
-            (name, include_registry, registry_id, generation, None)
-        ] = list(result)''',
-        TOOLSET_TESTS,
-    ),
+    # ("the memo write key disagrees with the lookup key" is gone: since the
+    # 0.21.1 port the write reuses the lookup's ``memo_key`` object, so there
+    # is no second key to drift.)
     # -- what the skeptical review forced -----------------------------
     (
         "review",
@@ -321,7 +314,7 @@ MUTATIONS = [
         REG,
         '''            existing = target.get(alias)''',
         '''            existing = self._merged_aliases(scope).get(alias)''',
-        SCOPE_TESTS,
+        ALIAS_TESTS,
     ),
     (
         "review",

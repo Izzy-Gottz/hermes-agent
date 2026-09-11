@@ -37,9 +37,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MCP = ROOT / "tools/mcp_tool.py"
+MCP = ROOT / "tools/mcp_tool_handlers.py"  # composio defaults live beside the handler since the upstream split
 SKILLS = ROOT / "tools/skills_tool.py"
-CRON = ROOT / "cron/scheduler.py"
+REGISTRATION = ROOT / "tools/mcp_tool_registration.py"  # schema-cache write-through lives here since the split
+CRON = ROOT / "cron/scheduler_preflight.py"  # preflight moved here in the Sep 2026 upstream split
 
 COMPOSIO_TESTS = ["tests/tools/test_mcp_composio_defaults.py"]
 SKILL_TESTS = ["tests/tools/test_skill_required_commands.py",
@@ -92,31 +93,31 @@ GROUPS = {
          ["undiscovered_tool_still_gets_the_default"]),
 
         (MCP, "rule 4: the disclosure is dropped from the payload",
-         '                if _defaults_note:\n                    payload["_hermes"] = _defaults_note',
-         '                if False:\n                    payload["_hermes"] = _defaults_note',
+         '    if defaults_note:\n        payload["_hermes"] = defaults_note',
+         '    if False:\n        payload["_hermes"] = defaults_note',
          ["result_names_what_was_applied",
           "structured_content_survives_alongside_the_note"]),
 
         (MCP, "rule 4b: the note no longer forces a payload",
-         "            if structured is not None or meta is not None or _defaults_note:",
-         "            if structured is not None or meta is not None:",
+         "    if structured is None and meta is None and not defaults_note:",
+         "    if structured is None and meta is None:",
          ["result_names_what_was_applied"]),
 
         (MCP, "rule 4c: a tool ERROR loses the note (the retry loop)",
-         '                        (error_text or "MCP tool returned an error")\n'
-         '                        + (("\\n\\n" + _defaults_note) if _defaults_note else "")',
-         '                        (error_text or "MCP tool returned an error")',
+         '            (_error_result_text(result) or "MCP tool returned an error")\n'
+         '            + (("\\n\\n" + defaults_note) if defaults_note else "")',
+         '            (_error_result_text(result) or "MCP tool returned an error")',
          ["tool_error_carries_the_note"]),
 
         (MCP, "rule 4d: a transport failure loses the note",
-         '                f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"\n'
-         '                + (("\\n\\n" + _defaults_note) if _defaults_note else "")',
-         '                f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"',
+         '            f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"\n'
+         '            + (("\\n\\n" + failure_note) if failure_note else "")',
+         '            f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"',
          ["transport_exception_carries_the_note"]),
 
         (MCP, "the note is appended to every failure, applied or not",
-         '                + (("\\n\\n" + _defaults_note) if _defaults_note else "")\n            ))',
-         '                + "\\n\\nHermes filled in something"\n            ))',
+         '            + (("\\n\\n" + failure_note) if failure_note else "")))',
+         '            + "\\n\\nHermes filled in something"))',
          ["failure_with_no_defaults_applied_says_nothing"]),
 
         (MCP, "the multiplexer path is skipped",
@@ -143,26 +144,26 @@ GROUPS = {
 
     "skills": (SKILL_TESTS, [
         (SKILLS, "the declared list goes back to a literal []",
-         '            "required_commands": required_commands,',
-         '            "required_commands": [],',
+         '        "required_commands": required_commands,',
+         '        "required_commands": [],',
          ["declared_present_command_is_reported", "missing_command_is_named",
           "present_and_absent_together"]),
 
         (SKILLS, "the missing list goes back to a literal [] (the original bug)",
-         '            "missing_required_commands": missing_required_commands,',
-         '            "missing_required_commands": [],',
+         '        "missing_required_commands": missing_required_commands,',
+         '        "missing_required_commands": [],',
          ["missing_command_is_named", "present_and_absent_together",
           "missing_binary_refuses_the_job_on_its_own"]),
 
         (SKILLS, "a missing binary relabels the skill after all",
-         "        missing_required_commands = _missing_required_commands(required_commands)",
-         "        missing_required_commands = _missing_required_commands(required_commands)\n"
-         "        if missing_required_commands:\n            setup_needed = True",
+         "    missing_required_commands = _missing_required_commands(required_commands)",
+         "    missing_required_commands = _missing_required_commands(required_commands)\n"
+         "    if missing_required_commands:\n        setup_needed = True",
          ["missing_command_is_named_but_does_not_relabel",
           "agentmail_key_is_optional"]),
 
         (SKILLS, "the note stops naming the binary",
-         "            ] + [\n                f\"command '{name}'\" for name in missing_required_commands\n            ]",
+         "                     + [f\"command '{name}'\" for name in missing_required_commands])",
          "            ]",
          ["setup_note_names_the_binary"]),
 
@@ -193,25 +194,25 @@ GROUPS = {
 
         (CRON, "preflight goes back to blocking only on setup_needed",
          '            or payload.get("readiness_status") == "setup_needed"\n'
-         "            or missing_commands\n        ):",
+         '            or payload.get("missing_required_commands")\n        ):',
          '            or payload.get("readiness_status") == "setup_needed"\n        ):',
          ["missing_binary_refuses_the_job_on_its_own"]),
 
         (CRON, "preflight refuses every job",
-         '        missing_commands = payload.get("missing_required_commands") or []',
-         '        missing_commands = ["anything"]',
+         '            or payload.get("missing_required_commands")\n        ):',
+         '            or True\n        ):',
          ["runnable_skill_is_not_refused"]),
 
         (CRON, "the refusal stops naming the binary",
-         '            missing += [f"command \'{name}\'" for name in missing_commands]',
-         '            missing += []',
+         '    ("missing_required_commands", "command \'{}\'"),\n',
+         '',
          ["missing_binary_refuses_the_job_on_its_own"]),
     ]),
 
     "schema-cache": (CACHE_TESTS, [
-        (MCP, "the writer reads the renamed field with getattr again",
-         '                schema_obj = mcp_field(mcp_tool, "input_schema", "inputSchema")',
-         '                schema_obj = getattr(mcp_tool, "inputSchema", None)',
+        (REGISTRATION, "the writer reads the renamed field with getattr again",
+         '            schema_obj = mcp_field(t, "input_schema", "inputSchema")',
+         '            schema_obj = getattr(t, "inputSchema", None)',
          ["written_cache_entry_keeps_the_parameters"]),
     ]),
 }

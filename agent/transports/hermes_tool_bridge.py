@@ -95,7 +95,7 @@ DEFAULT_TIMEOUT_SECONDS = 1500.0
 #: as a literal so this module imports without model_tools (the client end
 #: runs in a process that may not have loaded it yet) and asserted equal in
 #: tests.
-BRIDGED_TOOLS: tuple[str, ...] = ("todo", "memory", "session_search", "delegate_task")
+BRIDGED_TOOLS: tuple[str, ...] = ("todo_list", "memory", "session_search", "delegate_task")
 
 #: One line of JSON per message, both directions. A tool result can be large
 #: (a fan-out's aggregated JSON); the cap is a sanity bound, not a budget.

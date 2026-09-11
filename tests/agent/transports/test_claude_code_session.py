@@ -1012,12 +1012,12 @@ class TestToolBridgeWiring:
         )
         path = write_mcp_config(
             directory=str(tmp_path), bridge_socket="/tmp/b.sock", bridge_token="tok",
-            bridge_tools=("todo", "memory"),
+            bridge_tools=("todo_list", "memory"),
         )
         env = json.loads(Path(path).read_text())["mcpServers"]["hermes-tools"]["env"]
         assert env[BRIDGE_SOCKET_ENV] == "/tmp/b.sock"
         assert env[BRIDGE_TOKEN_ENV] == "tok"
-        assert env[BRIDGE_TOOLS_ENV] == "todo,memory"
+        assert env[BRIDGE_TOOLS_ENV] == "todo_list,memory"
         assert int(env[BRIDGE_TIMEOUT_ENV]) == int(DEFAULT_TIMEOUT_SECONDS)
         # The CLI has no use for any of it, so it is not in the CLI's env —
         # but this is housekeeping, not secrecy: Hermes' terminal runs inside
@@ -1051,10 +1051,10 @@ class TestToolBridgeWiring:
             bridge = session._tool_bridge
             env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
             assert call_bridged_tool("delegate_task", {"goal": "x"}, env=env)
-            session.rebind(tool_bridge_tools=("todo",))
+            session.rebind(tool_bridge_tools=("todo_list",))
             with pytest.raises(BridgeError, match="not bridged"):
                 call_bridged_tool("delegate_task", {"goal": "x"}, env=env)
-            assert call_bridged_tool("todo", env=env) == "todo"
+            assert call_bridged_tool("todo_list", env=env) == "todo_list"
         finally:
             session.close()
 
@@ -1123,17 +1123,17 @@ class TestToolBridgeWiring:
             session.ensure_started()
             bridge = session._tool_bridge
             env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
-            assert call_bridged_tool("todo", env=env) == "first"
+            assert call_bridged_tool("todo_list", env=env) == "first"
             session.rebind(
                 on_event=None,
                 approval_callback=None,
                 tool_bridge_dispatch=lambda tool, args: second.append(tool) or "second",
             )
-            assert call_bridged_tool("todo", env=env) == "second"
+            assert call_bridged_tool("todo_list", env=env) == "second"
             # A rebind that does not name a dispatcher keeps the current one.
             session.rebind(on_event=None, approval_callback=None)
-            assert call_bridged_tool("todo", env=env) == "second"
-            assert first == ["todo"] and second == ["todo", "todo"]
+            assert call_bridged_tool("todo_list", env=env) == "second"
+            assert first == ["todo_list"] and second == ["todo_list", "todo_list"]
         finally:
             session.close()
 
@@ -1395,17 +1395,17 @@ class TestToolBridgeWiring:
             fake_claude,
             expose_hermes_tools=True,
             tool_bridge_dispatch=lambda tool, args: tool,
-            tool_bridge_tools=("todo",),
+            tool_bridge_tools=("todo_list",),
         )
         try:
             session.ensure_started()
             env = json.loads(
                 Path(session._mcp_config_path).read_text()
             )["mcpServers"]["hermes-tools"]["env"]
-            assert env[BRIDGE_TOOLS_ENV] == "todo"
+            assert env[BRIDGE_TOOLS_ENV] == "todo_list"
             addr = {BRIDGE_SOCKET_ENV: env[BRIDGE_SOCKET_ENV],
                     BRIDGE_TOKEN_ENV: env[BRIDGE_TOKEN_ENV]}
-            assert call_bridged_tool("todo", env=addr) == "todo"
+            assert call_bridged_tool("todo_list", env=addr) == "todo_list"
             with pytest.raises(BridgeError, match="not bridged"):
                 call_bridged_tool("delegate_task", {"goal": "x"}, env=addr)
         finally:

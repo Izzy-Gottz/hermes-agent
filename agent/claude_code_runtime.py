@@ -1038,7 +1038,23 @@ def bridged_tools_for(agent) -> tuple:
     valid = getattr(agent, "valid_tool_names", None)
     if valid is None:
         return BRIDGED_TOOLS
-    return tuple(name for name in BRIDGED_TOOLS if name in valid)
+    # Upstream's tool search (0.21) defers most of the registry behind
+    # tool_search/tool_describe/tool_call, so ``valid_tool_names`` holds only
+    # the visible few; a deferred tool is still the agent's to run via
+    # ``tool_call``. The scoped-deferrable set is the same authority the
+    # executor uses to admit a ``tool_call`` unwrap — reuse it rather than
+    # invent a second one.
+    # Only when deferral is actually active on this agent (its surface carries
+    # ``tool_call``): a surface built without it is complete as it stands, and
+    # an empty one grants nothing — the word of the agent is still final.
+    deferred = frozenset()
+    if "tool_call" in valid:
+        try:
+            from agent.tool_executor import _tool_search_scoped_names
+            deferred = _tool_search_scoped_names(agent)
+        except Exception:
+            deferred = frozenset()
+    return tuple(name for name in BRIDGED_TOOLS if name in valid or name in deferred)
 
 
 def make_tool_bridge_dispatch(agent):

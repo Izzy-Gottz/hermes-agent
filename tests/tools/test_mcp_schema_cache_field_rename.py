@@ -26,6 +26,7 @@ import json
 import pytest
 
 from tools import mcp_tool
+from tools import mcp_tool_registration  # registration moved here in the Sep 2026 upstream split
 
 mcp_types = pytest.importorskip("mcp.types")
 
@@ -72,7 +73,7 @@ def test_the_written_cache_entry_keeps_the_parameters(monkeypatch, tmp_path):
     monkeypatch.setattr(msc, "write_cache_entry", _capture)
 
     server = _FakeServer([_real_tool()])
-    mcp_tool._register_server_tools("srv", server, {"url": "https://x/mcp"})
+    mcp_tool_registration._register_server_tools("srv", server, {"url": "https://x/mcp"})
 
     assert "tools" in written, "the write-through never ran"
     entry = next(t for t in written["tools"] if t["name"] == "GMAIL_FETCH_EMAILS")
@@ -99,4 +100,4 @@ class _FakeServer:
         # construction — a double without it is the double being wrong, not
         # an optional field. _ROOT_PROFILE_KEY is what every non-multiplexed
         # process answers, which is what this test is.
-        self._profile_key = mcp_tool._ROOT_PROFILE_KEY
+        # (``_profile_key`` was the fork's per-profile partition key; superseded on the 0.21.1 port.)

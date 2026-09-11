@@ -20,6 +20,20 @@ import contextlib
 
 import pytest
 
+# SUPERSEDED on the 0.21.1 port (2026-09-10). Upstream closed the same hole —
+# two profiles naming one server no longer share credentials — with a
+# different design: ``_server_scope_keys`` / ``_server_tool_scopes`` tag one
+# shared connection with its owning profile and let another profile ADOPT it
+# only when its route fingerprint matches (``_same_server_route``); a profile
+# with different credentials gets no tools rather than someone else's. The
+# fork's per-profile PARTITIONS (``_ProfileScopedDict``, ``_profile_key``,
+# ``shutdown_mcp_servers(profile_only=)``) gave each profile its own
+# subprocess instead. Moe runs one Hermes per tenant, so the partition design
+# was not load-bearing and was not carried over the split. Upstream's own
+# contract is tests/tools/test_mcp_registry_scope.py.
+pytest.skip("per-profile MCP partitions were superseded by upstream's scope-key design (see header)",
+            allow_module_level=True)
+
 import agent.secret_scope as secret_scope
 import tools.mcp_tool as mcp
 from hermes_constants import (

@@ -58,6 +58,16 @@ def _profile(home):
         reset_hermes_home_override(home_token)
 
 
+# The MCP-side half of these checks drove the fork's per-profile PARTITIONS
+# (``_mcp_profile_key``, ``server._profile_key``, ``_register_server_tools``
+# addressing a partition). That design was superseded on the 0.21.1 port by
+# upstream's scope-key model (see tests/tools/test_mcp_profile_isolation.py);
+# the registry-only checks below still run against the ported registry.
+_NO_PARTITIONS = not hasattr(mcp, "_ProfileScopedDict")
+_SUPERSEDED = pytest.mark.skipif(
+    _NO_PARTITIONS, reason="per-profile MCP partitions superseded by upstream's scope-key design")
+
+
 def _mcp_partitioned():
     """Every profile-partitioned registry in ``tools.mcp_tool``, by name.
 
@@ -69,12 +79,17 @@ def _mcp_partitioned():
     ``TestMCPSelectiveToolLoading::test_enabled_false_skips_connection_attempt``
     two files later. Enumerating is the only version that stays true.
     """
+    # The per-profile partitions were superseded on the 0.21.1 port (see
+    # tests/tools/test_mcp_profile_isolation.py); with them gone there is
+    # nothing MCP-side to save, and the registry-level checks below still run.
+    kinds = tuple(k for k in (getattr(mcp, "_ProfileScopedDict", None),
+                              getattr(mcp, "_ProfileScopedSet", None)) if k is not None)
+    if not kinds:
+        return {}
     return {
         attr: getattr(mcp, attr)
         for attr in dir(mcp)
-        if isinstance(
-            getattr(mcp, attr), (mcp._ProfileScopedDict, mcp._ProfileScopedSet)
-        )
+        if isinstance(getattr(mcp, attr), kinds)
     }
 
 
@@ -203,6 +218,7 @@ def _register(server, config=None):
 # The key translation — where a wrong answer makes tools vanish
 # ---------------------------------------------------------------------------
 
+@_SUPERSEDED
 def test_root_key_becomes_global_scope_not_the_empty_scope(homes):
     """Multiplex OFF ⇒ ``None`` (process-global), never the ``""`` partition.
 
@@ -237,6 +253,7 @@ def test_profile_key_becomes_the_registry_scope_under_multiplex(homes):
         assert mcp._mcp_registry_scope() == registry.current_scope_key()
 
 
+@_SUPERSEDED
 def test_unscoped_key_is_not_collapsed_to_global():
     """Multiplex ON with no scope installed ⇒ an unreadable partition.
 
@@ -253,6 +270,7 @@ def test_unscoped_key_is_not_collapsed_to_global():
 # Single profile: byte-identical to before
 # ---------------------------------------------------------------------------
 
+@_SUPERSEDED
 def test_single_profile_registration_stays_process_global(homes):
     """The property every ordinary Mac depends on, asserted structurally."""
     home_a, home_b = homes
@@ -278,6 +296,7 @@ def test_single_profile_registration_stays_process_global(homes):
 # Two profiles: names, schemas and provenance stay apart
 # ---------------------------------------------------------------------------
 
+@_SUPERSEDED
 def test_two_profiles_see_their_own_schema_not_each_others(homes):
     """The bug in one assertion: same tool name, two descriptions.
 
@@ -307,6 +326,7 @@ def test_two_profiles_see_their_own_schema_not_each_others(homes):
         assert entry.schema["description"] == "B's repositories."
 
 
+@_SUPERSEDED
 def test_a_profile_without_the_server_sees_no_tool(homes):
     home_a, home_b = homes
     secret_scope.set_multiplex_active(True)
@@ -325,6 +345,7 @@ def test_a_profile_without_the_server_sees_no_tool(homes):
         assert mcp.has_registered_mcp_tools() is True
 
 
+@_SUPERSEDED
 def test_registration_follows_the_server_not_the_ambient_context(homes):
     """``server._profile_key``, not whoever happens to be on the thread.
 
@@ -363,6 +384,7 @@ def test_registration_follows_the_server_not_the_ambient_context(homes):
 # Teardown — two scopes ALIVE at once, not two registrations
 # ---------------------------------------------------------------------------
 
+@_SUPERSEDED
 def test_teardown_removes_only_its_own_profiles_tools(homes):
     """Profile A's shutdown must not unregister profile B's LIVE tool."""
     home_a, home_b = homes
@@ -391,6 +413,7 @@ def test_teardown_removes_only_its_own_profiles_tools(homes):
         assert mcp.get_registered_mcp_server_names() == {"github"}
 
 
+@_SUPERSEDED
 def test_teardown_actually_removes_the_tool_in_its_own_profile(homes):
     """The other direction: a scoped teardown must not be a silent no-op.
 
@@ -417,6 +440,7 @@ def test_teardown_actually_removes_the_tool_in_its_own_profile(homes):
     assert server._registered_tool_names == []
 
 
+@_SUPERSEDED
 def test_unscoped_deregister_cannot_reach_a_scoped_tool(homes):
     """Why ``scope=`` had to be added rather than relying on the caller.
 
@@ -443,6 +467,7 @@ def test_unscoped_deregister_cannot_reach_a_scoped_tool(homes):
         assert registry.get_entry("mcp__github__list_repos") is None
 
 
+@_SUPERSEDED
 def test_single_profile_teardown_is_unchanged(homes):
     """Multiplex off: register and tear down through the global map."""
     home_a, _ = homes
@@ -463,6 +488,7 @@ def test_single_profile_teardown_is_unchanged(homes):
 # Provenance
 # ---------------------------------------------------------------------------
 
+@_SUPERSEDED
 def test_provenance_is_partitioned(homes):
     """``_mcp_tool_server_names`` is what policy reads, so it partitions too.
 
@@ -504,6 +530,7 @@ def test_provenance_is_partitioned(homes):
 # The two caches that would have kept names crossing anyway
 # ---------------------------------------------------------------------------
 
+@_SUPERSEDED
 def test_server_name_does_not_become_a_toolset_in_another_profile(homes):
     """An MCP server's raw name is registered as a toolset ALIAS.
 
@@ -529,6 +556,7 @@ def test_server_name_does_not_become_a_toolset_in_another_profile(homes):
         assert toolsets.validate_toolset("github") is False
 
 
+@_SUPERSEDED
 def test_single_profile_alias_is_still_global(homes):
     """Multiplex off: the alias lands in the global map, as before."""
     home_a, home_b = homes
@@ -545,6 +573,7 @@ def test_single_profile_alias_is_still_global(homes):
         assert registry.get_toolset_alias_target("github") == "mcp-github"
 
 
+@_SUPERSEDED
 def test_toolset_membership_memo_does_not_serve_another_profile(homes):
     """``toolsets._resolve_toolset_memo`` is keyed on the registry scope.
 
@@ -567,6 +596,7 @@ def test_toolset_membership_memo_does_not_serve_another_profile(homes):
         assert toolsets.resolve_toolset("mcp-github") == []
 
 
+@_SUPERSEDED
 def test_scoped_teardown_never_pops_a_global_toolset_check(homes):
     """``deregister(scope=...)`` must not mutate ``_toolset_checks``.
 
@@ -600,6 +630,7 @@ def test_scoped_teardown_never_pops_a_global_toolset_check(homes):
     assert registry._toolset_checks.get("mcp-github") is sentinel
 
 
+@_SUPERSEDED
 def test_global_teardown_still_drops_its_toolset_check(homes):
     """And the gate must not break the unscoped path it wraps."""
     home_a, _ = homes
@@ -616,6 +647,7 @@ def test_global_teardown_still_drops_its_toolset_check(homes):
         assert registry.get_toolset_alias_target("github") is None
 
 
+@_SUPERSEDED
 def test_scoped_teardown_leaves_another_profiles_alias_alone(homes):
     """A's shutdown must not drop the alias B's server still owns."""
     home_a, home_b = homes
@@ -668,6 +700,7 @@ def _cache_entry(tool_name, description):
     }
 
 
+@_SUPERSEDED
 def test_lazy_cache_registration_is_scoped_too(homes):
     """``_register_from_cache_sync`` has no server object to ask.
 
@@ -708,6 +741,7 @@ def test_lazy_cache_registration_is_scoped_too(homes):
         assert dict(mcp._mcp_tool_server_names) == {}
 
 
+@_SUPERSEDED
 def test_lazy_cache_registration_is_global_without_multiplexing(homes):
     """And unchanged on every ordinary Mac."""
     home_a, home_b = homes
@@ -728,6 +762,7 @@ def test_lazy_cache_registration_is_global_without_multiplexing(homes):
 # What the skeptical review of the first draft turned up
 # ---------------------------------------------------------------------------
 
+@_SUPERSEDED
 def test_the_eager_utility_branch_is_scoped_too(homes):
     """Resource/prompt stubs register through their own ``register`` call.
 
@@ -756,6 +791,7 @@ def test_the_eager_utility_branch_is_scoped_too(homes):
         assert registry.get_entry("mcp__github__list_prompts") is None
 
 
+@_SUPERSEDED
 def test_trust_metadata_lands_in_the_same_profile_as_the_tools(homes):
     """Trust is read at call time and fails OPEN, so a split is dangerous.
 
@@ -785,6 +821,7 @@ def test_trust_metadata_lands_in_the_same_profile_as_the_tools(homes):
         assert mcp._server_trust_levels.get("github") is None
 
 
+@_SUPERSEDED
 def test_unscoped_registration_says_so_loudly(homes, caplog):
     """The unscoped partition is invisible, so it must never be silent.
 
@@ -805,6 +842,7 @@ def test_unscoped_registration_says_so_loudly(homes, caplog):
 
 # --- tools/registry.py's own seams ----------------------------------------
 
+@_SUPERSEDED
 def test_a_plugin_cannot_deregister_from_another_profiles_scope(homes):
     """``scope=`` must not become a privilege-widening parameter.
 
@@ -905,6 +943,7 @@ def test_restore_registration_drops_an_orphaned_global_alias():
     assert registry.get_toolset_alias_target("_probe_pset_alias") is None
 
 
+@_SUPERSEDED
 def test_a_global_alias_registration_ignores_a_profiles_overlay(homes, caplog):
     """The collision warning must name the partition it is writing.
 

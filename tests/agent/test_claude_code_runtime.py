@@ -422,21 +422,21 @@ class TestTheRuntimeActuallyWiresTheBridge:
         monkeypatch.setattr(
             rt, "_claude_code_config", lambda: {**cfg, "expose_hermes_tools": True}
         )
-        agent = self._agent_with("wired", ("todo", "session_search"))
+        agent = self._agent_with("wired", ("todo_list", "session_search"))
         _turn(agent)
         session = agent._claude_code_session
         bridge = session._tool_bridge
         assert bridge is not None, "the runtime did not start a bridge"
-        assert bridge.allowed_tools == ("todo", "session_search")
+        assert bridge.allowed_tools == ("todo_list", "session_search")
 
         env = json.loads(
             Path(session._mcp_config_path).read_text()
         )["mcpServers"]["hermes-tools"]["env"]
-        assert env[BRIDGE_TOOLS_ENV] == "todo,session_search"
+        assert env[BRIDGE_TOOLS_ENV] == "todo_list,session_search"
 
         addr = self._addr(bridge)
-        assert call_bridged_tool("todo", env=addr) == "ran:todo"
-        assert agent._calls == ["todo"]
+        assert call_bridged_tool("todo_list", env=addr) == "ran:todo_list"
+        assert agent._calls == ["todo_list"]
         with pytest.raises(BridgeError, match="not bridged"):
             call_bridged_tool("delegate_task", {"goal": "x"}, env=addr)
 
@@ -449,18 +449,18 @@ class TestTheRuntimeActuallyWiresTheBridge:
         monkeypatch.setattr(
             rt, "_claude_code_config", lambda: {**cfg, "expose_hermes_tools": True}
         )
-        first = self._agent_with("warm", ("todo", "delegate_task"))
+        first = self._agent_with("warm", ("todo_list", "delegate_task"))
         _turn(first)
         bridge = first._claude_code_session._tool_bridge
         addr = self._addr(bridge)
         assert call_bridged_tool("delegate_task", {"goal": "x"}, env=addr)
 
-        second = self._agent_with("warm", ("todo",))
+        second = self._agent_with("warm", ("todo_list",))
         _turn(second)
         assert second._claude_code_session._tool_bridge is bridge
-        assert bridge.allowed_tools == ("todo",)
-        assert call_bridged_tool("todo", env=addr) == "ran:todo"
-        assert first._calls == ["delegate_task"] and second._calls == ["todo"]
+        assert bridge.allowed_tools == ("todo_list",)
+        assert call_bridged_tool("todo_list", env=addr) == "ran:todo_list"
+        assert first._calls == ["delegate_task"] and second._calls == ["todo_list"]
         with pytest.raises(BridgeError, match="not bridged"):
             call_bridged_tool("delegate_task", {"goal": "x"}, env=addr)
 
@@ -540,7 +540,7 @@ class TestToolBridgeDispatch:
 
     def test_the_session_id_stands_in_for_a_missing_task_id(self):
         agent = self._recording_agent("sess-9")
-        rt.make_tool_bridge_dispatch(agent)("todo", {})
+        rt.make_tool_bridge_dispatch(agent)("todo_list", {})
         assert agent._calls[0][2] == "sess-9"
 
     def test_only_bridged_names_are_accepted(self):
@@ -554,14 +554,14 @@ class TestToolBridgeDispatch:
         process and cannot know the child's toolsets, so a leaf subagent's
         `claude` IS offered delegate_task and memory — which
         DELEGATE_BLOCKED_TOOLS denies it. The agent's own surface decides."""
-        agent = self._recording_agent(tools=("todo", "session_search"))
+        agent = self._recording_agent(tools=("todo_list", "session_search"))
         agent.platform = "subagent"
         dispatch = rt.make_tool_bridge_dispatch(agent)
         for blocked in ("delegate_task", "memory"):
             out = json.loads(dispatch(blocked, {}))
             assert "not available to this agent" in out["error"]
-        assert dispatch("todo", {}) == "ran:todo"
-        assert [c[0] for c in agent._calls] == ["todo"]
+        assert dispatch("todo_list", {}) == "ran:todo_list"
+        assert [c[0] for c in agent._calls] == ["todo_list"]
 
     def test_an_agent_with_no_tool_list_at_all_is_not_second_guessed(self):
         """An embedder or a stand-in that never built a tool surface is taken
@@ -587,8 +587,8 @@ class TestToolBridgeDispatch:
         """Same source of truth decides what the child is TOLD it has and
         what it is allowed to call — otherwise a leaf subagent is advertised
         delegate_task and refused when it uses it."""
-        leaf = self._recording_agent(tools=("todo", "session_search"))
-        assert rt.bridged_tools_for(leaf) == ("todo", "session_search")
+        leaf = self._recording_agent(tools=("todo_list", "session_search"))
+        assert rt.bridged_tools_for(leaf) == ("todo_list", "session_search")
         from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
 
         parent = self._recording_agent()
@@ -618,10 +618,10 @@ class TestToolBridgeDispatch:
         try:
             agent._claude_code_task_id = "task-real"
             out = rt.make_tool_bridge_dispatch(agent)(
-                "todo", {"todos": [{"content": "bridge check", "status": "pending"}]}
+                "todo_list", {"todos": [{"content": "bridge check", "status": "pending"}]}
             )
             assert "bridge check" in out
-            assert seen and seen[0][0] == "todo"
+            assert seen and seen[0][0] == "todo_list"
             assert seen[0][1].startswith("bridge-")
             assert seen[0][2] == "task-real"
         finally:
@@ -638,15 +638,15 @@ class TestToolBridgeDispatch:
         _turn(first)
         session = first._claude_code_session
         assert first._claude_code_task_id == "t"
-        session._tool_bridge_dispatch("todo", {})
-        assert [c[0] for c in first._calls] == ["todo"]
+        session._tool_bridge_dispatch("todo_list", {})
+        assert [c[0] for c in first._calls] == ["todo_list"]
 
         second = self._recording_agent("shared")
         _turn(second)
         assert second._claude_code_session is session
-        session._tool_bridge_dispatch("todo", {})
-        assert [c[0] for c in second._calls] == ["todo"]
-        assert [c[0] for c in first._calls] == ["todo"]  # not called twice
+        session._tool_bridge_dispatch("todo_list", {})
+        assert [c[0] for c in second._calls] == ["todo_list"]
+        assert [c[0] for c in first._calls] == ["todo_list"]  # not called twice
 
 
 class TestPreWarmedSpare:
@@ -727,7 +727,7 @@ class TestPreWarmedSpare:
         warm_pid = spare.session.pid
 
         narrowed = _agent("child-1")
-        narrowed.valid_tool_names = {"todo"}      # a leaf's narrowed surface
+        narrowed.valid_tool_names = {"todo_list"}      # a leaf's narrowed surface
         assert rt.take_spare(narrowed) is None
         other_prompt = _agent("conv-x", ephemeral="SOMETHING-ELSE")
         assert rt.take_spare(other_prompt) is None

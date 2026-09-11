@@ -48,11 +48,6 @@ screen. Do NOT capture to confirm something you can state as a predicate — ask
 `verify_state`. Do NOT capture again straight after acting unless the action
 came back `unverifiable`; the verdict already told you.
 
-And in a Chromium browser, often do not capture at all: `browser_read` with
-a `query` answers "where is the Send button" for ~950 tokens and gives you the
-ref to act on, against ~1,570 image tokens and ~2.2 s for a screenshot you
-then have to look at. Both numbers measured, on this machine.
-
 Everything below still holds for the capture you do take.
 
 ## The canonical workflow
@@ -144,10 +139,9 @@ Clicking is the LAST rung, not the first. In order:
    is five steps that can each go wrong: capture, find it, click to open,
    capture again because the menu did not exist a moment ago, click again.
 4. **A keyboard shortcut**, when the menu shows one.
-5. **`browser_read`**, when the target is a page in Chrome / Edge / Brave /
-   Arc. It returns exact refs over the DevTools protocol, so there is no
-   screenshot in the loop at all. See the browser section below — and ask it
-   for the one thing you want, not for the page.
+5. **The `browser_*` tools**, when the target is a web page. They drive a
+   browser of your own with exact refs and no screenshot, and they are the
+   same tools in the cloud. See the browser section below.
 6. **`click`**, by `element` index.
 7. **`click` by coordinate** — only for canvas/video/WebGL surfaces with no
    AX tree.
@@ -278,7 +272,7 @@ Returned fields (present when the driver supports them):
 - `effect`: `"confirmed"` (driver read the result back — done), `"unverifiable"`
   (delivered, but confirm it yourself by re-capturing), or `"suspected_noop"`
   (ran but almost certainly did nothing).
-- `escalation`: `{recommended: "px" | "foreground" | "page", reason}` — present
+- `escalation`: `{recommended: "px" | "foreground", reason}` — present
   only when there's a next rung to try.
 - `code`: a structured refusal like `"background_unavailable"` or
   `"foreground_unsupported"`.
@@ -294,10 +288,7 @@ Walk it in order:
 3. **Pixel, background.** After `effect:"suspected_noop"` or a structured
    refusal recommends `"px"` (or a `degraded` capture has no elements), click
    by `coordinate=[x,y]` instead of `element`.
-4. **Typed page.** When `escalation.recommended == "page"` and the exact
-   browser-page contract below is available, use the namespaced typed route
-   before native foreground. This is not the legacy `page` workflow.
-5. **Foreground.** After `effect:"suspected_noop"`,
+4. **Foreground.** After `effect:"suspected_noop"`,
    `code:"background_unavailable"`, or a verified pixel no-op,
    re-issue the SAME action with `delivery_mode="foreground"`. This briefly
    raises the window and restores focus after; pair with `bring_to_front=True`
@@ -305,7 +296,7 @@ Walk it in order:
    (it's a visible focus change) and is only appropriate when the user isn't
    actively working. Classic cases: Electron/Chromium consent dialogs (e.g.
    tldraw offline's "Run Script"), DirectInput games, raw-input canvases.
-6. **Keystrokes verified-lost on a KDE/Qt editor → use the app's own I/O.**
+5. **Keystrokes verified-lost on a KDE/Qt editor → use the app's own I/O.**
    Some Qt text components (KTextEditor: Kate, KWrite, KDevelop) discard
    SYNTHETIC X keystrokes entirely — foreground `type` reports ok
    ("Typed N characters into the focused widget", `effect:"unverifiable"`)
@@ -333,69 +324,35 @@ NOT conclude "cua-driver can't drive this app" — climb the ladder. If
 action schema lacks that property; choose another verified rung without
 inferring support from the executable's reported version.
 
-## In a Chromium browser, read the page — do not photograph it
+## A web page is not a screen task — use the browser tools
 
-`computer_use(action="browser_read")` reads a Chrome / Edge / Brave / Arc tab
-through the DevTools protocol. You get a text outline and typed refs like
-`p3:17`, and you click a ref — there is nothing to locate in a picture, no
-coordinate to guess, and the read never touches the screen, so a tab on
-another Space or behind other windows reads exactly the same.
+`computer_use` drives the person's Mac. For a PAGE, Hermes has a separate set
+of tools — `browser_navigate`, `browser_snapshot`, `browser_click`,
+`browser_type`, `browser_press`, `browser_scroll`, `browser_back`,
+`browser_get_images`, `browser_vision`, `browser_console` — and they are the
+right rung for anything on the web.
 
-**Ask for what you need. Do not read whole pages.** Measured on a real
-article, through this tool:
+They drive **a browser of your own**, not the person's: a headless Chromium
+the agent controls. So nothing appears on their screen, nothing takes focus,
+and their tabs, logins and session are untouched. `browser_snapshot` returns
+the page as a text outline with typed refs (`[ref=e1]`), and you click a ref —
+there is nothing to locate in a picture.
 
-| call | tokens | |
-|---|---|---|
-| `browser_read(query="Send")` | ~950 | the normal way |
-| `browser_read()` | ~2,300 | outline + the refs in view |
-| `browser_read(full=true)` | ~15,800 | ten times a screenshot |
-| a `som` capture of the same window | ~1,570 | for comparison |
+The other half of why this is the lane: **it is the same tool in the cloud**.
+Moe away from the Mac has this and not `computer_use`, so a habit built here
+keeps working there. One vocabulary, both runtimes.
 
-So this beats a screenshot when you want to ACT on something specific, and
-loses badly when you use it to browse. `query` matches role, accessible name
-and visible text. `scope_ref` opens one panel or row from a previous read.
-A read that comes back `complete: false` carries a `continuation`.
+Measured on this Mac, a real article: `browser_snapshot` is ~3,956 tokens in
+3.8 s, against ~1,568 image tokens and ~2.2 s for a screenshot you then have
+to interpret. So it is not free — snapshot the page when you intend to ACT on
+it, not to browse.
 
-The binding is remembered between calls. Pass `rebind: true` after the person
-changes tab or window. `include_text: true` adds the page's prose, which is
-about a third of its tokens and none of it clickable — leave it off unless
-you are reading rather than acting.
-
-Safari is not a DevTools target. Capture and click it as usual, and use the
-normal ladder for browser chrome, permission prompts, native dialogs and
-extension surfaces — `browser_read` sees the page, not the window around it.
-
-### Acting on the page is not wired yet
-
-Only reading is exposed today. Once you have the ref, act with the ordinary
-rungs (`click` by element, `key`, `type`), or with `open -a` and a URL, which
-is still rung 1 for "go to this page". Earlier versions of this file described
-`cua_browser_click`, `cua_browser_type`, `cua_browser_navigate`,
-`cua_browser_pointer`, `cua_browser_dialog` and `cua_browser_prepare` — none
-of those ever existed in Hermes. They are removed rather than left to be
-tried, because a well-formed name that resolves to nothing is worse than an
-absent one: absence is honest, and a plausible name costs a failed call and a
-retry before anyone learns it was never real.
-
-### Reading someone's signed-in browser needs their say-so, once
-
-Attaching to the profile the person is actually logged into exposes its live
-pages, cookies and storage, so cua-driver refuses until the owner turns it on.
-The refusal comes back as `browser_consent_required`, and the answer is a
-config key, not a workaround:
-
-    computer_use:
-      grant_existing_profile: true
-
-in `~/.hermes/config.yaml`, then restart the session. It is a launch-time
-grant — nothing the agent does after startup can supply it. Tell the user the
-key by name and carry on with capture and click; do not retry, do not
-downgrade trust, and do not go looking for another route in.
-
-(`computer_use.permission_mode: bounded` with a reviewed capability manifest
-is the other accepted path. Hermes YOLO — `--yolo`, `/yolo`,
-`approvals.mode: off` — is NOT: skipping approval prompts is not consent to
-read a logged-in browser profile, and the host-side floor still applies.)
+Use `computer_use` for the browser instead only when the target is not a page:
+the browser's own chrome and menus, a native download or permission dialog, an
+extension surface, or a tab the person already has open and is looking at.
+Chrome exposes a page to a program only when it was started for it, and Moe
+does not restart somebody's browser — so their existing tabs are a screen
+task, and a page you opened is not.
 
 ### Key shortcuts vary per platform
 
@@ -574,7 +531,7 @@ before it.
 | `cua-driver not installed` | Run `hermes computer-use install`, or `hermes tools` and enable Computer Use |
 | Captures consistently return empty / "no on-screen window" | On Linux: DISPLAY may not be set (X11) or you're on pure Wayland — ask the user to run `hermes computer-use doctor`. On Windows: you may be in Session 0 (SSH session) instead of the interactive desktop — see the cua-driver `WINDOWS.md` deep-dive |
 | Element index stale ("Element N not in cache") | SOM indices are only valid until the next `capture`. Re-capture before clicking. The wrapper carries opaque `element_token`s for stale-detection; you'll see an explicit error rather than a wrong click |
-| Click had no effect | Read the structured verdict. `effect:"unverifiable"` → fresh capture/state before retry, even with an escalation hint. `effect:"suspected_noop"` or a structured refusal → climb the recommended ladder: coordinate (px), typed page route when exact, then foreground. Browser chrome/native prompts remain native. Don't conclude the app is undrivable |
+| Click had no effect | Read the structured verdict. `effect:"unverifiable"` → fresh capture/state before retry, even with an escalation hint. `effect:"suspected_noop"` or a structured refusal → climb the recommended ladder: coordinate (px), then foreground. Browser chrome/native prompts remain native; page content is a separate toolset. Don't conclude the app is undrivable |
 | Type text disappears into a terminal emulator | cua-driver detects terminals (Ghostty, iTerm2, Terminal.app, Windows Terminal, mintty, etc.) and routes through key-event synthesis — should "just work" on a recent cua-driver. If it doesn't, ask the user to run `hermes computer-use doctor` |
 | `blocked pattern in type text` | You tried to `type` a shell command matching the dangerous-pattern block list (`curl ... \| bash`, `sudo rm -rf`, etc.). Break the command up or reconsider |
 | Anything else weird | **First action: ask the user to run `hermes computer-use doctor`.** It runs the cua-driver `health_report` MCP tool and prints a structured per-check matrix. Their output tells you (and them) exactly what's wrong |

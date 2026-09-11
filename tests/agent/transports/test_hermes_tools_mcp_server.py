@@ -323,12 +323,12 @@ class TestExternalMcpPassthrough:
 
     def test_discovery_failure_still_serves_hermes_own_tools(self, monkeypatch):
         from agent.transports import hermes_tools_mcp_server as m
-        import tools.mcp_tool as mcp_tool
+        import tools.mcp_tool_discovery as mcp_tool_discovery
 
         def boom():
             raise RuntimeError("server unreachable")
 
-        monkeypatch.setattr(mcp_tool, "discover_mcp_tools", boom)
+        monkeypatch.setattr(mcp_tool_discovery, "discover_mcp_tools", boom)
         assert m.discover_external_mcp_servers() == []
 
 
@@ -394,9 +394,9 @@ class TestAgentLoopToolsOverTheBridge:
         )
         available = set(AGENT_LOOP_TOOLS) | {"terminal"}
         narrowed = tools_to_offer(
-            "claude-code", available, bridge=("todo", "session_search")
+            "claude-code", available, bridge=("todo_list", "session_search")
         )
-        assert "todo" in narrowed and "session_search" in narrowed
+        assert "todo_list" in narrowed and "session_search" in narrowed
         assert "delegate_task" not in narrowed and "memory" not in narrowed
 
     def test_a_narrowed_child_is_not_told_it_has_a_subagent_tool(self, monkeypatch, tmp_path):
@@ -406,12 +406,12 @@ class TestAgentLoopToolsOverTheBridge:
         bridge.start()
         try:
             server = self._build(
-                monkeypatch, ["todo", "delegate_task"], bridge=bridge,
-                offered=("todo",),
+                monkeypatch, ["todo_list", "delegate_task"], bridge=bridge,
+                offered=("todo_list",),
             )
-            assert "todo" in server.tools and "delegate_task" not in server.tools
+            assert "todo_list" in server.tools and "delegate_task" not in server.tools
             assert "delegate_task is this session's subagent tool" not in server.instructions
-            assert "todo" in server.instructions
+            assert "todo_list" in server.instructions
         finally:
             bridge.close()
 

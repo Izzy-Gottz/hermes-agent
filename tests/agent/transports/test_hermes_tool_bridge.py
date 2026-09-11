@@ -83,7 +83,7 @@ class TestRoundTrip:
         b = ToolBridge(lambda tool, args: {"ok": 1}, directory=str(tmp_path))
         b.start()
         try:
-            assert json.loads(call_bridged_tool("todo", env=_env(b))) == {"ok": 1}
+            assert json.loads(call_bridged_tool("todo_list", env=_env(b))) == {"ok": 1}
         finally:
             b.close()
 
@@ -101,7 +101,7 @@ class TestRoundTrip:
             threads = [
                 threading.Thread(
                     target=lambda i=i: results.__setitem__(
-                        i, call_bridged_tool("todo", {"i": i}, env=_env(b))
+                        i, call_bridged_tool("todo_list", {"i": i}, env=_env(b))
                     )
                 )
                 for i in range(3)
@@ -110,7 +110,7 @@ class TestRoundTrip:
                 t.start()
             for t in threads:
                 t.join(timeout=15)
-            assert results == {0: "todo", 1: "todo", 2: "todo"}
+            assert results == {0: "todo_list", 1: "todo_list", 2: "todo_list"}
         finally:
             b.close()
 
@@ -125,7 +125,7 @@ class TestRefusals:
     def test_a_wrong_token_is_refused(self, bridge):
         env = _env(bridge) | {BRIDGE_TOKEN_ENV: "not-the-token"}
         with pytest.raises(BridgeError, match="authentication failed"):
-            call_bridged_tool("todo", env=env)
+            call_bridged_tool("todo_list", env=env)
         assert bridge.calls == []
 
     def test_only_the_four_agent_loop_tools_are_dispatchable(self, bridge):
@@ -143,7 +143,7 @@ class TestRefusals:
         env = _env(bridge)
         bridge.close()
         with pytest.raises(BridgeError, match="not answering"):
-            call_bridged_tool("todo", env=env)
+            call_bridged_tool("todo_list", env=env)
 
     def test_a_dispatcher_exception_comes_back_as_an_error(self, bridge):
         with pytest.raises(BridgeError, match="dispatcher exploded"):
@@ -154,7 +154,7 @@ class TestRefusals:
         b.start()
         try:
             with pytest.raises(BridgeError, match="did not finish within"):
-                call_bridged_tool("todo", env=_env(b), timeout=0.4)
+                call_bridged_tool("todo_list", env=_env(b), timeout=0.4)
         finally:
             b.close()
 
@@ -182,7 +182,7 @@ class TestLifecycle:
             b.start()
             try:
                 assert os.path.dirname(os.path.dirname(b.socket_path)) == short
-                assert call_bridged_tool("todo", env=_env(b)) == "ok"
+                assert call_bridged_tool("todo_list", env=_env(b)) == "ok"
             finally:
                 b.close()
             assert os.listdir(short) == []
@@ -222,7 +222,7 @@ class TestLifecycle:
         path, owned = b.socket_path, os.path.dirname(b.socket_path)
         try:
             assert path and not path.startswith(str(deep))
-            assert call_bridged_tool("todo", env=_env(b)) == "ok"
+            assert call_bridged_tool("todo_list", env=_env(b)) == "ok"
             assert stat.S_IMODE(os.stat(owned).st_mode) == 0o700
         finally:
             b.close()
@@ -276,7 +276,7 @@ class TestHardening:
             for s_ in silent:
                 s_.close()
             # ...and the bridge still works afterwards.
-            assert call_bridged_tool("todo", env=_env(b)) == "ok"
+            assert call_bridged_tool("todo_list", env=_env(b)) == "ok"
         finally:
             b.close()
 
@@ -309,7 +309,7 @@ class TestHardening:
                 call_bridged_tool("delegate_task", env=_env(b))
             # ...while the cheap three are not metered and still answer.
             cheap = threading.Thread(
-                target=lambda: call_bridged_tool("todo", env=_env(b))
+                target=lambda: call_bridged_tool("todo_list", env=_env(b))
             )
             cheap.start()
             deadline = time.time() + 5
@@ -330,7 +330,7 @@ class TestHardening:
         t = None
         try:
             assert b.in_flight == 0
-            t = threading.Thread(target=lambda: call_bridged_tool("todo", env=_env(b)))
+            t = threading.Thread(target=lambda: call_bridged_tool("todo_list", env=_env(b)))
             t.start()
             deadline = time.time() + 5
             while b.in_flight == 0 and time.time() < deadline:
@@ -351,7 +351,7 @@ class TestHardening:
         b = ToolBridge(lambda *_: "before\udcff after", directory=str(tmp_path))
         b.start()
         try:
-            assert call_bridged_tool("todo", env=_env(b)) == "before\udcff after"
+            assert call_bridged_tool("todo_list", env=_env(b)) == "before\udcff after"
         finally:
             b.close()
 
@@ -369,7 +369,7 @@ class TestHardening:
         try:
             started = time.time()
             with pytest.raises(BridgeError, match="_Cancelled"):
-                call_bridged_tool("todo", env=_env(b), timeout=5)
+                call_bridged_tool("todo_list", env=_env(b), timeout=5)
             assert time.time() - started < 3
         finally:
             b.close()
@@ -378,11 +378,11 @@ class TestHardening:
 class TestNarrowedSurface:
     def test_a_bridge_can_be_given_fewer_tools_than_the_four(self, tmp_path):
         b = ToolBridge(lambda tool, args: tool, directory=str(tmp_path),
-                       allowed_tools=("todo",))
+                       allowed_tools=("todo_list",))
         b.start()
         try:
-            assert b.allowed_tools == ("todo",)
-            assert call_bridged_tool("todo", env=_env(b)) == "todo"
+            assert b.allowed_tools == ("todo_list",)
+            assert call_bridged_tool("todo_list", env=_env(b)) == "todo_list"
             with pytest.raises(BridgeError, match="not bridged"):
                 call_bridged_tool("delegate_task", {"goal": "x"}, env=_env(b))
         finally:
@@ -392,8 +392,8 @@ class TestNarrowedSurface:
         env = _env(bridge)
         assert bridged_tool_names({}) == ()
         assert bridged_tool_names(env) == BRIDGED_TOOLS  # unset = all
-        assert bridged_tool_names({**env, BRIDGE_TOOLS_ENV: "todo, memory"}) == (
-            "todo", "memory",
+        assert bridged_tool_names({**env, BRIDGE_TOOLS_ENV: "todo_list, memory"}) == (
+            "todo_list", "memory",
         )
         assert bridged_tool_names({**env, BRIDGE_TOOLS_ENV: "nonsense"}) == ()
 
@@ -419,7 +419,7 @@ class TestHolds:
             with bridge_hold(env):
                 assert b.active
                 # A hold takes no dispatch slot: real work still runs.
-                assert call_bridged_tool("todo", env=env) == "todo"
+                assert call_bridged_tool("todo_list", env=env) == "todo_list"
             deadline = time.time() + 5
             while b.active and time.time() < deadline:
                 time.sleep(0.02)
@@ -535,7 +535,7 @@ class TestBindFallback:
         b.start()
         try:
             assert not b.socket_path.startswith(first)
-            assert call_bridged_tool("todo", env=_env(b)) == "ok"
+            assert call_bridged_tool("todo_list", env=_env(b)) == "ok"
         finally:
             b.close()
 
@@ -544,10 +544,10 @@ class TestReNarrowing:
     def test_the_allowed_set_follows_the_agent_driving_the_turn(self, bridge):
         env = _env(bridge)
         assert call_bridged_tool("delegate_task", {"goal": "x"}, env=env)
-        bridge.set_allowed_tools(("todo",))
+        bridge.set_allowed_tools(("todo_list",))
         with pytest.raises(BridgeError, match="not bridged"):
             call_bridged_tool("delegate_task", {"goal": "x"}, env=env)
-        assert call_bridged_tool("todo", env=env) == "todo-ok"
+        assert call_bridged_tool("todo_list", env=env) == "todo_list-ok"
 
 
 class TestActivityStamp:
@@ -563,7 +563,7 @@ class TestActivityStamp:
         b.start()
         try:
             before = b.last_active
-            call_bridged_tool("todo", env=_env(b))
+            call_bridged_tool("todo_list", env=_env(b))
             after = b.last_active
             assert after > before
             # ...and it is the END that was stamped, not the start.
@@ -631,7 +631,7 @@ class TestSlotAccounting:
                     break
                 time.sleep(0.02)
             with pytest.raises(BridgeError, match="too many open connections|refused"):
-                call_bridged_tool("todo", env=_env(b))
+                call_bridged_tool("todo_list", env=_env(b))
         finally:
             parked.close()
             b.close()
@@ -643,7 +643,7 @@ class TestWireGuards:
 
         monkeypatch.setattr(htb, "_MAX_MESSAGE_BYTES", 64)
         with pytest.raises(BridgeError):
-            call_bridged_tool("todo", {"pad": "x" * 4096}, env=_env(bridge))
+            call_bridged_tool("todo_list", {"pad": "x" * 4096}, env=_env(bridge))
 
     def test_a_message_that_is_not_an_object_is_refused(self, bridge):
         import socket as _socket

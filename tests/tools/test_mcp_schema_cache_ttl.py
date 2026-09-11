@@ -64,7 +64,7 @@ class TestTheSDKDefaultIsNotAServerHint:
     def test_a_default_ttl_is_not_recorded(self):
         import mcp.types as mt
 
-        from tools.mcp_tool import mcp_field_was_set
+        from tools.mcp_tool_common import mcp_field_was_set
 
         assert mt.ListToolsResult(tools=[]).ttl_ms == 0, (
             "this test exists because the SDK default is 0; if that changed, "
@@ -75,7 +75,7 @@ class TestTheSDKDefaultIsNotAServerHint:
     def test_a_server_that_really_sends_zero_is_honoured(self):
         import mcp.types as mt
 
-        from tools.mcp_tool import mcp_field_was_set
+        from tools.mcp_tool_common import mcp_field_was_set
 
         sent = mt.ListToolsResult(tools=[], ttl_ms=0)
         assert mcp_field_was_set(sent, "ttl_ms", "ttlMs")
@@ -85,7 +85,7 @@ class TestTheSDKDefaultIsNotAServerHint:
     def test_a_real_ttl_is_still_recorded(self):
         import mcp.types as mt
 
-        from tools.mcp_tool import mcp_field_was_set
+        from tools.mcp_tool_common import mcp_field_was_set
 
         assert mcp_field_was_set(
             mt.ListToolsResult(tools=[], ttl_ms=60_000), "ttl_ms", "ttlMs"
@@ -93,7 +93,7 @@ class TestTheSDKDefaultIsNotAServerHint:
 
     def test_a_non_pydantic_result_falls_back_to_the_old_read(self):
         """mcp 1.x models and test doubles have no model_fields_set."""
-        from tools.mcp_tool import mcp_field_was_set
+        from tools.mcp_tool_common import mcp_field_was_set
 
         class Old:
             ttl_ms = 60_000

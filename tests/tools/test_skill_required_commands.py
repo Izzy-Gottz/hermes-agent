@@ -225,7 +225,7 @@ class TestCronPreflight:
         still refused, because a scheduled run has nobody to ask and would
         spend an LLM call before dying at the shell.
         """
-        from cron import scheduler
+        from cron import scheduler_preflight as scheduler  # preflight moved here in the Sep 2026 upstream split
 
         _write_skill(skills_root, "cronish", [
             "name: cronish",
@@ -242,7 +242,7 @@ class TestCronPreflight:
 
     def test_a_runnable_skill_is_not_refused(self, skills_root):
         """The control: preflight must not have started refusing everything."""
-        from cron import scheduler
+        from cron import scheduler_preflight as scheduler  # preflight moved here in the Sep 2026 upstream split
 
         _write_skill(skills_root, "fine", [
             "name: fine",
