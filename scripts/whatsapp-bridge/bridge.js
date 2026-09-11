@@ -13,18 +13,19 @@
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
- *   GET  /health         - Health check
+ *   GET  /health         - Health check (reports the history store, if one is kept)
+ *   POST /history/download - Fetch one stored message's media { messageId, chatId } → { path }
  *
  * Usage:
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, downloadContentFromMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -33,6 +34,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { addLidMappings, openHistoryStore } from './history_store.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -244,6 +246,68 @@ function buildLidMap() {
 }
 let lidToPhone = buildLidMap();
 
+// --- History: a SQLite mirror of every message this device sees ------
+// Off unless WHATSAPP_HISTORY_DB names a file. The bridge is the ONE linked
+// device for a phone, and Baileys hands it every chat, contact and message;
+// without this it kept only what the gateway's policy admitted, and a
+// reader wanting "what did Dad say last week" had nothing short of a second
+// linked device. Written BEFORE any of that policy runs, so what the
+// gateway is forwarded is unchanged. See history_store.js.
+//
+// WHATSAPP_SYNC_FULL_HISTORY asks the phone for its full history at link
+// time rather than the recent slice it sends by default; either way the
+// chunks land here as they arrive.
+function envFlag(name) {
+  const v = process.env[name];
+  return typeof v === 'string' && ['1', 'true', 'yes', 'on'].includes(v.trim().toLowerCase());
+}
+const HISTORY_DB = String(process.env.WHATSAPP_HISTORY_DB || '').trim();
+const SYNC_FULL_HISTORY = envFlag('WHATSAPP_SYNC_FULL_HISTORY');
+let history = null;
+if (HISTORY_DB) {
+  try {
+    history = openHistoryStore(HISTORY_DB);
+  } catch (err) {
+    // The bot still works without a store; say so rather than dying, and
+    // /health reports history: null so a reader can tell.
+    console.warn('[bridge] history store unavailable:', err?.message || err);
+  }
+}
+function historyRecord(fn) {
+  if (!history) return;
+  try {
+    fn(history);
+  } catch (err) {
+    console.warn('[bridge] history write failed:', err?.message || err);
+  }
+}
+function historyCounts() {
+  if (!history) return null;
+  try {
+    return { path: history.path, ...history.counts() };
+  } catch {
+    return { path: history.path, messages: 0, chats: 0 };
+  }
+}
+// In --pair-only mode the process used to exit two seconds after the
+// connection opened. The phone sends its history in the seconds and
+// minutes AFTER pairing, so with a store to fill the exit waits for the
+// chunks to stop arriving (quiet for 10 s), under a ceiling — what did not
+// arrive in time is delivered to the gateway's long-running bridge next.
+const PAIR_HISTORY_QUIET_MS = parseInt(process.env.WHATSAPP_PAIR_HISTORY_QUIET_MS || '10000', 10);
+const PAIR_HISTORY_CEILING_MS = parseInt(process.env.WHATSAPP_PAIR_HISTORY_CEILING_MS || '180000', 10);
+let pairExitTimer = null;
+let pairExitDeadline = 0;
+function schedulePairExit() {
+  if (!pairExitDeadline) pairExitDeadline = Date.now() + PAIR_HISTORY_CEILING_MS;
+  clearTimeout(pairExitTimer);
+  const wait = Math.max(500, Math.min(PAIR_HISTORY_QUIET_MS, pairExitDeadline - Date.now()));
+  pairExitTimer = setTimeout(() => {
+    emitPairEvent({ event: 'history_done', ...(historyCounts() || {}) });
+    process.exit(0);
+  }, wait);
+}
+
 const logger = pino({ level: 'warn' });
 
 // Message queue for polling
@@ -387,7 +451,7 @@ async function startSocket() {
     logger,
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
+    syncFullHistory: SYNC_FULL_HISTORY,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -399,6 +463,36 @@ async function startSocket() {
   });
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+
+  // The history store. Every handler is a no-op without one, and none of
+  // them decides anything about what the gateway sees.
+  sock.ev.on('messaging-history.set', ({ chats, contacts, messages, lidPnMappings, progress, isLatest, syncType }) => {
+    addLidMappings(lidToPhone, lidPnMappings);
+    historyRecord(h => {
+      h.recordContacts(contacts, { lidToPhone });
+      h.recordChats(chats, { lidToPhone });
+      h.recordMessages(messages, { lidToPhone });
+    });
+    if (history) {
+      emitPairEvent({
+        event: 'history',
+        chunkChats: (chats || []).length,
+        chunkMessages: (messages || []).length,
+        progress: progress ?? null,
+        isLatest: !!isLatest,
+        syncType: syncType ?? null,
+        ...historyCounts(),
+      });
+      if (PAIR_ONLY) schedulePairExit();
+    }
+  });
+  sock.ev.on('lid-mapping.update', (m) => { addLidMappings(lidToPhone, [m]); });
+  sock.ev.on('chats.upsert', (chats) => historyRecord(h => h.recordChats(chats, { lidToPhone })));
+  sock.ev.on('chats.update', (chats) => historyRecord(h => h.recordChats(chats, { lidToPhone })));
+  sock.ev.on('contacts.upsert', (contacts) => historyRecord(h => h.recordContacts(contacts, { lidToPhone })));
+  sock.ev.on('contacts.update', (contacts) => historyRecord(h => h.recordContacts(contacts, { lidToPhone })));
+  sock.ev.on('groups.upsert', (groups) => historyRecord(h => { for (const g of groups || []) h.nameChat(g?.id, g?.subject); }));
+  sock.ev.on('groups.update', (groups) => historyRecord(h => { for (const g of groups || []) h.nameChat(g?.id, g?.subject); }));
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -451,8 +545,13 @@ async function startSocket() {
         if (!PAIR_JSON) {
           console.log('✅ Pairing complete. Credentials saved.');
         }
-        // Give Baileys a moment to flush creds, then exit cleanly
-        setTimeout(() => process.exit(0), 2000);
+        if (history) {
+          // Creds flush in the same window; the history arrives after.
+          schedulePairExit();
+        } else {
+          // Give Baileys a moment to flush creds, then exit cleanly
+          setTimeout(() => process.exit(0), 2000);
+        }
       }
     }
   });
@@ -509,6 +608,11 @@ async function startSocket() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // The store first, whatever the type and before mode, allowlist and
+    // echo decide what the gateway is told: a message the bot must not
+    // answer is still one the person sent or received.
+    historyRecord(h => h.recordMessages(messages, { lidToPhone }));
+
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
@@ -1090,7 +1194,65 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    // null when no store is kept — a reader that finds no `history` key at
+    // all is talking to a bridge that predates the store.
+    history: historyCounts(),
   });
+});
+
+// Fetch one stored message's media. The store keeps what a download needs
+// (url, directPath, mediaKey) and nothing decrypted, so a voice note is
+// fetched when somebody asks to hear it, not for every message that
+// arrives. Written into the same cache directories inbound media uses.
+const HISTORY_EXT = {
+  'audio/ogg': 'ogg', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/aac': 'aac', 'audio/wav': 'wav',
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
+  'video/mp4': 'mp4', 'video/3gpp': '3gp', 'application/pdf': 'pdf',
+};
+const HISTORY_FALLBACK_EXT = { audio: 'ogg', image: 'jpg', video: 'mp4', sticker: 'webp', document: 'bin' };
+app.post('/history/download', async (req, res) => {
+  if (!history) {
+    return res.status(404).json({ error: 'No history store is kept by this bridge' });
+  }
+  const { messageId, chatId } = req.body || {};
+  if (!messageId || !chatId) {
+    return res.status(400).json({ error: 'messageId and chatId are required' });
+  }
+  let ref = null;
+  try {
+    ref = history.mediaRef(messageId, chatId);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+  if (!ref) {
+    return res.status(404).json({ error: 'No media on that message' });
+  }
+  if (!ref.mediaKey || !(ref.url || ref.directPath)) {
+    return res.status(410).json({ error: 'The media reference is incomplete, so it cannot be fetched' });
+  }
+  const kind = HISTORY_FALLBACK_EXT[ref.type] ? ref.type : 'document';
+  try {
+    const stream = await downloadContentFromMessage(
+      { mediaKey: ref.mediaKey, directPath: ref.directPath || undefined, url: ref.url || undefined },
+      kind,
+      {},
+    );
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    const buffer = Buffer.concat(chunks);
+    const dir = kind === 'audio' ? AUDIO_CACHE_DIR
+      : (kind === 'image' || kind === 'sticker') ? IMAGE_CACHE_DIR
+      : DOCUMENT_CACHE_DIR;
+    mkdirSync(dir, { recursive: true });
+    const mime = String(ref.mimetype || '').split(';')[0].trim().toLowerCase();
+    const ext = HISTORY_EXT[mime] || HISTORY_FALLBACK_EXT[kind];
+    const safeId = String(messageId).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
+    const file = path.join(dir, `hist_${safeId}.${ext}`);
+    writeFileSync(file, buffer);
+    res.json({ success: true, path: file, mimetype: ref.mimetype || '', bytes: buffer.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message || String(err) });
+  }
 });
 
 // Start
@@ -1114,6 +1276,9 @@ if (PAIR_ONLY) {
   app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
+    if (history) {
+      console.log(`🗂  History kept in: ${history.path}${SYNC_FULL_HISTORY ? ' (full history requested)' : ''}`);
+    }
     if (ALLOWED_USERS.size > 0) {
       console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
     } else if (WHATSAPP_MODE === 'self-chat') {
