@@ -444,6 +444,73 @@ class TestAgentCannotSetModelPin:
         assert stored["name"] == "renamed"
 
 
+class TestRegisteredHandlerForwardsLightContext:
+    """`light_context` must survive the whole model-facing path: schema →
+    registry adapter → cronjob() → create_job / update_job → list."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_the_schema_offers_it(self):
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+
+        prop = CRONJOB_SCHEMA["parameters"]["properties"]["light_context"]
+        assert prop["type"] == "boolean"
+
+    def test_create_persists_light_context(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "name": "Light canary",
+                    "schedule": "1h",
+                    "light_context": True,
+                    "prompt": "Reply exactly: canary",
+                },
+            )
+        )
+        assert created["success"] is True, created
+        assert get_job(created["job_id"]).get("light_context") is True
+        listing = json.loads(registry.dispatch("cronjob", {"action": "list"}))
+        listed = next(j for j in listing["jobs"] if j["job_id"] == created["job_id"])
+        assert listed.get("light_context") is True
+
+    def test_update_turns_it_on_then_off(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {"action": "create", "name": "plain", "schedule": "1h",
+                 "prompt": "Reply exactly: canary"},
+            )
+        )
+        assert created["success"] is True
+        assert "light_context" not in (get_job(created["job_id"]) or {})
+
+        on = json.loads(registry.dispatch(
+            "cronjob",
+            {"action": "update", "job_id": created["job_id"], "light_context": True},
+        ))
+        assert on["success"] is True, on
+        assert get_job(created["job_id"]).get("light_context") is True
+
+        off = json.loads(registry.dispatch(
+            "cronjob",
+            {"action": "update", "job_id": created["job_id"], "light_context": False},
+        ))
+        assert off["success"] is True, off
+        assert "light_context" not in get_job(created["job_id"])
+
+
 class TestRegisteredHandlerForwardsAttachToSession:
     """#84802 — schema + cronjob() already accept attach_to_session, but the
     registry adapter must forward it or create silently drops the field and

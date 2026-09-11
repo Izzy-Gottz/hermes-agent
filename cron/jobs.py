@@ -1999,6 +1999,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    light_context: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2066,6 +2067,13 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        light_context: When True, the job's agent runs with a light system
+                prompt: MEMORY.md / USER.md are not loaded (skip_memory) and
+                no AGENTS.md / CLAUDE.md context files are injected even when
+                a workdir is set. SOUL.md and the skills index still load.
+                For a job that does one small thing on a clock and must not
+                spend the person's context budget on their whole memory each
+                tick. Absent/False = pre-existing behaviour.
 
     Returns:
         The created job dict
@@ -2215,6 +2223,10 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # And for light_context: only ever stored as True. Absent = the full
+    # context every other job gets.
+    if light_context is True:
+        job["light_context"] = True
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2330,8 +2342,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["reasoning_effort"]
                 )
 
+            # light_context is a plain flag: anything truthy turns it on,
+            # anything else turns it off (the key is dropped below so an
+            # off job looks like one that never had it).
+            if "light_context" in updates:
+                updates["light_context"] = bool(updates["light_context"])
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if "light_context" in updated and not updated["light_context"]:
+                updated.pop("light_context", None)
 
             if (
                 is_terminal_job(job)

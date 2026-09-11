@@ -6412,6 +6412,7 @@ def run_job(
         except Exception as e:
             logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
+        _light_context = bool(job.get("light_context"))
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -6438,13 +6439,17 @@ def run_job(
             # HERMES_HOME. When a workdir is configured, also inject project
             # context files (AGENTS.md / CLAUDE.md / .cursorrules) from there.
             # Without a workdir, keep cwd context discovery disabled.
-            skip_context_files=not bool(_job_workdir),
+            # A `light_context` job skips them either way: it does one small
+            # thing on a clock and must not spend its budget on a repo's
+            # instructions.
+            skip_context_files=(not bool(_job_workdir)) or _light_context,
             load_soul_identity=True,
             # Memory is enabled for cron agents like any other agent run:
             # MEMORY.md / USER.md load into the system prompt and the memory
             # tool follows normal toolset resolution, so jobs benefit from
-            # (and can update) the user's persistent memory.
-            skip_memory=False,
+            # (and can update) the user's persistent memory. A `light_context`
+            # job opts out — SOUL and the skills index still load.
+            skip_memory=_light_context,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,
