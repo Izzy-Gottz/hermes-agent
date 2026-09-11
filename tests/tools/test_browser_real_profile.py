@@ -132,6 +132,38 @@ class TestSnapshotRealProfile:
         assert not (home / "browser-profile" / "chrome" / "Crashpad").exists()
         assert not (home / "browser-profile" / "chrome" / "SingletonLock").exists()
 
+    def test_auth_db_held_exclusively_by_a_running_browser_still_copies(self, tmp_path):
+        """A desktop Chrome keeps Login Data / Web Data open in EXCLUSIVE locking mode. The
+        locking read (mode=ro) can never get in; the copy must fall back to an immutable read
+        instead of running the five-second deadline out and failing the whole snapshot closed."""
+        import sqlite3
+        import time
+        import hermes_cli.browser_connect as bc
+        src = tmp_path / "Login Data"
+        with sqlite3.connect(src) as seed:
+            seed.execute("CREATE TABLE logins (origin_url TEXT)")
+            seed.execute("INSERT INTO logins VALUES ('https://example.com')")
+        holder = sqlite3.connect(src, isolation_level=None)
+        holder.execute("PRAGMA locking_mode=EXCLUSIVE")
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute("INSERT INTO logins VALUES ('https://bank.example')")  # takes the write lock for good
+        try:
+            dst = tmp_path / "copy" / "Default" / "Login Data"
+            started = time.monotonic()
+            assert bc._copy_auth_file(str(src), str(dst)) is True
+            assert time.monotonic() - started < 4.0, "fell back before the five-second deadline"
+            with sqlite3.connect(dst) as got:
+                rows = {r[0] for r in got.execute("SELECT origin_url FROM logins")}
+            assert "https://example.com" in rows  # committed state came across
+        finally:
+            holder.close()
+
+    def test_auth_db_copy_failure_that_is_not_a_lock_still_fails(self, tmp_path):
+        import hermes_cli.browser_connect as bc
+        src = tmp_path / "Web Data"
+        src.write_text("not a database")
+        assert bc._copy_auth_file(str(src), str(tmp_path / "copy" / "Web Data")) is False
+
     def test_existing_snapshot_refreshes_auth_files_only(self, tmp_path, monkeypatch):
         import hermes_cli.browser_connect as bc
         src = self._make_profile(tmp_path / "real")
@@ -1093,12 +1125,17 @@ class TestWindowsLockedProfileCopy:
                  str(src), str(dst)],
                 capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
             assert result.returncode == 0, result.stderr
-            assert result.stdout.strip() == "False"
+            # A locked SOURCE is the running browser holding its own database (Chrome keeps
+            # Login Data / Web Data in exclusive locking mode for as long as it runs): the copy
+            # falls back to an immutable read and succeeds. A locked DESTINATION is a copy-browser
+            # still using the snapshot: never overwritten, and the call says so.
+            assert result.stdout.strip() == ("True" if locked == "source" else "False")
         finally:
             holder.rollback()
             holder.close()
         with sqlite3.connect(dst) as conn:
-            assert conn.execute("select x from cookies").fetchall() == [(99,)]
+            expected = [(7,)] if locked == "source" else [(99,)]
+            assert conn.execute("select x from cookies").fetchall() == expected
         conn.close()
         assert bc._copy_auth_file(str(src), str(dst)) is True
         with sqlite3.connect(dst) as conn:
