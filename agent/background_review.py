@@ -294,6 +294,42 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
     return [{"role": "user", "content": digest}] + keep
 
 
+#: Cap for the transcript a fork carries inside its own message (chars). The
+#: tail is what a review needs, and the renderer is newest-biased.
+_INLINE_TRANSCRIPT_CHARS = 60_000
+
+
+def fork_conversation_context(
+    fork_agent: Any, messages_snapshot: List[Dict], routed: bool,
+) -> Tuple[str, List[Dict]]:
+    """How a parity fork is shown the conversation: ``(prompt_prefix, history)``.
+
+    On the ordinary runtimes the fork is handed the messages and Hermes sends
+    them, so the prefix is empty. On ``claude_code`` the child owns the
+    context and ``messages`` is never sent — the fork used to see the
+    conversation only because it resumed the conversation's own CLI
+    transcript, which is exactly the sharing that put a background review in
+    front of the person's next message. A laned fork has its own transcript,
+    so the conversation travels where it can actually be read: inside the
+    fork's message. Without this the review would still run, still cost a
+    process, and have nothing to review — a failure no test of "did it spawn"
+    can see.
+    """
+    history = _digest_history(messages_snapshot) if routed else list(messages_snapshot or [])
+    if str(getattr(fork_agent, "api_mode", "") or "") != "claude_code":
+        return "", history
+    from agent.side_question import render_history_for_side_question
+
+    rendered = render_history_for_side_question(
+        messages_snapshot, char_budget=_INLINE_TRANSCRIPT_CHARS
+    )
+    if not rendered or rendered == "(no prior conversation)":
+        return "", []
+    return (
+        "# The conversation so far\n\n" + rendered + "\n\n# What to do with it\n\n"
+    ), []
+
+
 # Review prompts. AIAgent exposes them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) so
 # per-agent overrides work; the text lives here.
 _MEMORY_REVIEW_PROMPT = (
@@ -893,6 +929,12 @@ def build_cache_parity_fork(
     review_agent._end_session_on_close = False
     review_agent._session_db = None
     review_agent.session_id = agent.session_id
+    # The session id is shared for cache warmth (below). On the claude_code
+    # runtime that id is ALSO the name of a warm process and its turn lock, so
+    # the fork announces which lane it is: its own child, its own transcript,
+    # and the person's next message never waits behind a review. Harmless on
+    # every other runtime, which never reads it.
+    review_agent._claude_code_lane = write_origin
     # Same model only: share the warm cached system prompt (~26% cost cut; a rebuilt prompt misses
     # the byte-exact prefix key) and pin session_start so any re-render (compression, plugin
     # hooks) stays byte-identical.
@@ -1008,9 +1050,17 @@ class _ReviewForkState:
 
 def _release_fork_clients(review_agent: Any) -> None:
     """The fork shares the foreground session ID: close() / shutdown_memory_provider() are
-    session-bound (close() kills that session's terminal processes), so release only clients."""
+    session-bound (close() kills that session's terminal processes), so release only clients.
+
+    Its claude_code LANE is its own, though, and a warm child kept for a review that has
+    finished is ~370 MB held against ``max_sessions`` for nothing. ``release_lane_session``
+    refuses to touch an agent with no lane, so the conversation's process is safe here."""
     with suppress(Exception):
         review_agent.release_clients()
+    with suppress(Exception):
+        from agent.claude_code_runtime import release_lane_session
+
+        release_lane_session(review_agent)
 
 
 def _run_review_fork(
@@ -1052,13 +1102,15 @@ def _run_review_fork(
     try:
         if review_run is None or review_run.begin_request(st.review_agent):
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
+            # claude_code -> the transcript rides in the message (see fork_conversation_context).
+            _prefix, _history = fork_conversation_context(st.review_agent, messages_snapshot, _routed)
             st.review_agent.run_conversation(
                 user_message=(
-                    prompt + "\n\nYou can only call " + memory_phrase_prompt +
+                    _prefix + prompt + "\n\nYou can only call " + memory_phrase_prompt +
                     "management tools. Other tools will be denied "
                     "at runtime — do not attempt them." + prompt_extra
                 ),
-                conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
+                conversation_history=_history,
             )
     finally:
         clear_thread_tool_whitelist()
