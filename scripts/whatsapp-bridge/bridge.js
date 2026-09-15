@@ -41,6 +41,7 @@ import {
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  clearAuthState,
   extractBridgeEvent,
   getMessageContent,
   inboundReadReceiptKeys,
@@ -421,9 +422,14 @@ async function startSocket() {
       connectionState = 'disconnected';
 
       if (reason === DisconnectReason.loggedOut) {
-        emitPairEvent({ event: 'error', error: 'logged_out', reason });
+        // The phone unlinked this device: every credential in SESSION_DIR is
+        // revoked. Throw them away before exiting, or the gateway's preflight
+        // still sees creds.json, still calls this paired, and restarts the
+        // bridge into the same 401 for as long as the person leaves it on.
+        const cleared = clearAuthState(SESSION_DIR);
+        emitPairEvent({ event: 'error', error: 'logged_out', reason, cleared: cleared.length });
         if (!PAIR_JSON) {
-          console.log('❌ Logged out. Delete session and restart to re-authenticate.');
+          console.log(`❌ Logged out by the phone. Cleared ${cleared.length} credential file(s) from ${SESSION_DIR}; pair again to reconnect.`);
         }
         process.exit(1);
       } else {
