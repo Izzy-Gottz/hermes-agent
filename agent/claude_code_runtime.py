@@ -459,6 +459,34 @@ def _prewarm_spares_from_config() -> int:
     return max(0, value)
 
 
+def _prewarm_session_keys_from_config() -> Optional[frozenset]:
+    """``claude_code.prewarm_session_keys``: the gateway session keys
+    (``X-Hermes-Session-Key``) whose conversations may mint a spare. Unset or
+    empty means every conversation may, which is the behaviour before it.
+
+    A spare's warm-up is a real model turn — measured on a Claude plan, about
+    38k tokens written to the prompt cache each — and a host that opens many
+    short-lived session keys (a meeting's action scan, a capability probe, a
+    dictation rewrite) mints spares in their image that nobody comes for:
+    72 minted, 5 taken, on one Mac over four days. A host names the one
+    conversation worth keeping a process warm for."""
+    raw = _claude_code_config().get("prewarm_session_keys")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return None
+    keys = frozenset(str(k).strip() for k in raw if str(k).strip())
+    return keys or None
+
+
+def _may_mint_for(agent) -> bool:
+    """Whether ``agent``'s conversation is one ``prewarm_session_keys`` names."""
+    allowed = _prewarm_session_keys_from_config()
+    if allowed is None:
+        return True
+    return str(getattr(agent, "_gateway_session_key", "") or "").strip() in allowed
+
+
 def _is_subagent(agent) -> bool:
     """A delegated child: its own session, its own narrowed prompt, gone in
     a minute. It neither mints a spare nor takes one meant for a
@@ -569,7 +597,7 @@ def refill_spare(agent) -> None:
     oldest spare is closed to make room — a profile that has not been asked
     for since before the others is the one least likely to be asked for next.
     """
-    if not _spare_enabled() or _is_subagent(agent):
+    if not _spare_enabled() or _is_subagent(agent) or not _may_mint_for(agent):
         return
     limit = _prewarm_spares_from_config()
     if limit <= 0:

@@ -868,6 +868,38 @@ class TestPreWarmedSpare:
         assert rt.take_spare(child) is None
         assert self._pool_keys() == [rt._spare_key(parent)]
 
+    def test_only_the_named_session_keys_mint_a_spare(self, monkeypatch):
+        """``prewarm_session_keys`` names the conversations worth a warm
+        process. Every other session key — a meeting's scan, a probe — mints
+        nothing, because each spare's warm-up is a real model turn nobody
+        may come for (72 minted, 5 taken, measured on one Mac)."""
+        cfg = rt._claude_code_config()
+        monkeypatch.setattr(rt, "_claude_code_config",
+                            lambda: {**cfg, "prewarm_session_keys": ["moe"]})
+        scan = _agent("meeting-scan", ephemeral="SCAN-PROMPT")
+        scan._gateway_session_key = "moe-meeting-scan"
+        _turn(scan)
+        rt.refill_spare(scan)
+        unkeyed = _agent("no-key", ephemeral="OTHER-PROMPT")
+        _turn(unkeyed)
+        rt.refill_spare(unkeyed)
+        assert self._wait_until_idle()
+        time.sleep(0.3)
+        assert self._pool_keys() == [], "a session key nobody named minted a spare"
+
+        chat = _agent("conv-1")
+        chat._gateway_session_key = "moe"
+        _turn(chat)
+        assert self._wait_for_spare(chat) is not None
+        assert self._pool_keys() == [rt._spare_key(chat)]
+
+    def test_no_session_key_list_means_every_conversation_mints(self, monkeypatch):
+        cfg = rt._claude_code_config()
+        for unset in (None, [], ""):
+            monkeypatch.setattr(rt, "_claude_code_config",
+                                lambda unset=unset: {**cfg, "prewarm_session_keys": unset})
+            assert rt._may_mint_for(_agent("any"))
+
     def test_each_stale_spare_is_reaped_on_its_own(self):
         one = _agent("conv-1", ephemeral="PROMPT-ONE")
         two = _agent("conv-2", ephemeral="PROMPT-TWO")
