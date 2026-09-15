@@ -508,10 +508,57 @@ def _profile_label(key: tuple) -> str:
         return "?"
 
 
+def _has_transcript(agent) -> bool:
+    """Whether ``agent``'s conversation already has a CLI transcript to resume.
+
+    Resolved exactly the way :class:`ClaudeCodeSession` resolves it — the id
+    map wins over the deterministic ``uuid5``, because a session whose resume
+    was once rejected has been rotated onto a fresh id and the map is the only
+    record of it. Asking the wrong id would report "no history" for precisely
+    the conversations that have the most.
+    """
+    from agent.transports.claude_code_session import (
+        claude_code_home,
+        load_session_map,
+        resume_transcript_exists,
+    )
+
+    hermes_sid = str(getattr(agent, "session_id", "") or "").strip()
+    if not hermes_sid:
+        return False
+    config_dir = claude_code_home()
+    try:
+        mapped = load_session_map(config_dir).get(hermes_sid)
+    except Exception:
+        logger.debug("claude-code: session map unreadable", exc_info=True)
+        mapped = None
+    try:
+        return resume_transcript_exists(config_dir, mapped or _claude_session_id_for(agent))
+    except Exception:
+        logger.debug("claude-code: transcript lookup failed", exc_info=True)
+        return False
+
+
 def take_spare(agent) -> Optional[Any]:
     """A warm session for ``agent``'s profile, or ``None`` to build one the
     usual way. Spares belonging to other profiles are never touched."""
     if not _spare_enabled() or _is_subagent(agent):
+        return None
+    # A spare spawns on a CLI session id nobody has a transcript for, and
+    # ``claim`` writes that id into the session map under this conversation's
+    # key — where it wins over the deterministic id on every later start. Give
+    # one to a conversation that already has history and the history is
+    # orphaned: the resume finds the spare's near-empty transcript instead,
+    # permanently, because the map entry outlives the process. Conversations
+    # leave the registry routinely (``max_sessions`` evicts the least recent, a
+    # restart drops all of them) and come back through this very branch, so
+    # this is the ordinary path, not a corner. The spare is not wasted — it
+    # stays warm for a conversation that has nothing to lose.
+    if bool(_claude_code_config().get("resume", True)) and _has_transcript(agent):
+        logger.info(
+            "claude-code: this conversation has a transcript to resume; "
+            "building it a session of its own and leaving the spare warm"
+        )
         return None
     wanted_prompt = combined_system_prompt(agent)
     key = _spare_key(agent, wanted_prompt)
