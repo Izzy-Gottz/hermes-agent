@@ -841,6 +841,50 @@ class TestPreWarmedSpare:
             "the spare was spawned with --resume on somebody's transcript"
         )
 
+    def test_a_conversation_that_has_a_transcript_is_never_handed_a_spare(self):
+        """A spare carries a CLI session id nobody has a transcript for, and
+        ``claim`` writes that id into the session map under the conversation's
+        key — where it WINS over the deterministic id on every later start
+        (``claude_code_session.py``: ``mapped or session_id or uuid4()``).
+
+        So a conversation that already has history must not be given one. It
+        leaves the registry all the time — ``max_sessions`` is 4 and the fifth
+        conversation evicts the least recent, and a gateway restart drops all
+        of them — and the next turn it takes is a fresh registry entry, which
+        is exactly the branch that takes a spare. Claiming one there points
+        the conversation at the spare's near-empty transcript and orphans
+        everything said before: the resume finds the wrong file, permanently,
+        because the map entry persists.
+
+        The spare is not wasted — it stays warm for whoever has no history.
+        """
+        first = _agent("conv-1")
+        _turn(first)
+        own = first._claude_code_session
+        own_id = own.requested_session_id
+        config_dir = own.config_dir
+        assert self._wait_for_spare(first) is not None
+
+        # The conversation has history on disk (the fake CLI writes none).
+        transcript_dir = Path(config_dir) / "projects" / "some-cwd-slug"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        (transcript_dir / f"{own_id}.jsonl").write_text("{}\n")
+
+        # ...and it falls out of the registry: an LRU eviction, or a restart.
+        for key in list(rt._REGISTRY):
+            rt.evict_session(key)
+
+        again = _agent("conv-1")          # the same conversation comes back
+        _turn(again)
+        assert again._claude_code_session.requested_session_id == own_id, (
+            "the returning conversation was handed a spare; its CLI session "
+            "id is now the spare's and its transcript is orphaned"
+        )
+        from agent.transports.claude_code_session import load_session_map
+        assert load_session_map(config_dir).get("conv-1") in (None, own_id), (
+            "the session map was repointed at the spare's transcript"
+        )
+
     def test_a_subagent_never_mints_a_spare(self):
         """Every delegation is its own short-lived session with its own
         narrowed prompt; a spare in its image would only displace one a
