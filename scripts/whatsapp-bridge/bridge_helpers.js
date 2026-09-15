@@ -1,5 +1,5 @@
 import path from 'path';
-import { mkdirSync, writeFileSync } from 'fs';
+import { mkdirSync, writeFileSync, readdirSync, unlinkSync } from 'fs';
 import { randomBytes } from 'crypto';
 
 export const MIME_MAP = {
@@ -662,4 +662,57 @@ export function resolveDeviceName(env = process.env) {
 
 export function browserDescription(env = process.env) {
   return [resolveDeviceName(env), 'Chrome', '120.0'];
+}
+
+/**
+ * Throw away the Baileys auth state after the phone has unlinked this device.
+ *
+ * `--session` is handed straight to `useMultiFileAuthState`, so the directory
+ * IS the auth folder: `creds.json` plus one file per key (`pre-key-*`,
+ * `session-*`, `app-state-sync-key-*`, `sender-key-*`, `lid-mapping-*`).
+ * After a 401 every one of them is dead — WhatsApp revoked the link, and no
+ * amount of reconnecting brings it back.
+ *
+ * Leaving them behind is what turns one logout into a loop. The gateway's
+ * preflight (`plugins/platforms/whatsapp/adapter.py`) decides "is this paired?"
+ * by asking whether `creds.json` exists, so a revoked session still reads as
+ * paired: the bridge starts, is logged out again, exits 1, and the adapter
+ * reports `whatsapp_bridge_exited` with `retryable=True` and starts it again.
+ * The person is shown "bridge process exited unexpectedly (code 1)", which
+ * names neither the cause nor the cure, and the only way out is deleting
+ * files by hand. Clearing the state makes the next preflight say the true
+ * thing instead — "enabled but not paired" — which is the message that tells
+ * them to pair again.
+ *
+ * Deletes by extension rather than by a list of key prefixes: Baileys names
+ * key files after its own key types, and a version that adds one would walk
+ * straight past a list. Anything that is not a `.json` is left alone, and so
+ * is every sibling of the session directory — notably the message store,
+ * which lives at `whatsapp/store/`, not inside `whatsapp/session/`.
+ *
+ * Returns the names removed, for the caller's log line. Never throws: this
+ * runs on the way out of a process that is exiting anyway, and a failure to
+ * tidy up must not replace the logout message with a stack trace.
+ */
+export function clearAuthState(sessionDir, fsImpl) {
+  const fs = fsImpl || { readdirSync, unlinkSync };
+  const removed = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(sessionDir);
+  } catch {
+    return removed;
+  }
+  for (const name of entries) {
+    if (!name.endsWith('.json')) continue;
+    try {
+      fs.unlinkSync(path.join(sessionDir, name));
+      removed.push(name);
+    } catch {
+      // Already gone, or not ours to delete. Keep going: a partial clear
+      // still removes creds.json in the common case, which is what the
+      // preflight reads.
+    }
+  }
+  return removed;
 }
