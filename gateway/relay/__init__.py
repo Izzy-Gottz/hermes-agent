@@ -19,7 +19,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger("gateway.relay")
 
@@ -672,6 +672,28 @@ def send_relay_policy() -> bool:
                 status,
             )
     return any_declared
+
+
+# ── link_request handler (Moe slice E3) ──────────────────────────────────────
+#
+# The connector may ask a gateway to become a second device of the person's
+# own Telegram or WhatsApp. The transport that receives the frame is built in
+# `register_relay_adapter` before any plugin has loaded, so the handler is
+# registered HERE, at module level, and the transport looks it up when a frame
+# arrives. One handler per process: it is the machine answering for itself.
+
+_LINK_HANDLER: Any = None
+
+
+def set_link_handler(handler: Any) -> None:
+    """Register ``handler(link, body) -> dict`` for ``link_request`` frames.
+    See ``WebSocketRelayTransport.set_link_handler`` for the contract."""
+    global _LINK_HANDLER
+    _LINK_HANDLER = handler
+
+
+def link_handler() -> Any:
+    return _LINK_HANDLER
 
 
 def register_relay_adapter(force: bool = False, url: Optional[str] = None) -> bool:
