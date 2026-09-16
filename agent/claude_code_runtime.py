@@ -147,7 +147,21 @@ _RESPAWN_WARN_WINDOW = 60.0
 _STALE_TEMP_AGE_SECONDS = 24 * 3600
 #: How long a second request for the same session waits for the in-flight
 #: turn before giving up with a clear error.
+#:
+#: A *person's* message waits far longer than this (``_turn_lock_wait_for``):
+#: on 2026-09-15 two messages typed while a turn ran came back to the owner's
+#: screen as "another turn is still running for session 1e495ecf-d44; try
+#: again" — an internal string, in the chat, as though it were Moe's reply.
+#: 15 s is the right bound for an auxiliary caller that can come back later
+#: and the wrong one for someone who has just spoken: they would rather queue
+#: behind the turn ahead of them than be told to try again.
 _TURN_LOCK_WAIT_SECONDS = 15.0
+#: How long a PERSON's turn waits for the one ahead of it
+#: (``claude_code.turn_lock_wait`` overrides). Two minutes covers an ordinary
+#: turn, so a second message is simply answered when the first finishes — and
+#: it is still a bound, because silently waiting out a 30-minute research turn
+#: is its own kind of broken. Past it the person gets a sentence.
+_LIVE_TURN_LOCK_WAIT_SECONDS = 120.0
 
 
 @dataclass
@@ -168,8 +182,50 @@ _SWEEPER_STARTED = False
 
 
 def _registry_key(agent) -> Optional[str]:
+    """The warm process this agent's turn runs in.
+
+    The Hermes session id, plus a *lane* for an agent that borrows that id
+    without being the conversation. ``build_cache_parity_fork`` gives the
+    background memory/skill review (and ``/btw``, and ``/refine``) the
+    parent's ``session_id`` on purpose — it buys a byte-exact prompt-cache
+    prefix — but on this runtime the session id is also the name of a
+    *process*, and sharing it made the review take the conversation's warm
+    ``claude`` and its turn lock. Measured on the owner's Mac, 2026-09-15:
+    the review started 70 ms after the reply, respawned the conversation's
+    child (its system prompt differs), and the two messages the owner typed
+    in the next 74 s were both refused with "another turn is still running
+    for session 1e495ecf-d44; try again" — which is what the owner read on
+    the island, verbatim. A lane gives the fork its own process, so a background
+    agent can never stand between a person and their assistant, and the
+    conversation keeps the warm child it had.
+    """
     sid = str(getattr(agent, "session_id", "") or "").strip()
-    return sid or None
+    if not sid:
+        return None
+    lane = str(getattr(agent, "_claude_code_lane", "") or "").strip()
+    return f"{sid}#{lane}" if lane else sid
+
+
+def _is_live_turn(agent) -> bool:
+    """False for an agent in a lane — every lane is a background caller."""
+    return not str(getattr(agent, "_claude_code_lane", "") or "").strip()
+
+
+def _turn_lock_wait_for(agent) -> float:
+    """Seconds to wait for the session's turn lock.
+
+    A background caller gets ``_TURN_LOCK_WAIT_SECONDS`` and is expected to
+    come back. A person's turn waits for the running turn to finish, because
+    "wait your place in the queue" is what someone who just spoke expects and
+    an error string is not.
+    """
+    if not _is_live_turn(agent):
+        return _TURN_LOCK_WAIT_SECONDS
+    try:
+        configured = float(_claude_code_config().get("turn_lock_wait") or 0.0)
+    except (TypeError, ValueError):
+        configured = 0.0
+    return configured if configured > 0 else _LIVE_TURN_LOCK_WAIT_SECONDS
 
 
 def _start_sweeper_locked() -> None:
@@ -243,6 +299,46 @@ def sweep_idle_sessions(idle_seconds: float, *, now: Optional[float] = None) -> 
         except Exception:
             pass
     return len(victims)
+
+
+def release_lane_session(agent) -> bool:
+    """Close the process a LANED agent ran in; no-op for the conversation.
+
+    A background fork's ``claude`` is a second ~370 MB child. It has nothing
+    to be warm for — the next review forks again — and left in the registry it
+    counts against ``max_sessions`` and can evict a live conversation. The
+    guard is what makes this safe to call from a fork's teardown: an agent
+    with no lane IS the conversation, and closing that is the bug this whole
+    change exists to prevent. Returns whether a session was closed.
+    """
+    if _is_live_turn(agent):
+        return False
+    key = _registry_key(agent)
+    if not key:
+        return False
+    with _REGISTRY_LOCK:
+        entry = _REGISTRY.get(key)
+    if entry is None:
+        return False
+    # Never close a process mid-turn: another thread in this lane may still be
+    # inside ``run_turn``. The idle sweeper collects what we leave behind.
+    if not entry.turn_lock.acquire(blocking=False):
+        return False
+    try:
+        with _REGISTRY_LOCK:
+            if _REGISTRY.get(key) is not entry:
+                return False
+            _REGISTRY.pop(key, None)
+    finally:
+        entry.turn_lock.release()
+    logger.info("claude-code: closing the %s lane's session (pid %s)",
+                key.split("#", 1)[-1], getattr(entry.session, "pid", None))
+    try:
+        if entry.session is not None:
+            entry.session.close()
+    except Exception:
+        logger.debug("claude-code: lane session close failed", exc_info=True)
+    return True
 
 
 def evict_session(key: Optional[str]) -> None:
@@ -551,12 +647,15 @@ def _has_transcript(agent) -> bool:
         resume_transcript_exists,
     )
 
-    hermes_sid = str(getattr(agent, "session_id", "") or "").strip()
-    if not hermes_sid:
+    # The registry key, not the bare session id: a lane has a transcript of
+    # its own, and asking under the conversation's key would answer for the
+    # conversation — "yes, there is history" — about a process that has none.
+    key = _registry_key(agent)
+    if not key:
         return False
     config_dir = claude_code_home()
     try:
-        mapped = load_session_map(config_dir).get(hermes_sid)
+        mapped = load_session_map(config_dir).get(key)
     except Exception:
         logger.debug("claude-code: session map unreadable", exc_info=True)
         mapped = None
@@ -829,11 +928,11 @@ def _acquire_entry(agent) -> tuple[_RegistryEntry, bool]:
             entry.ready.set()
             raise
         entry.ready.set()
-    elif not entry.ready.wait(timeout=_TURN_LOCK_WAIT_SECONDS) or entry.session is None:
+    elif not entry.ready.wait(timeout=_turn_lock_wait_for(agent)) or entry.session is None:
         raise TurnInFlightError(
             f"session {key[:12]} is still being set up by another request; try again"
         )
-    if not entry.turn_lock.acquire(timeout=_TURN_LOCK_WAIT_SECONDS):
+    if not entry.turn_lock.acquire(timeout=_turn_lock_wait_for(agent)):
         raise TurnInFlightError(
             f"another turn is still running for session {key[:12]}; try again"
         )
@@ -882,6 +981,9 @@ def _claude_code_config() -> Dict[str, Any]:
           extra_args: []            # appended verbatim to the claude command line
           resume: true              # --resume the CLI transcript of a resumed Hermes session
           turn_timeout: 600         # whole-turn bound (seconds)
+          turn_lock_wait: 120       # how long a PERSON's turn waits for the
+                                    # turn ahead of it before being answered
+                                    # in words; background callers get 15 s
           silence_timeout: 300      # max silence between two CLI events inside a turn
           idle_timeout: 600         # evict a warm `claude` process idle this long (registry)
           max_sessions: 8           # warm processes kept at once (LRU eviction beyond this)
@@ -1087,10 +1189,18 @@ _CLAUDE_SESSION_NAMESPACE = uuid.UUID("6f1c0d2e-7b3a-4c8e-9a5d-2f4b8c1e7d90")
 
 
 def _claude_session_id_for(agent) -> str:
-    hermes_sid = str(getattr(agent, "session_id", "") or "").strip()
-    if not hermes_sid:
+    """The CLI transcript this agent's process owns.
+
+    Derived from the REGISTRY KEY, not the bare Hermes session id, so a lane
+    gets a transcript of its own. Two ``claude`` processes resuming one
+    transcript is what a laned fork would otherwise do — it is the same file,
+    written by both — and it is also how the review used to append its harness
+    turn to the person's conversation.
+    """
+    key = _registry_key(agent)
+    if not key:
         return str(uuid.uuid4())
-    return str(uuid.uuid5(_CLAUDE_SESSION_NAMESPACE, f"hermes:{hermes_sid}"))
+    return str(uuid.uuid5(_CLAUDE_SESSION_NAMESPACE, f"hermes:{key}"))
 
 
 def bridged_tools_for(agent) -> tuple:
@@ -1217,7 +1327,7 @@ def _build_session(agent, *, session_key: Optional[str] = _UNSET):
     # contexts have none -> gated tools are denied with a message.
     approval_callback = _approval_callback()
     if session_key is _UNSET:
-        hermes_sid = str(getattr(agent, "session_id", "") or "").strip() or None
+        hermes_sid = _registry_key(agent)
         cli_session_id = _claude_session_id_for(agent)
     else:
         # A spare belongs to no conversation yet, so it must spawn with a CLI
@@ -1285,8 +1395,16 @@ def run_claude_code_turn(
     try:
         entry, created = _acquire_entry(agent)
     except TurnInFlightError as exc:
+        # ``final_response`` is what a client SHOWS. "another turn is still
+        # running for session 1e495ecf-d44; try again" went onto the owner's
+        # screen as Moe's reply on 2026-09-15; a person gets a sentence, and
+        # the id stays in ``error`` for the log and for a client that matches
+        # on it.
+        logger.info("claude-code: %s", exc)
         return {
-            "final_response": str(exc),
+            "final_response": (
+                "I was still finishing the last thing — say that again in a moment."
+            ),
             "messages": messages,
             "api_calls": 0,
             "completed": False,

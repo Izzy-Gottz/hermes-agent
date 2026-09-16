@@ -106,7 +106,8 @@ def _answer_via_fork(parent_agent: Any, question: str, history: Optional[List[Di
     stays byte-identical for cache parity, but the side question can never mutate anything.
     """
     from agent.background_review import (
-        _digest_history, _record_review_usage_to_parent, _snapshot_review_usage, build_cache_parity_fork,
+        _record_review_usage_to_parent, _snapshot_review_usage, build_cache_parity_fork,
+        fork_conversation_context,
     )
     from hermes_cli.plugins import clear_thread_tool_whitelist, set_thread_tool_whitelist
 
@@ -117,8 +118,13 @@ def _answer_via_fork(parent_agent: Any, question: str, history: Optional[List[Di
             "Side question (/btw) denied tool call: {tool_name}. "
             "Tools are disabled here — answer directly from the conversation context."))
         snapshot = trim_snapshot_for_fork(history)
-        result = fork.run_conversation(user_message=f"{_FORK_PROMPT}\n\nSide question: {question}",
-                                       conversation_history=_digest_history(snapshot) if routed else snapshot)
+        # On claude_code the fork runs in its own lane, so the conversation
+        # travels inside the message instead of in a transcript it no longer
+        # shares (agent/background_review.fork_conversation_context).
+        prefix, fork_history = fork_conversation_context(fork, snapshot, routed)
+        result = fork.run_conversation(
+            user_message=f"{prefix}{_FORK_PROMPT}\n\nSide question: {question}",
+            conversation_history=fork_history)
         answer = (result or {}).get("final_response", "") or ""
         if not answer and result and result.get("error"):
             raise RuntimeError(str(result["error"]))

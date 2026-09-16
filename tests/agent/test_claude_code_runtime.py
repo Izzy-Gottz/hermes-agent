@@ -171,6 +171,104 @@ class TestRegistry:
         assert "".join(seen2) == "echo: second"
 
 
+class TestBackgroundLanes:
+    """A background agent must never stand between a person and their assistant.
+
+    On 2026-09-15 the owner's Moe answered, its post-turn skill review forked
+    under the SAME Hermes session id, and the two messages typed in the next
+    74 seconds each came back as "another turn is still running for session
+    1e495ecf-d44; try again" — the internal string, in the chat window. These
+    tests hold the review's lock the way a running review does and require the
+    person to be answered anyway.
+    """
+
+    @staticmethod
+    def _laned(session_id: str, lane: str = "background_review"):
+        agent = _agent(session_id)
+        agent._claude_code_lane = lane
+        return agent
+
+    def test_a_review_fork_gets_its_own_process(self):
+        person = _agent("live")
+        _turn(person)
+        review = self._laned("live")
+        _turn(review)
+        assert review._claude_code_session is not person._claude_code_session
+        assert review._claude_code_session.pid != person._claude_code_session.pid
+        assert rt.registered_session_count() == 2
+        with rt._REGISTRY_LOCK:
+            assert set(rt._REGISTRY) == {"live", "live#background_review"}
+
+    def test_a_review_fork_writes_its_own_transcript(self):
+        """One CLI transcript, two processes, is the same sharing by another
+        name — and it is how the review's harness turn used to land in the
+        person's conversation."""
+        person = _agent("live")
+        review = self._laned("live")
+        assert rt._claude_session_id_for(review) != rt._claude_session_id_for(person)
+
+    def test_the_person_is_answered_while_a_review_is_running(self):
+        person = _agent("live")
+        _turn(person)
+        review = self._laned("live")
+        _turn(review)
+        lane_entry = rt._REGISTRY[rt._registry_key(review)]
+        assert lane_entry.turn_lock.acquire(timeout=5)  # a review, still going
+        try:
+            started = time.monotonic()
+            answer = _turn(_agent("live"), "you there?")
+            assert answer["completed"] is True, answer
+            assert time.monotonic() - started < 10  # not the 15 s refusal
+        finally:
+            lane_entry.turn_lock.release()
+
+    def test_a_person_waits_for_the_turn_ahead_of_them_a_background_caller_does_not(self, monkeypatch):
+        assert rt._turn_lock_wait_for(_agent("live")) == rt._LIVE_TURN_LOCK_WAIT_SECONDS
+        assert rt._turn_lock_wait_for(self._laned("live")) == rt._TURN_LOCK_WAIT_SECONDS
+        cfg = rt._claude_code_config()
+        monkeypatch.setattr(rt, "_claude_code_config", lambda: {**cfg, "turn_lock_wait": 900.0})
+        assert rt._turn_lock_wait_for(_agent("live")) == 900.0
+        assert rt._turn_lock_wait_for(self._laned("live")) == rt._TURN_LOCK_WAIT_SECONDS
+
+    def test_a_contended_turn_is_refused_in_words_not_in_identifiers(self, monkeypatch):
+        """Two live turns on one session is still possible (voice and typing at
+        once). What the person reads may not be an internal string."""
+        monkeypatch.setattr(rt, "_LIVE_TURN_LOCK_WAIT_SECONDS", 0.2)
+        person = _agent("busy")
+        _turn(person)
+        entry = rt._REGISTRY["busy"]
+        assert entry.turn_lock.acquire(timeout=5)
+        try:
+            result = _turn(_agent("busy"), "hello?")
+        finally:
+            entry.turn_lock.release()
+        assert result["completed"] is False
+        assert "still finishing" in result["final_response"]
+        assert "session" not in result["final_response"]
+        assert "busy" not in result["final_response"]
+        assert "another turn is still running" in (result["error"] or "")
+
+    def test_closing_a_lane_leaves_the_conversation_alone(self):
+        person = _agent("live")
+        _turn(person)
+        review = self._laned("live")
+        _turn(review)
+        assert rt.release_lane_session(review) is True
+        assert not review._claude_code_session.is_alive()
+        assert person._claude_code_session.is_alive()
+        with rt._REGISTRY_LOCK:
+            assert set(rt._REGISTRY) == {"live"}
+
+    def test_closing_refuses_an_agent_that_is_the_conversation(self):
+        """The guard that makes the teardown call safe: no lane, no close."""
+        person = _agent("live")
+        _turn(person)
+        assert rt.release_lane_session(person) is False
+        assert person._claude_code_session.is_alive()
+        with rt._REGISTRY_LOCK:
+            assert "live" in rt._REGISTRY
+
+
 class TestRegistryHardening:
     def test_retire_happens_under_the_turn_lock(self, monkeypatch, tmp_path):
         """A waiter on a retired session must get a fresh process, never the
