@@ -1016,6 +1016,79 @@ _ZAI_POLICY_NOTES = {
 }
 
 
+#: Above this, a wait is long enough that saying nothing reads as broken.
+#:
+#: The 5xx branch below already surfaces waits over 60s, with the reason in its
+#: own comment: "buffering that wait would leave the user silent for minutes".
+#: That argument was never carried to the rate-limit branch, which buffered
+#: every wait however long — and `_clear_status_buffer` DROPS the buffer on
+#: successful recovery, so a person who was rate-limited for ten minutes was
+#: not told late, they were never told at all.
+#:
+#: Measured 2026-09-15 on a person's own machine: an Anthropic 429 with
+#: `Retrying API call in 600s (attempt 1/3)` in the log and not one word on
+#: their phone, twice over, while they asked whether the thing was broken.
+SPEAK_UP_AFTER_S = 30.0
+
+
+def _provider_in_words(provider: Any) -> str:
+    """The provider named the way a person would name it, never hardcoded.
+
+    `CANONICAL_PROVIDERS` is Hermes's single source of provider identity, so a
+    provider added there is named here without anybody editing this function,
+    and somebody paying for ChatGPT is never told about Claude.
+
+    Two shapes, because they are two different things to a person. A
+    subscription is *theirs* — "your Claude plan" — while an API or a local
+    server is a service they are calling, and "your LM Studio plan" would be
+    nonsense. Hermes's own label carries the distinction already: the
+    subscription entries say so in the label, so that is what is read rather
+    than a second list of slugs to keep in step.
+    """
+    slug = str(provider or "").strip()
+    if not slug:
+        return "your model provider"
+    try:
+        from hermes_cli.models_catalog_static import CANONICAL_PROVIDERS
+    except Exception:
+        return slug
+    label = next((e.label for e in CANONICAL_PROVIDERS if e.slug == slug), "")
+    if not label:
+        return slug
+    # "Claude Subscription (Claude Code CLI)" -> "your Claude plan"
+    # "ChatGPT or Codex Subscription"         -> "your ChatGPT plan"
+    head = label.split(" (", 1)[0].strip()
+    if "subscription" in head.lower():
+        name = head.lower().replace("subscription", "").strip()
+        # "chatgpt or codex" — the person has one of them and knows which; the
+        # first is the one they signed in with.
+        name = name.split(" or ", 1)[0].strip()
+        if name:
+            return "your %s plan" % head[:len(name)].strip()
+    return head
+
+
+def _wait_in_words(seconds: float) -> str:
+    """A wait a person can act on: "about 10 minutes", not "600.0s"."""
+    if seconds < 60:
+        return "in under a minute"
+    if seconds < 90:
+        return "in about a minute"
+    return "in about %d minutes" % int(round(seconds / 60.0))
+
+
+def rate_limit_sentence(provider: Any, wait_time: float) -> str:
+    """What a PERSON is told when their provider is rate-limiting them.
+
+    Not "⏱️ Rate limited. Waiting 600.0s (attempt 1/3)...", which is a counter,
+    a stopwatch and an implementation detail. What somebody on a phone needs is
+    what went wrong, whose it is, and roughly how long — and nothing they
+    cannot act on. The counter still goes to the log, where it belongs.
+    """
+    return ("I've hit the limit on %s — I'll answer as soon as it clears, %s."
+            % (_provider_in_words(provider), _wait_in_words(wait_time)))
+
+
 def compute_error_backoff(
     agent: Any, api_error: Exception, *, retry_count: int, max_retries: int, is_rate_limited: bool,
     is_zai_coding_overload: bool, base_url: Any, model: Any,
@@ -1065,8 +1138,19 @@ def compute_error_backoff(
         _policy_note = _ZAI_POLICY_NOTES.get(_backoff_policy or "", "")
         _wait_reason = "Provider overloaded" if is_zai_coding_overload and not is_rate_limited else "Rate limited"
         _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
-        if _backoff_policy == "zai_coding_overload_long":
-            agent._emit_status(_rate_limit_status)
+        # **Say it, do not bury it.** A wait past `SPEAK_UP_AFTER_S` is long
+        # enough that silence reads as a broken product, and a buffered retry
+        # message is not merely late — `_clear_status_buffer` drops it on
+        # recovery, so the person is never told anything happened. The 5xx
+        # branch below has surfaced long waits since #26293 for exactly this
+        # reason; this is the same rule applied where it was missed.
+        #
+        # The sentence is the person's, not the engine's, and it names the
+        # provider from `CANONICAL_PROVIDERS` so somebody on a ChatGPT plan is
+        # never told about Claude. The engine line still goes to the log, which
+        # is where the counter and the attempt number belong.
+        if _backoff_policy == "zai_coding_overload_long" or wait_time >= SPEAK_UP_AFTER_S:
+            agent._emit_status(rate_limit_sentence(getattr(agent, "provider", None), wait_time))
         else:
             agent._buffer_status(_rate_limit_status)
     else:
