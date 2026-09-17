@@ -1149,3 +1149,96 @@ class TestParagraphBreakAfterTools:
         a = self._recording_agent("breaks-2")
         _turn(a, "hello")
         assert a.seen and all(flag is False for flag, _ in a.seen)
+
+
+# ── The child's activity clock ──────────────────────────────────────────────
+#
+# Moe ticket #4, 2026-09-16. A delegated X search-and-reply thinking with
+# Claude Code ran 63 tool calls in 18 minutes while its parent's heartbeat
+# read "initializing (iteration 0/250)" the whole time: nothing under this
+# runtime stamped the clocks the heartbeat and the turn watchdog read. The
+# heartbeat gave up after 15 cycles, the 600 s watchdog aborted the parent
+# turn and killed the working child, and the model was told the user had
+# rejected the tool. These read the clock through the REAL readers — the
+# agent's own summary and the delegate heartbeat — not through the fields.
+
+def _child():
+    """The attributes the liveness readers touch on a real AIAgent, with the
+    real ``_touch_activity`` and the real ``get_activity_summary``."""
+    import types
+    from agent.activity_tracking import ActivityTrackingMixin
+    from run_agent import AIAgent
+
+    class Child(ActivityTrackingMixin):
+        pass
+
+    c = Child()
+    c.session_id = "child"
+    c._session_db = None
+    c._current_tool = None
+    c._api_call_count = 0
+    c.max_iterations = 250
+    c.iteration_budget = SimpleNamespace(used=0, max_total=250)
+    c.get_activity_summary = types.MethodType(AIAgent.get_activity_summary, c)
+    return c
+
+
+def test_cli_tool_events_advance_the_childs_activity_clock():
+    child = _child()
+    before = child.get_activity_summary()
+    assert before["last_activity_ts"] is None and before["current_tool"] is None
+    on_event = rt.make_claude_code_event_bridge(child)
+
+    on_event({"kind": "tool_started", "call_id": "c1", "name": "browser_exec", "args": {"code": "x"}})
+    mid = child.get_activity_summary()
+    assert mid["last_activity_ts"] is not None
+    assert mid["current_tool"] == "browser_exec"
+    assert "browser_exec" in mid["last_activity_desc"]
+
+    time.sleep(0.01)
+    on_event({"kind": "tool_completed", "call_id": "c1", "name": "browser_exec", "args": {}, "result": "ok"})
+    after = child.get_activity_summary()
+    assert after["last_activity_ts"] > mid["last_activity_ts"]
+    assert after["current_tool"] is None, "between tools the child is idle, not stuck in one"
+
+    on_event({"kind": "assistant_message", "text": "done"})
+    assert child.get_activity_summary()["api_call_count"] == 1, "one model response is one iteration"
+
+
+def test_streaming_stamps_the_clock_but_not_per_token():
+    child = _child()
+    on_event = rt.make_claude_code_event_bridge(child)
+    on_event({"kind": "text_delta", "text": "a"})
+    first = child.get_activity_summary()["last_activity_ts"]
+    assert first is not None
+    for _ in range(50):
+        on_event({"kind": "text_delta", "text": "b"})
+    assert child.get_activity_summary()["last_activity_ts"] == first, "a stamp per token would take the lock 50 times"
+
+
+def test_the_delegate_heartbeat_sees_a_working_cli_child():
+    """The real reader. A child that emits CLI events between ticks is never
+    stale; the same child with no events IS — which is what proved this test
+    can fail, and what happened on 2026-09-16."""
+    from tools.delegate_tool import _HEARTBEAT_STALE_CYCLES_IDLE
+    from tools.delegate_tool_child_run import _Heartbeat
+
+    touched = []
+    parent = SimpleNamespace(_touch_activity=lambda desc, **kw: touched.append(desc))
+
+    silent = _child()
+    hb = _Heartbeat(silent, parent, 0)
+    verdicts = [hb.tick() for _ in range(_HEARTBEAT_STALE_CYCLES_IDLE + 1)]
+    assert False in verdicts, "a child nothing stamps goes stale (the old behaviour, and still right for a dead one)"
+
+    touched.clear()
+    working = _child()
+    on_event = rt.make_claude_code_event_bridge(working)
+    hb = _Heartbeat(working, parent, 0)
+    for i in range(_HEARTBEAT_STALE_CYCLES_IDLE + 5):
+        on_event({"kind": "tool_started", "call_id": f"c{i}", "name": "browser_exec", "args": {}})
+        time.sleep(0.002)
+        assert hb.tick() is not False, f"a child running tools was called stale on cycle {i}"
+        on_event({"kind": "tool_completed", "call_id": f"c{i}", "name": "browser_exec", "args": {}, "result": ""})
+    assert any("running browser_exec" in d for d in touched), touched[-3:]
+    assert not any("initializing" in d for d in touched)

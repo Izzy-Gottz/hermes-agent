@@ -1137,21 +1137,60 @@ def make_claude_code_event_bridge(agent) -> Callable[[dict], None]:
         except Exception:
             logger.debug("%s raised", name, exc_info=True)
 
+    # The child's activity clock. Everything that reads an agent's liveness
+    # — the delegate heartbeat (tools/delegate_tool_child_run._Heartbeat),
+    # the turn watchdog (agent/turn_liveness), the gateway's "is this session
+    # alive" — reads ``_last_activity_ts``, ``_current_tool`` and
+    # ``_api_call_count``, which the HTTP tool loop stamps on every model
+    # call and every tool call. Under this runtime the loop belongs to the
+    # CLI, so nothing stamped them: a subagent thinking with Claude Code
+    # reported "initializing (iteration 0/250)" for its whole life.
+    #
+    # Measured 2026-09-16, Moe ticket #4: a delegated X search-and-reply ran
+    # 63 tool calls in 18 minutes and posted a reply, while its parent's
+    # heartbeat saw no progress for 15 cycles, stopped touching the parent,
+    # and the 600 s watchdog aborted the turn and killed the child mid-task
+    # — three times in a row, each surfacing to the model as "the user
+    # doesn't want to proceed with this tool use". The child was working;
+    # nothing was watching the right clock. Every CLI event stamps it now.
+    _last_stamp = [0.0]
+
+    def _stamp(desc: str, *, every: float = 0.0) -> None:
+        now = time.monotonic()
+        if every and now - _last_stamp[0] < every:
+            return
+        _last_stamp[0] = now
+        _call("_touch_activity", desc)
+
     def on_event(event: dict) -> None:
         if not isinstance(event, dict):
             return
         kind = event.get("kind")
         if kind == "text_delta":
+            # Streaming text is progress too, at a sane rate: a stamp takes
+            # a lock and may write the session db.
+            _stamp("streaming a reply", every=5.0)
             _call("_fire_stream_delta", event.get("text") or "")
         elif kind == "reasoning_delta":
+            _stamp("thinking", every=5.0)
             _call("_fire_reasoning_delta", event.get("text") or "")
         elif kind == "tool_started":
             name = event.get("name") or "tool"
             args = event.get("args") or {}
+            try:
+                agent._current_tool = name
+            except Exception:
+                pass
+            _stamp(f"running {name}")
             _call("tool_progress_callback", "tool.started", name, event.get("preview"), args)
             _call("tool_start_callback", event.get("call_id"), name, args)
         elif kind == "tool_completed":
             name = event.get("name") or "tool"
+            try:
+                agent._current_tool = None
+            except Exception:
+                pass
+            _stamp(f"finished {name}")
             _call(
                 "tool_progress_callback", "tool.completed", name, None, None,
                 duration=event.get("duration"), is_error=bool(event.get("is_error")),
@@ -1170,6 +1209,13 @@ def make_claude_code_event_bridge(agent) -> Callable[[dict], None]:
             # "...take a few minutes.Found the data blob."
             agent._stream_needs_break = True
         elif kind == "assistant_message":
+            # One assistant message is one model response: the iteration
+            # count every liveness reader compares against.
+            try:
+                agent._api_call_count = int(getattr(agent, "_api_call_count", 0) or 0) + 1
+            except Exception:
+                pass
+            _stamp("model responded")
             if not getattr(agent, "show_commentary", True):
                 return
             text = event.get("text") or ""
