@@ -80,11 +80,15 @@ _READ_ONLY = frozenset({
     "verify_state",
 })
 
-# Six looks with nothing done is worth a word; ten is worth stopping.
-# Generous on purpose — real exploration takes several looks, and the run that
-# prompted this was seventeen.
-LOOK_SOFT_LIMIT = 6
-LOOK_HARD_LIMIT = 10
+# Twenty looks with nothing done is worth a word; thirty is worth stopping.
+# These were 6 and 10 until 2026-09-16, sized to the seventeen-look run above.
+# Then the owner ran real work through it — an X search-and-reply, a screen
+# task he was narrating — and met "I can only look at this 10 times" as an
+# obstacle, not a rescue. A limit the person hits while the work is going
+# well is the wrong limit. Raised, and overridable: ``computer_use.look_budget``
+# in config.yaml.
+LOOK_SOFT_LIMIT = 20
+LOOK_HARD_LIMIT = 30
 
 # ---------------------------------------------------------------- the budget
 #
@@ -106,10 +110,53 @@ LOOK_HARD_LIMIT = 10
 # reached the 20-response limit" — and the number is the point: a limit that
 # only fires on obviously-bad work would not have fired here.
 #
-# 20 matches theirs. 14 leaves room to say "six left" while six are still
-# useful.
-BUDGET_SOFT = 14
-BUDGET_HARD = 20
+# 20 matched theirs, and 14 left room to say "six left" while six were still
+# useful — until 2026-09-16, when the owner's X reply task spent all twenty on
+# one comment ("Ran out of action budget before reaching the 10+ comment
+# goal") and the screen work he was directing by voice stopped at "That is 20
+# screen actions on this one task" three times in an afternoon. Astra's
+# number is for a loop nobody is watching; this one is for a person who asked
+# for the work and is right there. 150 is about ten of those comments. The
+# soft tier still says how much road is left, thirty actions out.
+# Overridable: ``computer_use.action_budget`` in config.yaml.
+BUDGET_SOFT = 120
+BUDGET_HARD = 150
+
+
+def configured_budgets() -> Tuple[int, int, int, int]:
+    """``(action_soft, action_hard, look_soft, look_hard)`` from config.yaml,
+    the module numbers when unset or unreadable.
+
+        computer_use:
+          action_budget: 150   # screen actions per task before stopping
+          look_budget: 30      # reads in a row with nothing done
+
+    The soft tier is derived (four fifths of the hard one, at least one
+    below it) so a person sets one number, not two that have to agree.
+    """
+    action_hard, look_hard = BUDGET_HARD, LOOK_HARD_LIMIT
+    try:
+        from hermes_cli.config import load_config
+        section = (load_config() or {}).get("computer_use") or {}
+        if not isinstance(section, dict):
+            section = {}
+        raw = section.get("action_budget")
+        if raw is not None:
+            action_hard = max(1, int(raw))
+        raw = section.get("look_budget")
+        if raw is not None:
+            look_hard = max(2, int(raw))
+    except Exception:
+        pass
+    if action_hard == BUDGET_HARD:
+        action_soft = BUDGET_SOFT
+    else:
+        action_soft = max(1, min(action_hard - 1, int(action_hard * 4 / 5)))
+    if look_hard == LOOK_HARD_LIMIT:
+        look_soft = LOOK_SOFT_LIMIT
+    else:
+        look_soft = max(1, min(look_hard - 1, int(look_hard * 4 / 5)))
+    return action_soft, action_hard, look_soft, look_hard
 
 # When the count goes back to zero.
 #
@@ -203,6 +250,9 @@ class StallDetector:
     """
 
     def __init__(self, window: int = WINDOW) -> None:
+        # Read once per detector (one per computer-use session), so a config
+        # edit reaches the next session and a running task keeps its number.
+        self.budget_soft, self.budget_hard, self.look_soft, self.look_hard = configured_budgets()
         self._history: Deque[Tuple[str, str]] = deque(maxlen=window)
         self._lock = threading.Lock()
         # Consecutive read-only calls since anything last changed the screen.
@@ -231,7 +281,7 @@ class StallDetector:
         """Count this call against the budget, resetting after an idle gap.
 
         Returns the running total INCLUDING the call being considered, so a
-        caller can compare it against BUDGET_HARD directly.
+        caller can compare it against ``self.budget_hard`` directly.
         """
         with self._lock:
             if self._last_call_at and now - self._last_call_at > BUDGET_IDLE_RESET:
@@ -254,7 +304,7 @@ class StallDetector:
         if action in _EXEMPT:
             return None
         total = self._spend(time.monotonic() if now is None else now)
-        if total <= BUDGET_HARD:
+        if total <= self.budget_hard:
             return None
         return json.dumps({
             "ok": False,
@@ -262,7 +312,7 @@ class StallDetector:
             "code": "budget_spent",
             "error": (
                 f"Stop. That is {total - 1} screen actions on this one task, "
-                f"which is the limit ({BUDGET_HARD})."
+                f"which is the limit ({self.budget_hard})."
             ),
             "verdict": {
                 "decision": "stop_and_report",
@@ -281,14 +331,14 @@ class StallDetector:
     def budget_advisory(self) -> Optional[Dict[str, Any]]:
         """The soft tier: say how much road is left, while it is still useful."""
         total = self.spent()
-        if total < BUDGET_SOFT:
+        if total < self.budget_soft:
             return None
         return {
             "budget": {
                 "spent": total,
-                "of": BUDGET_HARD,
+                "of": self.budget_hard,
                 "note": (
-                    f"{BUDGET_HARD - total} screen action(s) left on this "
+                    f"{self.budget_hard - total} screen action(s) left on this "
                     "task. If it is not nearly done, say where you are now "
                     "rather than being cut off mid-way."
                 ),
@@ -371,9 +421,9 @@ class StallDetector:
         if action not in _READ_ONLY:
             return None
         seen = self.looks_without_acting()
-        if seen + 1 < LOOK_SOFT_LIMIT:
+        if seen + 1 < self.look_soft:
             return None
-        hard = seen + 1 >= LOOK_HARD_LIMIT
+        hard = seen + 1 >= self.look_hard
         return {
             "decision": "stop_and_report" if hard else "change_approach",
             "looks_without_acting": seen + 1,

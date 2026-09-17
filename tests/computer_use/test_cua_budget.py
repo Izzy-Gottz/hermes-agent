@@ -89,7 +89,9 @@ def test_the_allowance_refills_after_a_real_gap():
     in for handing back to the person, which the tool cannot see."""
     d = StallDetector()
     _spend(d, BUDGET_HARD + 1)
-    assert d.budget_reason("click", now=1000.0 + BUDGET_IDLE_RESET + 60) is None
+    # A gap measured from the LAST call, not from the first: spending the
+    # allowance takes a second per action, and 150 of them outlast the window.
+    assert d.budget_reason("click", now=1000.0 + BUDGET_HARD + BUDGET_IDLE_RESET + 60) is None
 
 
 def test_waiting_and_scrolling_are_not_spent():
@@ -111,9 +113,35 @@ def test_the_advisory_arrives_late_enough_to_be_useful():
     assert f"{BUDGET_HARD - BUDGET_SOFT} screen action(s) left" in note["budget"]["note"]
 
 
-def test_the_numbers_are_astras():
-    assert BUDGET_HARD == 20
-    assert BUDGET_SOFT == 14
+def test_the_numbers_are_for_a_person_who_is_there():
+    """Astra's 20 was for a loop nobody watches. On 2026-09-16 the owner's X
+    reply task spent all twenty on one comment and his screen work stopped
+    three times in an afternoon with "That is 20 screen actions". 150 is
+    about ten of those comments; the soft word comes thirty out."""
+    assert BUDGET_HARD == 150
+    assert BUDGET_SOFT == 120
+
+
+def test_the_budget_is_a_config_key(monkeypatch):
+    """``computer_use.action_budget`` and ``look_budget`` in config.yaml set
+    the numbers; the soft tier follows at four fifths. Read at detector
+    construction, so a running task keeps its number."""
+    import hermes_cli.config as cfg
+    from tools.computer_use import stall
+    monkeypatch.setattr(cfg, "load_config", lambda: {"computer_use": {"action_budget": 10, "look_budget": 5}})
+    d = StallDetector()
+    assert (d.budget_soft, d.budget_hard, d.look_soft, d.look_hard) == (8, 10, 4, 5)
+    _spend(d, 10)
+    assert d.budget_reason("click", now=1000.0 + 11) is not None, "the configured number is the one that stops"
+    body = json.loads(d.budget_reason("click", now=1000.0 + 12))
+    assert "(10)" in body["error"]
+    # Unreadable config: the module numbers, never a crash.
+    monkeypatch.setattr(cfg, "load_config", lambda: (_ for _ in ()).throw(RuntimeError("no config")))
+    d2 = StallDetector()
+    assert (d2.budget_hard, d2.look_hard) == (stall.BUDGET_HARD, stall.LOOK_HARD_LIMIT)
+    # A nonsense value is ignored, not honoured.
+    monkeypatch.setattr(cfg, "load_config", lambda: {"computer_use": {"action_budget": "lots"}})
+    assert StallDetector().budget_hard == stall.BUDGET_HARD
 
 
 if __name__ == "__main__":

@@ -46,8 +46,11 @@ def _look(det, n, action="capture", args=None):
 # --------------------------------------------------------- the real session
 
 def test_the_seventeen_look_run_is_caught():
+    # Seventeen was the run that prompted this, when the limits were 6 and
+    # 10. They are 20 and 30 since 2026-09-16 (see stall.py), so the run
+    # here is long enough to meet both.
     det = StallDetector()
-    verdicts = _look(det, 17)
+    verdicts = _look(det, LOOK_HARD_LIMIT + 7)
     advised = next(i for i, v in enumerate(verdicts) if v) + 1
     refused = next(i for i, v in enumerate(verdicts) if v and v["refused"]) + 1
     assert advised == LOOK_SOFT_LIMIT, f"first word at look {advised}"
@@ -58,7 +61,7 @@ def test_a_differing_screenshot_defeats_the_repeat_detector_but_not_this_one():
     """Why this exists at all: each capture returns different pixels, so the
     identical-call detector never fires."""
     det = StallDetector()
-    for i in range(12):
+    for i in range(LOOK_HARD_LIMIT + 2):
         args = {"app": "Freeform", "mode": "som"}
         # different result every time — a real screen
         det.record("capture", args, json.dumps({"total_elements": i}))
