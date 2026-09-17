@@ -945,6 +945,14 @@ class GatewayNotificationsMixin:
         """
         from gateway.wake import deliver_wake, persist_delegation_delivery
         if evt.get("type") == "async_delegation":
+            # A plugin that owns the surface behind this API session — a desktop
+            # app polling its own inbox, say — may take the completion and put
+            # it in front of the person now, instead of it waiting on the
+            # transcript for a turn the person may not start for hours. The
+            # first callback to answer truthy has it; nothing is persisted
+            # twice. Failures fall through to the durable row, never drop.
+            if await self._offer_detached_completion(synth_text, raw_sid, evt):
+                return True
             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
             fail = "Async delegation delivery persist failed for session %s: %s"
             deliver = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)  # noqa: E731
@@ -959,6 +967,24 @@ class GatewayNotificationsMixin:
         except Exception as e:
             logger.warning(fail, raw_sid, e)
             return False
+
+    async def _offer_detached_completion(self, synth_text: str, raw_sid: str, evt: dict) -> bool:
+        """``deliver_detached_completion`` plugin hook: True when a plugin took the completion."""
+        try:
+            from hermes_cli.plugins import has_hook, invoke_hook
+            if not has_hook("deliver_detached_completion"):
+                return False
+            results = await asyncio.to_thread(
+                invoke_hook, "deliver_detached_completion",
+                session_id=raw_sid, text=synth_text, event=dict(evt),
+            )
+        except Exception:
+            logger.warning("deliver_detached_completion hook failed for session %s", raw_sid, exc_info=True)
+            return False
+        if any(bool(r) for r in results):
+            logger.info("Async delegation completion for api_server session %s delivered by a plugin", raw_sid)
+            return True
+        return False
 
     def _resolve_injection_adapter(self, platform_name: str, source=None):
         """Adapter for a synthetic-event platform: alias-aware transport resolver first (one

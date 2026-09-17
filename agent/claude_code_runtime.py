@@ -1298,17 +1298,41 @@ def make_tool_bridge_dispatch(agent):
     ``pre_tool_call`` hooks (Moe's confirm gate), the same middleware and the
     same ``post_tool_call`` accounting as a call from Hermes' own loop.
 
-    Delegation is forced SYNCHRONOUS here. From the top-level model a
-    ``delegate_task`` normally returns a handle at once and each child's
-    result re-enters the conversation later as its own message — the right
-    shape when Hermes owns the loop and can inject one. Under this runtime the
-    loop belongs to the CLI, which is sitting on an open MCP call: returning a
-    handle would hand the model a receipt for work it will never be shown,
-    while blocking returns the actual results into the tool call that asked
-    for them. That is also how the CLI's own subagent tool behaves.
+    Delegation is forced SYNCHRONOUS here only when nothing can deliver the
+    result later. From the top-level model a ``delegate_task`` normally
+    returns a handle at once and each child's result re-enters the
+    conversation later as its own message. Under this runtime the loop
+    belongs to the CLI, which is sitting on an open MCP call — so a handle is
+    only honest when the session has declared a way to receive a detached
+    completion (``session_history_delivery``: the client addresses the
+    session by id and will read what lands on it). With that declared, the
+    child gets its handle and ends its turn, and the completion arrives the
+    way every other detached completion does. Without it, blocking returns
+    the actual results into the tool call that asked for them, which is also
+    how the CLI's own subagent tool behaves.
+
+    Measured 2026-09-16, Moe ticket #4: forced sync meant an X reply job the
+    person asked for "in the background" held the conversation for ten
+    minutes and was then killed by the turn watchdog.
+
+    The bridge thread has no session context of its own — ``_capture_origin``
+    reads the session id, the wake target and the delivery declaration from
+    contextvars, and on a bare thread every one is unset, which is what made
+    a background handle a receipt for nothing. ``run_claude_code_turn``
+    snapshots the request thread's context on the agent; the dispatch runs
+    inside that snapshot.
     """
     def _dispatch(tool: str, args: dict) -> str:
+        import contextvars
+
+        ctx = getattr(agent, "_turn_context", None)
+        if isinstance(ctx, contextvars.Context):
+            return ctx.copy().run(_dispatch_in_context, tool, args)
+        return _dispatch_in_context(tool, args)
+
+    def _dispatch_in_context(tool: str, args: dict) -> str:
         from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
+        from gateway.session_context import session_history_delivery_supported
         from tools.delegate_tool import forced_synchronous_delegation
 
         if tool not in BRIDGED_TOOLS:
@@ -1332,7 +1356,7 @@ def make_tool_bridge_dispatch(agent):
         # calls in one turn are indistinguishable without one.
         call_id = f"bridge-{uuid.uuid4().hex[:12]}"
         payload = dict(args or {})
-        if tool == "delegate_task":
+        if tool == "delegate_task" and not session_history_delivery_supported():
             with forced_synchronous_delegation():
                 return agent._invoke_tool(tool, payload, task_id, call_id)
         return agent._invoke_tool(tool, payload, task_id, call_id)
@@ -1424,6 +1448,14 @@ def run_claude_code_turn(
     Called from run_conversation() when ``agent.api_mode == "claude_code"``.
     Returns the same dict shape as the chat_completions path.
     """
+    # The request thread's context — session id, platform, the delivery
+    # declaration — for bridged tool calls, which arrive on a thread that has
+    # none. See make_tool_bridge_dispatch.
+    try:
+        import contextvars
+        agent._turn_context = contextvars.copy_context()
+    except Exception:
+        pass
     if getattr(agent, "compression_checkpoint_required", False) is True:
         from agent.conversation_compression import _checkpoint_blocked
 

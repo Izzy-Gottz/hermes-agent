@@ -124,6 +124,11 @@ VALID_HOOKS: Set[str] = {
     # Run-all-then-pick-first (see get_plugin_error_classification). Privacy: error_message/
     # error_body may be unredacted.
     "transform_api_error_classification", "on_session_start", "on_session_end",
+    # deliver_detached_completion: an async-delegation completion for an api_server session that
+    # no adapter can push to. Kwargs: session_id (raw), text (the synthesized completion block),
+    # event (the completion event). Return truthy to say the plugin put it in front of the person;
+    # anything else and the gateway persists it on the session transcript as before.
+    "deliver_detached_completion",
     "on_session_finalize", "on_session_reset",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",

@@ -622,10 +622,11 @@ class TestToolBridgeDispatch:
         # in one turn are indistinguishable without one.
         assert call_id and call_id.startswith("bridge-")
 
-    def test_delegation_from_the_child_is_forced_synchronous(self):
+    def test_delegation_from_the_child_is_forced_synchronous_when_nothing_can_deliver_later(self):
         """The caller is holding an open MCP tool call and will only ever see
-        this return value; a background handle would be a receipt for work it
-        is never shown."""
+        this return value; with no declared consumer for a detached
+        completion, a background handle would be a receipt for work it is
+        never shown."""
         agent = self._recording_agent()
         dispatch = rt.make_tool_bridge_dispatch(agent)
         dispatch("delegate_task", {"goal": "x"})
@@ -635,6 +636,57 @@ class TestToolBridgeDispatch:
         from tools.delegate_tool import synchronous_delegation_forced
 
         assert not synchronous_delegation_forced()
+
+    def test_a_session_that_can_receive_a_completion_later_gets_a_real_background_handle(self):
+        """Moe ticket #4, 2026-09-16: an X reply job asked for "in the
+        background" held the conversation for ten minutes under forced sync
+        and was then killed by the turn watchdog. A session that declared a
+        consumer for detached completions (the client addresses it by id and
+        reads what lands on it) is not forced: the child gets its handle.
+
+        The bridge thread has no context of its own, so the declaration — and
+        the origin session id the completion routes back on — must travel
+        from the request thread's snapshot, or the dispatch would be
+        background with nowhere to deliver."""
+        import contextvars
+        import threading
+
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.async_delegation import _current_origin_session_id
+
+        agent = self._recording_agent("moe-sess")
+        seen: dict = {}
+
+        def _invoke_tool(name, args, task_id, tool_call_id=None, *rest, **kw):
+            from tools.delegate_tool import synchronous_delegation_forced
+
+            seen["forced"] = synchronous_delegation_forced()
+            seen["origin"] = _current_origin_session_id()
+            return "ran"
+
+        agent._invoke_tool = _invoke_tool
+        tokens = set_session_vars(
+            platform="api_server", chat_id="moe-sess", session_key="moe-sess", session_id="moe-sess",
+            async_delivery=False, session_history_delivery="1",
+        )
+        try:
+            agent._turn_context = contextvars.copy_context()
+        finally:
+            clear_session_vars(tokens)
+        dispatch = rt.make_tool_bridge_dispatch(agent)
+        # On a bare thread, as the bridge runs it.
+        t = threading.Thread(target=lambda: dispatch("delegate_task", {"goal": "x"}))
+        t.start()
+        t.join(5)
+        assert seen["forced"] is False, "a declared consumer means a handle, not a ten-minute block"
+        assert seen["origin"] == "moe-sess", "the completion must route back to the session that asked"
+
+    def test_the_turn_snapshots_its_context_for_the_bridge(self, _env):
+        agent = _agent("snap-1")
+        _turn(agent)
+        import contextvars
+
+        assert isinstance(getattr(agent, "_turn_context", None), contextvars.Context)
 
     def test_the_session_id_stands_in_for_a_missing_task_id(self):
         agent = self._recording_agent("sess-9")
