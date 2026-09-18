@@ -95,7 +95,20 @@ DEFAULT_TIMEOUT_SECONDS = 1500.0
 #: as a literal so this module imports without model_tools (the client end
 #: runs in a process that may not have loaded it yet) and asserted equal in
 #: tests.
-BRIDGED_TOOLS: tuple[str, ...] = ("todo_list", "memory", "session_search", "delegate_task")
+#:
+#: ``cronjob_manage`` is bridged for the same reason as ``delegate_task``: its
+#: ``run`` action builds a cron agent *in the calling process*, and this one
+#: has no ``CLAUDE_CODE_OAUTH_TOKEN`` by design — so every manual run of a
+#: Claude-Code-brained job died on "needs a long-lived token" while the same
+#: job fired fine on its schedule from the gateway (Moe ticket #5,
+#: 2026-09-18). At home it also meets the gateway's plugin ``pre_tool_call``
+#: hooks, which ``create`` relies on.
+#: They are not agent-loop tools — ``handle_function_call`` runs them anywhere,
+#: and a runtime with no bridge (codex) keeps them local — so they are listed
+#: apart: ``BRIDGED_TOOLS`` is the agent-loop four plus these.
+HOME_ONLY_TOOLS: tuple[str, ...] = ("cronjob_manage",)
+BRIDGED_TOOLS: tuple[str, ...] = ("todo_list", "memory", "session_search", "delegate_task",
+                                  *HOME_ONLY_TOOLS)
 
 #: One line of JSON per message, both directions. A tool result can be large
 #: (a fan-out's aggregated JSON); the cap is a sanity bound, not a budget.

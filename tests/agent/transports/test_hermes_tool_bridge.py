@@ -60,17 +60,33 @@ def _env(b: ToolBridge) -> dict:
 
 
 class TestNames:
-    def test_bridged_tools_match_the_agent_loop_set(self):
+    def test_bridged_tools_cover_the_agent_loop_set(self):
         """If Hermes adds an agent-loop tool, the bridge must learn about it —
-        otherwise it silently goes missing under the CLI runtimes again."""
+        otherwise it silently goes missing under the CLI runtimes again. The
+        bridge may carry more (HOME_ONLY_TOOLS), never less."""
+        from agent.transports.hermes_tool_bridge import HOME_ONLY_TOOLS
         from model_tools import _AGENT_LOOP_TOOLS
 
-        assert set(BRIDGED_TOOLS) == set(_AGENT_LOOP_TOOLS)
+        assert set(_AGENT_LOOP_TOOLS) <= set(BRIDGED_TOOLS)
+        assert set(BRIDGED_TOOLS) - set(_AGENT_LOOP_TOOLS) == set(HOME_ONLY_TOOLS)
 
     def test_mcp_server_agrees(self):
         from agent.transports.hermes_tools_mcp_server import AGENT_LOOP_TOOLS
+        from model_tools import _AGENT_LOOP_TOOLS
 
-        assert set(AGENT_LOOP_TOOLS) == set(BRIDGED_TOOLS)
+        assert set(AGENT_LOOP_TOOLS) == set(_AGENT_LOOP_TOOLS)
+
+    def test_cronjob_manage_goes_home_because_a_manual_run_needs_the_credential(self):
+        """Moe ticket #5: `cronjob_manage run` from a Claude Code conversation
+        built the cron agent in the MCP server, whose environment has no
+        CLAUDE_CODE_OAUTH_TOKEN by design, and died on 'needs a long-lived
+        token' — while the same job fired fine on its schedule. A home-only
+        tool is NOT an agent-loop tool: without a bridge it still runs
+        locally rather than being withheld."""
+        from agent.transports.hermes_tools_mcp_server import AGENT_LOOP_TOOLS
+
+        assert "cronjob_manage" in BRIDGED_TOOLS
+        assert "cronjob_manage" not in AGENT_LOOP_TOOLS
 
 
 class TestRoundTrip:
