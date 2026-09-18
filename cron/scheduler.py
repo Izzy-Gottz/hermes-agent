@@ -2530,10 +2530,12 @@ def _classify_delivery_outcome(
 
 def _compose_run_delivery(
     job: dict, *, success: bool, error, final_response: str, output_file,
+    blocked_reason: Optional[str] = None,
 ) -> tuple[str, bool, bool, bool, Optional[str]]:
     """Text to deliver for a finished run. Returns ``(deliver_content, blocked_config,
     silent_alert, incident_acked, failure_incident_id)``; ``silent_alert``: an alert-once marker
-    says the operator was already told, deliver nothing."""
+    says the operator was already told, deliver nothing. ``blocked_reason``: the agent itself said
+    it could not do the job — its words are delivered as they are, every run, never summarized."""
     err = str(error) if error else ""
     # Failed jobs always deliver, except blocked-config runs, which alert exactly ONCE.
     blocked_config_silent = BLOCKED_CONFIG_SILENT_MARKER in err
@@ -2551,6 +2553,8 @@ def _compose_run_delivery(
         )
     elif success:
         deliver_content = final_response
+    elif blocked_reason:
+        deliver_content = strip_blocked_marker(final_response) + _failure_streak_nudge(job)
     else:
         # Record the job+error signature once; if already acked by the operator, suppress the
         # per-run ping. Best-effort: a ledger failure never breaks delivery.
@@ -2612,6 +2616,7 @@ class _RunDelivery:
     should_deliver: bool = False
     unresolved_origin: bool = False
     blocked_config: bool = False
+    blocked_reason: Optional[str] = None
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
@@ -2640,11 +2645,20 @@ def _save_compose_deliver(
             "(tool subprocess was killed mid-flight)."
         )
 
+    # The agent said it could not do the job ("[BLOCKED] not signed in to X"). That is not a
+    # completed run: book it blocked, count it in the failure streak, and deliver the agent's own
+    # words — the failure summarizer's auth/timeout guesses would only paraphrase them worse.
+    d.blocked_reason = blocked_reason(final_response) if d.success else None
+    if d.blocked_reason:
+        d.success = False
+        d.error = f"blocked: {d.blocked_reason}"
+        logger.info("Job '%s': agent reported blocked — %s", job["id"], d.blocked_reason)
+
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,
     ) = _compose_run_delivery(
         job, success=d.success, error=d.error, final_response=final_response,
-        output_file=output_file)
+        output_file=output_file, blocked_reason=d.blocked_reason)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
     # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
@@ -2655,6 +2669,12 @@ def _save_compose_deliver(
         # and wrongly swallowed a real report that merely quoted "[SILENT]" mid-sentence (#51438, #46917).
         logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
         d.should_deliver = False
+    elif d.should_deliver and d.success:
+        # A marker stapled onto a report is a report. The person gets it without the marker.
+        report = autonomous_silence_report(deliver_content)
+        if report is not None:
+            logger.info("Job '%s': %s beside a report — delivering the report", job["id"], SILENT_MARKER)
+            deliver_content = report
 
     if d.should_deliver and fence.lost():
         d.should_deliver = False
@@ -2721,6 +2741,8 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
+    elif d.blocked_reason:
+        mark_kwargs["status"] = "blocked"
     marked = mark_job_run(job["id"], d.success, d.error, **mark_kwargs)
     if fire_owner is not None and not marked:
         finish_execution(
@@ -3786,6 +3808,9 @@ from cron.scheduler_prompt import (  # noqa: E402
 from cron.scheduler_preflight import (  # noqa: E402
     BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,
     _is_transient_provider_resolve_error, _preflight_job_config,
+)
+from gateway.response_filters import (  # noqa: E402
+    autonomous_silence_report, blocked_reason, strip_blocked_marker,
 )
 
 

@@ -196,7 +196,13 @@ _CRON_HINT = (
     "SILENT: If there is genuinely nothing new to report, respond "
     "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
     "Never combine [SILENT] with content — either report your "
-    "findings normally, or say [SILENT] and nothing more.]\n\n"
+    "findings normally, or say [SILENT] and nothing more. "
+    "BLOCKED: If you could not do the job — not signed in, a login, "
+    "2FA or permission needed, a tool unavailable, the page not what "
+    "you expected — begin your response with \"[BLOCKED]\" and say why "
+    "in one line, then what you tried. Never report success for work "
+    "that did not happen, and never use [SILENT] for a job you could "
+    "not do.]\n\n"
 )
 
 
