@@ -220,3 +220,50 @@ class TestRuntimeResolutionTargetModel:
         assert success is True, error
         assert resolve_kwargs["target_model"] == "my-pinned-model"
         assert resolve_kwargs["requested"] == "openrouter"
+
+
+class TestConversationModel:
+    """``model: conversation`` (scheduler.CONVERSATION_MODEL) is the global assignment at fire
+    time, on both axes — not cron.model, not the creation snapshot. For a job a person asked for
+    that acts on their behalf (Moe ticket #5: a daily X follow-and-comment job ran on the fleet's
+    haiku), where the fleet-cheap default is the wrong economy."""
+
+    def test_conversation_beats_cron_model_and_snapshot(self, tmp_path):
+        job = _base_job(model="conversation", provider_snapshot="old-provider",
+                        model_snapshot="old-model")
+        success, error, agent_kwargs, resolve_kwargs = _run(
+            job, tmp_path, current_provider="new-provider", current_model="new-model",
+            cron_model="fleet-model")
+
+        assert success is True, error
+        assert agent_kwargs["model"] == "new-model"
+        assert resolve_kwargs["target_model"] == "new-model"
+        # The provider follows too: yesterday's provider under today's model name is a hard 400.
+        assert resolve_kwargs["requested"] == "new-provider"
+
+    def test_conversation_is_case_insensitive_and_follows_a_later_brain_change(self, tmp_path):
+        job = _base_job(model="Conversation")
+        _, _, agent_kwargs, _ = _run(job, tmp_path, current_provider="p1", current_model="m1")
+        assert agent_kwargs["model"] == "m1"
+        _, _, agent_kwargs, resolve_kwargs = _run(
+            job, tmp_path, current_provider="p2", current_model="m2")
+        assert agent_kwargs["model"] == "m2"
+        assert resolve_kwargs["requested"] == "p2"
+
+    def test_explicit_provider_pin_still_wins(self, tmp_path):
+        job = _base_job(model="conversation", provider="pinned-provider")
+        _, _, agent_kwargs, resolve_kwargs = _run(
+            job, tmp_path, current_provider="new-provider", current_model="new-model")
+        assert agent_kwargs["model"] == "new-model"
+        assert resolve_kwargs["requested"] == "pinned-provider"
+
+    def test_the_word_never_reaches_the_provider(self, tmp_path, monkeypatch):
+        """No global model at all: the run fails on 'no model configured', never sends the
+        literal word 'conversation' to a provider."""
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        success, error, agent_kwargs, _ = _run(
+            _base_job(model="conversation"), tmp_path, current_provider="openrouter",
+            current_model=None)
+        assert success is False
+        assert agent_kwargs is None
+        assert "no model configured" in error

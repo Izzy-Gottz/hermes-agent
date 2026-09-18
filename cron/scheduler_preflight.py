@@ -95,6 +95,11 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     requested = (
         job.get("provider") or str((_cron_cfg or {}).get("model_provider") or "").strip() or None)
     model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+    if _sched._follows_conversation(job):
+        # `model: conversation` is the global assignment, on both axes (scheduler.CONVERSATION_MODEL).
+        _model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        model = str(_model_cfg.get("default") or "").strip() or model
+        requested = str(_model_cfg.get("provider") or "").strip() or None
 
     from hermes_cli.auth import AuthError
     try:

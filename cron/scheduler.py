@@ -1351,11 +1351,23 @@ def _snapshot_pin(job: dict, axis: str, current: str, job_id: str) -> str:
     return snapshot
 
 
+# A job whose ``model`` is this word runs on whatever the *conversation* runs on, read at fire
+# time: it ignores ``cron.model`` (the fleet's cheap default) and its own creation snapshot, and
+# follows a later brain change on both axes. For jobs a person asked for that act on their
+# behalf — post, follow, buy — where a fleet-cheap model is the wrong economy.
+CONVERSATION_MODEL = "conversation"
+
+
+def _follows_conversation(job: dict) -> bool:
+    return str(job.get("model") or "").strip().lower() == CONVERSATION_MODEL
+
+
 def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
     """Load config.yaml and resolve the run's model: per-job override > cron.model (fleet default) >
     creation snapshot > HERMES_MODEL > config ``model:``. Re-read every tick (no cache) so
-    ``hermes cron edit --model`` applies next tick."""
-    model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+    ``hermes cron edit --model`` applies next tick. ``model: conversation`` (see
+    :data:`CONVERSATION_MODEL`) is the global assignment itself, bypassing cron.model and snapshot."""
+    model = ("" if _follows_conversation(job) else job.get("model")) or os.getenv("HERMES_MODEL") or ""
     _cron_default_provider = ""
     _cfg: dict = {}
     _model_cfg: Any = {}
@@ -1376,7 +1388,10 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             if isinstance(_cron_cfg_for_model, dict):
                 _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
                 _cron_default_provider = str(_cron_cfg_for_model.get("model_provider") or "").strip()
-            if not job.get("model"):
+            if _follows_conversation(job):
+                _, _global_model = resolve_cron_model_drift_defaults(_cfg)
+                model = _global_model or model
+            elif not job.get("model"):
                 if _cron_default_model:
                     model = _cron_default_model
                 else:
@@ -1499,8 +1514,12 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         global_provider = (
             str(jc.model_cfg.get("provider") or "").strip() if isinstance(jc.model_cfg, dict) else "")
         # None (not the config provider) keeps the legacy no-snapshot path resolving from persisted
-        # config exactly as before.
-        requested = _snapshot_pin(job, "provider", global_provider, job_id) or None
+        # config exactly as before. A conversation-following job follows the provider too: the
+        # snapshot would pin yesterday's provider under today's model name (a hard 400).
+        if _follows_conversation(job):
+            requested = global_provider or None
+        else:
+            requested = _snapshot_pin(job, "provider", global_provider, job_id) or None
     try:
         # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
         # and resurrect stale providers for unpinned jobs.
