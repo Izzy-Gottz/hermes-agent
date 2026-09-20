@@ -173,21 +173,35 @@ browser:
 ```
 
 When enabled, Hermes copies your default browser's **active** profile — the one
-you actually browse (`Local State → profile.last_used`), with its cookies, saved
-logins, and preferences — into a managed snapshot under
-`~/.hermes/browser-profile/<browser>/`, then launches your **real browser
-binary** on that snapshot and attaches its browsing engine to it. Launching the
-real binary (instead of a bundled Chromium with mock-keychain switches) is what
-keeps OS-encrypted cookies decryptable — on macOS, Chrome cookies are encrypted
-through the Keychain, and a mock-keychain launch would silently drop every one
-of them, opening signed out. Your live browser profile is **never opened
-directly**: the
-snapshot is a separate directory, so it doesn't fight your running browser for
-the profile lock and it sidesteps Chrome 136+'s block on remote-debugging the
-default profile directory. The auth files (cookies/logins/preferences) are
-re-synced from your real profile whenever a fresh session is launched, so logins
-you do in your own browser show up in the agent's session. Only the active
-profile is copied — other Chrome profiles are never snapshotted.
+you actually browse (`Local State → profile.last_used`), with its cookies and
+preferences — into a managed snapshot under
+`~/.hermes/browser-profile/<browser>/`, and browses on that snapshot with its
+**own packaged browser** (agent-browser's Chrome for Testing), never with your
+installed browser application. Your cookies are protected by the OS keychain
+(on macOS, through the Keychain entry only your real browser may read), so the
+snapshot is handed over in one short step: your real browser binary starts
+**headless, with no window, for well under a second** on the snapshot, reads
+its own cookie jar, and exits before Hermes's browser starts; the jar is then
+loaded into Hermes's browser, which keeps it under a browser-local key. No
+keychain prompt, and Hermes never holds your keychain secret.
+
+Hermes's browser is a **different application** from yours to the operating
+system (its own bundle identifier), which is the point: a second instance of
+your own browser app — even hidden — is what your Mac's Dock, Finder and
+`open` count as *your browser*, so while one lived, your browser would neither
+open nor quit. Your live browser profile is **never opened directly**: the
+snapshot is a separate directory, so it doesn't fight your running browser
+for the profile lock and it sidesteps Chrome 136+'s block on remote-debugging
+the default profile directory. The cookies are re-synced from your real
+profile whenever a fresh session is launched, so logins you do in your own
+browser show up in the agent's session. Only the active profile is copied —
+other Chrome profiles are never snapshotted — and the snapshot's
+keychain-encrypted stores (saved passwords, autofill) are removed after the
+hand-over, since Hermes's browser cannot read them.
+
+Hermes's browser is bound to the Hermes process that started it: it closes
+after the browser inactivity timeout once no task is using it, on exit, and a
+copy left behind by a Hermes that died uncleanly is closed by the next one.
 
 The snapshot browser runs **headless** — it drives your profile in the
 background with no visible window and never steals focus, so you can keep

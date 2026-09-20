@@ -357,6 +357,10 @@ def _reap_orphaned_browser_sessions():
         from tools.browser_lightpanda import reap_orphaned_lightpanda
         reap_orphaned_lightpanda()
     _best_effort("Lightpanda orphan reap", _reap_lp)
+    # Driven browsers launched by a Hermes that died uncleanly (Popen handle lost, atexit never
+    # ran) keep the copy dir open — and on macOS a second instance of the person's browser app
+    # once hijacked its Dock identity for days. Identity: --user-data-dir under our root.
+    _best_effort("Driven-browser orphan reap", _real_profile.reap_orphaned_driven_browsers)
 
     tmpdir = _bt._socket_safe_tmpdir()
     socket_dirs = []
@@ -402,6 +406,9 @@ def _browser_cleanup_thread_worker():
             _cleanup_inactive_browser_sessions()
         except Exception as e:
             _bt.logger.warning("Cleanup thread error: %s", e)
+        # The shared real-profile browser has no session of its own to go idle; release it once
+        # every task session that used it is gone and the same inactivity timeout has passed.
+        _best_effort("Real-profile idle release", _real_profile.release_if_idle)
 
         for _ in range(30):  # 1s granularity so stop is quick
             if not _bt._cleanup_running:

@@ -1,17 +1,35 @@
 """Real-profile local browsing: snapshot the user's default Chromium profile into a
-hermes-owned copy, launch the real browser binary on it, and attach agent-browser.
+hermes-owned copy, hand its sign-ins to the browser Hermes drives, and attach agent-browser.
+
+The browser Hermes DRIVES is agent-browser's own packaged Chrome for Testing (or Playwright's
+Chromium) — never the person's installed browser application. The person's browser binary is
+started only for a hand-over of a few hundred milliseconds: headless, on the copy, to read the
+cookie jar its OS keychain protects, and it is terminated before the driven browser starts.
+
+Why the person's browser must not be the driven one (measured on macOS 26, Chrome 153): a
+second instance of ``/Applications/Google Chrome.app`` — even ``--headless=new`` with
+``--no-startup-window`` — registers with Launch Services under Chrome's own bundle identifier.
+Launch Services identifies an application by that identifier, so while the hidden instance
+lived, the Dock, Finder and ``open`` routed "open Chrome" and "quit Chrome" to it: the person's
+browser would not open and would not quit. Chrome for Testing carries its own identifier
+(``com.google.chrome.for.testing``) and never collides with anything the person launches.
+
+The driven browser is bound to the Hermes process that launched it: closed after the session
+inactivity timeout, on exit, and — for a launch whose owner died uncleanly — by the orphan reaper
+of the next Hermes process. It is never adopted "until the user closes it".
 
 State (``_REAL_PROFILE_SESSION``, ``_real_profile_cdp_lock``, ``_real_profile_cdp_cache``,
-``_real_profile_chrome_procs``) lives in ``tools.browser_tool``; it is read
-through ``_bt`` (resolved per call — never import ``tools.browser_tool`` at import time).
+``_real_profile_chrome_procs``, ``_real_profile_last_used``) lives in ``tools.browser_tool``; it
+is read through ``_bt`` (resolved per call — never import ``tools.browser_tool`` at import time).
 """
 
+import json
 import os
 import re
 import subprocess
 import sys
 import time
-from typing import Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from tools.browser_tool_origin import origin_module as _origin
 from tools import browser_tool_cloud as _cloud
 from tools import browser_tool_install as _install
@@ -22,7 +40,7 @@ _RP = "browser.use_real_profile is on, but "
 
 
 def _terminate_real_profile_chrome() -> None:
-    """Terminate real-browser processes launched for real-profile sessions (idempotent, atexit-safe);
+    """Terminate browser processes launched for real-profile sessions (idempotent, atexit-safe);
     agent-browser only ATTACHED to them, so its own session cleanup never kills them."""
     from tools.browser_lightpanda import _terminate
     _bt = _origin()
@@ -39,7 +57,7 @@ def _cdp_http_ready(http_cdp: str) -> bool:
 def _real_profile_daemon_env() -> dict:
     """Reaper-visible socket dir + ``owner_pid`` claim like every other lane (agent-browser's
     default dir is invisible to the reaper — #100855). The daemon-side idle timeout is dropped:
-    Chrome is launched by Hermes, not the daemon, so a self-exiting daemon would leave Chrome
+    the browser is launched by Hermes, not the daemon, so a self-exiting daemon would leave it
     holding the copy dir under the next snapshot overlay."""
     _bt = _origin()
     socket_dir = _session._prepare_session_socket_dir(_bt._REAL_PROFILE_SESSION)
@@ -81,8 +99,8 @@ def _read_devtools_port(data_dir: str) -> Optional[str]:
 
 
 def _surviving_chrome_cdp(data_dir: str) -> Optional[str]:
-    """HTTP CDP root of a Chrome still running on ``data_dir``, or None. ``DevToolsActivePort``
-    outlives a crashed Chrome and its port can be recycled by another local CDP server, so the
+    """HTTP CDP root of a browser still running on ``data_dir``, or None. ``DevToolsActivePort``
+    outlives a crashed browser and its port can be recycled by another local CDP server, so the
     file's browser id (line 2) must match what ``/json/version`` reports before it is trusted."""
     try:
         with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8") as fh:
@@ -119,6 +137,19 @@ _REAL_PROFILE_CHROME_FLAGS = (
     "--disable-sync", "--disable-features=Translate", "--no-startup-window",
 )
 
+# The auth stores the snapshot copies are encrypted under the PERSON's browser keychain entry.
+# After the hand-over the driven browser (mock keychain) cannot read them, so they are removed:
+# an unreadable copy of someone's saved passwords is a liability, not a feature.
+_KEYCHAIN_BOUND_AUTH_FILES = (
+    "Cookies", os.path.join("Network", "Cookies"), "Login Data", "Login Data For Account", "Web Data",
+)
+
+# Fields of a CDP ``Network.Cookie`` (Storage.getCookies) that ``Network.CookieParam``
+# (Storage.setCookies) accepts. ``session``/``size``/``partitionKeyOpaque`` are read-only.
+_COOKIE_PARAM_KEYS = ("name", "value", "domain", "path", "secure", "httpOnly", "sameSite", "priority",
+                      "sameParty", "sourceScheme", "sourcePort", "partitionKey")
+_COOKIE_IMPORT_CHUNK = 300
+
 
 def _real_profile_unsupported_reason(browser) -> Optional[str]:
     """Fail-closed message when the default browser can't be used, else None.
@@ -147,50 +178,311 @@ def _real_profile_snapshot_error(err: str) -> str:
     return f"{_RP}{err}"
 
 
-def _launch_real_profile_chrome(real_binary: str, copy_dir: str) -> Tuple[Optional[int], Optional[str]]:
-    """Launch the user's REAL browser binary on the profile COPY; return (debug_port, error).
+# ---------------------------------------------------------------------------
+# The browser Hermes drives
+# ---------------------------------------------------------------------------
 
-    agent-browser's own launch force-adds --use-mock-keychain / --password-store=basic, which makes
-    macOS Chrome drop every keychain-encrypted cookie (signed-out copy); launching the real binary
-    ourselves keeps the OS keychain path intact and agent-browser attaches via ``--cdp <port>``.
-    Headless by default (a focus-stealing window defeats a background capability); Chrome's NEW
-    headless shares the profile's cookie store (legacy --headless does not). browser.headed /
-    AGENT_BROWSER_HEADED opts into a window, except on a display-less Linux host (launch would die).
+def _mock_keychain_flags() -> Tuple[str, ...]:
+    """The driven browser keeps its cookie store under a fixed, browser-local key — the same
+    switches agent-browser's own launch passes — so it never touches the OS keychain (no prompt,
+    no access to the person's browser entry)."""
+    if sys.platform == "darwin":
+        return ("--use-mock-keychain",)
+    if sys.platform.startswith("linux"):
+        return ("--password-store=basic",)
+    return ()
+
+
+def _version_key(entry: str) -> Tuple[int, ...]:
+    return tuple(int(p) for p in re.findall(r"\d+", entry))
+
+
+def _driven_browser_candidates(root: str, entry: str) -> List[str]:
+    """Executable paths a packaged download ``root/entry`` may hold, per platform. agent-browser's
+    Chrome for Testing (``chrome-<ver>``, measured on macOS: ``Google Chrome for Testing.app``) and
+    Playwright's Chromium (``chromium-<build>``). Headless-shell builds are skipped: legacy headless
+    keeps no persistent cookie store, so a hand-over into it would be lost on the next launch."""
+    base = os.path.join(root, entry)
+    if sys.platform == "darwin":
+        rels = ("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+                "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium")
+    elif sys.platform == "win32":
+        rels = ("chrome-win64/chrome.exe", "chrome-win/chrome.exe", "chrome.exe")
+    else:
+        rels = ("chrome-linux64/chrome", "chrome-linux/chrome", "chrome")
+    return [os.path.join(base, rel) for rel in rels]
+
+
+def driven_browser_executable() -> Optional[str]:
+    """Path of the browser Hermes drives, or None when no packaged build is on disk.
+
+    ``AGENT_BROWSER_EXECUTABLE_PATH`` wins when it names a file. Otherwise the newest packaged
+    build under agent-browser's / Playwright's download roots. The person's installed browser
+    application is never a candidate — see the module docstring for why.
+    """
+    override = os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()
+    if override and os.path.isfile(override):
+        return override
+    for root in _install._chromium_search_roots():
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            entries = [e for e in os.listdir(root) if e.startswith(("chrome-", "chromium-"))]
+        except OSError:
+            continue
+        for entry in sorted(entries, key=_version_key, reverse=True):
+            for candidate in _driven_browser_candidates(root, entry):
+                if os.path.isfile(candidate):
+                    return candidate
+    return None
+
+
+def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str], what: str,
+                           headless: bool) -> Tuple[Optional[subprocess.Popen], Optional[int], Optional[str]]:
+    """Launch ``binary`` on the profile COPY and wait for its debug port: ``(proc, port, error)``.
+
+    The process is recorded in ``_real_profile_chrome_procs`` so exit/idle/atexit cleanup can reach
+    it. On failure it is terminated here and ``(None, None, error)`` is returned.
     """
     _bt = _origin()
     try:
         os.unlink(os.path.join(copy_dir, "DevToolsActivePort"))  # stale port confuses reuse probes
     except OSError:
         pass
-    chrome_argv = [real_binary, f"--user-data-dir={copy_dir}", *_REAL_PROFILE_CHROME_FLAGS]
-    _has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    if not (_cloud._is_headed_mode() and (_has_display or not sys.platform.startswith("linux"))):
-        chrome_argv.append("--headless=new")
+    argv = [binary, f"--user-data-dir={copy_dir}", *_REAL_PROFILE_CHROME_FLAGS, *extra_flags]
+    if headless:
+        argv.append("--headless=new")
     try:
-        chrome_proc = subprocess.Popen(chrome_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       stdin=subprocess.DEVNULL, start_new_session=True, env=_bt._build_browser_env())
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=_bt._build_browser_env())
     except (subprocess.SubprocessError, OSError) as e:
-        return None, f"{_RP}the launch failed: {e}"
-    _bt._real_profile_chrome_procs.append(chrome_proc)
+        return None, None, f"{_RP}the {what} launch failed: {e}"
+    _bt._real_profile_chrome_procs.append(proc)
 
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         line = _read_devtools_port(copy_dir) or ""
         if line.isdigit():
-            return int(line), None
-        if chrome_proc.poll() is not None:
+            return proc, int(line), None
+        if proc.poll() is not None:
             _terminate_real_profile_chrome()
-            return None, _RP + "Chrome exited during startup (another instance may hold the profile copy)."
+            return None, None, _RP + f"the {what} exited during startup (another instance may hold the profile copy)."
         time.sleep(0.25)
     _terminate_real_profile_chrome()
-    return None, _RP + "the real-profile browser did not expose a debug port in time. Retry, or turn the toggle off."
+    return None, None, _RP + f"the {what} did not expose a debug port in time. Retry, or turn the toggle off."
 
+
+def _driven_browser_headless() -> bool:
+    """Headless by default (a focus-stealing window defeats a background capability); Chrome's NEW
+    headless shares the profile's cookie store (legacy --headless does not). browser.headed /
+    AGENT_BROWSER_HEADED opts into a window, except on a display-less Linux host (launch would die)."""
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return not (_cloud._is_headed_mode() and (has_display or not sys.platform.startswith("linux")))
+
+
+def _launch_driven_browser(binary: str, copy_dir: str) -> Tuple[Optional[int], Optional[str]]:
+    """Launch the browser Hermes drives on the copy; ``(debug_port, error)``. agent-browser then
+    attaches via ``--cdp <port>`` (its own launch would pick a throwaway profile)."""
+    _, port, err = _spawn_browser_on_copy(binary, copy_dir, _mock_keychain_flags(), "browser",
+                                          headless=_driven_browser_headless())
+    return port, err
+
+
+# ---------------------------------------------------------------------------
+# The hand-over: the person's browser reads its own cookie jar, briefly
+# ---------------------------------------------------------------------------
+
+def _cdp_call(port: int, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 20.0) -> Dict[str, Any]:
+    """One browser-level CDP call over the debug port; returns the ``result`` dict. Raises on error."""
+    import requests
+    from websockets.sync.client import connect
+    ws_url = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=3).json()["webSocketDebuggerUrl"]
+    with connect(ws_url, max_size=None, open_timeout=timeout, close_timeout=2) as ws:
+        ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = json.loads(ws.recv(timeout=max(0.1, deadline - time.monotonic())))
+            if msg.get("id") != 1:
+                continue
+            if "error" in msg:
+                raise RuntimeError(f"{method}: {msg['error'].get('message', msg['error'])}")
+            return msg.get("result") or {}
+    raise TimeoutError(f"{method}: no reply in {timeout:.0f}s")
+
+
+def _cookie_param(cookie: Dict[str, Any]) -> Dict[str, Any]:
+    """``Network.Cookie`` -> ``Network.CookieParam``: keep the settable fields; session cookies
+    carry no ``expires`` (getCookies reports -1, which setCookies rejects)."""
+    param = {k: cookie[k] for k in _COOKIE_PARAM_KEYS if k in cookie}
+    if not cookie.get("session") and float(cookie.get("expires", -1) or -1) > 0:
+        param["expires"] = cookie["expires"]
+    return param
+
+
+def _export_cookies_from_persons_browser(real_binary: str, copy_dir: str) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Start the person's browser binary headless on the copy, read every cookie its keychain
+    entry decrypts, and terminate it. ``(cookies, None)`` or ``(None, error)``.
+
+    This is the only moment the person's browser application runs for Hermes. It is headless,
+    opens no window, and lives for the read (sub-second, measured) — but while it lives Launch
+    Services counts it as that application, so it is never left running past this function.
+    """
+    _bt = _origin()
+    proc, port, err = _spawn_browser_on_copy(real_binary, copy_dir, (), "hand-over browser", headless=True)
+    if proc is None or port is None:
+        return None, err
+    try:
+        cookies = list(_cdp_call(port, "Storage.getCookies").get("cookies") or [])
+    except Exception as e:
+        return None, f"{_RP}the sign-in hand-over failed to read the cookie jar: {e}"
+    finally:
+        _terminate_real_profile_chrome()
+    _bt.logger.info("real-profile: hand-over read %d cookie(s) from %s", len(cookies), os.path.basename(real_binary))
+    return cookies, None
+
+
+def _forget_keychain_bound_auth_files(copy_dir: str) -> None:
+    """Remove the copy's keychain-encrypted auth stores after the hand-over (see the constant)."""
+    for rel in _KEYCHAIN_BOUND_AUTH_FILES:
+        for path in (os.path.join(copy_dir, "Default", rel), os.path.join(copy_dir, "Default", rel + "-journal")):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _import_cookies_into_driven_browser(port: int, cookies: List[Dict[str, Any]]) -> Optional[str]:
+    """``Storage.setCookies`` in chunks; None on success, else an error message."""
+    params = [_cookie_param(c) for c in cookies]
+    try:
+        for i in range(0, len(params), _COOKIE_IMPORT_CHUNK):
+            _cdp_call(port, "Storage.setCookies", {"cookies": params[i:i + _COOKIE_IMPORT_CHUNK]})
+    except Exception as e:
+        return f"{_RP}the sign-in hand-over failed to load the cookie jar: {e}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: bound to the Hermes process that launched it
+# ---------------------------------------------------------------------------
+
+def _browsers_on_data_dir(data_dir: str):
+    """Chromium-family processes whose command line binds THIS ``--user-data-dir`` (fail-closed on
+    an unreadable cmdline), reusing the profile-holder matcher from ``browser_connect``."""
+    from hermes_cli.browser_connect import _processes_holding_profile
+    return list(_processes_holding_profile(data_dir) or [])
+
+
+def _is_orphan(proc) -> bool:
+    """True when the process that launched ``proc`` is gone (re-parented to pid 1, or parent absent).
+    The driven browser starts in its own session, so a dead owner is visible only this way."""
+    try:
+        import psutil
+        ppid = proc.ppid()
+        return ppid <= 1 or not psutil.pid_exists(ppid)
+    except Exception:
+        return False
+
+
+def _terminate_processes(procs, what: str) -> int:
+    """Terminate ``procs`` and their trees (graceful, then kill); returns how many were signalled."""
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    targets = []
+    for p in procs:
+        targets.append(p)
+        try:
+            targets.extend(p.children(recursive=True))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    for p in targets:
+        try:
+            p.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    _, alive = psutil.wait_procs(targets, timeout=5.0)
+    for p in alive:
+        try:
+            p.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    if alive:
+        psutil.wait_procs(alive, timeout=3.0)
+    if targets:
+        _origin().logger.info("real-profile: terminated %d %s process(es)", len(targets), what)
+    return len(targets)
+
+
+def _own_browser_pids() -> set:
+    _bt = _origin()
+    return {p.pid for p in _bt._real_profile_chrome_procs if p.poll() is None}
+
+
+def _terminate_orphaned_browsers_on_dir(copy_dir: str) -> int:
+    """Terminate browsers holding ``copy_dir`` whose launching Hermes died. A holder whose owner is
+    alive (another Hermes process sharing this home) is left alone."""
+    own = _own_browser_pids()
+    orphans = [p for p in _browsers_on_data_dir(copy_dir) if p.pid not in own and _is_orphan(p)]
+    return _terminate_processes(orphans, "orphaned driven-browser") if orphans else 0
+
+
+def reap_orphaned_driven_browsers() -> int:
+    """Startup / periodic reap: every driven browser under this home's ``browser-profile`` root whose
+    owner is gone. Identity is the ``--user-data-dir`` under OUR root — never a name match, so the
+    person's own browser (no such argument) can never qualify."""
+    from hermes_cli.browser_connect import get_hermes_home
+    root = str(get_hermes_home() / "browser-profile")
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return 0
+    reaped = 0
+    for entry in entries:
+        copy_dir = os.path.join(root, entry)
+        if os.path.isdir(copy_dir):
+            reaped += _terminate_orphaned_browsers_on_dir(copy_dir)
+    return reaped
+
+
+def _real_profile_in_use() -> bool:
+    """True while any task session drives the shared real-profile browser."""
+    _bt = _origin()
+    with _bt._cleanup_lock:
+        return any((info.get("features") or {}).get("real_profile") for info in _bt._active_sessions.values())
+
+
+def release_if_idle(now: Optional[float] = None) -> bool:
+    """Close the driven browser once no task session uses it and the inactivity timeout has passed
+    since it was last requested. Runs from the cleanup thread; True when it released something."""
+    _bt = _origin()
+    now = time.time() if now is None else now
+    have_browser = bool(_bt._real_profile_cdp_cache.get("cdp")) or bool(_own_browser_pids())
+    if not have_browser:
+        return False
+    if now - _bt._real_profile_last_used <= _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT or _real_profile_in_use():
+        return False
+    with _bt._real_profile_cdp_lock:
+        _bt._real_profile_cdp_cache.pop("cdp", None)
+        _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
+        _terminate_real_profile_chrome()
+    _bt.logger.info("real-profile: driven browser released after %ds idle", _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def _attach_agent_browser_to_real_profile(port: int, copy_dir: str) -> Tuple[Optional[str], Optional[str]]:
-    """Make agent-browser ATTACH to the running Chrome (never launch its own); returns ``(http_cdp, error)``.
+    """Make agent-browser ATTACH to the running browser (never launch its own); returns ``(http_cdp, error)``.
 
     The daemon may answer with the endpoint of a browser IT spawned (throwaway temp profile);
-    the DevToolsActivePort OUR Chrome wrote is authoritative on disagreement.
+    the DevToolsActivePort OUR browser wrote is authoritative on disagreement.
     """
     _bt = _origin()
     try:
@@ -222,9 +514,10 @@ def _attach_agent_browser_to_real_profile(port: int, copy_dir: str) -> Tuple[Opt
 def _real_profile_cdp() -> tuple:
     """Resolve ``(cdp_url, error)`` for consented real-profile browsing.
 
-    Snapshot -> launch real binary on the copy -> return its HTTP CDP endpoint. The copy is a
-    non-default dir, so it sidesteps the Chrome >=136 default-profile remote-debugging block and
-    never contends with the user's running browser. One shared agent-browser session is reused
+    Snapshot -> hand-over (the person's binary reads the cookie jar, headless, and exits) ->
+    launch the driven browser on the copy -> load the jar -> return its HTTP CDP endpoint. The copy
+    is a non-default dir, so it sidesteps the Chrome >=136 default-profile remote-debugging block
+    and never contends with the user's running browser. One shared agent-browser session is reused
     across calls (cached, re-validated). ``(None, message)`` fail-closed; ``(None, None)`` when consent is off.
     """
     _bt = _origin()
@@ -249,6 +542,7 @@ def _real_profile_cdp() -> tuple:
                                             real_profile_copy_dir, snapshot_real_profile)
 
     with _bt._real_profile_cdp_lock:
+        _bt._real_profile_last_used = time.time()
         cached = _bt._real_profile_cdp_cache.get("cdp")
         if cached and _cdp_http_ready(cached):
             # Re-claim the shared daemon's socket dir so the orphan reaper's idle clock sees
@@ -272,17 +566,18 @@ def _real_profile_cdp() -> tuple:
             return existing, None
         if existing:  # stale/wrong-dir session: close it so nothing holds the dir open
             _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
-        # A Chrome from an earlier hermes process can still hold the copy dir after its attach
-        # daemon was reaped (that owner died). Re-attach to it rather than overlay a live profile;
-        # if the daemon cannot attach, fail closed — never snapshot over an open profile. Not ours
-        # to terminate (no Popen handle): it lives until the user closes it, by design.
+        # A browser from an EARLIER Hermes process can still hold the copy dir after its attach
+        # daemon was reaped. If that owner is dead it is an orphan: terminate it (identity-bound to
+        # our copy dir) so nothing ours outlives its owner. If the owner is alive (another Hermes
+        # sharing this home) re-attach rather than overlay a live profile.
+        _terminate_orphaned_browsers_on_dir(copy_dir)
         surviving = _surviving_chrome_cdp(copy_dir)
         if surviving:
             cdp, err = _attach_agent_browser_to_real_profile(int(surviving.rsplit(":", 1)[1]), copy_dir)
             if not cdp:
                 return None, err
             _bt._real_profile_cdp_cache["cdp"] = cdp
-            _bt.logger.info("real-profile: re-attached to surviving Chrome at %s (%s)", cdp, copy_dir)
+            _bt.logger.info("real-profile: re-attached to a live owner's browser at %s (%s)", cdp, copy_dir)
             return cdp, None
 
         copy_dir, err = snapshot_real_profile(browser)
@@ -291,12 +586,29 @@ def _real_profile_cdp() -> tuple:
         real_binary = chromium_executable(browser)
         if real_binary is None:
             return None, f"{_RP}the real browser binary for '{browser}' could not be found. Reinstall it or turn the toggle off."
-        port, err = _launch_real_profile_chrome(real_binary, copy_dir)
+        driven = driven_browser_executable()
+        if driven is None and _install._maybe_autoinstall_chromium():
+            driven = driven_browser_executable()
+        if driven is None:
+            return None, (_RP + "the browser engine's own Chrome is not installed, and Hermes never drives your "
+                          "installed browser application. Run `agent-browser install`, or turn the toggle off.")
+
+        cookies, err = _export_cookies_from_persons_browser(real_binary, copy_dir)
+        if cookies is None:
+            return None, err
+        _forget_keychain_bound_auth_files(copy_dir)
+        port, err = _launch_driven_browser(driven, copy_dir)
         if port is None:
+            return None, err
+        err = _import_cookies_into_driven_browser(port, cookies)
+        if err:
+            _terminate_real_profile_chrome()
             return None, err
         cdp, err = _attach_agent_browser_to_real_profile(port, copy_dir)
         if not cdp:
+            _terminate_real_profile_chrome()
             return None, err
         _bt._real_profile_cdp_cache["cdp"] = cdp
-        _bt.logger.info("real-profile browser ready for %s at %s (%s)", browser, cdp, copy_dir)
+        _bt.logger.info("real-profile browser ready for %s at %s (%s, %d cookie(s) handed over)",
+                        browser, cdp, copy_dir, len(cookies))
         return cdp, None
