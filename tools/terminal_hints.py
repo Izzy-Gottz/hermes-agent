@@ -45,27 +45,45 @@ def _missing_command_hint(missing: str) -> str:
 
 
 _EPERM_RE = re.compile(r"Operation not permitted|EPERM\b", re.I)
-_MACOS_PROTECTED_RE = re.compile(r"(?:^|[/\s'\"~:])(Desktop|Documents|Downloads|Mobile Documents)(?=$|[/\s'\":])", re.M)
-_MACOS_PROTECTED_NAMES = {"Mobile Documents": "iCloud Drive"}
+# The failing path IS a protected folder itself: "ls: /Users/a/Desktop: Operation not permitted",
+# "ls: Desktop: Operation not permitted", "find: …/Library/Mobile Documents: Operation not permitted".
+# Only listing the folder itself proves privacy protection: a file flag (chflags uchg) makes a FILE
+# inside it EPERM too, and a process-level EPERM ("kill: 1: Operation not permitted") has no folder.
+_MACOS_FOLDER_EPERM_RE = re.compile(
+    r"(?:^|[\s:'\"/~])(Desktop|Documents|Downloads|Mobile Documents|com~apple~CloudDocs)/?['\"]?: *"
+    r"(?:Operation not permitted|\[Errno 1\])", re.I | re.M)
+_MACOS_PROTECTED_NAMES = {"mobile documents": "iCloud Drive", "com~apple~clouddocs": "iCloud Drive"}
 
 
 def _macos_eperm_hint(command: str, output: str) -> Optional[str]:
-    """macOS only: EPERM ("Operation not permitted") is privacy protection or a file flag, never mode."""
-    if sys.platform != "darwin":
+    """macOS only: "Operation not permitted" (EPERM) is never ownership or mode, so the EACCES hint's
+    sudo advice is wrong for it. Privacy protection is claimed only on evidence: the failing path is
+    a protected folder itself, and the command addressed it. Otherwise the hint stays neutral."""
+    if sys.platform != "darwin" or not _EPERM_RE.search(output):
         return None
-    lines = [ln for ln in output.splitlines() if _EPERM_RE.search(ln)]
-    if not lines:
+    m = _MACOS_FOLDER_EPERM_RE.search(output)
+    if m and m.group(1).lower() in (command or "").lower():
+        name = _MACOS_PROTECTED_NAMES.get(m.group(1).lower(), m.group(1))
+        return (f"macOS privacy protection blocked access to the {name} folder (\"Operation not permitted\" "
+                "is not a file-mode problem, so sudo and chmod will not help). Tell the user the app needs "
+                f"access to {name} in System Settings › Privacy & Security, and do not retry until they "
+                "turn it on.")
+    return ("Operation not permitted: macOS may be protecting this (privacy protection, a file flag such "
+            "as uchg, or a process you may not signal); sudo won't help. Do not retry the same command.")
+
+
+_AE_REFUSED_RE = re.compile(r"Not authori[sz]ed to send Apple events to ([^\n]+?)\.? *(?:\(-1743\)|$)", re.M)
+_RUNS_APPLESCRIPT_RE = re.compile(r"(?:^|[\s;&|(`$/])osascript\b|\.(?:scpt|scptd|applescript)\b", re.M)
+
+
+def _automation_hint(command: str, output: str) -> Optional[str]:
+    """-1743 from a command that runs AppleScript/JXA itself; quoted in a log or a grep it is not one."""
+    if not _RUNS_APPLESCRIPT_RE.search(command or "") or not (m := _AE_REFUSED_RE.search(output)):
         return None
-    folder = next((f for ln in lines if (f := _MACOS_PROTECTED_RE.search(ln))), None) \
-        or _MACOS_PROTECTED_RE.search(command or "")
-    if folder:
-        name = _MACOS_PROTECTED_NAMES.get(folder.group(1), folder.group(1))
-        return (f"macOS privacy protection blocked access to {name} (\"Operation not permitted\" is not a "
-                "file-mode problem, so sudo and chmod will not help). Tell the user the app needs access to "
-                f"{name} in System Settings › Privacy & Security, and do not retry until they turn it on.")
-    return ("\"Operation not permitted\" on macOS is privacy protection (TCC) or a file flag "
-            "(`ls -lO` shows uchg/schg), not ownership or mode: sudo and chmod will not help. Do not retry "
-            "the same command.")
+    app = m.group(1).strip()
+    return (f"macOS has not allowed this app to control {app} (Automation, error -1743); retrying will "
+            f"fail the same way. Tell the user to turn on {app} under the app in System Settings › "
+            "Privacy & Security › Automation, then retry.")
 
 
 # Ordered by production frequency — first match wins.
@@ -94,10 +112,7 @@ _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
     # EPERM before EACCES: on macOS "Operation not permitted" is almost always privacy protection
     # (TCC), which sudo and chmod cannot change; the EACCES hint below would send the model to both.
     _macos_eperm_hint,
-    _regex_hint(r"Not authori[sz]ed to send Apple events to ([^\n]+?)\.? *(?:\(-1743\)|$)",
-                "macOS has not allowed this app to control {0} (Automation, error -1743); retrying will fail "
-                "the same way. Tell the user to turn on {0} under the app in System Settings › Privacy & "
-                "Security › Automation, then retry.", re.M),
+    _automation_hint,
     _regex_hint(r"Permission denied|EACCES",
                 "Permission denied. Check ownership/mode of the target path (`ls -la`); prefer a "
                 "user-writable location. Only escalate to sudo if the task genuinely requires it."),

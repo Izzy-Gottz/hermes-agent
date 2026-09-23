@@ -20,8 +20,12 @@ present (``null`` when not applicable)::
       "pane":    str | null,   # a PANES anchor (e.g. "Privacy_AllFiles"); the host turns it into
                                # x-apple.systempreferences:com.apple.preference.security?<pane>
       "subject": str | null,   # the app or folder involved ("Google Chrome", "Desktop", "Notes")
-      "retry":   bool          # whether the failed call can simply be run again once it is fixed
-      ...                      # optional code-specific extras (e.g. "path"), never one of the above
+      "retry":   bool          # the identical call is expected to succeed once the named fix is done,
+                               # with nothing else changed. False when something else must happen
+                               # first that the error says (e.g. relaunching the app).
+      ...                      # optional code-specific extras (e.g. "path"), never one of the above.
+                               # "restart": "driver" = the grant applies to a freshly launched
+                               # screen helper; Hermes relaunches it on the next call itself.
     }
 
 Unknown codes, owners or panes raise ``ValueError`` at the call site: a typo must fail a test, not

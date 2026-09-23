@@ -9,6 +9,7 @@ implementation serves every environment (local, docker, ssh, modal, ...). Compan
 
 import base64
 import binascii
+import errno
 import os
 import re
 import sys
@@ -679,6 +680,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             st = os.stat(full)
         except (FileNotFoundError, NotADirectoryError):
             return self._read_file_missing(path, offset, limit)
+        except PermissionError as e:
+            if e.errno == errno.EPERM:
+                return self._eperm_read_error(path, e)
+            return self._read_file_sequential(path, offset, limit)
         except OSError:
             return self._read_file_sequential(path, offset, limit)
         if not _stat.S_ISREG(st.st_mode):
@@ -733,6 +738,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                         total_lines += 1
                         lineno += 1
                         pos = nl + 1
+        except PermissionError as e:
+            if e.errno == errno.EPERM:
+                return self._eperm_read_error(path, e)
+            return self._read_file_sequential(path, offset, limit)
         except OSError:
             return self._read_file_sequential(path, offset, limit)
         if have_partial and offset <= lineno <= end_line:
@@ -744,6 +753,14 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             read_output, offset=offset, end_line=end_line, total_lines=total_lines,
             file_size=file_size,
             file_ends_with_newline=(last_byte == b"\n") if file_size else None)
+
+    @staticmethod
+    def _eperm_read_error(path: str, exc: OSError) -> ReadResult:
+        """EPERM on a native read is reported as itself. Handing it to the shell path (as any other
+        OSError is) cannot succeed, since the same process meets the same refusal, and the shell
+        misreported it: ``wc -c < file`` fails silently, so it read "Terminal environment
+        unavailable … Retry shortly". The file tools then check whether it is macOS privacy protection."""
+        return ReadResult(error=f"Failed to read file: {path}: [Errno {exc.errno}] {exc.strerror or 'Operation not permitted'}")
 
     @staticmethod
     def _image_redirect_result(file_size: int) -> ReadResult:

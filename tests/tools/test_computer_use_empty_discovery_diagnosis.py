@@ -98,7 +98,8 @@ def test_cli_fallback_fails_fast_on_daemon_not_running(monkeypatch):
     # driver_not_running (tools.fix_reasons): person-facing words, the driver's own kept as detail
     from tools.fix_reasons import fields_of
     fields = fields_of(raised.value)
-    assert fields["code"] == "driver_not_running" and fields["retry"] is True
+    # retry is False at the source: only the tool boundary knows whether it could relaunch a helper
+    assert fields["code"] == "driver_not_running" and fields["retry"] is False
     assert "daemon is not running" in fields["detail"]
 
     assert calls["n"] == 1, f"expected fail-fast, got {calls['n']} attempts"

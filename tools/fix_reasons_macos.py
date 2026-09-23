@@ -44,6 +44,11 @@ PROTECTED_FOLDERS: Tuple[Tuple[str, str, str], ...] = (
     ("iCloud Drive", os.path.join("Library", "Mobile Documents"), "Privacy_AllFiles"),
 )
 
+#: How every grant message ends. Nothing watches for the grant yet, so promising to carry on would let
+#: the turn end on a promise; the person asks again. Slice 4 (GrantWatch) changes this one line to
+#: "then I'll carry on", once the app watches the grant and resumes the task.
+THEN = "then ask me to try again"
+
 _PANE_WORDS = {
     "Privacy_FilesAndFolders": "Files & Folders",
     "Privacy_AllFiles": "Full Disk Access",
@@ -118,7 +123,7 @@ def files_denied(folder: str, path: str, pane: str) -> FixMessage:
     return fix_message(
         f"{_cap(app)} isn't allowed into your {folder} folder, so it couldn't open "
         f"{os.path.basename(path.rstrip(os.sep)) or folder}. macOS is blocking it, not the file itself, "
-        f"so sudo or changing the file's permissions won't help. To fix it, {turn_on}, then I'll carry on.",
+        f"so sudo or changing the file's permissions won't help. To fix it, {turn_on}, {THEN}.",
         TCC_FILES, pane=pane, subject=folder, retry=True, path=path)
 
 
@@ -151,16 +156,35 @@ def _path_candidates(line: str) -> Iterable[str]:
             yield field
 
 
-def files_denied_in_text(text: str, cwd: Optional[str] = None) -> Optional[FixMessage]:
-    """``tcc_files`` from command output: a line saying "Operation not permitted" that names a path
-    inside a protected folder, confirmed by the folder probe. The text alone is not proof."""
+def _command_touches(command: str, cand: str, cwd: Optional[str]) -> bool:
+    """Whether the COMMAND itself addresses ``cand``: it names the path, or it runs inside the protected
+    folder and the path is relative. A path that only appears in output (an old log, a test's
+    expected text) is not evidence, and must never cause the first touch of a protected folder."""
+    if not command:
+        return False
+    absolute = _absolute(cand, cwd)
+    home = os.path.normpath(os.path.expanduser("~"))
+    spellings = {cand, absolute}
+    if absolute.startswith(home + os.sep):
+        spellings.add("~" + absolute[len(home):])
+    if any(sp and sp in command for sp in spellings):
+        return True
+    return (not os.path.isabs(os.path.expanduser(cand)) and cwd is not None
+            and protected_folder(cwd) is not None)
+
+
+def files_denied_in_text(text: str, cwd: Optional[str] = None, command: str = "") -> Optional[FixMessage]:
+    """``tcc_files`` from a failed command's output: a line saying "Operation not permitted" that names
+    a path inside a protected folder which the command itself addressed, confirmed by the folder probe
+    AFTER that failure (the command touched the folder first, never the probe)."""
     if not _is_darwin() or not text or not _EPERM_TEXT.search(text):
         return None
     for line in text.splitlines():
         if not _EPERM_TEXT.search(line):
             continue
         for cand in _path_candidates(line):
-            if protected_folder(cand, cwd) and (fix := files_denied_for(cand, cwd)) is not None:
+            if (protected_folder(cand, cwd) and _command_touches(command, cand, cwd)
+                    and (fix := files_denied_for(cand, cwd)) is not None):
                 return fix
     return None
 
@@ -172,7 +196,20 @@ def files_denied_in_text(text: str, cwd: Optional[str] = None) -> Optional[FixMe
 _AE_REFUSED = re.compile(
     r"Not authori[sz]ed to send Apple events to (?P<app>[^\n]+?)\.?\s*(?:\((?P<num>-174[34])\)|$)", re.M)
 _AE_NUMBER = re.compile(r"\((?P<num>-174[34])\)")
+# The command itself runs AppleScript or JXA: osascript (incl. -l JavaScript), or a compiled/plain
+# script file. Output that merely QUOTES the refusal (grep of a header, cat of a log, a test's
+# assertion text) is not a refusal.
+_RUNS_APPLESCRIPT = re.compile(
+    r"(?:^|[\s;&|(`$/])osascript\b|\.(?:scpt|scptd|applescript)\b", re.M)
 _TELL_APP = re.compile(r"""tell\s+application\s+(?:id\s+)?["“]([^"”]+)["”]|Application\(\s*['"]([^'"]+)['"]\s*\)""", re.I)
+
+
+def automation_denied_in_command(command: str, output: str) -> Optional[FixMessage]:
+    """``tcc_automation`` for a terminal command: only when the command runs AppleScript/JXA itself AND
+    its output carries macOS's full "Not authorized to send Apple events to <App>" line."""
+    if not command or not _RUNS_APPLESCRIPT.search(command) or not _AE_REFUSED.search(output or ""):
+        return None
+    return automation_denied_in_text(output, command)
 
 
 def automation_denied_in_text(text: str, script: str = "") -> Optional[FixMessage]:
@@ -201,11 +238,11 @@ def automation_denied_in_text(text: str, script: str = "") -> Optional[FixMessag
     if num == "-1744":
         msg = (f"macOS needs to ask you before {app} can control {target}, and it couldn't ask just now. "
                f"Try again while you're at your Mac and choose Allow when macOS asks. If it doesn't ask, turn on "
-               f"{target} under {app} in System Settings › Privacy & Security › Automation.")
+               f"{target} under {app} in System Settings › Privacy & Security › Automation, {THEN}.")
         consent = "not_asked"
     else:
         msg = (f"{_cap(app)} isn't allowed to control {target}. To fix it, turn on {target} under {app} in "
-               f"System Settings › Privacy & Security › Automation, then I'll carry on.")
+               f"System Settings › Privacy & Security › Automation, {THEN}.")
         consent = "denied"
     return fix_message(msg, TCC_AUTOMATION, subject=target, retry=True, consent=consent, ae_error=int(num))
 
@@ -247,39 +284,54 @@ def _has(text: str, needles: Iterable[str]) -> bool:
 
 
 def driver_grant_message(code: str, *, both: bool = False) -> FixMessage:
-    """The words for a missing CuaDriver grant. ``both``: the driver did not say which of its two."""
+    """The words for a missing CuaDriver grant. ``both``: the driver did not say which of its two.
+    ``restart: "driver"``: the grant only applies to a freshly launched driver (cua-driver: "grant ...
+    then restart the daemon"); the computer_use boundary drops the session's backend so the next call
+    launches one, which is what keeps ``retry`` true."""
     app = host_app_name()
     helper = f"{DRIVER_NAME}, the helper {app} uses to see and use your screen,"
     if both:
         return fix_message(
             f"{helper} is still waiting for macOS permission. Turn {DRIVER_NAME} on in System Settings › "
-            f"Privacy & Security › Accessibility, and in Screen & System Audio Recording, then I'll carry on. "
+            f"Privacy & Security › Accessibility, and in Screen & System Audio Recording, {THEN}. "
             f"This is {DRIVER_NAME}'s own switch, not {app}'s.",
-            TCC_DRIVER_ACCESSIBILITY, subject=DRIVER_NAME, retry=True, also_pane="Privacy_ScreenCapture")
+            TCC_DRIVER_ACCESSIBILITY, subject=DRIVER_NAME, retry=True, restart="driver",
+            also_pane="Privacy_ScreenCapture")
     if code == TCC_DRIVER_SCREEN:
         return fix_message(
             f"{helper} isn't allowed to see your screen. Turn {DRIVER_NAME} on in System Settings › Privacy & "
-            f"Security › Screen & System Audio Recording, then I'll carry on. This is {DRIVER_NAME}'s own "
+            f"Security › Screen & System Audio Recording, {THEN}. This is {DRIVER_NAME}'s own "
             f"switch, not {app}'s.",
-            TCC_DRIVER_SCREEN, subject=DRIVER_NAME, retry=True)
+            TCC_DRIVER_SCREEN, subject=DRIVER_NAME, retry=True, restart="driver")
     return fix_message(
         f"{helper} isn't allowed to control your Mac. Turn {DRIVER_NAME} on in System Settings › Privacy & "
-        f"Security › Accessibility, then I'll carry on. This is {DRIVER_NAME}'s own switch, not {app}'s.",
-        TCC_DRIVER_ACCESSIBILITY, subject=DRIVER_NAME, retry=True)
+        f"Security › Accessibility, {THEN}. This is {DRIVER_NAME}'s own switch, not {app}'s.",
+        TCC_DRIVER_ACCESSIBILITY, subject=DRIVER_NAME, retry=True, restart="driver")
 
 
-def driver_not_running_message(detail: Optional[str] = None) -> FixMessage:
-    """``driver_not_running``: the fix is restarting the helper, which Hermes does itself (the caller
-    drops the dead session so the next call launches a fresh one), so ``retry`` is True."""
+def driver_not_running_message(detail: Optional[str] = None, *, reset: bool = False) -> FixMessage:
+    """``driver_not_running``. ``reset``: a backend with its OWN (embedded) daemon was actually dropped,
+    so the next call launches a fresh helper and the identical call is expected to work (``retry``).
+    Anything else (nothing was released, or the machine-wide daemon Hermes does not own) is said
+    plainly, with ``retry`` false: running the call again changes nothing until the helper runs."""
     app = host_app_name()
+    extra = {"detail": detail} if detail else {}
+    if reset:
+        return fix_message(
+            f"The screen helper ({DRIVER_NAME}) had stopped. I've reset it, so it starts again on the next "
+            f"try. If it keeps stopping, quitting and reopening {app} restarts it.",
+            DRIVER_NOT_RUNNING, subject=DRIVER_NAME, retry=True, **extra)
     return fix_message(
-        f"The screen helper ({DRIVER_NAME}) had stopped. I've reset it, so it starts again on the next try. "
-        f"If it keeps stopping, quitting and reopening {app} restarts it.",
-        DRIVER_NOT_RUNNING, subject=DRIVER_NAME, retry=True, **({"detail": detail} if detail else {}))
+        f"The screen helper ({DRIVER_NAME}) isn't running, so I can't see or use your screen right now. "
+        f"Quitting and reopening {app} starts it again; {THEN}.",
+        DRIVER_NOT_RUNNING, subject=DRIVER_NAME, retry=False, **extra)
 
 
 def driver_fix_in(text: str = "", driver_code: Optional[str] = None) -> Optional[FixMessage]:
-    """The fixable cause in a cua-driver failure (its message and/or its refusal code), else ``None``."""
+    """The fixable cause in a cua-driver failure (its message and/or its refusal code), else ``None``.
+    macOS only: these are TCC grants and a LaunchServices-launched helper."""
+    if not _is_darwin():
+        return None
     text = text or ""
     code = driver_code if isinstance(driver_code, str) else ""
     if _has(text, _DRIVER_DOWN_TEXT):

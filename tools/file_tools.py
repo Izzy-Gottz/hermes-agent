@@ -247,21 +247,32 @@ def _is_expected_write_exception(exc: Exception) -> bool:
         isinstance(exc, OSError) and exc.errno in _EXPECTED_WRITE_ERRNOS)
 
 
-def _tcc_files_denial(resolved: str | None, task_id: str) -> str | None:
-    """``tcc_files`` error JSON when macOS privacy protection refuses this process the protected folder
-    (Desktop, Documents, Downloads, iCloud Drive) holding ``resolved``; None otherwise.
+def _tcc_files_after_failure(resolved: str | None, task_id: str, error_text: str) -> str | None:
+    """``tcc_files`` error JSON for a read/write/patch that has ALREADY FAILED on a path inside a
+    protected folder (Desktop, Documents, Downloads, iCloud Drive), when macOS privacy protection is why.
 
-    Checked BEFORE the read/write because nothing downstream can say it: the native read catches the
-    EPERM and falls back to the shell, where ``wc -c < file`` fails silently and the result claimed
-    "Terminal environment unavailable … Retry shortly" (and ``sed | cut`` exits with cut's 0, an empty
-    read). Only paths inside a protected folder pay the probe, and only on this host's filesystem."""
+    Never before the operation: a file the person granted individually (``com.apple.macl``) opens even
+    when its folder does not, so a folder probe first would refuse a file that works, and would be the
+    first touch of the folder. The evidence is the failure's own EPERM ("Operation not permitted" in
+    its words, or re-opening the file raises EPERM; the shell's words are often a lie here: "Terminal
+    environment unavailable … Retry shortly"), and then the folder refusing EPERM confirms it is
+    privacy protection and not a file flag."""
     import sys as _sys  # not the module-level PLUGIN-COMPAT import
-    if _sys.platform != "darwin" or not resolved:
+    if _sys.platform != "darwin" or not resolved or not error_text:
         return None
     from tools.fix_reasons_macos import files_denied_for, protected_folder
     if protected_folder(resolved) is None or not _file_ops_uses_host_paths(_get_file_ops(task_id)):
         return None
-    fix = files_denied_for(resolved)
+    evidence = "operation not permitted" in str(error_text).lower()
+    if not evidence:
+        try:
+            with open(resolved, "rb"):
+                pass
+        except PermissionError as e:
+            evidence = e.errno == errno.EPERM
+        except OSError:
+            pass
+    fix = files_denied_for(resolved) if evidence else None
     if fix is None:
         return None
     from tools.fix_reasons import as_tool_error
@@ -587,10 +598,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
-        # macOS privacy protection (tcc_files) before any read: downstream it is misreported.
-        if (tcc_denied := _tcc_files_denial(str(_resolved), task_id)) is not None:
-            return tcc_denied
-
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
         if _file_ops_uses_host_paths(_get_file_ops(task_id)):
             kind = _special_file_kind(_resolved)
@@ -644,6 +651,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
 
         result = _get_file_ops(task_id).read_file(path, offset, limit)
         result_dict = result.to_dict()
+        if result_dict.get("error") and (
+                tcc_denied := _tcc_files_after_failure(resolved_str, task_id, result_dict["error"])) is not None:
+            return tcc_denied
 
         # Cache a not-found result for retries. Deliberately NO early return:
         # error results still flow through the tracking below unchanged.
@@ -817,8 +827,6 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # Resolution failure falls back to the legacy unlocked path (the write
         # still proceeds; the per-task staleness check still runs).
         _resolved = _resolve_or_none(path, task_id)
-        if (tcc_denied := _tcc_files_denial(_resolved, task_id)) is not None:
-            return tcc_denied
         path_to_resolved = {path: _resolved}
         with ExitStack() as _lock:
             if _resolved:
@@ -838,6 +846,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 result_dict["resolved_path"] = _resolved
             if result_dict.get("error"):
                 _update_read_timestamp(path, task_id)
+                if (tcc_denied := _tcc_files_after_failure(_resolved, task_id, result_dict["error"])) is not None:
+                    return tcc_denied
             else:
                 if _resolved:
                     result_dict["files_modified"] = [_resolved]
@@ -904,9 +914,6 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # overlapping multi-file patches can't deadlock (every caller locks in
         # the same order). An unresolvable path is simply not locked.
         _path_to_resolved: dict[str, str] = {_p: _resolve_or_none(_p, task_id) for _p in _paths_to_check}
-        for _r in _path_to_resolved.values():
-            if (tcc_denied := _tcc_files_denial(_r, task_id)) is not None:
-                return tcc_denied
         with ExitStack() as _locks:
             for _r in sorted({_r for _r in _path_to_resolved.values() if _r}):
                 _locks.enter_context(file_state.lock_path(_r))
@@ -930,6 +937,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            if result_dict.get("error"):
+                for _r in _path_to_resolved.values():
+                    if (tcc_denied := _tcc_files_after_failure(_r, task_id, result_dict["error"])) is not None:
+                        return tcc_denied
             if stale_warnings:
                 result_dict["_warning"] = " | ".join(stale_warnings)
             if not result_dict.get("error"):

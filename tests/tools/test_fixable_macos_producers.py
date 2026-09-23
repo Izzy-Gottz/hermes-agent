@@ -58,32 +58,56 @@ def _contract(out):
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """A fake $HOME with the protected folders, and a switch that makes macOS refuse one of them
-    exactly the way it does: opening the folder raises PermissionError(EPERM)."""
+    """A fake $HOME with the protected folders, and switches that make macOS refuse exactly the way it
+    does: ``deny(folder)`` makes opening the folder raise PermissionError(EPERM), ``deny_file(path)``
+    makes opening that file raise it. ``probes`` records every open of a protected folder, so a test
+    can prove a folder was never touched before the operation itself failed."""
+    import builtins
     h = tmp_path / "home"
     for d in ("Desktop", "Documents", "Downloads", "Library/Mobile Documents/com~apple~CloudDocs"):
         (h / d).mkdir(parents=True)
     monkeypatch.setenv("HOME", str(h))
     monkeypatch.setenv("HERMES_HOST_APP_NAME", "Memoe")
-    real_scandir, denied = os.scandir, set()
+    real_scandir, real_open = os.scandir, builtins.open
+    state = SimpleNamespace(folders=set(), files=set(), probes=[])
 
     def scandir(p="."):
-        if os.path.normpath(os.fspath(p)) in denied:
+        norm = os.path.normpath(os.fspath(p))
+        if norm.startswith(str(h) + os.sep):
+            state.probes.append(norm)
+        if norm in state.folders:
             raise PermissionError(errno.EPERM, "Operation not permitted", os.fspath(p))
         return real_scandir(p)
 
+    def fake_open(file, *a, **k):
+        if isinstance(file, (str, os.PathLike)) and os.path.normpath(os.fspath(file)) in state.files:
+            raise PermissionError(errno.EPERM, "Operation not permitted", os.fspath(file))
+        return real_open(file, *a, **k)
+
     monkeypatch.setattr(os, "scandir", scandir)
-    _denied[str(h)] = denied
+    monkeypatch.setattr(builtins, "open", fake_open)
+    _state[str(h)] = state
     return h
 
 
-_denied: dict = {}
+_state: dict = {}
 
 
 @pytest.fixture
 def deny(home):
     """``deny("Desktop")``: macOS refuses this process that folder."""
-    return lambda rel: _denied[str(home)].add(os.path.normpath(str(home / rel)))
+    return lambda rel: _state[str(home)].folders.add(os.path.normpath(str(home / rel)))
+
+
+@pytest.fixture
+def deny_file(home):
+    """``deny_file(path)``: opening this file raises EPERM, as it does inside a refused folder."""
+    return lambda p: _state[str(home)].files.add(os.path.normpath(str(p)))
+
+
+@pytest.fixture
+def probes(home):
+    return _state[str(home)].probes
 
 
 @pytest.fixture
@@ -91,31 +115,76 @@ def darwin(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
 
 
+@pytest.fixture
+def uchg():
+    """REAL EPERM that is not privacy: ``chflags uchg``. Always undone, or pytest can't clean up."""
+    flagged = []
+
+    def flag(p):
+        subprocess.run(["chflags", "uchg", str(p)], check=True)
+        flagged.append(p)
+    yield flag
+    for p in reversed(flagged):
+        subprocess.run(["chflags", "nouchg", str(p)], check=False)
+
+
 class TestTccFiles:
-    def test_read_file_in_a_refused_folder(self, home, darwin, deny):
-        (home / "Desktop" / "notes.txt").write_text("hi\n")
+    def test_read_file_in_a_refused_folder(self, home, darwin, deny, deny_file):
+        f = home / "Desktop" / "notes.txt"
+        f.write_text("hi\n")
         deny("Desktop")
+        deny_file(f)
         from tools.file_tools import read_file_tool
-        out = _contract(read_file_tool(str(home / "Desktop" / "notes.txt")))
+        out = _contract(read_file_tool(str(f)))
         assert out["code"] == "tcc_files" and out["owner"] == "app"
         assert out["pane"] == "Privacy_FilesAndFolders" and out["subject"] == "Desktop"
-        assert out["retry"] is True and out["path"] == str(home / "Desktop" / "notes.txt")
+        assert out["retry"] is True and out["path"] == str(f)
         assert "Memoe isn't allowed into your Desktop folder" in out["error"]
-        assert "sudo" in out["error"]  # says sudo will NOT help, which the old hint told it to try
+        assert out["error"].endswith("then ask me to try again.")
         assert "content" not in out
 
-    def test_write_file_and_patch_in_a_refused_folder(self, home, darwin, deny):
+    def test_native_eperm_is_not_misreported_as_the_shell(self, home, darwin, deny_file):
+        """Without the folder refusing, it is not TCC, but the read still says what happened instead of
+        the shell fallback's "Terminal environment unavailable … Retry shortly"."""
+        f = home / "Desktop" / "notes.txt"
+        f.write_text("hi\n")
+        deny_file(f)
+        from tools.file_tools import read_file_tool
+        out = json.loads(read_file_tool(str(f)))
+        assert "code" not in out and "Operation not permitted" in out["error"], out
+        assert "Terminal environment unavailable" not in out["error"]
+
+    def test_a_file_granted_on_its_own_is_never_refused(self, home, darwin, deny, probes):
+        """The folder refuses, the file itself opens (granted individually, com.apple.macl): the read
+        works, and the folder is never probed because nothing failed."""
+        f = home / "Downloads" / "granted.txt"
+        f.write_text("ok\n")
+        deny("Downloads")
+        from tools.file_tools import read_file_tool, write_file_tool
+        out = json.loads(read_file_tool(str(f)))
+        assert "code" not in out and "ok" in out["content"], out
+        assert probes == [], f"probed before any failure: {probes}"
+
+    @darwin_only
+    def test_write_and_patch_in_a_refused_folder(self, home, darwin, deny, uchg):
+        """The write REALLY fails with EPERM (the folder is uchg, so nothing can be created in it); the
+        folder refusing EPERM afterwards is what makes it privacy protection."""
+        (home / "Documents" / "old.txt").write_text("a\n")
+        uchg(home / "Documents")
         deny("Documents")
         from tools.file_tools import patch_tool, write_file_tool
         out = _contract(write_file_tool(str(home / "Documents" / "new.txt"), "x"))
         assert (out["code"], out["subject"]) == ("tcc_files", "Documents")
         assert not (home / "Documents" / "new.txt").exists()
-        out = _contract(patch_tool("replace", str(home / "Documents" / "new.txt"), "a", "b"))
+        out = _contract(patch_tool("replace", str(home / "Documents" / "old.txt"), "a", "b"))
         assert out["code"] == "tcc_files"
+        assert (home / "Documents" / "old.txt").read_text() == "a\n"
 
-    def test_icloud_drive_names_full_disk_access(self, home, darwin, deny):
+    def test_icloud_drive_names_full_disk_access(self, home, darwin, deny, deny_file):
         deny("Library/Mobile Documents/com~apple~CloudDocs")
         path = home / "Library/Mobile Documents/com~apple~CloudDocs/plan.txt"
+        path.write_text("p\n")
+        deny_file(path)
         from tools.file_tools import read_file_tool
         out = _contract(read_file_tool(str(path)))
         assert (out["subject"], out["pane"]) == ("iCloud Drive", "Privacy_AllFiles")
@@ -133,28 +202,25 @@ class TestTccFiles:
             assert frm.tcc_denied_folder(str(home / "Downloads" / "a.txt")) is None
             from tools.file_tools import read_file_tool
             out = json.loads(read_file_tool(str(home / "Downloads" / "a.txt")))
-            assert "code" not in out, out
+            assert "error" in out and "code" not in out, out
         finally:
             os.chmod(home / "Downloads", 0o755)
 
     @darwin_only
-    def test_immutable_file_is_a_real_eperm_and_not_tcc(self, home):
+    def test_immutable_file_is_a_real_eperm_and_not_tcc(self, home, uchg):
         """REAL: ``chflags uchg`` makes writes fail with EPERM "Operation not permitted", the same errno
         TCC uses. The folder still opens, so it is not privacy protection and gets no code."""
         f = home / "Desktop" / "locked.txt"
         f.write_text("x")
-        subprocess.run(["chflags", "uchg", str(f)], check=True)
-        try:
-            with pytest.raises(PermissionError) as e:
-                open(f, "w")
-            assert e.value.errno == errno.EPERM
-            assert frm.files_denied_from_exc(e.value) is None
-            from tools.file_tools import write_file_tool
-            out = json.loads(write_file_tool(str(f), "y"))
-            assert out.get("code") is None, out
-            assert f.read_text() == "x"
-        finally:
-            subprocess.run(["chflags", "nouchg", str(f)], check=True)
+        uchg(f)
+        with pytest.raises(PermissionError) as e:
+            open(f, "w")
+        assert e.value.errno == errno.EPERM
+        assert frm.files_denied_from_exc(e.value) is None
+        from tools.file_tools import write_file_tool
+        out = json.loads(write_file_tool(str(f), "y"))
+        assert out.get("error") and out.get("code") is None, out
+        assert f.read_text() == "x"
 
     def test_eperm_exception_is_confirmed_on_the_folder(self, home, darwin, deny):
         deny("Desktop")
@@ -186,12 +252,24 @@ def _finalize(command, output, rc=1, env_type="local", cwd=None):
 
 class TestTerminal:
     def test_eperm_hint_is_not_sudo(self, darwin):
+        """Privacy protection is claimed only when the failing path IS the protected folder."""
         from tools.terminal_hints import annotate_failure
         hint = annotate_failure("ls ~/Desktop", 1, "ls: /Users/a/Desktop: Operation not permitted")
-        assert "privacy protection" in hint and "Desktop" in hint and "sudo" in hint
+        assert "privacy protection blocked access to the Desktop folder" in hint and "sudo" in hint
         assert "escalate to sudo" not in hint  # the EACCES hint it used to fall through to
         # EACCES keeps its own hint
         assert "ownership/mode" in annotate_failure("touch /etc/x", 1, "touch: /etc/x: Permission denied")
+
+    @pytest.mark.parametrize("command, output", [
+        ("cd ~/Documents/proj && kill -9 1", "kill: 1: Operation not permitted"),       # a process, no folder
+        ("rm -f ~/Desktop/locked.txt", "rm: /Users/a/Desktop/locked.txt: Operation not permitted"),  # a file
+        ("cat old.log", "ls: /Users/a/Desktop: Operation not permitted"),                # only quoted
+    ])
+    def test_eperm_hint_is_neutral_without_evidence(self, darwin, command, output):
+        from tools.terminal_hints import annotate_failure
+        hint = annotate_failure(command, 1, output)
+        assert hint.startswith("Operation not permitted: macOS may be protecting this") and "sudo won't help" in hint
+        assert "privacy protection blocked" not in hint
 
     def test_automation_hint(self, darwin):
         from tools.terminal_hints import annotate_failure
@@ -209,10 +287,40 @@ class TestTerminal:
         assert "Memoe isn't allowed to control Notes" in out["error"]
         assert AE_1743 in out["output"]
 
+    # Output that only QUOTES a refusal. Each was reproduced by the review as a false tcc_automation.
+    QUOTED_REFUSALS = {
+        "grep of a header, then false": (
+            "grep -n errAEEventNotPermitted AE.h; false",
+            "AE.h:88:  errAEEventNotPermitted = -1743, /* (-1743) */\n" + "0:34: " + AE_1743),
+        "cat of an old log, then exit 1": ("cat ~/logs/notes-sync.log; exit 1", "2026-09-01 12:00 " + AE_1743),
+        "failing pytest quoting the line": (
+            "python -m pytest tests/test_notes.py -q",
+            f"E       AssertionError: assert 'ok' == '{AE_1743}'\nFAILED tests/test_notes.py::test_x"),
+    }
+
+    @pytest.mark.parametrize("case", list(QUOTED_REFUSALS))
+    def test_quoted_refusal_is_not_automation(self, darwin, case):
+        command, output = self.QUOTED_REFUSALS[case]
+        out = _finalize(command, output)
+        assert "code" not in out and out["error"] is None, out
+        assert "Automation" not in (out.get("hint") or "")
+
+    def test_jxa_and_script_files_count(self, darwin):
+        for command in ("osascript -l JavaScript -e 'Application(\"Notes\").notes()'", "osascript ./sync.scpt",
+                        "/usr/bin/osascript sync.applescript"):
+            assert _finalize(command, "0:1: " + AE_1743).get("code") == "tcc_automation", command
+
     def test_protected_folder_in_output(self, home, darwin, deny):
         deny("Desktop")
         out = _contract(_finalize("ls Desktop", "ls: Desktop: Operation not permitted", cwd=str(home)))
         assert (out["code"], out["subject"]) == ("tcc_files", "Desktop")
+
+    def test_a_log_line_never_probes_a_folder(self, home, darwin, deny, probes):
+        """The command never addressed ~/Desktop: its output alone must not make Hermes open it."""
+        deny("Desktop")
+        out = _finalize("cat old.log; exit 1", f"ls: {home}/Desktop: Operation not permitted", cwd=str(home))
+        assert "code" not in out and out["error"] is None
+        assert probes == [], probes
 
     def test_success_and_containers_get_no_code(self, home, darwin, deny):
         deny("Desktop")
@@ -222,17 +330,16 @@ class TestTerminal:
                                        env_type="docker", cwd=str(home))
 
     @darwin_only
-    def test_real_eperm_that_is_not_tcc_gets_the_hint_but_no_code(self, home):
+    def test_real_eperm_that_is_not_tcc_gets_a_neutral_hint_and_no_code(self, home, uchg):
+        """REAL: rm of a uchg file on the Desktop is EPERM. It is not privacy, and nothing may say so."""
         f = home / "Desktop" / "locked.txt"
         f.write_text("x")
-        subprocess.run(["chflags", "uchg", str(f)], check=True)
-        try:
-            proc = subprocess.run(["/bin/rm", "-f", str(f)], capture_output=True, text=True)
-            assert proc.returncode != 0 and "Operation not permitted" in proc.stderr  # real
-            out = _finalize(f"rm -f {f}", proc.stderr, rc=proc.returncode, cwd=str(home))
-            assert "code" not in out and "privacy protection" in out["hint"]
-        finally:
-            subprocess.run(["chflags", "nouchg", str(f)], check=True)
+        uchg(f)
+        proc = subprocess.run(["/bin/rm", "-f", str(f)], capture_output=True, text=True)
+        assert proc.returncode != 0 and "Operation not permitted" in proc.stderr  # real
+        out = _finalize(f"rm -f {f}", proc.stderr, rc=proc.returncode, cwd=str(home))
+        assert "code" not in out and out["error"] is None
+        assert out["hint"].startswith("Operation not permitted: macOS may be protecting this")
 
     def test_cwd_fallback_is_surfaced_once(self, home, darwin, monkeypatch, deny):
         """``os.getcwd()`` in a refused folder raises EPERM; the fallback used to be silent."""
@@ -298,9 +405,13 @@ class _FakeBackend:
 def cu(monkeypatch):
     from tools.computer_use import tool as cu_tool
     released = []
-    state = SimpleNamespace(tool=cu_tool, released=released, backend=None)
+    state = SimpleNamespace(tool=cu_tool, released=released, backend=None, releases=True)
     monkeypatch.setattr(cu_tool, "_get_backend", lambda session_id="": state.backend)
-    monkeypatch.setattr(cu_tool, "release_computer_use_session", lambda sid: released.append(sid) or True)
+    monkeypatch.setattr(cu_tool, "release_computer_use_session",
+                        lambda sid: released.append(sid) or state.releases)
+    # a cached backend for session sid that owns its (embedded) daemon, as Moe's does
+    state.cache_embedded = lambda sid: monkeypatch.setitem(
+        cu_tool._backends, sid, SimpleNamespace(_embedded_daemon=object()))
     monkeypatch.setenv("HERMES_HOST_APP_NAME", "Memoe")
     state.run = lambda args, **kw: json.loads(cu_tool.handle_computer_use(args, **kw))
     return state
@@ -318,8 +429,9 @@ class TestComputerUse:
         cu.backend = _FakeBackend(raises=RuntimeError(f"cua-driver get_window_state failed: {words}"))
         out = _contract(cu.run({"action": "capture"}, session_id="s1"))
         assert (out["code"], out["owner"], out["pane"], out["subject"]) == (code, "driver", pane, "CuaDriver")
-        assert out["retry"] is True and words in out["detail"]
+        assert out["retry"] is True and words in out["detail"] and out["restart"] == "driver"
         assert ("also_pane" in out) is both
+        assert out["error"].count("then ask me to try again") == 1
         assert "CuaDriver's own switch, not Memoe's" in out["error"]
         assert cu.released == ["s1"]  # relaunched on the next call, so the new grant applies
 
@@ -337,7 +449,12 @@ class TestComputerUse:
         assert cu_tool._with_fixable_cause(ok, "s") == ok
         assert cu.released == []
 
-    def test_embedded_daemon_down(self, cu):
+    @pytest.mark.parametrize("embedded, releases, reset", [
+        (True, True, True),     # Moe's route: its own daemon, dropped -> the next call relaunches it
+        (False, True, False),   # machine-wide daemon: dropping the backend never restarts it
+        (True, False, False),   # nothing was cached to drop
+    ])
+    def test_embedded_daemon_down(self, cu, embedded, releases, reset):
         from tools.computer_use.cua_backend_daemon import _EmbeddedCuaDaemon
         daemon = object.__new__(_EmbeddedCuaDaemon)
         daemon._running = False
@@ -346,9 +463,14 @@ class TestComputerUse:
         # as it reaches the tool: wrapped by the session's setup, cause chain intact
         wrapped = RuntimeError(f"cua-driver session setup failed: {e.value}")
         wrapped.__cause__ = e.value
-        cu.backend = _FakeBackend(raises=wrapped)
+        cu.backend, cu.releases = _FakeBackend(raises=wrapped), releases
+        if embedded:
+            cu.cache_embedded("s3")
         out = _contract(cu.run({"action": "capture"}, session_id="s3"))
-        assert (out["code"], out["owner"], out["pane"], out["retry"]) == ("driver_not_running", None, None, True)
+        assert (out["code"], out["owner"], out["pane"], out["retry"]) == ("driver_not_running", None, None, reset)
+        assert ("I've reset it" in out["error"]) is reset
+        if not reset:
+            assert "isn't running" in out["error"] and "then ask me to try again" in out["error"]
         assert "embedded cua-driver daemon is not running" in out["detail"]
         assert cu.released == ["s3"]
 
@@ -372,8 +494,18 @@ class TestComputerUse:
         assert cu.released == ["s4"]
 
     def test_driver_cli_words_for_daemon_down(self, cu):
+        """The machine-wide daemon's own CLI words, no embedded backend cached: said plainly."""
         cu.backend = _FakeBackend(raises=RuntimeError(DRV_DOWN))
-        assert _contract(cu.run({"action": "capture"}))["code"] == "driver_not_running"
+        out = _contract(cu.run({"action": "capture"}))
+        assert out["code"] == "driver_not_running" and out["retry"] is False
+        assert "I've reset it" not in out["error"]
+
+    def test_off_macos_nothing_is_read(self, cu, monkeypatch):
+        from tools.computer_use import tool as cu_tool
+        monkeypatch.setattr(sys, "platform", "linux")
+        failed = json.dumps({"ok": False, "action": "click", "error": DRV_AX})
+        assert cu_tool._with_fixable_cause(failed, "s") == failed
+        assert frm.driver_fix_in(DRV_AX) is None
 
     def test_backend_that_cannot_start(self, cu, monkeypatch):
         from tools.computer_use import tool as cu_tool
@@ -406,6 +538,15 @@ def _space_backend():
         def _load_windows(self):
             return _ingest_windows([w for w in raw if w["on_current_space"] is True])
 
+        # bring_to_front is the driver's; record it rather than raise a real window
+        _session = SimpleNamespace(_has_tool=lambda name: True)
+        raised: list = []
+
+        def bring_to_front(self, *, pid, window_id=None):
+            from tools.computer_use.backend import ActionResult
+            self.raised.append((pid, window_id))
+            return ActionResult(ok=True, action="bring_to_front", message="raised")
+
         def list_apps(self):
             return []
     return _B()
@@ -429,6 +570,98 @@ class TestOtherSpace:
         assert out["ok"] is False and out["code"] == "window_other_space" and out["subject"] == "Calendar"
         assert out["message"].startswith("No on-screen window found for app 'Calendar'.")
 
+    def test_raise_window_reaches_the_off_space_window(self):
+        """What the off-Space advice says to do now works: no window_other_space loop."""
+        backend = _space_backend()
+        backend.raised = []
+        res = backend.focus_app("Calendar", raise_window=True)
+        assert res.ok is True and res.action == "focus_app" and res.fix is None
+        assert backend.raised == [(7253, 122663)]
+        assert (backend._active_pid, backend._active_window_id) == (7253, 122663)
+
     def test_not_running_is_not_other_space(self):
         res = _space_backend().focus_app("Pages")
         assert res.fix is None and res.message == "No on-screen window found for app 'Pages'."
+
+
+# ── every route to the model keeps the contract (as slice 1's 12-route test) ─────────────────
+# One real failure per producer, sent through each way a terminal or computer_use result reaches a
+# model: the tool function, the registry dispatcher, and the claude-code bridge Moe uses (the
+# hermes-tools MCP server's per-tool handler: handle_function_call then to_mcp_content).
+
+# A REAL command, run by the real terminal tool in the local environment: ``osascript`` is a shell
+# function here printing macOS's exact refusal, so no Apple event is ever sent to a real app.
+_OSASCRIPT_CMD = ("osascript() { echo \"0:34: " + AE_1743 + "\" >&2; return 1; }; "
+                  "osascript -e 'tell application \"Notes\" to get name of every note'")
+
+
+def _via_registry(name, args):
+    import tools.terminal_tool  # noqa: F401 — registers terminal
+    import tools.computer_use.tool  # noqa: F401 — registers computer_use
+    from tools.registry import registry
+    return registry.dispatch(name, args)
+
+
+def _via_claude_code_bridge(name, args, monkeypatch):
+    import mcp.server as mcp_server
+    import model_tools
+    from agent.transports import hermes_tools_mcp_server as m
+
+    class _RecordingServer:
+        def __init__(self, name, instructions=None):
+            self.tools = {}
+
+        def add_tool(self, fn, name=None, description=None, meta=None, structured_output=None):
+            self.tools[name or fn.__name__] = fn
+
+    monkeypatch.setattr(mcp_server, "MCPServer", _RecordingServer)
+    monkeypatch.setattr(m, "discover_external_mcp_servers", lambda: [])
+    monkeypatch.setattr(m, "tools_to_offer", lambda *a, **k: [name])
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda *a, **k: [
+        {"type": "function", "function": {"name": name, "parameters": {"type": "object", "properties": {
+            k: {"type": "string"} for k in args}}}}])
+    server = m._build_server("claude-code")
+    out = server.tools[name](**args)
+    assert isinstance(out, str), f"the bridge must hand the child text, got {type(out)}"
+    return out
+
+
+def _terminal_direct(mp):
+    from tools.terminal_tool import terminal_tool
+    return terminal_tool(_OSASCRIPT_CMD)
+
+
+TERMINAL_ROUTES = {
+    "terminal_tool": _terminal_direct,
+    "registry/terminal": lambda mp: _via_registry("terminal", {"command": _OSASCRIPT_CMD}),
+    "claude-code-bridge/terminal": lambda mp: _via_claude_code_bridge("terminal", {"command": _OSASCRIPT_CMD}, mp),
+}
+
+CU_ROUTES = {
+    "handle_computer_use": lambda mp: __import__("tools.computer_use.tool", fromlist=["x"]).handle_computer_use(
+        {"action": "capture"}),
+    "registry/computer_use": lambda mp: _via_registry("computer_use", {"action": "capture"}),
+    "claude-code-bridge/computer_use": lambda mp: _via_claude_code_bridge("computer_use", {"action": "capture"}, mp),
+}
+
+
+@darwin_only
+@pytest.mark.parametrize("route", list(TERMINAL_ROUTES))
+def test_every_terminal_route_delivers_the_contract(route, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOST_APP_NAME", "Memoe")
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    out = json.loads(TERMINAL_ROUTES[route](monkeypatch))
+    assert {k: out.get(k) for k in ("code", "owner", "pane", "subject", "retry", "consent")} == {
+        "code": "tcc_automation", "owner": "app", "pane": "Privacy_Automation", "subject": "Notes",
+        "retry": True, "consent": "denied"}, f"{route} dropped the contract: {out}"
+    assert out["exit_code"] == 1 and out["error"].startswith("Memoe isn't allowed to control Notes")
+
+
+@pytest.mark.parametrize("route", list(CU_ROUTES))
+def test_every_computer_use_route_delivers_the_contract(route, cu, monkeypatch):
+    cu.backend = _FakeBackend(raises=RuntimeError(f"cua-driver get_window_state failed: {DRV_SCREEN}"))
+    out = json.loads(CU_ROUTES[route](monkeypatch))
+    assert {k: out.get(k) for k in ("code", "owner", "pane", "subject", "retry", "restart")} == {
+        "code": "tcc_driver_screen", "owner": "driver", "pane": "Privacy_ScreenCapture", "subject": "CuaDriver",
+        "retry": True, "restart": "driver"}, f"{route} dropped the contract: {out}"

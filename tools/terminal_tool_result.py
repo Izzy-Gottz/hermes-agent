@@ -172,15 +172,19 @@ def _fixable_cause(command: str, returncode: int, output: str, env_type: str, cw
     """A fixable macOS cause (tools.fix_reasons) behind a FAILED command on this host, or None.
 
     The exit code stays the command's own. What this adds is the contract a host app acts on, for the two
-    causes a shell cannot fix and the person can: an Apple event macOS refused (tcc_automation, from
-    osascript's stderr) and a protected folder it refused (tcc_files, "Operation not permitted" naming a
-    path inside Desktop / Documents / Downloads / iCloud Drive, confirmed by opening that folder). Only
-    for the local backend: a container's EPERM is not this Mac's privacy protection."""
+    causes a shell cannot fix and the person can: an Apple event macOS refused (tcc_automation: the
+    command runs osascript/JXA itself AND its output has the full "Not authorized to send Apple events"
+    line) and a protected folder it refused (tcc_files: "Operation not permitted" naming a path inside
+    Desktop / Documents / Downloads / iCloud Drive that the command itself addressed, confirmed by
+    opening that folder afterwards). Output that only QUOTES either (a grep, a log, a test's expected
+    text) gets nothing, and ``error`` stays None. Only for the local backend: a container's EPERM is
+    not this Mac's privacy protection."""
     if returncode == 0 or env_type != "local" or not output:
         return None
     with _quiet("fixable cause"):
-        from tools.fix_reasons_macos import automation_denied_in_text, files_denied_in_text
-        return automation_denied_in_text(output, command) or files_denied_in_text(output, cwd=cwd)
+        from tools.fix_reasons_macos import automation_denied_in_command, files_denied_in_text
+        return (automation_denied_in_command(command, output)
+                or files_denied_in_text(output, cwd=cwd, command=command))
     return None
 
 

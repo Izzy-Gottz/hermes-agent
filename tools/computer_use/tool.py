@@ -700,12 +700,33 @@ def _fix_of_exception(exc: BaseException):
     return _fix_in_text(str(exc))
 
 
-def _relaunch_driver_if_needed(code: Optional[str], session_id: str) -> None:
-    if code in _RELAUNCH_DRIVER_CODES:
-        with contextlib.suppress(Exception):
-            if release_computer_use_session(session_id):
-                logger.info("computer_use: dropped session %r backend after %s; the next call relaunches it",
-                            session_id, code)
+def _relaunch_driver_if_needed(code: Optional[str], session_id: str) -> Tuple[bool, bool]:
+    """``(released, embedded)``: whether a cached backend was dropped, and whether it owned its daemon
+    (only then does the next call launch a fresh driver; the machine-wide daemon is not Hermes's)."""
+    if code not in _RELAUNCH_DRIVER_CODES:
+        return False, False
+    with _backend_lock:
+        cached = _backends.get(str(session_id or ""))
+    embedded = cached is not None and getattr(cached, "_embedded_daemon", None) is not None
+    released = False
+    with contextlib.suppress(Exception):
+        released = bool(release_computer_use_session(session_id))
+    if released:
+        logger.info("computer_use: dropped session %r backend after %s; the next call relaunches it%s",
+                    session_id, code, "" if embedded else " (no embedded daemon: the helper itself is not restarted)")
+    return released, embedded
+
+
+def _settle_fields(fields: Dict[str, Any], session_id: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Relaunch the driver when the code needs it, and make driver_not_running say what actually
+    happened: "I've reset it" and ``retry`` only when an embedded backend was really dropped."""
+    released, embedded = _relaunch_driver_if_needed(fields.get("code"), session_id)
+    if fields.get("code") != "driver_not_running":
+        return None, fields
+    from tools.fix_reasons import fields_of
+    from tools.fix_reasons_macos import driver_not_running_message
+    fix = driver_not_running_message(fields.get("detail"), reset=released and embedded)
+    return str(fix), fields_of(fix)
 
 
 def _fixable_exception_result(exc: BaseException, raw: str, session_id: str) -> Optional[str]:
@@ -715,14 +736,18 @@ def _fixable_exception_result(exc: BaseException, raw: str, session_id: str) -> 
         return None
     from tools.fix_reasons import fields_of
     fields = fields_of(fix)
-    _relaunch_driver_if_needed(fields.get("code"), session_id)
-    return json.dumps({"error": str(fix), **fields, **({} if "detail" in fields else {"detail": raw})})
+    words, fields = _settle_fields(fields, session_id)
+    return json.dumps({"error": words or str(fix), **fields, **({} if "detail" in fields else {"detail": raw})})
 
 
 def _with_fixable_cause(result: Any, session_id: str) -> Any:
     """A failed result, with the contract merged in when its words (or the driver's refusal code) name a
     fixable cause. Successes, and results that already carry a vocabulary code, pass through untouched:
-    only ``error`` and a failed call's ``message`` are read, never window titles or element labels."""
+    only ``error`` and a failed call's ``message`` are read, never window titles or element labels.
+    macOS only: every cause it reads is a macOS grant or the LaunchServices-launched helper."""
+    import sys as _sys
+    if _sys.platform != "darwin":
+        return result
     from tools.fix_reasons import CODES, fields_of
     data = result
     if isinstance(result, str):
@@ -735,8 +760,13 @@ def _with_fixable_cause(result: Any, session_id: str) -> Any:
     code = data.get("code")
     code = code if isinstance(code, str) else None
     if code in CODES:  # a producer below already attached it (off-Space, a FixableError payload)
-        _relaunch_driver_if_needed(code, session_id)
-        return result
+        if code not in _RELAUNCH_DRIVER_CODES:
+            return result
+        words, fields = _settle_fields({k: data[k] for k in data if k in ("code", "detail")}, session_id)
+        if words is None:
+            return result
+        merged = {**data, "error": words, **fields}
+        return json.dumps(merged) if isinstance(result, str) else merged
     failed = data.get("ok") is False or bool(data.get("error"))
     if not failed:
         return result
@@ -750,8 +780,8 @@ def _with_fixable_cause(result: Any, session_id: str) -> Any:
         merged["driver_code"] = code  # the driver's own refusal code, kept; ``code`` is the vocabulary's
     if data.get("error") and "detail" not in fields:
         merged["detail"] = data["error"]
-    merged.update({"error": str(fix), **fields})
-    _relaunch_driver_if_needed(fields.get("code"), session_id)
+    words, fields = _settle_fields(fields, session_id)
+    merged.update({"error": words or str(fix), **fields})
     return json.dumps(merged) if isinstance(result, str) else merged
 
 def _attach_stall_advisory(detector: StallDetector, action: str, args: Dict[str, Any], result: Any) -> Any:

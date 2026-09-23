@@ -200,8 +200,10 @@ def _off_space_fix(app: str, window: Dict[str, Any]) -> Dict[str, Any]:
     ``retry`` because the same call works once that desktop is the current one."""
     from tools.fix_reasons import WINDOW_OTHER_SPACE, fix_fields
     name = str(window.get("app_name") or app or "That app")
+    from tools.fix_reasons_macos import THEN
     return {"error": (f"{name}'s window is on another desktop (Space), so I can't click in it from here. "
-                      f"Switch to that desktop, then I'll carry on."),
+                      f"I can bring it here, which switches your screen to that desktop, or you can switch "
+                      f"to it yourself, {THEN}."),
             **fix_fields(WINDOW_OTHER_SPACE, subject=name, retry=True, window_id=window.get("window_id"),
                          pid=window.get("pid"), space_ids=list(window.get("space_ids") or []))}
 
@@ -646,6 +648,12 @@ class _CaptureMixin:
         and uses the standalone ``bring_to_front`` tool."""
         with self._disarming():
             matched = self._match_windows_for_app(self._load_windows(), app)
+            if not matched and raise_window:
+                # Raising is explicitly approved and is what switches Spaces, so an app one Space away
+                # is a valid target here: the off-Space advice (capture's text, window_other_space)
+                # says exactly this, and refusing it would send the model round in a loop.
+                matched = [w for w in self._match_windows_for_app(self._load_windows_all_spaces(), app)
+                           if w.get("on_current_space") is False and w.get("space_ids")]
         # No silent fallback to the frontmost window: that hides the real failure (often a localized macOS
         # app-name mismatch).
         if not matched:
