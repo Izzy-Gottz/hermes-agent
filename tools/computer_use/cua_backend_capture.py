@@ -100,6 +100,24 @@ def _is_driver_window(w: Dict[str, Any], driver_pids: frozenset = frozenset()) -
             or str(w.get("bundle_id") or "").strip().lower() in _DRIVER_BUNDLE_IDS)
 
 
+# A window smaller than this in either dimension is a strip (toolbar, tab bar, title-bar
+# accessory), not something a person means by "the screen". Measured 2026-09-23: Chrome window 3408,
+# untitled, 1470x41, and cmux window 205, untitled, 1470x32, each sat above the app's real window.
+_MIN_REAL_WINDOW_SIDE = 120.0
+
+
+def _darwin_window_rank(w: Dict[str, Any]) -> int:
+    """0 = titled, full-sized, layer-0 app window; then untitled full-sized; then titled strips;
+    then untitled strips and non-zero layers. Missing size or layer counts as the good case, so a
+    driver that omits them keeps the plain frontmost order."""
+    b = w.get("bounds") or {}
+    tiny = bool(b) and min(b.get("width", 0.0), b.get("height", 0.0)) < _MIN_REAL_WINDOW_SIDE
+    titled = bool(str(w.get("title") or "").strip())
+    if w.get("layer", 0) != 0:
+        return 4
+    return {(True, False): 0, (False, False): 1, (True, True): 2, (False, True): 3}[(titled, tiny)]
+
+
 def _is_driver_self_refusal(exc: BaseException) -> bool:
     return _DRIVER_SELF_REFUSAL in str(exc)
 
@@ -108,7 +126,8 @@ def _capture_candidates(windows: List[Dict[str, Any]], *, app_requested: bool, e
                         driver_pids: frozenset = frozenset()) -> List[Dict[str, Any]]:
     """Capture targets best-first from z-sorted (frontmost-first) list_windows output. Unqualified
     default captures (no app filter, no exact target) never pick the screen-control helper's own
-    windows, on any platform; on Linux they also skip desktop/shell helper windows — targetable but
+    windows, on any platform; on macOS they prefer titled, full-sized, layer-0 windows over strips
+    (``_darwin_window_rank``); on Linux they also skip desktop/shell helper windows — targetable but
     capture as empty — and when every remaining candidate shares one ``z_index`` (the common X11 case)
     ``_NET_ACTIVE_WINDOW`` beats list order. Exact-target captures never pay for the ``xprop`` probe.
     Empty only when a default capture finds nothing but the helper's windows.
@@ -120,6 +139,9 @@ def _capture_candidates(windows: List[Dict[str, Any]], *, app_requested: bool, e
     if exact_target or app_requested:
         return pool or windows[:1]
     pool = [w for w in (pool or windows[:1]) if not _is_driver_window(w, driver_pids)]
+    if sys.platform == "darwin":
+        # Rank, never drop: frontmost-first within each tier (sorted() is stable).
+        pool = sorted(pool, key=_darwin_window_rank)
     if sys.platform == "linux":
         pool = [w for w in pool if _is_real_app_window(w)] or pool
         if pool and _z_index_uninformative(pool):

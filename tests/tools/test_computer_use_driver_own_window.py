@@ -106,8 +106,10 @@ def test_driver_window_known_only_by_pid_is_skipped(monkeypatch):
 
 def test_refusal_falls_through_to_the_next_window():
     """Nothing identifies the window (no name, pid unknown), so it is tried — and the driver's
-    refusal moves the default capture on to the next window instead of failing it."""
-    backend = _backend([{**DRIVER_WINDOW, "app_name": ""}, SAFARI_WINDOW])
+    refusal moves the default capture on to the next window instead of failing it. The next window
+    is untitled too, so macOS ranking (titled first) keeps the driver's window first and the
+    fall-through itself is what is tested."""
+    backend = _backend([{**DRIVER_WINDOW, "app_name": ""}, {**SAFARI_WINDOW, "title": ""}])
     cap = backend.capture()
     assert cap.app == "Safari" and cap.png_b64 == _PNG_B64
     assert backend._session.gws_targets() == [(69038, 405), (812, 9911)]
@@ -154,3 +156,47 @@ def test_select_capture_target_contract():
     assert cap_mod._select_capture_target(windows, app_requested=True)["app_name"] == "Cua Driver"
     bundled = _ingest_windows([{**DRIVER_WINDOW, "app_name": "x", "bundle_id": "com.trycua.driver"}, SAFARI_WINDOW])
     assert cap_mod._select_capture_target(bundled, app_requested=False)["app_name"] == "Safari"
+
+
+# ── macOS: a strip is not "the screen" ──────────────────────────────────────────────────────────
+# Measured 2026-09-23 after the driver-window fix: the unqualified capture picked Chrome window 3408,
+# untitled and 1470x41 (a toolbar strip); the real 801 px Chrome window was fourth. Live the same
+# day: cmux window 205, untitled, 1470x32, above cmux window 79, "ssh sruly-5", 1470x923.
+CHROME_STRIP = {"app_name": "Google Chrome", "bounds": {"height": 41, "width": 1470, "x": 0, "y": 33},
+                "is_on_screen": True, "layer": 0, "on_current_space": True, "pid": 5120,
+                "space_ids": [45], "title": "", "window_id": 3408, "z_index": 4}
+CMUX_STRIP = {"app_name": "cmux", "bounds": {"height": 32.0, "width": 1470.0, "x": 0.0, "y": 33.0},
+              "is_on_screen": True, "layer": 0, "on_current_space": True, "pid": 36280,
+              "space_ids": [45], "title": "", "window_id": 205, "z_index": 3}
+CHROME_MAIN = {"app_name": "Google Chrome", "bounds": {"height": 801, "width": 1470, "x": 0, "y": 74},
+               "is_on_screen": True, "layer": 0, "on_current_space": True, "pid": 5120,
+               "space_ids": [45], "title": "Google Flights - Find Cheap Flight Options", "window_id": 3391,
+               "z_index": 2}
+
+
+def test_darwin_default_capture_prefers_the_real_window_over_strips(monkeypatch):
+    monkeypatch.setattr(cap_mod.sys, "platform", "darwin")
+    backend = _backend([DRIVER_WINDOW, CHROME_STRIP, CMUX_STRIP, CHROME_MAIN], driver_pid=69038)
+    cap = backend.capture()
+    assert (backend._active_pid, backend._active_window_id) == (5120, 3391), cap
+    assert backend._session.gws_targets() == [(5120, 3391)]
+
+
+def test_darwin_ranking_keeps_frontmost_order_within_a_tier(monkeypatch):
+    from tools.computer_use.cua_backend_parse import _ingest_windows
+    monkeypatch.setattr(cap_mod.sys, "platform", "darwin")
+    front_titled = {**CHROME_MAIN, "window_id": 1, "z_index": 9, "title": "A"}
+    windows = sorted(_ingest_windows([CHROME_STRIP, CMUX_STRIP, CHROME_MAIN, front_titled]),
+                     key=lambda w: w["z_index"], reverse=True)
+    order = [w["window_id"] for w in cap_mod._capture_candidates(windows, app_requested=False)]
+    assert order == [1, 3391, 3408, 205]  # titled+sized (z order), then the untitled strips (z order)
+
+
+def test_darwin_ranking_without_bounds_is_plain_frontmost(monkeypatch):
+    """A driver that omits bounds/layer keeps the old frontmost order (nothing to rank on)."""
+    from tools.computer_use.cua_backend_parse import _ingest_windows
+    monkeypatch.setattr(cap_mod.sys, "platform", "darwin")
+    bare = [{k: v for k, v in w.items() if k not in ("bounds", "layer")} | {"title": "t"}
+            for w in (CHROME_STRIP, CMUX_STRIP, CHROME_MAIN)]
+    windows = sorted(_ingest_windows(bare), key=lambda w: w["z_index"], reverse=True)
+    assert [w["window_id"] for w in cap_mod._capture_candidates(windows, app_requested=False)] == [3408, 205, 3391]

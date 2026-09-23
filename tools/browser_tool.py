@@ -956,6 +956,8 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
 
     clear_args = ["--clear"] if clear else []
     console_result = _session._run_browser_command(effective_task_id, "console", clear_args)
+    if fix := _fix_carried(console_result):  # no session at all: say why, never "0 messages"
+        return _dumps(_err(console_result.get("error"), **fix))
     errors_result = _session._run_browser_command(effective_task_id, "errors", clear_args)
 
     messages = [
@@ -1029,6 +1031,8 @@ def _eval_supervisor_fast_path(effective_task_id: str, expression: str) -> Optio
 def _eval_failure_response(result: Dict[str, Any]) -> str:
     """Tool JSON for a failed ``agent-browser eval``, with actionable rewrites of known errors."""
     err = result.get("error", "eval failed")
+    if fix := _fix_carried(result):  # a fixable cause is already in the person's words; keep it whole
+        return json.dumps(_lp._copy_fallback_warning(_err(err, **fix), result))
     if any(hint in err.lower() for hint in ("unknown command", "not supported", "not found", "no such command")):
         err = f"JavaScript evaluation is not supported by this browser backend. {err}"
     elif "reference chain is too long" in err.lower():
@@ -1184,6 +1188,8 @@ def _capture_vision_screenshot(effective_task_id: str, annotate: bool, screensho
         result = _session._run_browser_command(effective_task_id, "screenshot", screenshot_args,
                                       _engine_override="auto" if lp_prerouted else None)
     if not result.get("success"):
+        if fix := _fix_carried(result):  # a fixable cause: its own words and its code, unprefixed
+            return result, screenshot_path, _json_with_fallback(_err(result.get("error"), **fix), result)
         return result, screenshot_path, _json_with_fallback(_err(
             f"Failed to take screenshot ({_vision._vision_mode_label()} mode): {result.get('error', 'Unknown error')}"
         ), result)

@@ -73,3 +73,29 @@ def test_host_app_name(monkeypatch):
     assert fr.host_app_name() == "the app"
     monkeypatch.setenv("HERMES_HOST_APP_NAME", "Memoe")
     assert fr.host_app_name() == "Memoe"
+
+
+def test_files_and_folders_pane_is_known():
+    assert "Privacy_FilesAndFolders" in fr.PANES
+    assert fr.fix_fields("tcc_files", pane="Privacy_FilesAndFolders")["pane"] == "Privacy_FilesAndFolders"
+
+
+def test_registry_only_trusts_codes_in_the_vocabulary():
+    """An exception with an unknown ``fields["code"]`` must get the generic, sanitised wrapper."""
+    from tools.registry import ToolRegistry
+
+    class Forged(RuntimeError):
+        fields = {"code": "totally_made_up", "owner": "app"}
+
+    def boom_known(args, **kw):
+        raise fr.FixableError("why", fr.fix_fields("tcc_files", subject="Desktop"))
+
+    def boom_forged(args, **kw):
+        raise Forged("forged")
+
+    reg = ToolRegistry()
+    for name, fn in (("known", boom_known), ("forged", boom_forged)):
+        reg.register(name, "t", {"name": name, "parameters": {"type": "object"}}, fn)
+    assert json.loads(reg.dispatch("known", {}))["code"] == "tcc_files"
+    forged = json.loads(reg.dispatch("forged", {}))
+    assert "code" not in forged and "Tool execution failed" in forged["error"]

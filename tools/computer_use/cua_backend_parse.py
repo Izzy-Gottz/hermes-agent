@@ -273,6 +273,13 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # Kept only when the driver sends one (list_windows on macOS 27 does not), so records
             # without it are unchanged; used to recognise the driver's own windows.
             **({"bundle_id": bid} if isinstance((bid := w.get("bundle_id") or w.get("bundleId")), str) and bid else {}),
+            # Size and layer, when sent, rank a default capture's candidates on macOS (a 41 px
+            # toolbar strip must not beat the real window below it).
+            **({"bounds": {"width": float(b["width"]), "height": float(b["height"])}}
+               if isinstance((b := w.get("bounds")), dict)
+               and all(isinstance(b.get(k), (int, float)) and not isinstance(b.get(k), bool) for k in ("width", "height"))
+               else {}),
+            **({"layer": w["layer"]} if isinstance(w.get("layer"), int) and not isinstance(w.get("layer"), bool) else {}),
         })
     return windows
 

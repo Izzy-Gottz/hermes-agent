@@ -8,6 +8,7 @@ loopback CDP port (dual-stack: IPv4 first, then IPv6).
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 import ntpath
@@ -399,8 +400,9 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
     if sys.platform == "darwin":
         # sqlite reports an unreadable source as a generic "unable to open database file", which
         # the except below would count as one more "unavailable" DB and the caller would blame on
-        # the browser being open. On macOS that is app-data protection (EPERM), and it must reach
-        # snapshot_real_profile as the PermissionError it is.
+        # the browser being open. On macOS that is app-data protection (EPERM) or plain mode bits
+        # (EACCES); either must reach snapshot_real_profile as the PermissionError it is, and
+        # _is_app_data_denial tells them apart by errno and path.
         try:
             with open(src_file, "rb"):
                 pass
@@ -682,19 +684,42 @@ def browser_display_name(browser: str) -> str:
     return str(browser or "the browser").title()
 
 
-def _is_app_data_denial(exc: BaseException) -> bool:
-    """macOS app-data protection: another app's ``~/Library/Application Support`` subtree returns
-    EPERM to every process without Full Disk Access (measured on macOS 27 against Chrome's dir,
-    which carries ``com.apple.macl``). Python raises it as PermissionError."""
-    return sys.platform == "darwin" and isinstance(exc, PermissionError)
-
-
-def _app_data_denied(src: str, source_profile: str | None = None) -> bool:
-    """Probe, before copying anything, whether macOS refuses this process the browser's data: list
-    the user-data dir, read ``Local State``, open the profile's cookie DB. Only a PermissionError
-    counts; any other failure is left to the copy path, which reports it on its own terms."""
-    if sys.platform != "darwin":
+def _is_under(path, root: str) -> bool:
+    """Whether ``path`` is ``root`` or inside it (lexically, and after resolving symlinks)."""
+    if not path or not root:
         return False
+    for norm in (os.path.abspath, os.path.realpath):
+        try:
+            p, r = os.path.normcase(norm(os.fspath(path))), os.path.normcase(norm(root))
+            if os.path.commonpath([p, r]) == r:
+                return True
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
+
+
+def _is_app_data_denial(exc: BaseException, src: str | None = None) -> bool:
+    """macOS app-data protection, and nothing else. Another app's ``~/Library/Application Support``
+    subtree returns **EPERM** (errno 1, "Operation not permitted") to every process without Full
+    Disk Access — measured on macOS 27 against Chrome's dir, which carries ``com.apple.macl``.
+
+    Python raises both EPERM and EACCES (errno 13, "Permission denied": ordinary mode bits) as
+    PermissionError, and only EPERM is the privacy grant: a chmod'd file is not fixed by Full Disk
+    Access. And only a denial on the SOURCE profile counts — ``src`` given, the exception's
+    ``filename`` must be under it; a denied write into Hermes' own snapshot dir is never the
+    browser's data being protected."""
+    if sys.platform != "darwin" or not isinstance(exc, PermissionError) or exc.errno != errno.EPERM:
+        return False
+    return src is None or _is_under(getattr(exc, "filename", None), src)
+
+
+def _probe_source_access(src: str, source_profile: str | None = None) -> PermissionError | None:
+    """Probe, before copying anything, whether this process may read the browser's data: list the
+    user-data dir, read ``Local State``, open the profile's cookie DB. Returns the first
+    PermissionError (EPERM or EACCES — the caller tells them apart); any other failure is left to
+    the copy path, which reports it on its own terms."""
+    if sys.platform != "darwin":
+        return None
     probes = [lambda: os.listdir(src)]
     for rel in ("Local State",
                 *((os.path.join(source_profile, "Network", "Cookies"), os.path.join(source_profile, "Cookies"))
@@ -704,11 +729,33 @@ def _app_data_denied(src: str, source_profile: str | None = None) -> bool:
     for probe in probes:
         try:
             probe()
-        except PermissionError:
-            return True
+        except PermissionError as e:
+            return e
         except OSError:
             continue
-    return False
+    return None
+
+
+def _app_data_denied(src: str, source_profile: str | None = None) -> bool:
+    """True only for macOS app-data protection (EPERM) on the browser's own data."""
+    exc = _probe_source_access(src, source_profile)
+    return exc is not None and _is_app_data_denial(exc, src)
+
+
+def _permission_denied_error(browser: str, exc: PermissionError, dst: str | None = None) -> str:
+    """An honest, code-less message for a PermissionError that is NOT app-data protection
+    (EACCES from mode bits, or anything on Hermes' own snapshot dir): the path, and no advice
+    that cannot help."""
+    where = getattr(exc, "filename", None) or dst or "a profile file"
+    return (f"permission denied on {where} ({exc.strerror or exc}) while copying the '{browser}' "
+            "profile. That file's owner or mode bits refuse this process; it is not a macOS privacy "
+            "setting, and quitting the browser will not change it.")
+
+
+def _source_denial_error(browser: str, src: str, exc: PermissionError):
+    """The right error for a PermissionError on the source: tcc_app_data for EPERM, plain for EACCES."""
+    return (_app_data_denied_error(browser, src) if _is_app_data_denial(exc, src)
+            else _permission_denied_error(browser, exc))
 
 
 def _app_data_denied_error(browser: str, src: str):
@@ -753,22 +800,23 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     if src and not os.path.isdir(src):
         try:  # isdir() swallows EPERM; a protected dir is not a missing one
             os.stat(src)
-        except OSError as e:
-            if _is_app_data_denial(e):
-                return None, _app_data_denied_error(browser, src)
+        except PermissionError as e:
+            return None, _source_denial_error(browser, src, e)
+        except OSError:
+            pass
     if not src or not os.path.isdir(src):
         return None, (
             f"profile directory for '{browser}' was not found ({src!r}). "
             "Launch that browser at least once, or turn browser.use_real_profile off.")
     # macOS app-data protection BEFORE resolving the profile: an unreadable Local State would
     # otherwise silently resolve to "Default" and the failure surface later as something else.
-    if _app_data_denied(src):
-        return None, _app_data_denied_error(browser, src)
+    if (denied := _probe_source_access(src)) is not None:
+        return None, _source_denial_error(browser, src, denied)
     source_profile, resolve_err = _resolve_source_profile(src)
     if resolve_err or not source_profile:
         return None, resolve_err
-    if _app_data_denied(src, source_profile):
-        return None, _app_data_denied_error(browser, src)
+    if (denied := _probe_source_access(src, source_profile)) is not None:
+        return None, _source_denial_error(browser, src, denied)
     dst = real_profile_copy_dir(browser)
     # Fast lock probe BEFORE any copy: a blocking file op on a Windows-locked cookie DB can
     # hang the launch for minutes. Windows only, so copy-while-running still works elsewhere.
@@ -806,8 +854,10 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
         # AFTER the marker write so the marker itself is covered; every pass, so old snapshots heal.
         _secure_snapshot(dst, contents=True)
     except OSError as e:
-        if _is_app_data_denial(e):
+        if _is_app_data_denial(e, src):  # EPERM on the SOURCE only; never the snapshot dir
             return None, _app_data_denied_error(browser, src)
+        if isinstance(e, PermissionError):
+            return None, _permission_denied_error(browser, e, dst)
         return None, f"could not snapshot the '{browser}' profile into {dst}: {e}"
     return dst, None
 

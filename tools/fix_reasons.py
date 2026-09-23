@@ -72,7 +72,7 @@ OWNER_DRIVER = "driver"
 OWNERS = frozenset({OWNER_APP, OWNER_DRIVER})
 
 PANES = frozenset({
-    "Privacy_AllFiles", "Privacy_Automation", "Privacy_Accessibility", "Privacy_ScreenCapture",
+    "Privacy_AllFiles", "Privacy_FilesAndFolders", "Privacy_Automation", "Privacy_Accessibility", "Privacy_ScreenCapture",
     "Privacy_Microphone", "Privacy_Calendars", "Privacy_Reminders", "Privacy_Contacts",
 })
 
