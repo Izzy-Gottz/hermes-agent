@@ -93,8 +93,13 @@ def test_cli_fallback_fails_fast_on_daemon_not_running(monkeypatch):
     monkeypatch.setattr(_sp, "run", _fake_run)
     monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
 
-    with pytest.raises(RuntimeError, match="daemon is not running"):
+    with pytest.raises(RuntimeError) as raised:
         session._call_tool_via_cli("list_windows", {}, 10.0)
+    # driver_not_running (tools.fix_reasons): person-facing words, the driver's own kept as detail
+    from tools.fix_reasons import fields_of
+    fields = fields_of(raised.value)
+    assert fields["code"] == "driver_not_running" and fields["retry"] is True
+    assert "daemon is not running" in fields["detail"]
 
     assert calls["n"] == 1, f"expected fail-fast, got {calls['n']} attempts"
     assert sleeps == [], f"expected no backoff sleeps, got {sleeps}"

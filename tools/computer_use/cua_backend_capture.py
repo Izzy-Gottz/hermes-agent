@@ -195,6 +195,17 @@ def _is_desktop_window(w: Dict[str, Any], names: Tuple[str, ...] = _DESKTOP_WIND
     return any(name in f"{w.get('app_name', '')} {w.get('title', '')}".lower() for name in names)
 
 
+def _off_space_fix(app: str, window: Dict[str, Any]) -> Dict[str, Any]:
+    """``window_other_space``: the window exists, on another desktop. Not a grant (owner/pane null);
+    ``retry`` because the same call works once that desktop is the current one."""
+    from tools.fix_reasons import WINDOW_OTHER_SPACE, fix_fields
+    name = str(window.get("app_name") or app or "That app")
+    return {"error": (f"{name}'s window is on another desktop (Space), so I can't click in it from here. "
+                      f"Switch to that desktop, then I'll carry on."),
+            **fix_fields(WINDOW_OTHER_SPACE, subject=name, retry=True, window_id=window.get("window_id"),
+                         pid=window.get("pid"), space_ids=list(window.get("space_ids") or []))}
+
+
 class _CaptureMixin:
     """capture()/list_windows()/list_apps()/focus_app() and their window-discovery helpers."""
 
@@ -207,10 +218,10 @@ class _CaptureMixin:
             self._clear_active_target()
             raise
 
-    def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
+    def _failed_capture(self, mode: str, message: str = "", fix: Optional[Dict[str, Any]] = None) -> CaptureResult:
         """Return an empty capture after disarming any prior target context."""
         self._clear_active_target()
-        return CaptureResult(mode=mode, width=0, height=0, window_title=message)
+        return CaptureResult(mode=mode, width=0, height=0, window_title=message, fix=fix)
 
     def _call_capture_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Call a capture-stage tool and disarm state on transport or logical failure."""
@@ -342,6 +353,9 @@ class _CaptureMixin:
         return locatable
 
     def _no_match_reason(self, app: str) -> str:
+        return self._no_match(app)[0]
+
+    def _no_match(self, app: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Explain why ``app=`` matched nothing, distinguishing the causes.
 
         There are two very different reasons a filter comes back empty, and
@@ -364,7 +378,7 @@ class _CaptureMixin:
         if off_space:
             w = off_space[0]
             spaces = ", ".join(str(x) for x in w.get("space_ids") or []) or "unknown"
-            return (
+            return ((
                 f"<app={app!r} IS running, on another macOS Space "
                 f"(window_id={w['window_id']}, pid={w['pid']}, "
                 f"space_ids=[{spaces}]). This is NOT a naming problem; do not "
@@ -380,18 +394,18 @@ class _CaptureMixin:
                 f"switches the user's desktop to another Space mid-work, so "
                 f"read in place unless you actually need to click. "
                 f"{len(off_space)} window(s) of this app are off-Space.>"
-            )
+            ), _off_space_fix(app, w))
 
         if elsewhere:
-            return (
+            return ((
                 f"<app={app!r} is running but none of its {len(elsewhere)} "
                 f"window(s) are on-screen (minimized or hidden). Input to a "
                 f"minimized window is refused (minimized_or_hidden_window). "
                 f"Un-minimize with focus_app(app={app!r}, raise_window=true), "
                 f"or target one directly by window_id to read it.>"
-            )
+            ), None)
 
-        return (
+        return ((
             f"<no window matched app={app!r} on any Space. Either it is not "
             f"running, or it is named something else here, or window discovery "
             f"itself came back empty this call. Call list_apps to see available "
@@ -399,7 +413,7 @@ class _CaptureMixin:
             f"'計算機' instead of 'Calculator'; some Linux/Qt apps only resolve "
             f"via list_apps metadata). If the app should be running, launch it "
             f"first.>"
-        )
+        ), None)
 
     def _match_windows_for_app(self, windows: List[Dict[str, Any]], app: str) -> List[Dict[str, Any]]:
         """Resolve ``app=``: exact window names, then exact list_apps aliases (Linux ``list_windows`` can
@@ -464,7 +478,7 @@ class _CaptureMixin:
             return desktop or self._failed_capture(mode, _NO_DESKTOP_WINDOW_MSG.format(app=app))
         # When the filter matches nothing, say so instead of silently capturing the frontmost window — on
         # macOS list_windows returns the localized app name (e.g. "計算機"), so `app="Calculator"` legitimately misses.
-        return self._match_windows_for_app(windows, app) or self._failed_capture(mode, self._no_match_reason(app))
+        return self._match_windows_for_app(windows, app) or self._failed_capture(mode, *self._no_match(app))
 
     def _gws_args(self) -> Dict[str, Any]:
         return {"pid": self._active_pid, "window_id": self._active_window_id, "session": self._session_id}
@@ -636,6 +650,12 @@ class _CaptureMixin:
         # app-name mismatch).
         if not matched:
             self._clear_active_target()
+            # "No on-screen window" is also what an app one Space away gets (``_load_windows`` is
+            # current-Space only); say which, with the code, instead of implying it is not running.
+            reason, fix = self._no_match(app)
+            if fix is not None:
+                return ActionResult(ok=False, action="focus_app", code=fix["code"], fix=fix,
+                                    message=f"No on-screen window found for app '{app}'. {reason}")
             return ActionResult(ok=False, action="focus_app", message=f"No on-screen window found for app '{app}'.")
         self._set_active_target(target := matched[0])
         self._last_app = target["app_name"] or app  # retained for back-compat diagnostics

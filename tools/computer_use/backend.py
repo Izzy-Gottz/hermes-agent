@@ -91,6 +91,9 @@ class CaptureResult:
     # to tell "this app has no AX tree" from "this window is somewhere I cannot
     # see it". Both look like an empty capture; only one has a fix.
     degraded_reason: Optional[str] = None
+    # A fixable cause (tools.fix_reasons contract: error/code/owner/pane/subject/retry) when the capture
+    # failed for one; the tool boundary merges it into the result the model and the host read.
+    fix: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -118,6 +121,7 @@ class ActionResult:
     degraded: Optional[bool] = None  # AX walk found no actionable elements (act by px instead)
     delivery_mode: Optional[str] = None  # the delivery_mode the caller requested, echoed back
     code: Optional[str] = None       # refusal code, e.g. "background_unavailable", "desktop_scope_disabled"
+    fix: Optional[Dict[str, Any]] = None  # a fixable cause (tools.fix_reasons contract), see CaptureResult.fix
 
 
 class ComputerUseBackend(ABC):

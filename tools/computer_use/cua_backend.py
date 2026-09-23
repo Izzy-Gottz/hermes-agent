@@ -470,7 +470,12 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
             out = self._session.call_tool(name, args)
         except Exception as e:
             logger.exception("cua-driver %s call failed", name)
-            return ActionResult(ok=False, action=name, message=f"cua-driver error: {e}")
+            # A fixable cause the exception carries (driver_not_running from the daemon or the CLI
+            # fallback) rides on the result; the words alone are the person's and name no code.
+            from tools.fix_reasons import fields_of
+            fields = fields_of(e)
+            return ActionResult(ok=False, action=name, message=f"cua-driver error: {e}",
+                                code=fields.get("code"), fix={"error": str(e), **fields} if fields else None)
         data = out["data"]
         structured = out.get("structuredContent") or {}
         message = (str(data.get("message", "")) if isinstance(data, dict) else data if isinstance(data, str) else "") \

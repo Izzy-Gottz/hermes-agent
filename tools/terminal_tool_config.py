@@ -45,11 +45,61 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
 def _safe_getcwd() -> str:
     """``os.getcwd()`` tolerant of a deleted cwd (FileNotFoundError) or a macOS
     TCC-protected one without Full Disk Access (PermissionError); falls back
-    to TERMINAL_CWD, then the home directory."""
+    to TERMINAL_CWD, then the home directory.
+
+    The fallback is no longer silent when it changes where commands run (no
+    TERMINAL_CWD): it is logged once and ``take_cwd_fallback_note`` hands the
+    next terminal result one line saying so, so the model does not go on
+    believing it is in the folder the session started in."""
     try:
         return os.getcwd()
-    except (FileNotFoundError, PermissionError):
-        return _tenv("TERMINAL_CWD") or os.path.expanduser("~")
+    except (FileNotFoundError, PermissionError) as exc:
+        configured = _tenv("TERMINAL_CWD")
+        fallback = configured or os.path.expanduser("~")
+        if not configured:
+            _note_cwd_fallback(exc, fallback)
+        return fallback
+
+
+#: The last cwd fallback: reported to the model once, logged once per distinct cause (the cleanup
+#: thread calls ``_safe_getcwd`` every 60 s, and a traceback per tick is what this function exists to stop).
+_cwd_fallback: dict = {}
+
+
+def _note_cwd_fallback(exc: OSError, fallback: str) -> None:
+    lost = os.environ.get("PWD") or ""
+    key = (lost, fallback, getattr(exc, "errno", None))
+    if _cwd_fallback.get("key") == key:
+        return
+    logger.warning("terminal: the working directory %s cannot be used (%s); commands run in %r instead",
+                   repr(lost) if lost else "(unknown)", exc, fallback)
+    _cwd_fallback.clear()
+    _cwd_fallback.update(key=key, lost=lost, fallback=fallback, errno=getattr(exc, "errno", None), reported=False)
+
+
+def take_cwd_fallback_note() -> dict | None:
+    """Once per fallback: ``{"note": ..., "from": ..., "to": ...}`` and, when macOS privacy protection
+    is the cause (EPERM on a protected folder), the ``tcc_files`` contract under ``"fix"``. Nested, not
+    top-level: the command itself may have succeeded, and top-level ``error`` means THIS call failed."""
+    import errno as _errno
+    if not _cwd_fallback or _cwd_fallback.get("reported"):
+        return None
+    _cwd_fallback["reported"] = True
+    lost, fallback = _cwd_fallback["lost"], _cwd_fallback["fallback"]
+    out: dict = {"from": lost or None, "to": fallback}
+    fix = None
+    if _cwd_fallback.get("errno") == _errno.EPERM and lost:
+        from tools.fix_reasons_macos import files_denied_for
+        fix = files_denied_for(lost)
+    if fix is not None:
+        from tools.fix_reasons import fields_of
+        out["note"] = (f"macOS would not let this session open its starting folder {lost}, so commands ran "
+                       f"in {fallback} instead. {fix}")
+        out["fix"] = {"error": str(fix), **fields_of(fix)}
+    else:
+        out["note"] = (f"The starting folder {lost or '(unknown)'} could not be used, so commands ran in "
+                       f"{fallback} instead.")
+    return out
 
 
 # Host-cwd shapes that cannot exist inside a container sandbox: POSIX user dirs and ANY Windows

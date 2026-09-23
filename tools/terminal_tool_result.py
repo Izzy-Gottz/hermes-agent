@@ -158,6 +158,32 @@ def _failure_hint(command: str, returncode: int, output: str, exit_note) -> Opti
     return None
 
 
+def _cwd_fallback_note(env_type: str):
+    """The one-time note that the local cwd fell back (tools.terminal_tool_config._safe_getcwd)."""
+    if env_type != "local":
+        return None
+    with _quiet("cwd fallback note"):
+        from tools.terminal_tool_config import take_cwd_fallback_note
+        return take_cwd_fallback_note()
+    return None
+
+
+def _fixable_cause(command: str, returncode: int, output: str, env_type: str, cwd: Optional[str]):
+    """A fixable macOS cause (tools.fix_reasons) behind a FAILED command on this host, or None.
+
+    The exit code stays the command's own. What this adds is the contract a host app acts on, for the two
+    causes a shell cannot fix and the person can: an Apple event macOS refused (tcc_automation, from
+    osascript's stderr) and a protected folder it refused (tcc_files, "Operation not permitted" naming a
+    path inside Desktop / Documents / Downloads / iCloud Drive, confirmed by opening that folder). Only
+    for the local backend: a container's EPERM is not this Mac's privacy protection."""
+    if returncode == 0 or env_type != "local" or not output:
+        return None
+    with _quiet("fixable cause"):
+        from tools.fix_reasons_macos import automation_denied_in_text, files_denied_in_text
+        return automation_denied_in_text(output, command) or files_denied_in_text(output, cwd=cwd)
+    return None
+
+
 def _redact_spill_file(path, total_chars, command) -> list[tuple[str, Any]]:
     """Spill handle so the model can read the omitted middle instead of
     re-running. The collector wrote it raw; redact it with the same pass so no
@@ -258,10 +284,16 @@ def finalize_foreground_result(
         ("approval", approval_note or None),
         ("exit_code_meaning", exit_note or None),
         ("hint", failure_hint or None),
+        ("cwd_fallback", _cwd_fallback_note(env_type)),
         ("sudo_auth_failed", True if sudo_auth_failed else None),
         ("sudo_cache_cleared", True if sudo_cache_cleared else None),
     ]
     for key, value in optional_fields:
         if value is not None:
             result_dict[key] = value
+    fix = _fixable_cause(command, returncode, output, env_type, command_cwd)
+    if fix is not None:
+        from tools.fix_reasons import fields_of
+        result_dict["error"] = str(fix)
+        result_dict.update(fields_of(fix))
     return json.dumps(result_dict, ensure_ascii=False)

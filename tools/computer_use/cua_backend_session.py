@@ -110,9 +110,12 @@ def _cli_run_json(cmd: List[str], env: Dict[str, str], name: str, timeout: float
         out, err = (proc.stdout or "").strip(), proc.stderr or ""
         last_err = out[:200] or err[:200]
         if "daemon is not running" in out or "daemon is not running" in err:
-            raise RuntimeError(f"cua-driver CLI fallback for {name} unavailable: the "
-                               "machine-wide cua-driver daemon is not running (the "
-                               "CLI transport requires it; the MCP runtime does not).")
+            # driver_not_running (tools.fix_reasons), carried by the exception so no wrapper loses it.
+            from tools.fix_reasons import as_error
+            from tools.fix_reasons_macos import driver_not_running_message
+            logger.warning("cua-driver CLI fallback for %s unavailable: the cua-driver daemon is not running "
+                           "(the CLI transport requires it; the MCP runtime does not)", name)
+            raise as_error(driver_not_running_message((out or err).strip()[:300]))
         start = min((i for i in (out.find("{"), out.find("[")) if i != -1), default=-1)
         with contextlib.suppress(json.JSONDecodeError):
             if start != -1:

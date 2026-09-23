@@ -10,6 +10,7 @@ in 1-2 sentences; pure function, no I/O or config reads.
 from __future__ import annotations
 
 import re
+import sys
 from typing import Callable, Optional
 
 _SCAN_CHARS = 4000
@@ -43,6 +44,30 @@ def _missing_command_hint(missing: str) -> str:
         "or use an absolute path instead of retrying the same command.")
 
 
+_EPERM_RE = re.compile(r"Operation not permitted|EPERM\b", re.I)
+_MACOS_PROTECTED_RE = re.compile(r"(?:^|[/\s'\"~:])(Desktop|Documents|Downloads|Mobile Documents)(?=$|[/\s'\":])", re.M)
+_MACOS_PROTECTED_NAMES = {"Mobile Documents": "iCloud Drive"}
+
+
+def _macos_eperm_hint(command: str, output: str) -> Optional[str]:
+    """macOS only: EPERM ("Operation not permitted") is privacy protection or a file flag, never mode."""
+    if sys.platform != "darwin":
+        return None
+    lines = [ln for ln in output.splitlines() if _EPERM_RE.search(ln)]
+    if not lines:
+        return None
+    folder = next((f for ln in lines if (f := _MACOS_PROTECTED_RE.search(ln))), None) \
+        or _MACOS_PROTECTED_RE.search(command or "")
+    if folder:
+        name = _MACOS_PROTECTED_NAMES.get(folder.group(1), folder.group(1))
+        return (f"macOS privacy protection blocked access to {name} (\"Operation not permitted\" is not a "
+                "file-mode problem, so sudo and chmod will not help). Tell the user the app needs access to "
+                f"{name} in System Settings › Privacy & Security, and do not retry until they turn it on.")
+    return ("\"Operation not permitted\" on macOS is privacy protection (TCC) or a file flag "
+            "(`ls -lO` shows uchg/schg), not ownership or mode: sudo and chmod will not help. Do not retry "
+            "the same command.")
+
+
 # Ordered by production frequency — first match wins.
 _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
     # gh version drift; gh already prints the valid field list.
@@ -66,6 +91,13 @@ _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
     _regex_hint(r"API rate limit|was submitted too quickly",
                 "GitHub API rate limit hit — immediate retries will keep failing. Continue with "
                 "other work and retry this operation later."),
+    # EPERM before EACCES: on macOS "Operation not permitted" is almost always privacy protection
+    # (TCC), which sudo and chmod cannot change; the EACCES hint below would send the model to both.
+    _macos_eperm_hint,
+    _regex_hint(r"Not authori[sz]ed to send Apple events to ([^\n]+?)\.? *(?:\(-1743\)|$)",
+                "macOS has not allowed this app to control {0} (Automation, error -1743); retrying will fail "
+                "the same way. Tell the user to turn on {0} under the app in System Settings › Privacy & "
+                "Security › Automation, then retry.", re.M),
     _regex_hint(r"Permission denied|EACCES",
                 "Permission denied. Check ownership/mode of the target path (`ls -la`); prefer a "
                 "user-writable location. Only escalate to sudo if the task genuinely requires it."),

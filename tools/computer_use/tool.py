@@ -648,6 +648,8 @@ def handle_computer_use(args: Dict[str, Any], _nested: bool = False, **kwargs) -
     try:
         backend = _get_backend(session_id=session_id)
     except Exception as e:
+        if (fixed := _fixable_exception_result(e, f"computer_use backend unavailable: {e}", session_id)) is not None:
+            return fixed
         return json.dumps({"error": f"computer_use backend unavailable: {e}",
                            "hint": "If the cua-driver binary is missing, run `hermes computer-use install`. "
                                    "If a Python dependency is missing, the error above shows the exact install command."})
@@ -658,11 +660,99 @@ def handle_computer_use(args: Dict[str, Any], _nested: bool = False, **kwargs) -
             result = _dispatch(backend, action, args)
     except Exception as e:
         logger.exception("computer_use %s failed", action)
-        failed = json.dumps({"error": f"{action} failed: {e}"})
+        failed = _fixable_exception_result(e, f"{action} failed: {e}", session_id) or json.dumps(
+            {"error": f"{action} failed: {e}"})
         detector.record(action, args, failed)
         return failed
+    result = _with_fixable_cause(result, session_id)
     detector.record(action, args, result)
     return _attach_stall_advisory(detector, action, args, result)
+
+
+# ── Fixable causes (tools.fix_reasons) at the tool boundary ─────────────────
+# Every route a failure takes to the model passes through here: an exception from any layer (the
+# driver's words are wrapped two or three times on the way up), a failed ActionResult or capture
+# payload, a backend that could not start. Whatever it says, if it names a cause the person can fix
+# the result carries the contract (error/code/owner/pane/subject/retry), so the model reads the code
+# instead of interpreting a paragraph, and the host can offer the fix.
+
+# Codes that mean the driver process must be relaunched before the call can work: the daemon is gone,
+# or a grant changed (cua-driver: "grant Accessibility and Screen Recording permissions, then restart
+# the daemon"). Dropping the session's backend makes the next call launch a fresh one, which is what
+# makes ``retry: true`` honest for these.
+_RELAUNCH_DRIVER_CODES = frozenset({"driver_not_running", "tcc_driver_accessibility", "tcc_driver_screen"})
+
+
+def _fix_in_text(text: str, driver_code: Optional[str] = None):
+    from tools.fix_reasons_macos import automation_denied_in_text, driver_fix_in
+    return driver_fix_in(text, driver_code) or automation_denied_in_text(text)
+
+
+def _fix_of_exception(exc: BaseException):
+    """The FixMessage an exception carries (anywhere in its cause chain), or one read from its text."""
+    from tools.fix_reasons import FixMessage, fields_of
+    seen, cur = set(), exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if (fields := fields_of(cur)):
+            return FixMessage(str(cur), fields)
+        cur = cur.__cause__ or (None if cur.__suppress_context__ else cur.__context__)
+    return _fix_in_text(str(exc))
+
+
+def _relaunch_driver_if_needed(code: Optional[str], session_id: str) -> None:
+    if code in _RELAUNCH_DRIVER_CODES:
+        with contextlib.suppress(Exception):
+            if release_computer_use_session(session_id):
+                logger.info("computer_use: dropped session %r backend after %s; the next call relaunches it",
+                            session_id, code)
+
+
+def _fixable_exception_result(exc: BaseException, raw: str, session_id: str) -> Optional[str]:
+    """The tool-result JSON for a failed call whose cause is fixable, else None (caller keeps its own)."""
+    fix = _fix_of_exception(exc)
+    if fix is None:
+        return None
+    from tools.fix_reasons import fields_of
+    fields = fields_of(fix)
+    _relaunch_driver_if_needed(fields.get("code"), session_id)
+    return json.dumps({"error": str(fix), **fields, **({} if "detail" in fields else {"detail": raw})})
+
+
+def _with_fixable_cause(result: Any, session_id: str) -> Any:
+    """A failed result, with the contract merged in when its words (or the driver's refusal code) name a
+    fixable cause. Successes, and results that already carry a vocabulary code, pass through untouched:
+    only ``error`` and a failed call's ``message`` are read, never window titles or element labels."""
+    from tools.fix_reasons import CODES, fields_of
+    data = result
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except (TypeError, ValueError):
+            return result
+    if not isinstance(data, dict) or data.get("_multimodal"):
+        return result
+    code = data.get("code")
+    code = code if isinstance(code, str) else None
+    if code in CODES:  # a producer below already attached it (off-Space, a FixableError payload)
+        _relaunch_driver_if_needed(code, session_id)
+        return result
+    failed = data.get("ok") is False or bool(data.get("error"))
+    if not failed:
+        return result
+    text = " ".join(str(data[k]) for k in ("error", "message") if data.get(k))
+    fix = _fix_in_text(text, code)
+    if fix is None:
+        return result
+    fields = fields_of(fix)
+    merged = dict(data)
+    if code:
+        merged["driver_code"] = code  # the driver's own refusal code, kept; ``code`` is the vocabulary's
+    if data.get("error") and "detail" not in fields:
+        merged["detail"] = data["error"]
+    merged.update({"error": str(fix), **fields})
+    _relaunch_driver_if_needed(fields.get("code"), session_id)
+    return json.dumps(merged) if isinstance(result, str) else merged
 
 def _attach_stall_advisory(detector: StallDetector, action: str, args: Dict[str, Any], result: Any) -> Any:
     """Fold the soft-tier warning into the channel the model actually reads.
@@ -1023,7 +1113,7 @@ def _action_payload(res: ActionResult) -> Dict[str, Any]:
             **{k: v for k in ("verified", "effect", "escalation", "path", "degraded", "delivery_mode", "code")
                if (v := getattr(res, k)) is not None}, **_present(meta=res.meta),
             **{k: meta[k] for k in _LANDING_KEYS if k in meta},
-            "verdict": _classify_action_result(res)}
+            "verdict": _classify_action_result(res), **(res.fix or {})}
 
 def _text_response(res: ActionResult) -> str:
     return json.dumps(_action_payload(res))
@@ -1211,6 +1301,7 @@ def _text_capture_payload(v: SimpleNamespace, summary: str, extra: Optional[Dict
         **(extra or {}),
         **_present(truncated_elements=v.truncated, elements_file=v.elements_file, screenshot_path=v.screenshot_path,
                    bounds_scale=v.bounds_scale),
+        **(getattr(v.cap, "fix", None) or {}),  # a failed capture's fixable cause (tools.fix_reasons)
     })
 
 def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS) -> Any:

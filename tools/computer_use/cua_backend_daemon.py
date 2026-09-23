@@ -192,7 +192,12 @@ class _EmbeddedCuaDaemon:
 
     def proxy_invocation(self) -> Tuple[str, List[str]]:
         if not self._running:
-            raise RuntimeError("embedded cua-driver daemon is not running")
+            # driver_not_running (tools.fix_reasons): the tool boundary drops this session's backend, so
+            # the next call launches a fresh daemon. The raw text stays in the log, not the person's words.
+            from tools.fix_reasons import as_error
+            from tools.fix_reasons_macos import driver_not_running_message
+            logger.warning("embedded cua-driver daemon is not running")
+            raise as_error(driver_not_running_message("embedded cua-driver daemon is not running"))
         return self._command, [*self._mcp_args, "--embedded", "--socket", self.socket_path]
 
     def stop(self) -> None:

@@ -247,6 +247,38 @@ def _is_expected_write_exception(exc: Exception) -> bool:
         isinstance(exc, OSError) and exc.errno in _EXPECTED_WRITE_ERRNOS)
 
 
+def _tcc_files_denial(resolved: str | None, task_id: str) -> str | None:
+    """``tcc_files`` error JSON when macOS privacy protection refuses this process the protected folder
+    (Desktop, Documents, Downloads, iCloud Drive) holding ``resolved``; None otherwise.
+
+    Checked BEFORE the read/write because nothing downstream can say it: the native read catches the
+    EPERM and falls back to the shell, where ``wc -c < file`` fails silently and the result claimed
+    "Terminal environment unavailable … Retry shortly" (and ``sed | cut`` exits with cut's 0, an empty
+    read). Only paths inside a protected folder pay the probe, and only on this host's filesystem."""
+    import sys as _sys  # not the module-level PLUGIN-COMPAT import
+    if _sys.platform != "darwin" or not resolved:
+        return None
+    from tools.fix_reasons_macos import files_denied_for, protected_folder
+    if protected_folder(resolved) is None or not _file_ops_uses_host_paths(_get_file_ops(task_id)):
+        return None
+    fix = files_denied_for(resolved)
+    if fix is None:
+        return None
+    from tools.fix_reasons import as_tool_error
+    return as_tool_error(fix)
+
+
+def _file_exception_error(exc: Exception, path: str | None, task_id: str) -> str:
+    """``tool_error`` for an exception from a file tool: ``tcc_files`` when it is macOS privacy
+    protection (EPERM, confirmed on the folder), otherwise the raw text as before."""
+    from tools.fix_reasons_macos import files_denied_from_exc
+    fix = files_denied_from_exc(exc, _resolve_or_none(path, task_id) if path else None)
+    if fix is not None:
+        from tools.fix_reasons import as_tool_error
+        return as_tool_error(fix)
+    return tool_error(str(exc))
+
+
 # ── ShellFileOperations per terminal environment ─────────────────────────
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
@@ -555,6 +587,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        # macOS privacy protection (tcc_files) before any read: downstream it is misreported.
+        if (tcc_denied := _tcc_files_denial(str(_resolved), task_id)) is not None:
+            return tcc_denied
+
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
         if _file_ops_uses_host_paths(_get_file_ops(task_id)):
             kind = _special_file_kind(_resolved)
@@ -651,7 +687,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 "If you are stuck in a loop, stop reading and proceed with writing or responding.")
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
-        return tool_error(str(e))
+        return _file_exception_error(e, path, task_id)
 
 
 # ── Shared write/patch plumbing ──────────────────────────────────────────
@@ -781,6 +817,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # Resolution failure falls back to the legacy unlocked path (the write
         # still proceeds; the per-task staleness check still runs).
         _resolved = _resolve_or_none(path, task_id)
+        if (tcc_denied := _tcc_files_denial(_resolved, task_id)) is not None:
+            return tcc_denied
         path_to_resolved = {path: _resolved}
         with ExitStack() as _lock:
             if _resolved:
@@ -810,7 +848,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
         else:
             logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
-        return tool_error(str(e))
+        return _file_exception_error(e, path, task_id)
 
 
 def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str]] | str:
@@ -866,6 +904,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # overlapping multi-file patches can't deadlock (every caller locks in
         # the same order). An unresolvable path is simply not locked.
         _path_to_resolved: dict[str, str] = {_p: _resolve_or_none(_p, task_id) for _p in _paths_to_check}
+        for _r in _path_to_resolved.values():
+            if (tcc_denied := _tcc_files_denial(_r, task_id)) is not None:
+                return tcc_denied
         with ExitStack() as _locks:
             for _r in sorted({_r for _r in _path_to_resolved.values() if _r}):
                 _locks.enter_context(file_state.lock_path(_r))
@@ -923,7 +964,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     "content, or search_files to locate the text.")
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
-        return tool_error(str(e))
+        return _file_exception_error(e, path, task_id)
 
 
 def search_tool(pattern: str, target: str = "content", path: str = ".",

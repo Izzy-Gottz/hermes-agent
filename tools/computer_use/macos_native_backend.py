@@ -224,6 +224,18 @@ def looks_blank(png: bytes, sample: int = 64) -> bool:
 # Backend
 # ---------------------------------------------------------------------------
 
+
+def _raise_if_automation_denied(stderr: str, script: str) -> None:
+    """osascript -1743/-1744 (System Events, Finder, the target app) is ``tcc_automation``: raise it as a
+    ``FixableError`` so the computer_use boundary hands the model and the host the code, the pane and
+    the app to turn on, instead of raw stderr."""
+    from tools.fix_reasons import as_error
+    from tools.fix_reasons_macos import automation_denied_in_text
+    fix = automation_denied_in_text(stderr, script)
+    if fix is not None:
+        raise as_error(fix)
+
+
 class MacNativeBackend(ComputerUseBackend):
     """Foreground desktop control with stock macOS tooling. See module doc."""
 
@@ -265,6 +277,7 @@ class MacNativeBackend(ComputerUseBackend):
                 raise RuntimeError(
                     "Accessibility permission missing for the app that launched this "
                     "process (System Settings › Privacy & Security › Accessibility): " + err)
+            _raise_if_automation_denied(err, script)
             raise RuntimeError(err or f"osascript exit {proc.returncode}")
         return (proc.stdout or "").strip()
 
@@ -273,7 +286,9 @@ class MacNativeBackend(ComputerUseBackend):
         proc = subprocess.run(cmd, input=script, capture_output=True, text=True,
                               timeout=20, check=False)
         if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or "").strip() or f"osascript exit {proc.returncode}")
+            err = (proc.stderr or "").strip()
+            _raise_if_automation_denied(err, script)
+            raise RuntimeError(err or f"osascript exit {proc.returncode}")
         return (proc.stdout or "").strip()
 
     # ── geometry ─────────────────────────────────────────────────────
