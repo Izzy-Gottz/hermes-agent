@@ -126,8 +126,8 @@ def _capture_candidates(windows: List[Dict[str, Any]], *, app_requested: bool, e
                         driver_pids: frozenset = frozenset()) -> List[Dict[str, Any]]:
     """Capture targets best-first from z-sorted (frontmost-first) list_windows output. Unqualified
     default captures (no app filter, no exact target) never pick the screen-control helper's own
-    windows, on any platform; on macOS they prefer titled, full-sized, layer-0 windows over strips
-    (``_darwin_window_rank``); on Linux they also skip desktop/shell helper windows — targetable but
+    windows, on any platform; on macOS they prefer the frontmost app's titled, full-sized, layer-0 windows over
+    its strips (``_darwin_window_rank``, within that app only); on Linux they also skip desktop/shell helper windows — targetable but
     capture as empty — and when every remaining candidate shares one ``z_index`` (the common X11 case)
     ``_NET_ACTIVE_WINDOW`` beats list order. Exact-target captures never pay for the ``xprop`` probe.
     Empty only when a default capture finds nothing but the helper's windows.
@@ -139,9 +139,13 @@ def _capture_candidates(windows: List[Dict[str, Any]], *, app_requested: bool, e
     if exact_target or app_requested:
         return pool or windows[:1]
     pool = [w for w in (pool or windows[:1]) if not _is_driver_window(w, driver_pids)]
-    if sys.platform == "darwin":
-        # Rank, never drop: frontmost-first within each tier (sorted() is stable).
-        pool = sorted(pool, key=_darwin_window_rank)
+    if sys.platform == "darwin" and pool:
+        # Rank WITHIN the frontmost app only: its toolbar strip must not beat its own real window,
+        # but a titled window of an app further back must never beat the app the person is in
+        # (an untitled Spotify window, a small Finder "Copy" dialog). Rank, never drop; stable.
+        front_pid = pool[0].get("pid")
+        front = sorted((w for w in pool if w.get("pid") == front_pid), key=_darwin_window_rank)
+        pool = front + [w for w in pool if w.get("pid") != front_pid]
     if sys.platform == "linux":
         pool = [w for w in pool if _is_real_app_window(w)] or pool
         if pool and _z_index_uninformative(pool):

@@ -193,10 +193,39 @@ def test_darwin_ranking_keeps_frontmost_order_within_a_tier(monkeypatch):
 
 
 def test_darwin_ranking_without_bounds_is_plain_frontmost(monkeypatch):
-    """A driver that omits bounds/layer keeps the old frontmost order (nothing to rank on)."""
+    """A driver that omits bounds/layer keeps the frontmost pick (nothing to rank on); the
+    frontmost app's other windows follow it, then every other app in z-order."""
     from tools.computer_use.cua_backend_parse import _ingest_windows
     monkeypatch.setattr(cap_mod.sys, "platform", "darwin")
     bare = [{k: v for k, v in w.items() if k not in ("bounds", "layer")} | {"title": "t"}
             for w in (CHROME_STRIP, CMUX_STRIP, CHROME_MAIN)]
     windows = sorted(_ingest_windows(bare), key=lambda w: w["z_index"], reverse=True)
-    assert [w["window_id"] for w in cap_mod._capture_candidates(windows, app_requested=False)] == [3408, 205, 3391]
+    assert [w["window_id"] for w in cap_mod._capture_candidates(windows, app_requested=False)] == [3408, 3391, 205]
+
+
+# ── the ranking never crosses apps: the frontmost app wins ─────────────────────────────────────
+MAIL_INBOX = {"app_name": "Mail", "bounds": {"height": 820, "width": 1300, "x": 60, "y": 60},
+              "is_on_screen": True, "layer": 0, "on_current_space": True, "pid": 700,
+              "space_ids": [45], "title": "Inbox", "window_id": 60, "z_index": 1}
+
+
+def test_darwin_untitled_frontmost_app_beats_a_titled_app_behind(monkeypatch):
+    """Spotify is frontmost with an untitled 1200x800 window; Mail "Inbox" is behind it."""
+    monkeypatch.setattr(cap_mod.sys, "platform", "darwin")
+    spotify = {"app_name": "Spotify", "bounds": {"height": 800, "width": 1200, "x": 100, "y": 50},
+               "is_on_screen": True, "layer": 0, "on_current_space": True, "pid": 900,
+               "space_ids": [45], "title": "", "window_id": 77, "z_index": 3}
+    backend = _backend([DRIVER_WINDOW, spotify, MAIL_INBOX], driver_pid=69038)
+    backend.capture()
+    assert (backend._active_pid, backend._active_window_id) == (900, 77)
+
+
+def test_darwin_small_frontmost_dialog_beats_a_titled_app_behind(monkeypatch):
+    """A Finder "Copy" progress dialog (400x110) is frontmost; Mail is behind it."""
+    monkeypatch.setattr(cap_mod.sys, "platform", "darwin")
+    copy_dialog = {"app_name": "Finder", "bounds": {"height": 110, "width": 400, "x": 500, "y": 300},
+                   "is_on_screen": True, "layer": 0, "on_current_space": True, "pid": 420,
+                   "space_ids": [45], "title": "Copy", "window_id": 88, "z_index": 3}
+    backend = _backend([DRIVER_WINDOW, copy_dialog, MAIL_INBOX], driver_pid=69038)
+    backend.capture()
+    assert (backend._active_pid, backend._active_window_id) == (420, 88)
