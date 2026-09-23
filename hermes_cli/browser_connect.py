@@ -20,6 +20,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -395,6 +396,18 @@ _SQLITE_AUTH_DBS = frozenset({"Cookies", "Login Data", "Login Data For Account",
 def _copy_auth_file(src_file: str, dst_file: str) -> bool:
     """Copy auth state; refuse a DB that cannot be snapshotted consistently within five seconds."""
     os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+    if sys.platform == "darwin":
+        # sqlite reports an unreadable source as a generic "unable to open database file", which
+        # the except below would count as one more "unavailable" DB and the caller would blame on
+        # the browser being open. On macOS that is app-data protection (EPERM), and it must reach
+        # snapshot_real_profile as the PermissionError it is.
+        try:
+            with open(src_file, "rb"):
+                pass
+        except PermissionError:
+            raise
+        except OSError:
+            pass  # anything else (vanished mid-copy) keeps the best-effort handling below
     try:
         if os.path.basename(src_file) in _SQLITE_AUTH_DBS:
             deadline = time.monotonic() + 5.0
@@ -485,7 +498,13 @@ _PROFILE_LOCKED_PREFIX = "[profile-locked] "
 def _profile_is_locked(src: str, source_profile: str) -> bool:
     """True when the active profile's cookie DB can't be opened (browser running). On Windows a
     running browser holds Cookies deny-all (PermissionError); this FAST probe fails closed BEFORE
-    the heavy snapshot so a locked profile never hangs the launch. Always False on POSIX."""
+    the heavy snapshot so a locked profile never hangs the launch.
+
+    Always False off Windows: on POSIX ``open()`` never fails because another process has the file
+    open, so a PermissionError there is not a lock. On macOS it is app-data protection (see
+    ``_app_data_denied``); reading it as a lock told people to quit a browser, which cannot help."""
+    if sys.platform != "win32":
+        return False
     db = _first_present(  # modern Network/ location first
         os.path.join(src, source_profile, rel)
         for rel in (os.path.join("Network", "Cookies"), "Cookies"))
@@ -648,7 +667,60 @@ def _locked_profile_error(browser: str) -> str:
             "Fully quit the browser (including any background/tray instance) and retry, or turn "
             "browser.use_real_profile off. (Enable browser.real_profile_autoclose to let Hermes "
             "offer to close it for you.)")
-    return _PROFILE_LOCKED_PREFIX + msg
+    from tools.fix_reasons import PROFILE_LOCKED, fix_message
+    return fix_message(_PROFILE_LOCKED_PREFIX + msg, PROFILE_LOCKED, subject=browser_display_name(browser),
+                       retry=True, browser=browser)
+
+
+def browser_display_name(browser: str) -> str:
+    """The name a person knows the browser by ("Google Chrome"), from its macOS app bundle."""
+    entry = _BROWSER_BY_KEY.get(browser)
+    if entry is not None:
+        m = re.search(r"/([^/]+)\.app/", entry.mac_app)
+        if m:
+            return m.group(1)
+    return str(browser or "the browser").title()
+
+
+def _is_app_data_denial(exc: BaseException) -> bool:
+    """macOS app-data protection: another app's ``~/Library/Application Support`` subtree returns
+    EPERM to every process without Full Disk Access (measured on macOS 27 against Chrome's dir,
+    which carries ``com.apple.macl``). Python raises it as PermissionError."""
+    return sys.platform == "darwin" and isinstance(exc, PermissionError)
+
+
+def _app_data_denied(src: str, source_profile: str | None = None) -> bool:
+    """Probe, before copying anything, whether macOS refuses this process the browser's data: list
+    the user-data dir, read ``Local State``, open the profile's cookie DB. Only a PermissionError
+    counts; any other failure is left to the copy path, which reports it on its own terms."""
+    if sys.platform != "darwin":
+        return False
+    probes = [lambda: os.listdir(src)]
+    for rel in ("Local State",
+                *((os.path.join(source_profile, "Network", "Cookies"), os.path.join(source_profile, "Cookies"))
+                  if source_profile else ())):
+        path = os.path.join(src, rel)
+        probes.append(lambda path=path: open(path, "rb").close())
+    for probe in probes:
+        try:
+            probe()
+        except PermissionError:
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _app_data_denied_error(browser: str, src: str):
+    """The ``tcc_app_data`` error: why, what fixes it, and the one thing NOT to do."""
+    from tools.fix_reasons import TCC_APP_DATA, fix_message, host_app_name
+    name, app = browser_display_name(browser), host_app_name()
+    return fix_message(
+        f"{app[:1].upper()}{app[1:]} isn't allowed to read {name}'s data, so it can't use your "
+        f"sign-ins. Turn {app} on in System Settings › Privacy & Security › Full Disk Access, "
+        f"then I'll carry on. Don't quit {name}; that won't help.",
+        TCC_APP_DATA, owner="app", pane="Privacy_AllFiles", subject=name, retry=True,
+        browser=browser, path=src)
 
 
 def _copy_profile_tree(src: str, dst: str, source_profile: str) -> None:
@@ -678,16 +750,28 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     completion marker is written only after full success, so a torn first copy (disk full, Ctrl+C)
     never looks "already populated" — it is redone from scratch."""
     src = src or real_profile_data_dir(browser)
+    if src and not os.path.isdir(src):
+        try:  # isdir() swallows EPERM; a protected dir is not a missing one
+            os.stat(src)
+        except OSError as e:
+            if _is_app_data_denial(e):
+                return None, _app_data_denied_error(browser, src)
     if not src or not os.path.isdir(src):
         return None, (
             f"profile directory for '{browser}' was not found ({src!r}). "
             "Launch that browser at least once, or turn browser.use_real_profile off.")
+    # macOS app-data protection BEFORE resolving the profile: an unreadable Local State would
+    # otherwise silently resolve to "Default" and the failure surface later as something else.
+    if _app_data_denied(src):
+        return None, _app_data_denied_error(browser, src)
     source_profile, resolve_err = _resolve_source_profile(src)
     if resolve_err or not source_profile:
         return None, resolve_err
+    if _app_data_denied(src, source_profile):
+        return None, _app_data_denied_error(browser, src)
     dst = real_profile_copy_dir(browser)
     # Fast lock probe BEFORE any copy: a blocking file op on a Windows-locked cookie DB can
-    # hang the launch for minutes. Never trips on POSIX, so copy-while-running still works.
+    # hang the launch for minutes. Windows only, so copy-while-running still works elsewhere.
     if _profile_is_locked(src, source_profile):
         return None, _locked_profile_error(browser)
     marker = os.path.join(dst, _SNAPSHOT_DONE_MARKER)
@@ -722,6 +806,8 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
         # AFTER the marker write so the marker itself is covered; every pass, so old snapshots heal.
         _secure_snapshot(dst, contents=True)
     except OSError as e:
+        if _is_app_data_denial(e):
+            return None, _app_data_denied_error(browser, src)
         return None, f"could not snapshot the '{browser}' profile into {dst}: {e}"
     return dst, None
 

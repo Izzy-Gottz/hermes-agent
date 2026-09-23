@@ -603,7 +603,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         env["BU_NAME"] = session
     route_err = _route_backend(env, session, task_id, bool(local))
     if route_err:
-        return tool_error(route_err)
+        from tools.fix_reasons import as_tool_error
+        return as_tool_error(route_err)  # keeps a fixable cause's code (tools.fix_reasons)
     _attach_vault_supervisor(env, task_id)
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see

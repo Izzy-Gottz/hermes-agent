@@ -929,6 +929,13 @@ class ToolRegistry:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
+            fix = getattr(e, "fields", None)
+            if isinstance(fix, dict) and fix.get("code"):
+                # A fixable cause (tools.fix_reasons.FixableError) is already in the person's words
+                # and carries the code a host acts on; the generic wrapper below would drop both.
+                from tools.fix_reasons import as_tool_error
+                logger.info("Tool %s: fixable failure %s", name, fix.get("code"))
+                return as_tool_error(e)
             # exc_info already renders the exception, so keep the message copy bounded.
             logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
             # Sanitize so framing tokens/CDATA/fences in exception text aren't structural noise.

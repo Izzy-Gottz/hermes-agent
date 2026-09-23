@@ -169,7 +169,8 @@ def _create_local_session(task_id: str, allow_real_profile: bool = True) -> Dict
     if allow_real_profile:
         cdp_url, err = _real_profile._real_profile_cdp()
         if err:
-            raise RuntimeError(err)
+            from tools.fix_reasons import as_error
+            raise as_error(err)  # a FixableError when err carries a fix code, else RuntimeError
         if cdp_url:
             info = _session_record("rp", _cdp._resolve_cdp_override(cdp_url), {"local": True, "real_profile": True})
             _bt.logger.info("Created real-profile local session %s for task %s", info["session_name"], task_id)
@@ -573,6 +574,9 @@ def _run_browser_command(
         session_info = _get_session_info(task_id)
     except Exception as e:
         _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
+        from tools.fix_reasons import fields_of
+        if fields := fields_of(e):  # a fixable cause is already in the person's words; keep its code
+            return {"success": False, "error": str(e), **fields}
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
     # Cleanup stops the supervisor before closing the backend; keep it stopped.
     if command != "close" and session_info.get("cdp_url"):

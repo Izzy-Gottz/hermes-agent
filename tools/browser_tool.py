@@ -580,6 +580,12 @@ def _err(error: str, **extra) -> dict:
     return {"success": False, "error": error, **extra}
 
 
+def _fix_carried(result: Dict[str, Any]) -> Dict[str, Any]:
+    """A fixable cause's code/owner/pane/... from a failed command result (tools.fix_reasons)."""
+    from tools.fix_reasons import carried
+    return carried(result)
+
+
 def _dumps(payload: Dict[str, Any], **kw) -> str:
     return json.dumps(payload, ensure_ascii=False, **kw)
 
@@ -729,7 +735,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     result = _session._run_browser_command(nav_session_key, "open", [url],
                                   timeout=_get_open_command_timeout(first_open=is_first_nav))
     if not result.get("success"):
-        return _dumps(_err(result.get("error", "Navigation failed")))
+        return _dumps(_err(result.get("error", "Navigation failed"), **_fix_carried(result)))
 
     data = result.get("data", {})
     title = data.get("title", "")
@@ -811,7 +817,7 @@ def _json_with_fallback(response: Dict[str, Any], result: Dict[str, Any]) -> str
 
 
 def _failed_response(result: Dict[str, Any], default_error: str) -> str:
-    return _json_with_fallback(_err(result.get("error", default_error)), result)
+    return _json_with_fallback(_err(result.get("error", default_error), **_fix_carried(result)), result)
 
 
 def _tool_response(result: Dict[str, Any], ok: Dict[str, Any], default_error: str) -> str:
@@ -865,7 +871,7 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     if result.get("success"):
         response = {"success": True, "typed": display_text, "element": ref}
     else:
-        response = _err(result.get("error", f"Failed to type into {ref}"))
+        response = _err(result.get("error", f"Failed to type into {ref}"), **_fix_carried(result))
     return _dumps(redact_browser_typed_text_for_display(_lp._copy_fallback_warning(response, result), text))
 
 

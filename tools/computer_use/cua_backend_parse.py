@@ -270,6 +270,9 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             ),
             "title": title if isinstance(title, str) else "",
             "z_index": z_raw if isinstance(z_raw, (int, float)) and not isinstance(z_raw, bool) else 0,
+            # Kept only when the driver sends one (list_windows on macOS 27 does not), so records
+            # without it are unchanged; used to recognise the driver's own windows.
+            **({"bundle_id": bid} if isinstance((bid := w.get("bundle_id") or w.get("bundleId")), str) and bid else {}),
         })
     return windows
 

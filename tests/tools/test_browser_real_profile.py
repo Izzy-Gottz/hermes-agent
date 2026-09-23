@@ -1098,8 +1098,13 @@ class TestReviewRound3:
         (tmp_path / "Default").mkdir(parents=True)
         assert bc._profile_is_locked(str(tmp_path), "Default") is False
 
-    def test_lock_probe_true_on_permissionerror(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("platform, locked", [("win32", True), ("darwin", False), ("linux", False)])
+    def test_lock_probe_true_on_permissionerror(self, tmp_path, monkeypatch, platform, locked):
+        """A PermissionError is a lock only on Windows. On POSIX open() never fails because a
+        browser holds the file; on macOS it is app-data protection (tcc_app_data), and calling it
+        a lock told people to quit a browser, which cannot help (ticket #8)."""
         import hermes_cli.browser_connect as bc
+        monkeypatch.setattr(bc.sys, "platform", platform)
         (tmp_path / "Default").mkdir(parents=True)
         (tmp_path / "Default" / "Cookies").write_bytes(b"db")
         import builtins
@@ -1111,7 +1116,7 @@ class TestReviewRound3:
             return real_open(path, *a, **k)
 
         monkeypatch.setattr(builtins, "open", deny)
-        assert bc._profile_is_locked(str(tmp_path), "Default") is True
+        assert bc._profile_is_locked(str(tmp_path), "Default") is locked
 
     def test_snapshot_fails_fast_when_locked(self, tmp_path, monkeypatch):
         """snapshot_real_profile always BLOCKS when locked — never kills, never

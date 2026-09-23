@@ -169,12 +169,20 @@ def _real_profile_unsupported_reason(browser) -> Optional[str]:
 
 
 def _real_profile_snapshot_error(err: str) -> str:
-    """User-facing message for a failed profile snapshot; a locked profile adds the approved-close
-    command, which the agent must ASK the user about first (it quits their browser)."""
+    """User-facing message for a failed profile snapshot. A fixable cause (``tools.fix_reasons``)
+    passes through unchanged, fields and all: it is already in the person's words, and prefixing it
+    would drop the code. A locked profile (Windows only — nowhere else can a browser lock its files
+    against a reader) adds the approved-close command, which the agent must ASK the user about
+    first (it quits their browser)."""
     from hermes_cli.browser_connect import _PROFILE_LOCKED_PREFIX
+    from tools.fix_reasons import FixMessage, PROFILE_LOCKED, fields_of
+    fields = fields_of(err)
     if err and err.startswith(_PROFILE_LOCKED_PREFIX):
-        return (err[len(_PROFILE_LOCKED_PREFIX):] + " To close it (only after the user approves — it "
-                "quits their browser and loses unsaved tabs), run: `hermes browser close-profile`, then retry.")
+        msg = (err[len(_PROFILE_LOCKED_PREFIX):] + " To close it (only after the user approves — it "
+               "quits their browser and loses unsaved tabs), run: `hermes browser close-profile`, then retry.")
+        return FixMessage(msg, fields) if fields.get("code") == PROFILE_LOCKED else msg
+    if fields:
+        return err
     return f"{_RP}{err}"
 
 

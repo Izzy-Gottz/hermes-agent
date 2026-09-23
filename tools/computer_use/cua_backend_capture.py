@@ -53,23 +53,91 @@ def _linux_x11_active_window_id() -> Optional[int]:
         return None
     return _parse_xprop_net_active_window(proc.stdout or "") if proc.returncode == 0 else None
 
-def _select_capture_target(windows: List[Dict[str, Any]], *, app_requested: bool,
-                           exact_target: bool = False) -> Dict[str, Any]:
-    """Best window from z-sorted (frontmost-first) list_windows output. Unqualified default captures on
-    Linux (no app filter, no exact target) skip desktop/shell helper windows first — targetable but capture
-    as empty — and when every remaining candidate shares one ``z_index`` (the common X11 case)
+# The screen-control helper's own windows. When the standalone CuaDriver daemon runs it owns an
+# on-screen, untitled, full-screen window on every Space — measured on macOS 27:
+#   {"app_name":"Cua Driver","bounds":{"height":956,"width":1470,"x":0,"y":0},"is_on_screen":true,
+#    "layer":0,"pid":69038,"title":"","window_id":405,...}
+# and over the MCP transport with a session it is list_windows' index 0. get_window_state on it is
+# refused, so every unqualified capture failed (7 times in 6 sessions, 2026-09-17 to 09-23).
+_DRIVER_APP_NAMES = frozenset({"cua driver", "cuadriver", "cua-driver"})
+_DRIVER_BUNDLE_IDS = frozenset({"com.trycua.driver"})
+_DRIVER_SELF_REFUSAL = "refuses operations that target its own authorization process"
+_DRIVER_OWN_WINDOW_MSG = ("that window belongs to the screen-control helper itself ({app}, pid {pid}, window "
+                          "{window_id}); capture another app — capture() with no target picks the frontmost other "
+                          "window, or pass app='<AppName>'")
+_ONLY_DRIVER_WINDOWS_MSG = ("<the only on-screen window belongs to the screen-control helper itself ({app}, pid {pid}); "
+                            "there is no other app window on this Space to capture. Open or name the app to "
+                            "capture with capture(app='<AppName>'), or capture(app='screen') for the whole screen.>")
+
+
+def _driver_pids() -> frozenset:
+    """PIDs of running cua-driver processes (the daemon whose windows are its own). Best-effort:
+    list_apps cannot answer this — measured, it reports Cua Driver ``running: false, pid: 0``
+    while the daemon runs — so this asks the process table. Empty on any failure."""
+    try:
+        import psutil
+    except ImportError:
+        return frozenset()
+    pids = set()
+    try:
+        for proc in psutil.process_iter(["name", "exe"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                exe = proc.info.get("exe") or ""
+            except Exception:
+                continue
+            if name == "cua-driver" or "/CuaDriver.app/" in exe:
+                pids.add(proc.pid)
+    except Exception as exc:
+        logger.debug("cua-driver pid lookup failed: %s", exc)
+    return frozenset(pids)
+
+
+def _is_driver_window(w: Dict[str, Any], driver_pids: frozenset = frozenset()) -> bool:
+    """True for a window the screen-control helper owns: its pid, app name or bundle id."""
+    return (w.get("pid") in driver_pids
+            or str(w.get("app_name") or "").strip().lower() in _DRIVER_APP_NAMES
+            or str(w.get("bundle_id") or "").strip().lower() in _DRIVER_BUNDLE_IDS)
+
+
+def _is_driver_self_refusal(exc: BaseException) -> bool:
+    return _DRIVER_SELF_REFUSAL in str(exc)
+
+
+def _capture_candidates(windows: List[Dict[str, Any]], *, app_requested: bool, exact_target: bool = False,
+                        driver_pids: frozenset = frozenset()) -> List[Dict[str, Any]]:
+    """Capture targets best-first from z-sorted (frontmost-first) list_windows output. Unqualified
+    default captures (no app filter, no exact target) never pick the screen-control helper's own
+    windows, on any platform; on Linux they also skip desktop/shell helper windows — targetable but
+    capture as empty — and when every remaining candidate shares one ``z_index`` (the common X11 case)
     ``_NET_ACTIVE_WINDOW`` beats list order. Exact-target captures never pay for the ``xprop`` probe.
+    Empty only when a default capture finds nothing but the helper's windows.
 
     Callers pass windows already sorted by ``z_index`` descending (higher = frontmost). When ordering is
     informative, keep that frontmost contract. See #58026.
     """
     pool = [w for w in windows if not w["off_screen"]]
-    if not exact_target and not app_requested and sys.platform == "linux":
+    if exact_target or app_requested:
+        return pool or windows[:1]
+    pool = [w for w in (pool or windows[:1]) if not _is_driver_window(w, driver_pids)]
+    if sys.platform == "linux":
         pool = [w for w in pool if _is_real_app_window(w)] or pool
         if pool and _z_index_uninformative(pool):
             active_id = _linux_x11_active_window_id()
             if active_id is not None and (hit := [w for w in pool if w.get("window_id") == active_id]):
-                return hit[0]
+                return hit + [w for w in pool if w is not hit[0]]
+    return pool
+
+
+def _select_capture_target(windows: List[Dict[str, Any]], *, app_requested: bool,
+                           exact_target: bool = False, driver_pids: frozenset = frozenset()) -> Dict[str, Any]:
+    """The best capture target (``_capture_candidates``' first); a helper-only screen yields the
+    frontmost window, which ``capture`` then reports as the helper's own."""
+    candidates = _capture_candidates(windows, app_requested=app_requested, exact_target=exact_target,
+                                     driver_pids=driver_pids)
+    if candidates:
+        return candidates[0]
+    pool = [w for w in windows if not w["off_screen"]]
     return pool[0] if pool else windows[0]
 
 def _sorted_windows(out: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -443,14 +511,37 @@ class _CaptureMixin:
         windows = self._resolve_capture_windows(mode, app, pid, window_id)
         if isinstance(windows, CaptureResult):
             return windows
-        self._set_active_target(target := _select_capture_target(windows, app_requested=bool(app), exact_target=exact_target))
+        default_capture = not exact_target and not app
+        driver_pids = _driver_pids() if default_capture else frozenset()
+        candidates = _capture_candidates(windows, app_requested=bool(app), exact_target=exact_target,
+                                         driver_pids=driver_pids)
+        if not candidates:  # a default capture that found only the helper's own windows
+            helper = next((w for w in windows if not w["off_screen"]), windows[0])
+            return self._failed_capture(mode, _ONLY_DRIVER_WINDOWS_MSG.format(
+                app=helper.get("app_name") or "cua-driver", pid=helper.get("pid")))
+        for attempt, target in enumerate(candidates):
+            self._set_active_target(target)
+            try:
+                png_b64, image_mime_type, elements, window_title, degraded_reason = (
+                    self._capture_vision() if mode == "vision" else self._capture_window_state())
+            except RuntimeError as exc:
+                if not _is_driver_self_refusal(exc):
+                    raise
+                # The driver refused a window of its own that the name/pid filter could not recognise.
+                if default_capture and attempt + 1 < len(candidates):
+                    logger.info("cua-driver refused its own window (pid=%s window_id=%s); trying the next window",
+                                target.get("pid"), target.get("window_id"))
+                    continue
+                self._clear_active_target()
+                raise RuntimeError(_DRIVER_OWN_WINDOW_MSG.format(
+                    app=target.get("app_name") or "cua-driver", pid=target.get("pid"),
+                    window_id=target.get("window_id"))) from exc
+            break
         app_name = target["app_name"]
         # Record the resolved app so capture_after= follow-ups re-target the same app rather than falling back
-        # to the frontmost window.
+        # to the frontmost window. Only after the capture succeeded, so a refused window is never recorded.
         if app or not self._last_app:
             self._last_app = app_name or app or ""
-        png_b64, image_mime_type, elements, window_title, degraded_reason = (
-            self._capture_vision() if mode == "vision" else self._capture_window_state())
         png_bytes_len, width, height = _png_metrics(png_b64, 0, 0) if png_b64 else (0, 0, 0)
         # An empty element list has to say why: the driver's own degraded_reason travels with the capture.
         return CaptureResult(mode=mode, width=width, height=height, png_b64=png_b64, elements=elements, app=app_name,
