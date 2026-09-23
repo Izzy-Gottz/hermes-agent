@@ -183,7 +183,7 @@ def _fixable_cause(command: str, returncode: int, output: str, env_type: str, cw
         return None
     with _quiet("fixable cause"):
         from tools.fix_reasons_macos import automation_denied_in_command, files_denied_in_text
-        return (automation_denied_in_command(command, output)
+        return (automation_denied_in_command(command, output, cwd=cwd)
                 or files_denied_in_text(output, cwd=cwd, command=command))
     return None
 

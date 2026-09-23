@@ -156,21 +156,45 @@ def _path_candidates(line: str) -> Iterable[str]:
             yield field
 
 
+_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "|&", ";;", "(", ")", "()", "{", "}"})
+
+
+def _command_tokens(command: str) -> list:
+    """Shell words and operators of ``command`` (quotes resolved), or [] if it cannot be tokenised."""
+    import shlex
+    try:
+        lex = shlex.shlex((command or "").replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
+        return []
+
+
+def _segments(command: str) -> list:
+    """The simple commands of ``command``, split on ``; && || | &`` and grouping, each as argv."""
+    segs, cur = [], []
+    for tok in _command_tokens(command):
+        if tok in _SEPARATORS:
+            if cur:
+                segs.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        segs.append(cur)
+    return segs
+
+
 def _command_touches(command: str, cand: str, cwd: Optional[str]) -> bool:
-    """Whether the COMMAND itself addresses ``cand``: it names the path, or it runs inside the protected
-    folder and the path is relative. A path that only appears in output (an old log, a test's
-    expected text) is not evidence, and must never cause the first touch of a protected folder."""
+    """Whether the COMMAND itself operates on ``cand``: one of its words IS that path (after ~ and cwd).
+    A path that only appears in output (an old log, a test's expected text), or only as part of a
+    longer argument (``~/Documents/build.log`` is not ``~/Documents``), is not evidence, and must
+    never cause the first touch of a protected folder."""
     if not command:
         return False
-    absolute = _absolute(cand, cwd)
-    home = os.path.normpath(os.path.expanduser("~"))
-    spellings = {cand, absolute}
-    if absolute.startswith(home + os.sep):
-        spellings.add("~" + absolute[len(home):])
-    if any(sp and sp in command for sp in spellings):
-        return True
-    return (not os.path.isabs(os.path.expanduser(cand)) and cwd is not None
-            and protected_folder(cwd) is not None)
+    target = _absolute(cand, cwd).rstrip(os.sep)
+    return any(_absolute(tok, cwd).rstrip(os.sep) == target
+               for seg in _segments(command) for tok in seg if tok and not tok.startswith("-"))
 
 
 def files_denied_in_text(text: str, cwd: Optional[str] = None, command: str = "") -> Optional[FixMessage]:
@@ -196,20 +220,75 @@ def files_denied_in_text(text: str, cwd: Optional[str] = None, command: str = ""
 _AE_REFUSED = re.compile(
     r"Not authori[sz]ed to send Apple events to (?P<app>[^\n]+?)\.?\s*(?:\((?P<num>-174[34])\)|$)", re.M)
 _AE_NUMBER = re.compile(r"\((?P<num>-174[34])\)")
-# The command itself runs AppleScript or JXA: osascript (incl. -l JavaScript), or a compiled/plain
-# script file. Output that merely QUOTES the refusal (grep of a header, cat of a log, a test's
-# assertion text) is not a refusal.
-_RUNS_APPLESCRIPT = re.compile(
-    r"(?:^|[\s;&|(`$/])osascript\b|\.(?:scpt|scptd|applescript)\b", re.M)
 _TELL_APP = re.compile(r"""tell\s+application\s+(?:id\s+)?["“]([^"”]+)["”]|Application\(\s*['"]([^'"]+)['"]\s*\)""", re.I)
 
 
-def automation_denied_in_command(command: str, output: str) -> Optional[FixMessage]:
-    """``tcc_automation`` for a terminal command: only when the command runs AppleScript/JXA itself AND
-    its output carries macOS's full "Not authorized to send Apple events to <App>" line."""
-    if not command or not _RUNS_APPLESCRIPT.search(command) or not _AE_REFUSED.search(output or ""):
+_WRAPPERS = frozenset({"env", "sudo", "time", "command", "exec", "nohup", "caffeinate"})
+_SCRIPT_FILE = re.compile(r"\.(?:scpt|scptd|applescript)$")
+
+
+def _osascript_invocation(argv: list) -> Optional[Tuple[list, Optional[str]]]:
+    """``(argv, script path or None)`` when this simple command RUNS osascript (argv[0] after variable
+    assignments and env/sudo/time/... wrappers) or executes a script file directly; else None."""
+    i = 0
+    while i < len(argv) and ("=" in argv[i] and not argv[i].startswith(("-", "/", "."))):
+        i += 1  # FOO=1 osascript ...
+    while i < len(argv) and (os.path.basename(argv[i]) in _WRAPPERS or (i and argv[i].startswith("-"))):
+        i += 1
+    rest = argv[i:]
+    if not rest:
         return None
-    return automation_denied_in_text(output, command)
+    exe = os.path.basename(rest[0])
+    if exe == "osascript":
+        args, script_file, j = rest[1:], None, 0
+        while j < len(args):
+            if args[j] in ("-e", "-l", "-s"):
+                j += 2
+                continue
+            if not args[j].startswith("-"):
+                script_file = args[j]
+                break
+            j += 1
+        return rest, script_file
+    if _SCRIPT_FILE.search(rest[0]):
+        return rest, rest[0]
+    return None
+
+
+def _script_targets(argv: list, script_file: Optional[str], cwd: Optional[str]) -> set:
+    """The apps the script tells, from its ``-e`` text or its readable plain-text file."""
+    text = " ".join(argv[k + 1] for k in range(len(argv) - 1) if argv[k] == "-e")
+    if script_file and not text:
+        try:
+            with open(_absolute(script_file, cwd), "rb") as fh:
+                raw = fh.read(1 << 20)
+            text = raw.decode("utf-8") if b"\0" not in raw else ""  # a compiled .scpt is binary
+        except (OSError, UnicodeDecodeError):
+            text = ""
+    return {next(g for g in m.groups() if g) for m in _TELL_APP.finditer(text)}
+
+
+def automation_denied_in_command(command: str, output: str, cwd: Optional[str] = None) -> Optional[FixMessage]:
+    """``tcc_automation`` for a failed terminal command, only on this evidence:
+
+    - the command's LAST simple command runs osascript (its argv[0], not a word in a grep pattern or a
+      filename) or executes a script file, so the failing exit status is that invocation's own;
+    - the output has exactly ONE of macOS's full "Not authorized to send Apple events to <App>" lines
+      (the terminal merges stdout and stderr, so an old refusal printed by an earlier ``cat`` cannot
+      be told apart from a new one; two lines is ambiguity, not evidence);
+    - when the script's text is readable, the refused app is one it tells.
+    """
+    segs = _segments(command)
+    inv = _osascript_invocation(segs[-1]) if segs else None
+    if inv is None:
+        return None
+    refusals = list(_AE_REFUSED.finditer(output or ""))
+    if len(refusals) != 1:
+        return None
+    targets = _script_targets(inv[0], inv[1], cwd)
+    if targets and refusals[0].group("app").strip() not in targets:
+        return None
+    return automation_denied_in_text(refusals[0].group(0), command)
 
 
 def automation_denied_in_text(text: str, script: str = "") -> Optional[FixMessage]:

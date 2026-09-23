@@ -50,9 +50,27 @@ _EPERM_RE = re.compile(r"Operation not permitted|EPERM\b", re.I)
 # Only listing the folder itself proves privacy protection: a file flag (chflags uchg) makes a FILE
 # inside it EPERM too, and a process-level EPERM ("kill: 1: Operation not permitted") has no folder.
 _MACOS_FOLDER_EPERM_RE = re.compile(
-    r"(?:^|[\s:'\"/~])(Desktop|Documents|Downloads|Mobile Documents|com~apple~CloudDocs)/?['\"]?: *"
+    r"(?:^|: )['\"]?([^:'\"\n]*?(Desktop|Documents|Downloads|Mobile Documents|com~apple~CloudDocs))/?['\"]?: *"
     r"(?:Operation not permitted|\[Errno 1\])", re.I | re.M)
 _MACOS_PROTECTED_NAMES = {"mobile documents": "iCloud Drive", "com~apple~clouddocs": "iCloud Drive"}
+
+
+def _command_names_path(command: str, printed: str) -> bool:
+    """Whether one of the command's words IS the refused path the output printed: the same path, or
+    the same path spelled with ``~`` (``~/Desktop`` for ``/Users/a/Desktop``). A longer argument
+    (``~/Documents/build.log``) is a different path, and its output may be quoting someone else's."""
+    import shlex
+    try:
+        words = shlex.split(command or "", comments=False)
+    except ValueError:
+        words = (command or "").split()
+    printed = printed.rstrip("/")
+    for w in (w.rstrip("/") for w in words):
+        if not w or w.startswith("-"):
+            continue
+        if w == printed or (w.startswith("~/") and printed.endswith(w[1:])):
+            return True
+    return False
 
 
 def _macos_eperm_hint(command: str, output: str) -> Optional[str]:
@@ -61,29 +79,16 @@ def _macos_eperm_hint(command: str, output: str) -> Optional[str]:
     a protected folder itself, and the command addressed it. Otherwise the hint stays neutral."""
     if sys.platform != "darwin" or not _EPERM_RE.search(output):
         return None
-    m = _MACOS_FOLDER_EPERM_RE.search(output)
-    if m and m.group(1).lower() in (command or "").lower():
-        name = _MACOS_PROTECTED_NAMES.get(m.group(1).lower(), m.group(1))
+    m = next((m for m in _MACOS_FOLDER_EPERM_RE.finditer(output)
+              if _command_names_path(command, m.group(1).strip())), None)
+    if m:
+        name = _MACOS_PROTECTED_NAMES.get(m.group(2).lower(), m.group(2))
         return (f"macOS privacy protection blocked access to the {name} folder (\"Operation not permitted\" "
                 "is not a file-mode problem, so sudo and chmod will not help). Tell the user the app needs "
                 f"access to {name} in System Settings › Privacy & Security, and do not retry until they "
                 "turn it on.")
     return ("Operation not permitted: macOS may be protecting this (privacy protection, a file flag such "
             "as uchg, or a process you may not signal); sudo won't help. Do not retry the same command.")
-
-
-_AE_REFUSED_RE = re.compile(r"Not authori[sz]ed to send Apple events to ([^\n]+?)\.? *(?:\(-1743\)|$)", re.M)
-_RUNS_APPLESCRIPT_RE = re.compile(r"(?:^|[\s;&|(`$/])osascript\b|\.(?:scpt|scptd|applescript)\b", re.M)
-
-
-def _automation_hint(command: str, output: str) -> Optional[str]:
-    """-1743 from a command that runs AppleScript/JXA itself; quoted in a log or a grep it is not one."""
-    if not _RUNS_APPLESCRIPT_RE.search(command or "") or not (m := _AE_REFUSED_RE.search(output)):
-        return None
-    app = m.group(1).strip()
-    return (f"macOS has not allowed this app to control {app} (Automation, error -1743); retrying will "
-            f"fail the same way. Tell the user to turn on {app} under the app in System Settings › "
-            "Privacy & Security › Automation, then retry.")
 
 
 # Ordered by production frequency — first match wins.
@@ -112,7 +117,6 @@ _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
     # EPERM before EACCES: on macOS "Operation not permitted" is almost always privacy protection
     # (TCC), which sudo and chmod cannot change; the EACCES hint below would send the model to both.
     _macos_eperm_hint,
-    _automation_hint,
     _regex_hint(r"Permission denied|EACCES",
                 "Permission denied. Check ownership/mode of the target path (`ls -la`); prefer a "
                 "user-writable location. Only escalate to sudo if the task genuinely requires it."),

@@ -154,6 +154,18 @@ class TestTccFiles:
         assert "code" not in out and "Operation not permitted" in out["error"], out
         assert "Terminal environment unavailable" not in out["error"]
 
+    def test_a_failure_without_eperm_never_probes(self, home, darwin, deny, probes):
+        """Desktop refused, one file on it granted, and a patch that fails for its own reason ("Could not
+        find a match"): not privacy, no code, and the folder is never opened. (Built by the review:
+        without the EPERM-evidence gate this probed and reported tcc_files.)"""
+        f = home / "Desktop" / "granted.py"
+        f.write_text("x = 1\n")
+        deny("Desktop")
+        from tools.file_tools import patch_tool
+        out = json.loads(patch_tool("replace", str(f), "nothing like this", "y"))
+        assert "Could not find" in out["error"] and "code" not in out, out
+        assert probes == [], probes
+
     def test_a_file_granted_on_its_own_is_never_refused(self, home, darwin, deny, probes):
         """The folder refuses, the file itself opens (granted individually, com.apple.macl): the read
         works, and the folder is never probed because nothing failed."""
@@ -271,10 +283,11 @@ class TestTerminal:
         assert hint.startswith("Operation not permitted: macOS may be protecting this") and "sudo won't help" in hint
         assert "privacy protection blocked" not in hint
 
-    def test_automation_hint(self, darwin):
+    def test_no_automation_hint_from_text_alone(self, darwin):
+        """The -1743 hint is gone: the result's own code carries it, on evidence, or nothing does."""
         from tools.terminal_hints import annotate_failure
         hint = annotate_failure("osascript -e 'tell application \"Notes\" to get name'", 1, "0:5: " + AE_1743)
-        assert "Automation" in hint and "Notes" in hint
+        assert hint is None or "Automation" not in hint, hint
 
     def test_osascript_refusal_carries_the_code(self, darwin, monkeypatch):
         monkeypatch.setenv("HERMES_HOST_APP_NAME", "Memoe")
@@ -296,6 +309,25 @@ class TestTerminal:
         "failing pytest quoting the line": (
             "python -m pytest tests/test_notes.py -q",
             f"E       AssertionError: assert 'ok' == '{AE_1743}'\nFAILED tests/test_notes.py::test_x"),
+        # second review, (a)-(d): each got tcc_automation / Notes before
+        "(a) osascript fails for Finder (-1728), then cat prints an old Notes refusal": (
+            "osascript -e 'tell application \"Finder\" to get name of window 1'; cat sync.log",
+            "0:40: execution error: Finder got an error: Can't get window 1. (-1728)\n" + AE_1743),
+        "(b) osascript succeeds, then an old refusal is printed and exit 1": (
+            "osascript -e 'tell application \"Notes\" to get name'; echo \"" + AE_1743 + "\"; exit 1",
+            "Notes\n" + AE_1743),
+        "(c) grep for the word osascript, then false": (
+            "grep -rn osascript ~/logs | tail; false", "~/logs/a.log:3: 0:34: " + AE_1743),
+        "(d) .applescript inside a log's filename": (
+            "grep -n Notes ~/logs/notes.applescript.log", "12: 0:34: " + AE_1743),
+        "log show filtering on osascript": (
+            "log show --last 1h --predicate 'process == \"osascript\"'", "osascript: " + AE_1743),
+        "the refused app is not the one the script tells": (
+            "osascript -e 'tell application \"Finder\" to get name'", "0:34: " + AE_1743),
+        "two refusal lines are ambiguity, not evidence": (
+            "osascript -e 'tell application \"Notes\" to get name'", "0:34: " + AE_1743 + "\n0:34: " + AE_1743),
+        "the number without macOS's full line": (
+            "osascript -e 'tell application \"Notes\" to get name'", "0:34: execution error: Notes got an error: (-1743)"),
     }
 
     @pytest.mark.parametrize("case", list(QUOTED_REFUSALS))
@@ -309,6 +341,13 @@ class TestTerminal:
         for command in ("osascript -l JavaScript -e 'Application(\"Notes\").notes()'", "osascript ./sync.scpt",
                         "/usr/bin/osascript sync.applescript"):
             assert _finalize(command, "0:1: " + AE_1743).get("code") == "tcc_automation", command
+
+    def test_a_folder_named_only_inside_a_longer_argument(self, home, darwin, deny, probes):
+        """``tail ~/Documents/build.log`` is not an operation on ~/Documents, whatever its output lists."""
+        deny("Documents")
+        out = _finalize("tail ~/Documents/build.log", f"ls: {home}/Documents: Operation not permitted", cwd=str(home))
+        assert "code" not in out and out["error"] is None and probes == []
+        assert out["hint"].startswith("Operation not permitted: macOS may be protecting this")
 
     def test_protected_folder_in_output(self, home, darwin, deny):
         deny("Desktop")
