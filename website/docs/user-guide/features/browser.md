@@ -213,6 +213,37 @@ same [headed-mode](#headed-mode-visible-browser-window) toggle applies —
 real-profile browsing too. On a display-less host (servers, CI) it always runs
 headless regardless.
 
+**It tells sites the truth about what it is.** Out of the box, headless Chrome
+announces itself: its user agent says `HeadlessChrome`, `navigator.webdriver`
+is `true`, it claims to be plain "Chromium", and it reports an 800×600 screen.
+Cloudflare, Kayak, Skyscanner (PerimeterX) and Trip.com answered that with
+challenge or bot pages. None of it is true of the person the browser acts for.
+So by default the real-profile browser reports what is true:
+
+- the user agent and `Sec-CH-UA` brands of **your own installed browser** (on
+  macOS the version is read from the app's `Info.plist`; the app is never
+  launched for this), with a truthful platform (macOS, arm64 or x86);
+- `navigator.webdriver` is `false` (`--disable-blink-features=AutomationControlled`);
+- your main display's real size and scale, not 800×600.
+
+The brands apply to every tab, popup, frame and worker, from the first request.
+Hermes holds one DevTools connection for the browser's lifetime, which
+auto-attaches each new target before it runs. There is no CAPTCHA solving, no
+proxy rotation, no invented or randomised fingerprint, and no script injected
+into pages. Every value is the browser's own or your browser's. To turn it off:
+
+```yaml
+# ~/.hermes/config.yaml
+browser:
+  stealth_fidelity: false
+```
+
+It stays headless because that is the only mode measured never to show a
+window or take focus on macOS. A headed Chrome for Testing takes focus whenever
+a tab opens in the foreground, even when the app is hidden. macOS keeps 40 px of
+an off-screen window visible. Even a bundle copy marked background-only opens
+its popups full-size on screen.
+
 If your browser has several profiles (say a work profile and a personal one)
 and you don't want "whichever profile you touched last" deciding the agent's
 identity, pin the snapshot source explicitly:

@@ -32,6 +32,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from tools.browser_tool_origin import origin_module as _origin
 from tools import browser_tool_cloud as _cloud
+from tools import browser_tool_fidelity as _fidelity
 from tools import browser_tool_install as _install
 from tools import browser_tool_lightpanda_fallback as _lp
 from tools import browser_tool_session as _session
@@ -44,6 +45,7 @@ def _terminate_real_profile_chrome() -> None:
     agent-browser only ATTACHED to them, so its own session cleanup never kills them."""
     from tools.browser_lightpanda import _terminate
     _bt = _origin()
+    _fidelity.stop_keepers()
     while _bt._real_profile_chrome_procs:
         _terminate(_bt._real_profile_chrome_procs.pop(), what="real-profile chrome")
 
@@ -291,11 +293,35 @@ def _driven_browser_headless() -> bool:
     return not (_cloud._is_headed_mode() and (has_display or not sys.platform.startswith("linux")))
 
 
-def _launch_driven_browser(binary: str, copy_dir: str) -> Tuple[Optional[int], Optional[str]]:
+def _driven_browser_flags(identity: Optional[Dict[str, Any]], headless: bool) -> Tuple[str, ...]:
+    """Switches beyond the shared set: the mock keychain, plus (``browser.stealth_fidelity``, on
+    by default) the truthful identity in ``tools.browser_tool_fidelity``."""
+    flags = list(_mock_keychain_flags())
+    if _fidelity.fidelity_enabled():
+        flags += _fidelity.launch_flags(identity, headless, _fidelity.main_display() if headless else None)
+    return tuple(flags)
+
+
+def _persons_identity(browser: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The person's browser's brand and version (from its Info.plist), or None."""
+    from hermes_cli.browser_connect import chromium_executable
+    try:
+        return _fidelity.persons_browser_identity(browser, chromium_executable(browser) if browser else None)
+    except Exception as e:
+        _origin().logger.debug("real-profile: browser identity unreadable: %s", e)
+        return None
+
+
+def _launch_driven_browser(binary: str, copy_dir: str,
+                           identity: Optional[Dict[str, Any]] = None) -> Tuple[Optional[int], Optional[str]]:
     """Launch the browser Hermes drives on the copy; ``(debug_port, error)``. agent-browser then
-    attaches via ``--cdp <port>`` (its own launch would pick a throwaway profile)."""
-    _, port, err = _spawn_browser_on_copy(binary, copy_dir, _mock_keychain_flags(), "browser",
-                                          headless=_driven_browser_headless())
+    attaches via ``--cdp <port>`` (its own launch would pick a throwaway profile). The fidelity
+    keeper attaches before anything else does, so the first tab already carries the brands."""
+    headless = _driven_browser_headless()
+    _, port, err = _spawn_browser_on_copy(binary, copy_dir, _driven_browser_flags(identity, headless), "browser",
+                                          headless=headless)
+    if port is not None:
+        _fidelity.ensure_keeper(port, identity)
     return port, err
 
 
@@ -570,6 +596,7 @@ def _real_profile_cdp() -> tuple:
         copy_dir = real_profile_copy_dir(browser)
         existing = _agent_browser_get_cdp(_bt._REAL_PROFILE_SESSION)
         if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
+            _fidelity.ensure_keeper(int(existing.rsplit(":", 1)[1]), _persons_identity(browser))
             _bt._real_profile_cdp_cache["cdp"] = existing
             return existing, None
         if existing:  # stale/wrong-dir session: close it so nothing holds the dir open
@@ -581,6 +608,7 @@ def _real_profile_cdp() -> tuple:
         _terminate_orphaned_browsers_on_dir(copy_dir)
         surviving = _surviving_chrome_cdp(copy_dir)
         if surviving:
+            _fidelity.ensure_keeper(int(surviving.rsplit(":", 1)[1]), _persons_identity(browser))
             cdp, err = _attach_agent_browser_to_real_profile(int(surviving.rsplit(":", 1)[1]), copy_dir)
             if not cdp:
                 return None, err
@@ -605,7 +633,7 @@ def _real_profile_cdp() -> tuple:
         if cookies is None:
             return None, err
         _forget_keychain_bound_auth_files(copy_dir)
-        port, err = _launch_driven_browser(driven, copy_dir)
+        port, err = _launch_driven_browser(driven, copy_dir, _persons_identity(browser))
         if port is None:
             return None, err
         err = _import_cookies_into_driven_browser(port, cookies)
