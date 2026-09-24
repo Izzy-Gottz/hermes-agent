@@ -946,3 +946,89 @@ time.sleep(120)
         if gateway.poll() is None:
             gateway.kill()
             gateway.wait(5)
+
+
+class _BeatingFake(_FakeProc):
+    def describe(self):
+        return {**super().describe(), "beat": 1234.5, "heartbeat_age": self.age, "pending": 0,
+                "resume_failures": 0, "resume_retries": 0, "unresumed": 0}
+
+
+class TestLiveStatus:
+    def test_the_status_is_rewritten_on_every_monitor_tick(self):
+        """A healthy keeper's status must not freeze at start: each monitor tick rewrites it,
+        carrying the keeper's heartbeat, so a reader can tell a live keeper from a dead one."""
+        _BeatingFake.made = []
+        with patch.object(fid, "KeeperProcess", _BeatingFake), patch.object(fid, "_ensure_monitor"):
+            fid._start_keeper(4900, CHROME_153)
+            path = fid._status_path()
+            if os.path.exists(path):
+                os.unlink(path)
+            before = time.time()
+            fid._monitor_once()  # a healthy keeper: nothing replaced, and still written
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        assert data["updated"] >= before
+        (k,) = data["keepers"]
+        assert k["beat"] == 1234.5 and k["port"] == 4900 and "resume_failures" in k
+
+    def test_describe_carries_the_keepers_heartbeat_and_counters(self, tmp_path):
+        """What the parent writes comes from the keeper process's per-second file."""
+        kp = object.__new__(fid.KeeperProcess)
+        kp.port, kp.identity, kp.ua, kp._stopped = 4901, CHROME_153, "ua", False
+        kp.status_path = str(tmp_path / "hermes-fidelity-4901-x.json")
+
+        class _Alive:
+            pid, returncode = 4242, None
+
+            def poll(self):
+                return None
+        kp.proc = _Alive()
+        beat = time.time() - 1
+        (tmp_path / "hermes-fidelity-4901-x.json").write_text(json.dumps(
+            {"state": "serving", "applied": {"page": 3}, "beat": beat, "pending": 1,
+             "resume_failures": 2, "resume_retries": 1, "unresumed": 1}))
+        d = kp.describe()
+        assert d["beat"] == beat and 0 < d["heartbeat_age"] < 5
+        assert (d["applied"], d["pending"], d["resume_failures"], d["resume_retries"], d["unresumed"]) == \
+            ({"page": 3}, 1, 2, 1, 1)
+
+
+class TestResumeFailures:
+    def _keeper(self):
+        ws = _FakeWs([])
+        keeper = fid.FidelityKeeper(9, CHROME_153, connect=lambda port: ws)
+        keeper._ws = ws
+        return ws, keeper
+
+    @staticmethod
+    def _resumes(ws, session):
+        return [m for m in ws.sent if m["method"] == "Runtime.runIfWaitingForDebugger" and m.get("sessionId") == session]
+
+    def test_a_failed_resume_warns_is_retried_once_and_is_counted(self, caplog):
+        ws, keeper = self._keeper()
+        keeper.handle(_attached("s1", "page"))
+        (first,) = self._resumes(ws, "s1")
+        with caplog.at_level("WARNING", logger=fid.logger.name):
+            keeper.handle({"id": first["id"], "error": {"code": -32000, "message": "Target closed"}})
+            assert any("resume" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+            assert keeper.resume_failures == 1
+            with patch.object(fid, "RESUME_SECONDS", 0.0):
+                keeper._tick()  # past the bound: one more resume
+                assert len(self._resumes(ws, "s1")) == 2 and keeper.resume_retries == 1
+                keeper._tick()  # still no answer: given up on, counted, logged
+                keeper._tick()
+        assert len(self._resumes(ws, "s1")) == 2  # one retry, never more
+        snap = keeper.snapshot()
+        assert (snap["resume_failures"], snap["resume_retries"], snap["unresumed"], snap["pending"]) == (1, 1, 1, 0)
+        assert any("still not resumed" in r.getMessage() for r in caplog.records)
+
+    def test_an_acknowledged_resume_is_not_retried(self):
+        ws, keeper = self._keeper()
+        keeper.handle(_attached("s2", "page"))
+        (first,) = self._resumes(ws, "s2")
+        keeper.handle({"id": first["id"], "result": {}})
+        with patch.object(fid, "RESUME_SECONDS", 0.0):
+            keeper._tick()
+        assert len(self._resumes(ws, "s2")) == 1 and keeper.snapshot()["pending"] == 0
+        assert keeper.resume_retries == keeper.unresumed == 0

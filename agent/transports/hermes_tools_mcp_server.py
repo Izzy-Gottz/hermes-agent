@@ -794,6 +794,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Quiet mode: keep Hermes' own banners off stdout (which is the MCP wire).
     os.environ.setdefault("HERMES_QUIET", "1")
     os.environ.setdefault("HERMES_REDACT_SECRETS", "true")
+    # Under the claude-code runtime this process owns the driven browser, so its warnings (the
+    # fidelity keeper being replaced or restarted, a tab never resumed) must reach the same
+    # agent.log / errors.log the gateway writes: same rotation, same redacting format. stderr
+    # alone goes nowhere anyone reads. setup_logging lowers the root to the file level, so the
+    # stderr handler keeps the level it was asked for.
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.StreamHandler) and getattr(handler, "stream", None) is sys.stderr:
+            handler.setLevel(log_level)
+    try:
+        from hermes_logging import setup_logging
+        setup_logging()
+    except Exception:
+        logger.debug("hermes-tools MCP server: file logging not set up", exc_info=True)
     # Credentials that belong to the spawning CLI, not to Hermes' tools
     # (CLAUDE_CODE_OAUTH_TOKEN): drop them before any tool can spawn a shell.
     scrubbed = scrub_environment()

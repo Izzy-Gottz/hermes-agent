@@ -292,6 +292,9 @@ _WORKER_LIKE = ("worker", "service_worker", "shared_worker", "shared_storage_wor
 STALL_SECONDS = 10.0
 # How stale another process's keeper heartbeat may be before it is taken over.
 HOLDER_STALE_SECONDS = 10.0
+# A target attached (so paused by waitForDebuggerOnStart) whose resume is not acknowledged within
+# this long gets one more Runtime.runIfWaitingForDebugger; one still paused after that is counted.
+RESUME_SECONDS = 3.0
 
 
 def commands_for_attached_target(params: Dict[str, Any], ua: str, metadata: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
@@ -450,17 +453,24 @@ class FidelityKeeper(threading.Thread):
         self._lock_fd: Optional[int] = None
         self.beat = 0.0  # wall clock of the loop's last tick: the heartbeat
         self._next_id = 0
+        # Targets attached (so paused) whose resume has not been acknowledged:
+        # session -> {"at": monotonic attach time, "kind", "resume_id", "retried"}.
+        self._pending: Dict[str, Dict[str, Any]] = {}
+        self.resume_failures = 0  # resumes the browser answered with an error
+        self.resume_retries = 0   # second resumes sent for a target still paused after RESUME_SECONDS
+        self.unresumed = 0        # targets still not resumed after the retry: given up on, logged
         self._send_lock = threading.Lock()
 
     # -- plumbing -------------------------------------------------------------------------------
 
-    def _send(self, method: str, params: Dict[str, Any], session: Optional[str] = None) -> None:
+    def _send(self, method: str, params: Dict[str, Any], session: Optional[str] = None) -> int:
         with self._send_lock:
             self._next_id += 1
             msg: Dict[str, Any] = {"id": self._next_id, "method": method, "params": params}
             if session:
                 msg["sessionId"] = session
             self._ws.send(json.dumps(msg))
+            return self._next_id
 
     def _try_lock(self, fd: int) -> bool:
         import fcntl
@@ -553,22 +563,73 @@ class FidelityKeeper(threading.Thread):
             return None
         return connect(ws_url, max_size=None, open_timeout=10, close_timeout=2)
 
+    def _pending_for(self, msg_id: Any) -> Optional[str]:
+        for session, p in self._pending.items():
+            if p["resume_id"] == msg_id:
+                return session
+        return None
+
     def handle(self, msg: Dict[str, Any]) -> None:
         """React to one DevTools message (public for tests)."""
-        if msg.get("method") == "Target.attachedToTarget":
+        import time
+        method = msg.get("method")
+        if method == "Target.attachedToTarget":
             params = msg.get("params") or {}
             session = params.get("sessionId")
             kind = (params.get("targetInfo") or {}).get("type", "?")
-            for method, cmd_params in commands_for_attached_target(params, self.ua, self.metadata):
-                self._send(method, cmd_params, session)
+            resume_id = None
+            for m, cmd_params in commands_for_attached_target(params, self.ua, self.metadata):
+                sent = self._send(m, cmd_params, session)
+                if m == "Runtime.runIfWaitingForDebugger":
+                    resume_id = sent
             self.applied[kind] = self.applied.get(kind, 0) + 1
-        elif "error" in msg and msg.get("id"):
-            # A target that went away between attach and override answers with an error; harmless.
-            logger.debug("fidelity: command %s failed: %s", msg.get("id"), msg["error"])
+            if session and resume_id is not None:
+                self._pending[session] = {"at": time.monotonic(), "kind": kind,
+                                          "resume_id": resume_id, "retried": False}
+        elif method == "Target.detachedFromTarget":
+            self._pending.pop((msg.get("params") or {}).get("sessionId"), None)
+        elif msg.get("id"):
+            session = self._pending_for(msg["id"])
+            if session is None:
+                if "error" in msg:
+                    # A target that went away between attach and override answers with an error.
+                    logger.debug("fidelity: command %s failed: %s", msg.get("id"), msg["error"])
+            elif "error" in msg:
+                # The target stays paused: every script on it (and a daemon waiting on it) hangs.
+                self.resume_failures += 1
+                logger.warning("fidelity: resume of %s target %s failed on port %s: %s",
+                               self._pending[session]["kind"], session, self.port, msg["error"])
+            else:
+                self._pending.pop(session, None)
+
+    def _check_pending(self) -> None:
+        """A target attached but not resumed within RESUME_SECONDS is resumed once more; one still
+        paused after that is counted, logged and let go (the status carries the count)."""
+        import time
+        now = time.monotonic()
+        for session, p in list(self._pending.items()):
+            if now - p["at"] < RESUME_SECONDS:
+                continue
+            if not p["retried"]:
+                self.resume_retries += 1
+                logger.warning("fidelity: %s target %s on port %s not resumed after %.0fs; resuming again",
+                               p["kind"], session, self.port, now - p["at"])
+                try:
+                    p["resume_id"] = self._send("Runtime.runIfWaitingForDebugger", {}, session)
+                except Exception as e:
+                    logger.warning("fidelity: resume retry for %s failed: %s", session, e)
+                p["retried"], p["at"] = True, now
+            else:
+                self.unresumed += 1
+                logger.warning("fidelity: %s target %s on port %s still not resumed after a retry; "
+                               "it may stay paused", p["kind"], session, self.port)
+                self._pending.pop(session, None)
 
     def _tick(self) -> None:
         import time
         self.beat = time.time()
+        if self._pending:
+            self._check_pending()
         if self.lock_path and self._lock_fd is not None:
             try:
                 os.utime(self.lock_path)  # the cross-process heartbeat
@@ -621,6 +682,8 @@ class FidelityKeeper(threading.Thread):
     def snapshot(self) -> Dict[str, Any]:
         return {"pid": os.getpid(), "port": self.port, "state": self.state, "applied": dict(self.applied),
                 "error": self.error, "beat": self.beat, "ua": self.ua, "lock_path": self.lock_path,
+                "pending": len(self._pending), "resume_failures": self.resume_failures,
+                "resume_retries": self.resume_retries, "unresumed": self.unresumed,
                 "claims": f"{self.identity.get('brand') or 'Chromium'} {self.identity['full_version']}"}
 
 
@@ -794,7 +857,11 @@ class KeeperProcess:
     def describe(self) -> Dict[str, Any]:
         snap = self._snap()
         d = {"port": self.port, "state": self.state, "pid": self.proc.pid, "applied": snap.get("applied") or {},
-             "error": self.error, "claims": snap.get("claims") or f"{self.identity.get('brand') or 'Chromium'} {self.identity['full_version']}"}
+             "error": self.error, "claims": snap.get("claims") or f"{self.identity.get('brand') or 'Chromium'} {self.identity['full_version']}",
+             # The keeper process's own heartbeat and counters, so a reader can tell live from frozen.
+             "beat": snap.get("beat") or 0, "heartbeat_age": round(self.heartbeat_age(), 1),
+             "pending": snap.get("pending", 0), "resume_failures": snap.get("resume_failures", 0),
+             "resume_retries": snap.get("resume_retries", 0), "unresumed": snap.get("unresumed", 0)}
         if d["state"] == "follower" and snap.get("lock_path"):
             d["holder_stale"] = holder_is_stale(snap["lock_path"])
         return d
@@ -827,7 +894,9 @@ def _monitor_once() -> None:
             with _keepers_lock:
                 if _keepers.get(port) is keeper:
                     _start_keeper(port, keeper.identity)
-            write_status()
+    # Every tick, not only on start/replace/stop: a healthy keeper's file must stay live, with
+    # its heartbeat and counters, or it cannot be told apart from a frozen one.
+    write_status()
 
 
 def _ensure_monitor() -> None:

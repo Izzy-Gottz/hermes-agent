@@ -9,6 +9,7 @@ build helper assembles a server when the SDK is present.
 from __future__ import annotations
 
 import inspect
+import os
 from typing import get_args
 
 import pytest
@@ -692,3 +693,41 @@ class TheRealServerMarksEveryToolAlwaysLoad:
         for name in ("terminal", "read_file", "write_file", "clarify"):
             assert name in server.tools, "%s missing from the child surface" % name
 
+
+
+class TestFileLogging:
+    def test_main_sends_warnings_to_the_hermes_logs(self, monkeypatch):
+        """Under the claude-code runtime this process owns the driven browser: the fidelity
+        keeper's warnings must land in HERMES_HOME/logs, redacted, not only on stderr."""
+        import logging
+        from pathlib import Path
+        import hermes_logging
+        import agent.transports.hermes_tools_mcp_server as m
+
+        class FakeServer:
+            def run(self):
+                raise KeyboardInterrupt()
+
+        root = logging.getLogger()
+        before, level = list(root.handlers), root.level
+        hermes_logging._logging_initialized = False
+        hermes_logging._reset_queued_handlers()
+        monkeypatch.setattr(m, "_build_server", lambda: FakeServer())
+        secret = "sk-ant-api03-" + "Q" * 60
+        try:
+            assert m.main([]) == 0
+            logging.getLogger("tools.browser_tool_fidelity").warning(
+                "fidelity: keeper for port 1 silent for 12s; replacing it now %s", secret)
+            hermes_logging._reset_queued_handlers()  # drains the async queue to disk
+            logs = Path(os.environ["HERMES_HOME"]) / "logs"
+            for name in ("agent.log", "errors.log"):
+                text = (logs / name).read_text()
+                assert "replacing it now" in text and secret not in text
+        finally:
+            hermes_logging._reset_queued_handlers()
+            for h in list(root.handlers):
+                if h not in before:
+                    root.removeHandler(h)
+                    h.close()
+            root.setLevel(level)
+            hermes_logging._logging_initialized = False
