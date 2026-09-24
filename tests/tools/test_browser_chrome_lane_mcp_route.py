@@ -128,8 +128,10 @@ def route(tmp_path_factory):
         bridge.close()
 
 
-def _set_turn(route, platform, origin, cron=""):
+def _set_turn(route, platform, origin, cron="", live=True):
+    """A turn in progress (run_claude_code_turn sets both); live=False is that turn after it ended."""
     route.agent._turn_context = _turn_context(platform, origin, cron)
+    route.agent._turn_live = live
 
 
 CHROME_BRIDGE = "5999/devtools/browser/secret"  # the person's Chrome, via the extension bridge
@@ -149,6 +151,16 @@ def test_a_persons_live_turn_routes_to_their_chrome(route):
     assert "SINGLE_QUERY=1" in auto["output"]
     explicit = json.loads(route.client.call("browser_exec", {"code": "print(1)", "where": "chrome"}))
     assert explicit["lane"] == "chrome" and "CDP_WS=ws://127.0.0.1:5999" in explicit["output"]
+
+
+def test_a_persons_turn_that_has_ended_never_reaches_their_chrome(route):
+    """The claude child outlives the turn: a background subagent asking after the person's turn ended
+    reads the ended flag, not the person's stale snapshot."""
+    _set_turn(route, "api_server", "person", live=False)
+    auto = route.client.call("browser_exec", {"code": AUTO})
+    assert CHROME_BRIDGE not in auto and '"lane": "chrome"' not in auto, auto
+    explicit = json.loads(route.client.call("browser_exec", {"code": "print(1)", "where": "chrome"}))
+    assert "error" in explicit and "a turn that has already ended" in explicit["error"], explicit
 
 
 @pytest.mark.parametrize("platform,origin,cron,why", [
