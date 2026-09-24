@@ -156,6 +156,7 @@ def _path_candidates(line: str) -> Iterable[str]:
             yield field
 
 
+_SEPARATOR_CHARS = frozenset(";&|\n()")
 _SEPARATORS = frozenset({";", "&&", "||", "|", "&", "|&", ";;", "(", ")", "()", "{", "}"})
 
 
@@ -163,7 +164,10 @@ def _command_tokens(command: str) -> list:
     """Shell words and operators of ``command`` (quotes resolved), or [] if it cannot be tokenised."""
     import shlex
     try:
-        lex = shlex.shlex((command or "").replace("\n", " ; "), posix=True, punctuation_chars=True)
+        # newline is a command separator OUTSIDE quotes only: it is punctuation, not whitespace, so
+        # a quoted ``sh -c "…\n…"`` string keeps its own lines for the recursion to split
+        lex = shlex.shlex(command or "", posix=True, punctuation_chars="();<>|&\n")
+        lex.whitespace = " \t\r"
         lex.whitespace_split = True
         return list(lex)
     except ValueError:
@@ -174,7 +178,7 @@ def _segments(command: str) -> list:
     """The simple commands of ``command``, split on ``; && || | &`` and grouping, each as argv."""
     segs, cur = [], []
     for tok in _command_tokens(command):
-        if tok in _SEPARATORS:
+        if tok in _SEPARATORS or (tok and set(tok) <= _SEPARATOR_CHARS):
             if cur:
                 segs.append(cur)
             cur = []
@@ -224,41 +228,99 @@ _TELL_APP = re.compile(r"""tell\s+application\s+(?:id\s+)?["“]([^"”]+)["”]
 
 
 _WRAPPERS = frozenset({"env", "sudo", "time", "command", "exec", "nohup", "caffeinate"})
+# wrapper flags that take a value (``sudo -u bob``, ``env -u VAR``)
+_WRAPPER_VALUE_FLAGS = {"sudo": {"-u", "-g", "-p", "-C", "-h", "-U", "-r", "-t", "-D"},
+                        "env": {"-u", "-C", "-P", "-S"}}
+_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+_REDIRECTS = frozenset({"<", ">", ">>", "<<", "<<<", ">&", "<&", "&>", "&>>", ">|", "2>", "2>>", "1>"})
 _SCRIPT_FILE = re.compile(r"\.(?:scpt|scptd|applescript)$")
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_]\w*)\2([^\n]*)\n(.*?)\n[ \t]*\3[ \t]*(?=\n|$)", re.S)
+_HEREDOC_TOKEN = re.compile(r"^__HERMES_HEREDOC_(\d+)__$")
 
 
-def _osascript_invocation(argv: list) -> Optional[Tuple[list, Optional[str]]]:
-    """``(argv, script path or None)`` when this simple command RUNS osascript (argv[0] after variable
-    assignments and env/sudo/time/... wrappers) or executes a script file directly; else None."""
+def _lift_heredocs(command: str) -> Tuple[str, list]:
+    """``command`` with each heredoc body replaced by a placeholder word, and the bodies. Newlines
+    separate commands, which would otherwise shred a heredoc into commands."""
+    bodies: list = []
+
+    def sub(m):
+        bodies.append(m.group(5))
+        return f"<< __HERMES_HEREDOC_{len(bodies) - 1}__{m.group(4)}"
+    return _HEREDOC.sub(sub, command or ""), bodies
+
+
+def _unwrap(argv: list) -> list:
+    """argv without leading ``VAR=x`` assignments and env/sudo/time/... wrappers (with their flags)."""
     i = 0
-    while i < len(argv) and ("=" in argv[i] and not argv[i].startswith(("-", "/", "."))):
-        i += 1  # FOO=1 osascript ...
-    while i < len(argv) and (os.path.basename(argv[i]) in _WRAPPERS or (i and argv[i].startswith("-"))):
+    while i < len(argv):
+        tok = argv[i]
+        if "=" in tok and not tok.startswith(("-", "/", ".")):
+            i += 1  # FOO=1 osascript ...
+            continue
+        name = os.path.basename(tok)
+        if name not in _WRAPPERS:
+            break
         i += 1
-    rest = argv[i:]
+        takes_value = _WRAPPER_VALUE_FLAGS.get(name, set())
+        while i < len(argv) and (argv[i].startswith("-") or ("=" in argv[i] and name == "env")):
+            i += 2 if argv[i] in takes_value else 1
+    return argv[i:]
+
+
+def _osascript_invocation(argv: list, bodies: list = (), depth: int = 0
+                          ) -> Optional[Tuple[list, Optional[str], str]]:
+    """``(argv, script path or None, script text)`` when this simple command RUNS osascript (argv[0]
+    after unwrapping), executes a script file directly, or is ``bash/sh/zsh -c '…'`` whose own last
+    command does; else None. Redirections are not arguments: ``osascript <<EOF`` takes its script
+    from the heredoc body, ``osascript < f.applescript`` from the file."""
+    rest = _unwrap(argv)
     if not rest:
         return None
     exe = os.path.basename(rest[0])
-    if exe == "osascript":
-        args, script_file, j = rest[1:], None, 0
-        while j < len(args):
-            if args[j] in ("-e", "-l", "-s"):
-                j += 2
-                continue
-            if not args[j].startswith("-"):
-                script_file = args[j]
-                break
-            j += 1
-        return rest, script_file
-    if _SCRIPT_FILE.search(rest[0]):
-        return rest, rest[0]
-    return None
+    if exe in _SHELLS and depth < 3:
+        for k, tok in enumerate(rest[1:-1], start=1):
+            if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
+                return _invocation_of(rest[k + 1], depth + 1)
+        return None
+    if exe != "osascript":
+        return (rest, rest[0], "") if _SCRIPT_FILE.search(rest[0]) else None
+    script_file, text, j, args = None, "", 0, rest[1:]
+    while j < len(args):
+        tok = args[j]
+        if tok in _REDIRECTS:
+            target = args[j + 1] if j + 1 < len(args) else ""
+            if tok == "<<" and (m := _HEREDOC_TOKEN.match(target)) and int(m.group(1)) < len(bodies):
+                text += bodies[int(m.group(1))]
+            elif tok == "<<<":
+                text += target
+            elif tok == "<" and target:
+                script_file = target
+            j += 2
+            continue
+        if tok in ("-e", "-l", "-s"):
+            if tok == "-e" and j + 1 < len(args):
+                text += " " + args[j + 1]
+            j += 2
+            continue
+        if not tok.startswith("-") and script_file is None:
+            script_file = tok
+            break
+        j += 1
+    return rest, script_file, text
 
 
-def _script_targets(argv: list, script_file: Optional[str], cwd: Optional[str]) -> set:
-    """The apps the script tells, from its ``-e`` text or its readable plain-text file."""
-    text = " ".join(argv[k + 1] for k in range(len(argv) - 1) if argv[k] == "-e")
-    if script_file and not text:
+def _invocation_of(command: str, depth: int = 0) -> Optional[Tuple[list, Optional[str], str]]:
+    """The osascript invocation that is ``command``'s LAST simple command, or None. A ``sh -c``
+    string is its own command: its heredocs are lifted when the recursion reaches it."""
+    lifted, bodies = _lift_heredocs(command)
+    segs = _segments(lifted)
+    return _osascript_invocation(segs[-1], bodies, depth) if segs else None
+
+
+def _script_targets(inv: Tuple[list, Optional[str], str], cwd: Optional[str]) -> set:
+    """The apps the script tells, from its ``-e`` / heredoc text or its readable plain-text file."""
+    _argv, script_file, text = inv
+    if script_file and not text.strip():
         try:
             with open(_absolute(script_file, cwd), "rb") as fh:
                 raw = fh.read(1 << 20)
@@ -268,24 +330,33 @@ def _script_targets(argv: list, script_file: Optional[str], cwd: Optional[str]) 
     return {next(g for g in m.groups() if g) for m in _TELL_APP.finditer(text)}
 
 
+# Every AppleScript runtime error osascript prints: "<pos>: execution error: <message> (<number>)".
+_EXEC_ERROR = re.compile(r"execution error: [^\n]*\((-?\d+)\)")
+
+
 def automation_denied_in_command(command: str, output: str, cwd: Optional[str] = None) -> Optional[FixMessage]:
     """``tcc_automation`` for a failed terminal command, only on this evidence:
 
-    - the command's LAST simple command runs osascript (its argv[0], not a word in a grep pattern or a
-      filename) or executes a script file, so the failing exit status is that invocation's own;
+    - the command's LAST simple command runs osascript (its argv[0] after env/sudo/time wrappers,
+      also inside ``bash -c '…'``; not a word in a grep pattern or a filename) or executes a script
+      file, so the failing exit status is that invocation's own;
     - the output has exactly ONE of macOS's full "Not authorized to send Apple events to <App>" lines
       (the terminal merges stdout and stderr, so an old refusal printed by an earlier ``cat`` cannot
-      be told apart from a new one; two lines is ambiguity, not evidence);
-    - when the script's text is readable, the refused app is one it tells.
+      be told apart from a new one; two lines is ambiguity, not evidence), and no OTHER osascript
+      ``execution error`` line: a -1728 beside an old -1743 means the -1743 is not this run's;
+    - when the script's text is readable (``-e``, a heredoc, a plain-text file), the refused app is
+      one it tells.
     """
-    segs = _segments(command)
-    inv = _osascript_invocation(segs[-1]) if segs else None
+    inv = _invocation_of(command)
     if inv is None:
         return None
-    refusals = list(_AE_REFUSED.finditer(output or ""))
+    text = output or ""
+    refusals = list(_AE_REFUSED.finditer(text))
     if len(refusals) != 1:
         return None
-    targets = _script_targets(inv[0], inv[1], cwd)
+    if any("Not authori" not in m.group(0) for m in _EXEC_ERROR.finditer(text)):
+        return None
+    targets = _script_targets(inv, cwd)
     if targets and refusals[0].group("app").strip() not in targets:
         return None
     return automation_denied_in_text(refusals[0].group(0), command)

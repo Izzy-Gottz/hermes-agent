@@ -623,6 +623,65 @@ class TestOtherSpace:
         assert res.fix is None and res.message == "No on-screen window found for app 'Pages'."
 
 
+# ── the shapes a real refusal comes in, and the one that only looks like one ───────────────
+
+_NOTES_SCRIPT = 'tell application "Notes" to get name of every note'
+_OTHER_ERROR = "0:20: execution error: Notes got an error: Can't get foo. (-1728)"
+
+
+class TestAutomationShapes:
+    POSITIVE = {
+        "heredoc, quoted delimiter": f"osascript <<'EOF'\n{_NOTES_SCRIPT}\nEOF",
+        "heredoc, bare delimiter, piped": f"osascript <<EOF 2>&1\n{_NOTES_SCRIPT}\nEOF",
+        "heredoc, <<- with tabs": f"osascript <<-END\n\t{_NOTES_SCRIPT}\n\tEND",
+        "bash -c": f"bash -c \"osascript -e '{_NOTES_SCRIPT}'\"",
+        "zsh -lc": f"zsh -lc \"osascript -e '{_NOTES_SCRIPT}'\"",
+        "sh -c with a heredoc inside": f"sh -c \"osascript <<EOF\n{_NOTES_SCRIPT}\nEOF\"",
+        "sudo -u bob": f"sudo -u bob osascript -e '{_NOTES_SCRIPT}'",
+        "env -u VAR": f"env -u LANG FOO=1 osascript -e '{_NOTES_SCRIPT}'",
+        "here-string": f"osascript <<< '{_NOTES_SCRIPT}'",
+    }
+    NEGATIVE = {
+        "heredoc that tells another app": "osascript <<EOF\ntell application \"Finder\" to get name\nEOF",
+        "bash -c whose last command is false": f"bash -c \"osascript -e '{_NOTES_SCRIPT}'; false\"",
+        "a heredoc fed to cat, not osascript": f"cat <<EOF\n{_NOTES_SCRIPT}\nEOF",
+        "sudo -u bob grep osascript": "sudo -u bob grep -rn osascript /var/log",
+        "bash -c without osascript": "bash -c 'grep -n osascript ~/logs/a.log'",
+        "a newline, then false": f"osascript -e '{_NOTES_SCRIPT}'\nfalse",
+    }
+
+    @pytest.mark.parametrize("case", list(POSITIVE))
+    def test_real_refusal_shapes(self, darwin, case):
+        out = _contract(_finalize(self.POSITIVE[case], "0:34: " + AE_1743))
+        assert (out["code"], out["subject"]) == ("tcc_automation", "Notes"), case
+
+    @pytest.mark.parametrize("case", list(NEGATIVE))
+    def test_look_alike_shapes(self, darwin, case):
+        out = _finalize(self.NEGATIVE[case], "0:34: " + AE_1743)
+        assert "code" not in out and out["error"] is None, (case, out)
+
+    def test_an_old_refusal_beside_this_runs_real_error(self, darwin):
+        """The review's last false positive: the log holds an old Notes -1743, this run's error is -1728."""
+        command = "cat old.log; osascript -e 'tell application \"Notes\" to get foo'"
+        out = _finalize(command, "2026-09-01 " + AE_1743 + "\n" + _OTHER_ERROR)
+        assert "code" not in out and out["error"] is None, out
+        # and the same command with only the refusal still counts
+        assert _finalize(command, "0:34: " + AE_1743).get("code") == "tcc_automation"
+
+    @darwin_only
+    def test_a_real_heredoc_through_the_terminal(self, monkeypatch, tmp_path):
+        """A REAL command in the local shell: ``osascript`` is a function that reads its script from the
+        heredoc on stdin and prints macOS's refusal, so no Apple event is sent."""
+        from tools.terminal_tool import terminal_tool
+        monkeypatch.setenv("HERMES_HOST_APP_NAME", "Memoe")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        command = ("osascript() { cat >/dev/null; echo \"0:34: " + AE_1743 + "\" >&2; return 1; }\n"
+                   f"osascript <<'EOF'\n{_NOTES_SCRIPT}\nEOF")
+        out = _contract(json.loads(terminal_tool(command)))
+        assert (out["code"], out["subject"], out["exit_code"]) == ("tcc_automation", "Notes", 1)
+
+
 # ── every route to the model keeps the contract (as slice 1's 12-route test) ─────────────────
 # One real failure per producer, sent through each way a terminal or computer_use result reaches a
 # model: the tool function, the registry dispatcher, and the claude-code bridge Moe uses (the
