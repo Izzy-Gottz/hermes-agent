@@ -231,8 +231,9 @@ So by default the real-profile browser reports what is true:
   depth, not 800×600.
 
 The brands apply to every tab, popup, frame and worker (dedicated, shared and
-service). Hermes holds one DevTools connection for the browser's lifetime, which
-auto-attaches each new target before it runs. Only one Hermes process holds it
+service). A small helper process holds one DevTools connection for the browser's
+lifetime, which auto-attaches each new target before it runs. It is a separate
+process so that a busy Hermes never delays it. Only one Hermes process holds it
 per browser, so a second process attached to the same browser can't stall it.
 The connection is checked every time the browser is used, and restarted if it
 died or stalled. `/browser status` and `hermes doctor` report when it isn't

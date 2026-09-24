@@ -284,11 +284,14 @@ def default_window_size(width: int, height: int) -> Tuple[int, int]:
 _PAGE_LIKE = ("page", "iframe", "webview")  # browser_ui / other: Chrome's own UI, only resumed
 _WORKER_LIKE = ("worker", "service_worker", "shared_worker", "shared_storage_worklet", "auction_worklet")
 
-# A keeper whose loop has not ticked for this long is wedged. It closes its own connection:
-# Chrome releases every target it holds paused, and they run as plain Chrome for Testing.
-STALL_SECONDS = 3.0
-# How stale another process's keeper heartbeat may be before status reports it stalled.
-HOLDER_STALE_SECONDS = 5.0
+# The keeper runs in its OWN process (see :class:`KeeperProcess`). A keeper whose heartbeat is
+# older than this is treated as stuck: the parent kills it (Chrome releases what it held paused)
+# and restarts it at once, and the restart re-applies the brands to every running target
+# (measured). 10 s, not less: a short hitch only delays new tabs, and they still come out
+# correct. Killing too early would briefly strip the brands from tabs that were fine.
+STALL_SECONDS = 10.0
+# How stale another process's keeper heartbeat may be before it is taken over.
+HOLDER_STALE_SECONDS = 10.0
 
 
 def commands_for_attached_target(params: Dict[str, Any], ua: str, metadata: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
@@ -336,20 +339,22 @@ def holder_is_stale(lock_path: str, now: Optional[float] = None) -> bool:
         return False
 
 
+
 class FidelityKeeper(threading.Thread):
     """One browser-level DevTools connection that puts the person's brands on every target.
 
-    Only ONE keeper pauses a given browser, across every Hermes process: it holds an exclusive
-    ``flock`` for the browser instance. A pause set by one DevTools client can be released only by
-    that client (measured: a healthy client's ``runIfWaitingForDebugger`` does not release a
-    target another client holds). So a second keeper would only add a second way to wedge every
-    new tab. A process that finds the lock taken becomes a ``follower``: it adds no pauses, and it
-    retries the lock on its next acquire (the holder may have exited).
+    It runs inside a keeper process of its own (:class:`KeeperProcess`), so it shares no GIL with
+    the Hermes gateway: a gateway stall never delays it.
 
-    Daemon thread: it never keeps Hermes alive. It ends when the browser's socket closes, when
-    :meth:`stop` is called, or when its own loop stalls (a watchdog closes the socket, which makes
-    Chrome release everything it held). ``state`` is one of ``starting``, ``serving``,
-    ``follower``, ``stalled``, ``failed`` or ``stopped``."""
+    Only ONE keeper pauses a given browser, across every Hermes process. It holds an exclusive
+    ``flock`` for the browser instance, because a pause can only be released by the DevTools
+    client that set it. Measured: a healthy client's ``runIfWaitingForDebugger`` does not release
+    a target another client holds, so a second keeper would only add a second way to wedge every
+    new tab. A keeper that finds the lock taken becomes a ``follower`` and adds no pauses. If the
+    holder's heartbeat is more than :data:`HOLDER_STALE_SECONDS` old, and the holder really is a
+    keeper process, the new one kills it and takes over; SIGKILL reaches a stopped process too.
+
+    ``state`` is one of ``starting``, ``serving``, ``follower``, ``failed`` or ``stopped``."""
 
     def __init__(self, port: int, identity: Dict[str, Any], connect=None):
         super().__init__(name=f"hermes-browser-fidelity-{port}", daemon=True)
@@ -364,7 +369,7 @@ class FidelityKeeper(threading.Thread):
         self.state = "starting"
         self.lock_path: Optional[str] = None
         self._lock_fd: Optional[int] = None
-        self._beat = 0.0
+        self.beat = 0.0  # wall clock of the loop's last tick: the heartbeat
         self._next_id = 0
         self._send_lock = threading.Lock()
 
@@ -378,19 +383,42 @@ class FidelityKeeper(threading.Thread):
                 msg["sessionId"] = session
             self._ws.send(json.dumps(msg))
 
-    def _claim(self, lock_path: str) -> bool:
-        """Take the per-browser lock; False when another live process holds it."""
+    def _try_lock(self, fd: int) -> bool:
         import fcntl
-        self.lock_path = lock_path
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
         except OSError:
+            return False
+
+    def _claim(self, lock_path: str) -> bool:
+        """Take the per-browser lock; False when another live, heartbeating keeper holds it."""
+        self.lock_path = lock_path
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        if not self._try_lock(fd) and not (self._take_over_stale_holder(lock_path) and self._try_lock(fd)):
             os.close(fd)
             return False
         os.ftruncate(fd, 0)
         os.write(fd, str(os.getpid()).encode())
+        os.utime(lock_path)
         self._lock_fd = fd
+        return True
+
+    def _take_over_stale_holder(self, lock_path: str) -> bool:
+        """Kill a holder whose heartbeat stopped (e.g. SIGSTOPped), only if it is a keeper process."""
+        if not holder_is_stale(lock_path):
+            return False
+        try:
+            pid = int(open(lock_path, encoding="utf-8").read().strip() or 0)
+            import psutil
+            if pid <= 1 or pid == os.getpid() or _KEEPER_MARK not in " ".join(psutil.Process(pid).cmdline()):
+                return False
+            logger.warning("fidelity: keeper pid %s stopped heartbeating; taking the browser over", pid)
+            os.kill(pid, 9)
+            psutil.Process(pid).wait(3)
+        except Exception as e:
+            logger.debug("fidelity: stale-holder takeover skipped: %s", e)
+            return "NoSuchProcess" in type(e).__name__
         return True
 
     def _release(self) -> None:
@@ -412,7 +440,8 @@ class FidelityKeeper(threading.Thread):
         # A browser that has just written its port can take a few seconds to answer under load.
         for attempt in range(4):
             try:
-                version = requests.get(f"http://127.0.0.1:{self.port}/json/version", timeout=3).json()
+                version = requests.get(f"http://127.0.0.1:{self.port}/json/version", timeout=3,
+                                       proxies={"http": None, "https": None}).json()
                 break
             except requests.RequestException:
                 if attempt == 3 or self._halt.is_set():
@@ -441,21 +470,12 @@ class FidelityKeeper(threading.Thread):
 
     def _tick(self) -> None:
         import time
-        self._beat = time.monotonic()
+        self.beat = time.time()
         if self.lock_path and self._lock_fd is not None:
             try:
-                os.utime(self.lock_path)  # cross-process heartbeat
+                os.utime(self.lock_path)  # the cross-process heartbeat
             except OSError:
                 pass
-
-    def _watchdog(self) -> None:
-        import time
-        while not self._halt.wait(0.5):
-            if self.state == "serving" and time.monotonic() - self._beat > STALL_SECONDS:
-                self.state, self.error = "stalled", f"keeper loop stalled > {STALL_SECONDS:.0f}s"
-                logger.warning("fidelity: %s; closing its connection so Chrome releases every paused target", self.error)
-                self._close_ws()
-                return
 
     def _close_ws(self) -> None:
         try:
@@ -469,15 +489,14 @@ class FidelityKeeper(threading.Thread):
             self._ws = self._open()
             if self._ws is None:
                 self.state = "follower"
-                logger.info("fidelity: browser on port %s is served by another Hermes process's keeper (%s)",
-                            self.port, self.lock_path)
+                logger.info("fidelity: browser on port %s is served by another keeper (%s)", self.port, self.lock_path)
                 return
             # Browser level: attach every existing and future top-level target, paused at start.
+            # Already-running targets are attached too, which is how a restart re-applies the brands.
             self._send("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True})
             self._tick()
             self.state = "serving"
             self.ready.set()
-            threading.Thread(target=self._watchdog, name=f"{self.name}-watchdog", daemon=True).start()
             while not self._halt.is_set():
                 try:
                     raw = self._ws.recv(timeout=1.0)
@@ -486,8 +505,8 @@ class FidelityKeeper(threading.Thread):
                     continue
                 self.handle(json.loads(raw))
                 self._tick()
-        except Exception as e:  # the browser went away, never answered, or the watchdog closed us
-            if not self._halt.is_set() and self.state != "stalled":
+        except Exception as e:  # the browser went away or never answered
+            if not self._halt.is_set():
                 self.state, self.error = "failed", f"{type(e).__name__}: {e}"
                 logger.warning("fidelity keeper for port %s ended: %s", self.port, self.error)
         finally:
@@ -496,23 +515,15 @@ class FidelityKeeper(threading.Thread):
             self._release()
             self.ready.set()
             self._close_ws()
-            write_status()
-
-    def healthy(self) -> bool:
-        """Serving, and its loop ticked recently."""
-        import time
-        return self.is_alive() and self.state == "serving" and time.monotonic() - self._beat <= STALL_SECONDS
 
     def stop(self) -> None:
         self._halt.set()
         self._close_ws()
 
-    def describe(self) -> Dict[str, Any]:
-        d = {"port": self.port, "state": self.state, "pid": os.getpid(), "applied": dict(self.applied),
-             "error": self.error, "claims": self.ua and f"{self.identity.get('brand') or 'Chromium'} {self.identity['full_version']}"}
-        if self.state == "follower" and self.lock_path:
-            d["holder_stale"] = holder_is_stale(self.lock_path)
-        return d
+    def snapshot(self) -> Dict[str, Any]:
+        return {"pid": os.getpid(), "port": self.port, "state": self.state, "applied": dict(self.applied),
+                "error": self.error, "beat": self.beat, "ua": self.ua, "lock_path": self.lock_path,
+                "claims": f"{self.identity.get('brand') or 'Chromium'} {self.identity['full_version']}"}
 
 
 def with_engine_version(identity: Dict[str, Any], engine_version: Optional[str]) -> Dict[str, Any]:
@@ -529,22 +540,208 @@ def with_engine_version(identity: Dict[str, Any], engine_version: Optional[str])
     return {**identity, "full_version": engine_version, "major": engine_major}
 
 
-_keepers: Dict[int, FidelityKeeper] = {}
+# ---------------------------------------------------------------------------
+# The keeper process: no GIL shared with the gateway
+# ---------------------------------------------------------------------------
+
+_KEEPER_MARK = "tools.browser_tool_fidelity"
+# Bound at import: a test that fakes subprocess.Popen to watch browser launches must not also
+# capture (or break) the keeper's own helper process.
+from subprocess import Popen as _Popen  # noqa: E402
+
+
+def _keeper_main(argv: List[str]) -> int:
+    """Entry point of a keeper process: ``python -m tools.browser_tool_fidelity keeper PORT
+    IDENTITY_JSON STATUS_PATH``. It exits when its parent goes away (stdin reaches EOF), when the
+    browser goes away, or on SIGTERM. Its heartbeat and counters go to STATUS_PATH every second."""
+    import signal
+    import time
+    port, identity, status_path = int(argv[0]), json.loads(argv[1]), argv[2]
+    keeper = FidelityKeeper(port, identity)
+
+    def write():
+        tmp = f"{status_path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(keeper.snapshot(), fh)
+            os.replace(tmp, status_path)
+        except OSError:
+            pass
+
+    def parent_gone():
+        try:
+            while sys.stdin.buffer.read(1):
+                pass
+        except Exception:
+            pass
+        keeper.stop()
+
+    signal.signal(signal.SIGTERM, lambda *_: keeper.stop())
+    threading.Thread(target=parent_gone, daemon=True).start()
+    keeper.start()
+    write()
+    keeper.ready.wait(20)  # report "serving"/"follower"/"failed" the moment it is known
+    while keeper.is_alive():
+        write()
+        keeper.join(1.0)
+    write()
+    return 0
+
+
+class KeeperProcess:
+    """The gateway's handle on one keeper process. The same surface the tests and callers use:
+    ``port``, ``ua``, ``state``, ``applied``, ``error``, ``healthy()``, ``stop()``, ``join()``."""
+
+    def __init__(self, port: int, identity: Dict[str, Any]):
+        import subprocess
+        import tempfile
+        self.port, self.identity = port, identity
+        self.ua = user_agent(identity)
+        fd, self.status_path = tempfile.mkstemp(prefix=f"hermes-fidelity-{port}-", suffix=".json")
+        os.close(fd)
+        os.unlink(self.status_path)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, PYTHONPATH=root + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""))
+        self.proc = _Popen([sys.executable, "-m", _KEEPER_MARK, "keeper", str(port), json.dumps(identity),
+                                      self.status_path], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, env=env, close_fds=True)
+        self._stopped = False
+
+    def _snap(self) -> Dict[str, Any]:
+        try:
+            with open(self.status_path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {}
+
+    @property
+    def state(self) -> str:
+        snap = self._snap()
+        state = snap.get("state") or "starting"
+        if self.proc.poll() is not None and state in ("starting", "serving"):
+            return "stopped" if self._stopped else "failed"
+        return state
+
+    @property
+    def applied(self) -> Dict[str, int]:
+        return self._snap().get("applied") or {}
+
+    @property
+    def error(self) -> Optional[str]:
+        snap = self._snap()
+        if snap.get("error"):
+            return snap["error"]
+        if self.proc.poll() is not None and not self._stopped and snap.get("state") != "follower":
+            return f"keeper process exited ({self.proc.returncode})"
+        return None
+
+    def heartbeat_age(self) -> float:
+        import time
+        return time.time() - float(self._snap().get("beat") or 0)
+
+    def wait_ready(self, wait: float) -> None:
+        import time
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and self.state == "starting":
+            time.sleep(0.05)
+
+    def is_alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def healthy(self) -> bool:
+        return self.is_alive() and self.state == "serving" and self.heartbeat_age() <= STALL_SECONDS
+
+    def stop(self) -> None:
+        self._stopped = True
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        if self.proc.poll() is None:
+            self.proc.terminate()
+
+    def kill(self) -> None:
+        self._stopped = True
+        if self.proc.poll() is None:
+            self.proc.kill()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        import subprocess
+        try:
+            self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            self.kill()
+            self.proc.wait(2)
+
+    def describe(self) -> Dict[str, Any]:
+        snap = self._snap()
+        d = {"port": self.port, "state": self.state, "pid": self.proc.pid, "applied": snap.get("applied") or {},
+             "error": self.error, "claims": snap.get("claims") or f"{self.identity.get('brand') or 'Chromium'} {self.identity['full_version']}"}
+        if d["state"] == "follower" and snap.get("lock_path"):
+            d["holder_stale"] = holder_is_stale(snap["lock_path"])
+        return d
+
+
+_keepers: Dict[int, "KeeperProcess"] = {}
 _keepers_lock = threading.Lock()
+_monitor: Optional[threading.Thread] = None
 
 
-def ensure_keeper(port: int, identity, wait: float = 15.0) -> Optional[FidelityKeeper]:
+def _start_keeper(port: int, identity: Dict[str, Any]) -> "KeeperProcess":
+    keeper = KeeperProcess(port, identity)
+    _keepers[port] = keeper
+    _ensure_monitor()
+    return keeper
+
+
+def _monitor_once() -> None:
+    """Replace a keeper that is alive but stuck: kill it (Chrome releases its pauses) and start a
+    new one at once, whose attach re-applies the brands to every running target. A keeper that
+    exited on its own (browser gone, follower, failure) is left for the next acquire."""
+    with _keepers_lock:
+        items = list(_keepers.items())
+    for port, keeper in items:
+        if keeper.is_alive() and keeper.state == "serving" and keeper.heartbeat_age() > STALL_SECONDS:
+            logger.warning("fidelity: keeper for port %s silent for %.0fs; replacing it now",
+                           port, keeper.heartbeat_age())
+            keeper.kill()
+            keeper.join(3)
+            with _keepers_lock:
+                if _keepers.get(port) is keeper:
+                    _start_keeper(port, keeper.identity)
+            write_status()
+
+
+def _ensure_monitor() -> None:
+    global _monitor
+    if _monitor is not None and _monitor.is_alive():
+        return
+
+    def loop():
+        import time
+        while True:
+            time.sleep(2.0)
+            try:
+                _monitor_once()
+            except Exception as e:
+                logger.debug("fidelity monitor: %s", e)
+
+    _monitor = threading.Thread(target=loop, name="hermes-browser-fidelity-monitor", daemon=True)
+    _monitor.start()
+
+
+def ensure_keeper(port: int, identity, wait: float = 15.0) -> Optional["KeeperProcess"]:
     """Make sure a keeper serves the browser on ``port``: start one, or restart one that died,
-    stalled or was a follower last time. Called on EVERY acquire of the real-profile browser,
-    the cache-hit path included. ``identity`` is a dict or a zero-argument callable returning one.
-    None when fidelity is off or the identity is unknown."""
+    failed, or was a follower last time. Called on EVERY acquire of the real-profile browser, the
+    cache-hit path included. ``identity`` is a dict or a zero-argument callable returning one
+    (resolved only when a keeper must start). None when fidelity is off or the identity is unknown."""
     if not fidelity_enabled():
         return None
     with _keepers_lock:
         keeper = _keepers.get(port)
         if keeper is not None and keeper.healthy():
             return keeper
-    if callable(identity):  # resolved only when a keeper has to start: the cache-hit path stays cheap
+    if callable(identity):
         identity = identity()
     if not identity:
         return None
@@ -552,16 +749,17 @@ def ensure_keeper(port: int, identity, wait: float = 15.0) -> Optional[FidelityK
         keeper = _keepers.get(port)
         if keeper is not None and keeper.healthy():
             return keeper
-        if keeper is not None and keeper.state not in ("follower", "starting"):
-            logger.warning("fidelity: keeper for port %s was %s (%s); restarting it", port, keeper.state, keeper.error)
-        if keeper is not None:
-            keeper.stop()
-        keeper = FidelityKeeper(port, identity)
-        _keepers[port] = keeper
-        keeper.start()
-    keeper.ready.wait(wait)
+        if keeper is not None and keeper.state == "starting" and keeper.is_alive():
+            pass  # another acquire is starting it right now: wait on that one
+        else:
+            if keeper is not None:
+                if keeper.state not in ("follower",):
+                    logger.warning("fidelity: keeper for port %s was %s (%s); restarting it", port, keeper.state, keeper.error)
+                keeper.stop()
+            keeper = _start_keeper(port, identity)
+    keeper.wait_ready(wait)
     if keeper.state == "failed":
-        logger.warning("fidelity: brands not applied (%s); the browser reports itself as plain Chrome for Testing", keeper.error)
+        logger.warning("fidelity: brands not applied (%s)", keeper.error)
     write_status()
     return keeper
 
@@ -573,9 +771,8 @@ def stop_keepers() -> None:
         _keepers.clear()
     for keeper in keepers:
         keeper.stop()
-    for keeper in keepers:  # let each finish its own last status write before ours
-        if keeper is not threading.current_thread():
-            keeper.join(2)
+    for keeper in keepers:
+        keeper.join(3)
     write_status()
 
 
@@ -629,3 +826,8 @@ def status_summary() -> Optional[Tuple[bool, str]]:
     why = "the serving process has stopped responding" if k.get("state") == "follower" else (k.get("error") or k.get("state"))
     return False, (f"Browser fidelity: NOT applied ({why}). The browser reports itself as plain Chrome for Testing; "
                    f"it recovers on the next browser use")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "keeper":
+    logging.basicConfig(level=logging.WARNING)
+    sys.exit(_keeper_main(sys.argv[2:]))

@@ -234,16 +234,67 @@ class TestKeeper:
         keeper.join(2)
         assert not keeper.is_alive() and keeper.state == "failed" and "gone" in keeper.error
 
-    def test_a_stalled_keeper_closes_its_own_connection(self):
-        """A keeper whose loop stops ticking closes its socket, and Chrome then releases every
-        target it held paused. One stuck keeper must not wedge every new tab."""
-        ws = _FakeWs([], block=True)
-        with patch.object(fid, "STALL_SECONDS", 0.6):
-            keeper = fid.FidelityKeeper(9, CHROME_153, connect=lambda port: ws)
-            keeper.start()
-            keeper.join(5)
-        assert ws.closed and keeper.state == "stalled" and not keeper.is_alive()
-        assert not keeper.healthy()
+
+
+class _FakeProc:
+    """Stands in for a KeeperProcess: the surface ensure_keeper and the monitor use."""
+    made = []
+
+    def __init__(self, port, identity, state="serving", age=0.0):
+        self.port, self.identity, self._state, self.age = port, identity, state, age
+        self.alive, self.killed, self.stopped = True, False, False
+        self.ua = fid.user_agent(identity)
+        _FakeProc.made.append(self)
+
+    state = property(lambda self: self._state)
+    error = None
+
+    def heartbeat_age(self):
+        return self.age
+
+    def is_alive(self):
+        return self.alive
+
+    def healthy(self):
+        return self.alive and self._state == "serving" and self.age <= fid.STALL_SECONDS
+
+    def wait_ready(self, wait):
+        pass
+
+    def stop(self):
+        self.stopped, self.alive = True, False
+
+    def kill(self):
+        self.killed, self.alive = True, False
+
+    def join(self, timeout=None):
+        pass
+
+    def describe(self):
+        return {"port": self.port, "state": self._state, "applied": {}, "error": None}
+
+
+class TestMonitor:
+    def test_a_silent_keeper_is_replaced_at_once(self):
+        """Stuck for longer than STALL_SECONDS: killed (Chrome releases its pauses) and replaced
+        straight away, not at the next acquire, so running tabs get their brands back."""
+        _FakeProc.made = []
+        with patch.object(fid, "KeeperProcess", _FakeProc), patch.object(fid, "_ensure_monitor"):
+            stuck = fid._start_keeper(4700, CHROME_153)
+            stuck.age = fid.STALL_SECONDS + 1
+            fid._monitor_once()
+        assert stuck.killed and len(_FakeProc.made) == 2 and fid._keepers[4700] is _FakeProc.made[1]
+
+    def test_a_short_hitch_is_left_alone(self):
+        """A 4 s hitch only delays new tabs, and they come out right. Killing would strip the
+        brands from every running tab (measured by the reviewer), so the bound is 10 s."""
+        assert fid.STALL_SECONDS >= 10
+        _FakeProc.made = []
+        with patch.object(fid, "KeeperProcess", _FakeProc), patch.object(fid, "_ensure_monitor"):
+            k = fid._start_keeper(4800, CHROME_153)
+            k.age = 4.0
+            fid._monitor_once()
+        assert not k.killed and len(_FakeProc.made) == 1
 
 
 class TestOneKeeperPerBrowser:
@@ -268,9 +319,53 @@ class TestOneKeeperPerBrowser:
         os.utime(lock, (old, old))
         assert fid.holder_is_stale(str(lock)) is True
 
+    def test_a_stale_keeper_holder_is_taken_over(self, tmp_path):
+        """A holder that stopped heartbeating (SIGSTOPped) is killed and the lock taken, but only
+        when its command line shows it is a keeper process."""
+        import subprocess
+        import sys
+        lock = str(tmp_path / "k.lock")
+        holder = subprocess.Popen([sys.executable, "-c", f"""
+import fcntl, os, time  # {fid._KEEPER_MARK} keeper (stand-in)
+fd = os.open({lock!r}, os.O_RDWR | os.O_CREAT); fcntl.flock(fd, fcntl.LOCK_EX)
+os.write(fd, str(os.getpid()).encode()); print("held", flush=True); time.sleep(60)
+"""], stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            b = fid.FidelityKeeper(9, CHROME_153)
+            assert b._claim(lock) is False  # heartbeat fresh: a live keeper, leave it
+            old = time.time() - 60
+            os.utime(lock, (old, old))
+            assert b._claim(lock) is True  # stale: taken over
+            assert holder.wait(5) is not None
+            b._release()
+        finally:
+            holder.kill()
+            holder.wait(5)
+
+    def test_a_stale_holder_that_is_not_a_keeper_is_never_killed(self, tmp_path):
+        import subprocess
+        import sys
+        lock = str(tmp_path / "k.lock")
+        holder = subprocess.Popen([sys.executable, "-c", f"""
+import fcntl, os, time
+fd = os.open({lock!r}, os.O_RDWR | os.O_CREAT); fcntl.flock(fd, fcntl.LOCK_EX)
+os.write(fd, str(os.getpid()).encode()); print("held", flush=True); time.sleep(60)
+"""], stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            old = time.time() - 60
+            os.utime(lock, (old, old))
+            assert fid.FidelityKeeper(9, CHROME_153)._claim(lock) is False
+            assert holder.poll() is None
+        finally:
+            holder.kill()
+            holder.wait(5)
+
     def test_a_follower_adds_no_pause_and_is_retried(self):
-        with patch.object(fid.FidelityKeeper, "_open", return_value=None), \
-             patch.object(fid, "fidelity_enabled", return_value=True):
+        _FakeProc.made = []
+        with patch.object(fid, "KeeperProcess", lambda port, ident: _FakeProc(port, ident, state="follower")), \
+             patch.object(fid, "_ensure_monitor"), patch.object(fid, "fidelity_enabled", return_value=True):
             first = fid.ensure_keeper(4400, CHROME_153)
             assert first.state == "follower"
             second = fid.ensure_keeper(4400, CHROME_153)
@@ -279,30 +374,26 @@ class TestOneKeeperPerBrowser:
 
 class TestEnsureKeeper:
     def test_restarts_a_dead_keeper_and_resolves_identity_lazily(self):
-        real_init = fid.FidelityKeeper.__init__
-
-        def init(self, port, identity, connect=None):
-            real_init(self, port, identity, connect=lambda p: _FakeWs([]))
-
         calls = []
 
         def identity():
             calls.append(1)
             return CHROME_153
 
-        with patch.object(fid.FidelityKeeper, "__init__", init), patch.object(fid, "fidelity_enabled", return_value=True):
+        _FakeProc.made = []
+        with patch.object(fid, "KeeperProcess", _FakeProc), patch.object(fid, "_ensure_monitor"), \
+             patch.object(fid, "fidelity_enabled", return_value=True):
             a = fid.ensure_keeper(4500, identity)
             assert a.healthy() and calls == [1]
             assert fid.ensure_keeper(4500, identity) is a and calls == [1]  # healthy: identity not even read
-            a.stop()
-            a.join(2)
+            a.alive = False  # it died
             b = fid.ensure_keeper(4500, identity)
             assert b is not a and b.healthy() and calls == [1, 1]
 
     def test_off_or_unknown_identity_starts_nothing(self):
-        with patch.object(fid, "FidelityKeeper") as K, patch.object(fid, "fidelity_enabled", return_value=False):
+        with patch.object(fid, "KeeperProcess") as K, patch.object(fid, "fidelity_enabled", return_value=False):
             assert fid.ensure_keeper(4600, CHROME_153) is None
-        with patch.object(fid, "FidelityKeeper") as K2, patch.object(fid, "fidelity_enabled", return_value=True):
+        with patch.object(fid, "KeeperProcess") as K2, patch.object(fid, "fidelity_enabled", return_value=True):
             assert fid.ensure_keeper(4600, None) is None
             assert fid.ensure_keeper(4600, lambda: None) is None
         K.assert_not_called()
@@ -585,7 +676,7 @@ class TestLiveBrowser:
                                   "userGesture": True}, s)
         got = _wait_for(lambda: _report(log, "page"))
         assert got and got["brands"] == "Google Chrome,Not_A Brand,Chromium" and got["ua"] == keeper.ua
-        assert keeper.applied.get("page", 0) >= 3
+        assert _wait_for(lambda: keeper.applied.get("page", 0) >= 3, secs=5)  # counters reach status each second
 
     @pytest.mark.xfail(strict=True, reason="KNOWN LIMIT: waitForDebuggerOnStart holds the renderer, not the "
                        "browser-side navigation, so a tab created straight at a URL sends its first request "
@@ -602,9 +693,9 @@ class TestLiveBrowser:
         must be visible in status, and the next acquire must close it."""
         call, keeper, sp, log = live_browser
         port = keeper.port
-        keeper.stop()
-        keeper.join(5)
-        keeper.state, keeper.error = "failed", "killed by the test"
+        os.kill(keeper.proc.pid, 9)  # a crash, not a stop
+        keeper.proc.wait(5)
+        assert keeper.state == "failed"
         fid.write_status()
         with patch.object(fid, "fidelity_enabled", return_value=True):
             ok, line = fid.status_summary()
@@ -650,3 +741,88 @@ time.sleep(120)
             os.kill(child.pid, signal.SIGCONT)
             child.kill()
             child.wait(5)
+
+    def test_a_gateway_stall_changes_nothing(self, live_browser):
+        """The reviewer's case: the gateway holds the GIL for 4 s. With the keeper in a thread, its
+        watchdog closed the connection and every open tab fell to Chromium brands. With the
+        keeper in its own process, open tabs keep the brands, and a tab another process opens
+        during the stall gets them without waiting for the stall to end."""
+        import subprocess
+        import sys
+        call, keeper, sp, log = live_browser
+        _blank_then_navigate(call, f"http://localhost:{sp}/page?t1")
+        assert _wait_for(lambda: _report(log, "page"))["brands"] == "Google Chrome,Not_A Brand,Chromium"
+        # A peer process opens a tab during the stall, against its own server (ours is stalled too).
+        child = subprocess.Popen([sys.executable, "-c", _PEER_TAB % {"port": keeper.port}],
+                                 stdout=subprocess.PIPE, text=True)
+        t0 = time.monotonic()
+        per = time.monotonic(); sum(range(10 ** 8)); per = time.monotonic() - per
+        sum(range(int(10 ** 8 * 4.5 / max(per, 1e-3))))  # one C call: holds the GIL for about 4.5 s
+        stall = time.monotonic() - t0
+        peer = json.loads(child.communicate(timeout=60)[0].strip().splitlines()[-1])
+        assert stall >= 3.5, stall
+        assert peer["brands"] == "Google Chrome,Not_A Brand,Chromium", peer
+        assert peer["secs"] < stall, peer  # it did not wait for the gateway
+        log.clear()
+        s = _blank_then_navigate(call, f"http://localhost:{sp}/plain")
+        brands = call("Runtime.evaluate", {"expression": "1", "returnByValue": True}, s)
+        tabs = [t for t in call("Target.getTargets")["targetInfos"] if t["type"] == "page" and "t1" in t["url"]]
+        s1 = call("Target.attachToTarget", {"targetId": tabs[0]["targetId"], "flatten": True})["sessionId"]
+        t = time.monotonic()
+        brands = call("Runtime.evaluate", {"expression": "navigator.userAgentData.brands.map(b=>b.brand).join()",
+                                           "returnByValue": True}, s1)["result"]["value"]
+        assert brands == "Google Chrome,Not_A Brand,Chromium"  # the open tab kept them
+        assert time.monotonic() - t < 2  # and answers at once (no 20 s hang)
+        assert keeper.healthy()
+
+    def test_a_stuck_keeper_is_replaced_and_open_tabs_get_their_brands_back(self, live_browser):
+        """SIGSTOP the keeper process past STALL_SECONDS: the monitor kills and replaces it without
+        waiting for an acquire, and the replacement re-applies the brands to the open tab."""
+        import signal
+        call, keeper, sp, log = live_browser
+        s1 = _blank_then_navigate(call, f"http://localhost:{sp}/page?t1")
+        assert _wait_for(lambda: _report(log, "page"))
+        os.kill(keeper.proc.pid, signal.SIGSTOP)
+        replaced = _wait_for(lambda: fid._keepers.get(keeper.port) is not keeper and fid._keepers.get(keeper.port),
+                             secs=fid.STALL_SECONDS + 10)
+        assert replaced, "the monitor never replaced the stopped keeper"
+        assert keeper.proc.wait(5) is not None  # SIGKILL reaches a stopped process
+        replaced.wait_ready(15)
+        assert replaced.state == "serving"
+        time.sleep(0.5)
+        brands = call("Runtime.evaluate", {"expression": "navigator.userAgentData.brands.map(b=>b.brand).join()",
+                                           "returnByValue": True}, s1)["result"]["value"]
+        assert brands == "Google Chrome,Not_A Brand,Chromium"
+
+
+_PEER_TAB = r'''
+import http.server, json, socketserver, threading, time
+import requests
+from websockets.sync.client import connect
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+        self.wfile.write(b"<html><body>peer</body></html>")
+class TS(socketserver.ThreadingMixIn, http.server.HTTPServer): daemon_threads = True
+srv = TS(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+time.sleep(0.5)  # let the gateway's stall begin
+t0 = time.monotonic()
+ws = connect(requests.get("http://127.0.0.1:%(port)d/json/version", timeout=5).json()["webSocketDebuggerUrl"], max_size=None)
+n = [0]
+def call(method, params=None, session=None):
+    n[0] += 1; msg = {"id": n[0], "method": method, "params": params or {}}
+    if session: msg["sessionId"] = session
+    ws.send(json.dumps(msg))
+    while True:
+        m = json.loads(ws.recv(timeout=30))
+        if m.get("id") == n[0]: return m.get("result", {})
+tab = call("Target.createTarget", {"url": "about:blank"})["targetId"]
+s = call("Target.attachToTarget", {"targetId": tab, "flatten": True})["sessionId"]
+call("Page.navigate", {"url": "http://localhost:%%d/" %% srv.server_address[1]}, s)
+for _ in range(100):
+    if call("Runtime.evaluate", {"expression": "document.readyState", "returnByValue": True}, s)["result"]["value"] == "complete": break
+    time.sleep(0.05)
+b = call("Runtime.evaluate", {"expression": "navigator.userAgentData.brands.map(b=>b.brand).join()", "returnByValue": True}, s)["result"]["value"]
+print(json.dumps({"brands": b, "secs": time.monotonic() - t0}), flush=True)
+'''
