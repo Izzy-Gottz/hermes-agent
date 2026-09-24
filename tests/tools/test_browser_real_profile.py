@@ -1380,4 +1380,6 @@ class TestWindowsLockedProfileCopy:
                             lambda s, d: False if os.path.basename(s) in bc._SQLITE_AUTH_DBS else True)
         dst, err = bc.snapshot_real_profile("chrome", src=str(root))
         assert dst is None
-        assert err and "login data" in err.lower() and "close" in err.lower()
+        # A FIRST snapshot still fails closed — but never tells the person to close their
+        # browser: it is open because they are using it (ticket #13).
+        assert err and "login data" in err.lower() and "close" not in err.lower()

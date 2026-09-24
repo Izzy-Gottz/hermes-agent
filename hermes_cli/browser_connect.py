@@ -395,7 +395,9 @@ _SQLITE_AUTH_DBS = frozenset({"Cookies", "Login Data", "Login Data For Account",
 
 
 def _copy_auth_file(src_file: str, dst_file: str) -> bool:
-    """Copy auth state; refuse a DB that cannot be snapshotted consistently within five seconds."""
+    """Copy auth state; refuse a DB that cannot be snapshotted consistently. A DB is backed up into
+    a side file and swapped in only once it is whole, so a failed copy leaves the previous one
+    exactly as it was (the snapshot stays usable, just older)."""
     os.makedirs(os.path.dirname(dst_file), exist_ok=True)
     if sys.platform == "darwin":
         # sqlite reports an unreadable source as a generic "unable to open database file", which
@@ -410,59 +412,137 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
             raise
         except OSError:
             pass  # anything else (vanished mid-copy) keeps the best-effort handling below
+    if os.path.basename(src_file) not in _SQLITE_AUTH_DBS:
+        try:
+            shutil.copy2(src_file, dst_file)
+            return True
+        except OSError as e:
+            logger.debug("real-profile: could not copy %s: %s", src_file, e)
+            return False
+    side = dst_file + _SIDE_COPY_SUFFIX
     try:
-        if os.path.basename(src_file) in _SQLITE_AUTH_DBS:
-            deadline = time.monotonic() + 5.0
+        # Only the SOURCE lock is the browser's. A destination some other connection holds is a
+        # copy-browser still using the snapshot, and that is never overwritten. EXCLUSIVE, not
+        # IMMEDIATE: a Chrome that has only READ its Login Data holds a SHARED lock, which an
+        # IMMEDIATE probe walks straight past (measured: the old probe let the copy unlink Login
+        # Data out from under a live driven browser).
+        if _db_in_use(dst_file):
+            raise sqlite3.OperationalError(f"{dst_file} is open in a running browser")
+        src_uri = Path(src_file).resolve().as_uri()
+
+        def _backup(query: str) -> None:
+            # SQLite must coordinate both ends: immutable ignores committed source WAL, while
+            # replacing only the destination file can replay its abandoned WAL. Connection busy
+            # timeouts do not bound backup's retry loop; its callback does.
+            _discard_partial_db(side)
+            deadline = time.monotonic() + _AUTH_DB_BACKUP_SECONDS
 
             def check_deadline(_status: int, _remaining: int, _total: int) -> None:
                 if _status != sqlite3.SQLITE_DONE and time.monotonic() >= deadline:
                     raise TimeoutError("auth database backup exceeded five seconds")
 
-            # SQLite must coordinate both ends: immutable ignores committed source WAL,
-            # while replacing only the destination file can replay its abandoned WAL.
-            # Connection busy timeouts do not bound backup's retry loop; its callback does.
-            src_uri = Path(src_file).resolve().as_uri()
+            with contextlib.closing(sqlite3.connect(src_uri + query, uri=True, timeout=0.0)) as source:
+                with contextlib.closing(sqlite3.connect(side, timeout=0.0)) as out:
+                    source.backup(out, pages=256, progress=check_deadline, sleep=0.1)
 
-            def _backup(query: str) -> None:
-                with contextlib.closing(sqlite3.connect(src_uri + query, uri=True, timeout=0.0)) as source:
-                    with contextlib.closing(sqlite3.connect(dst_file, timeout=0.0)) as out:
-                        source.backup(out, pages=256, progress=check_deadline, sleep=0.1)
-
-            try:
-                _backup("?mode=ro")
-            except (TimeoutError, sqlite3.OperationalError) as first:
-                if isinstance(first, sqlite3.OperationalError) and not _is_lock_error(first):
-                    raise
-                # A running desktop Chrome keeps "Login Data", "Login Data For Account" and "Web
-                # Data" open in EXCLUSIVE locking mode (Cookies is not), so a locking read never
-                # gets in: measured on macOS 26 with Chrome 140, every backup of those three ran
-                # the five seconds out while Cookies copied in 2 ms, and real-profile browsing
-                # failed closed with "3 database(s) unavailable" for as long as Chrome was open —
-                # which for the person whose logins these are is always. `immutable=1` reads the
-                # file without taking a lock. The price is any commit still only in a WAL sidecar
-                # (Chrome keeps these three in rollback-journal mode, so on Chrome there is none);
-                # the alternative price was the whole feature.
-                # Only the SOURCE lock is the browser's. A locked destination is a copy-browser
-                # still using the snapshot, and that is never overwritten — say so instead.
-                if os.path.exists(dst_file):
-                    try:
-                        with contextlib.closing(sqlite3.connect(dst_file, timeout=0.0)) as probe:
-                            probe.execute("BEGIN IMMEDIATE")
-                            probe.rollback()
-                    except sqlite3.OperationalError:
-                        raise first
-                _discard_partial_db(dst_file)
-                logger.debug("real-profile: %s is locked by the running browser (%s); re-reading it immutable",
-                             src_file, first)
-                deadline = time.monotonic() + 5.0
-                _backup("?immutable=1")
-        else:
-            shutil.copy2(src_file, dst_file)
+        try:
+            if _source_held_exclusively(src_uri):
+                raise sqlite3.OperationalError("database is locked")
+            _backup("?mode=ro")
+        except (TimeoutError, sqlite3.OperationalError) as first:
+            if isinstance(first, sqlite3.OperationalError) and not _is_lock_error(first):
+                raise
+            # A running desktop Chrome keeps "Login Data", "Login Data For Account" and "Web
+            # Data" open in EXCLUSIVE locking mode (Cookies is not), so a locking read never
+            # gets in: measured on macOS 26 with Chrome 140, and again on macOS 27 with Chrome
+            # for Testing 154 (a plain `SELECT` with no busy timeout says "database is locked" at
+            # once, which is how the doomed five-second backup is now skipped). `immutable=1`
+            # reads the file without taking a lock. The price is any commit still only in a WAL
+            # sidecar (Chrome keeps these three in rollback-journal mode, so on Chrome there is
+            # none) — and a TORN read when Chrome writes mid-copy: measured 2026-09-24, 11 of 20
+            # immutable copies of a DB under a steady writer were corrupt ("database disk image
+            # is malformed", freelist errors) and every one was reported as a good copy. So each
+            # immutable copy is checked, and retried a few times, before it may replace anything.
+            logger.debug("real-profile: %s is locked by the running browser (%s); re-reading it immutable",
+                         src_file, first)
+            _immutable_copy(src_file, side, _backup)
+        _install_side_copy(side, dst_file)
         return True
     except (OSError, sqlite3.Error) as e:
         # A raw DB copy can lose committed WAL or overwrite a locked destination.
+        _discard_partial_db(side)
         logger.debug("real-profile: could not copy %s: %s", src_file, e)
         return False
+
+
+# A DB copy is written beside its destination and renamed over it only once whole.
+_SIDE_COPY_SUFFIX = ".hermes-new"
+_AUTH_DB_BACKUP_SECONDS = 5.0
+_IMMUTABLE_ATTEMPTS = 4
+
+
+def _db_in_use(path: str) -> bool:
+    """True when another connection holds ``path`` (any lock, SHARED included)."""
+    if not os.path.exists(path):
+        return False
+    try:
+        with contextlib.closing(sqlite3.connect(path, timeout=0.0)) as probe:
+            probe.execute("BEGIN EXCLUSIVE")
+            probe.rollback()
+    except sqlite3.OperationalError as e:
+        return _is_lock_error(e)
+    except sqlite3.DatabaseError:
+        return False  # not a usable DB: nothing is using it, and it is about to be replaced
+    return False
+
+
+def _source_held_exclusively(src_uri: str) -> bool:
+    """True when the source answers "locked" at once: a browser holding it in EXCLUSIVE locking
+    mode. A locking read would only spend the whole backup deadline finding that out."""
+    try:
+        with contextlib.closing(sqlite3.connect(src_uri + "?mode=ro", uri=True, timeout=0.0)) as c:
+            c.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.OperationalError as e:
+        return _is_lock_error(e)
+    return False
+
+
+def _immutable_copy(src_file: str, side: str, backup) -> None:
+    """Lock-free read of a DB the browser holds, retried until a copy passes ``quick_check`` with
+    the source unchanged underneath it. Raises the last error when no attempt comes out whole."""
+    last: Exception = sqlite3.DatabaseError("no attempt made")
+    for attempt in range(_IMMUTABLE_ATTEMPTS):
+        if attempt:
+            time.sleep(0.2 * attempt)
+        try:
+            before = _stat_key(src_file)
+            backup("?immutable=1")
+            with contextlib.closing(sqlite3.connect(side, timeout=0.0)) as check:
+                verdict = check.execute("PRAGMA quick_check").fetchone()[0]
+            if verdict != "ok":
+                raise sqlite3.DatabaseError(f"torn read: {verdict}")
+            if _stat_key(src_file) != before:
+                raise sqlite3.DatabaseError("source changed during the copy")
+            return
+        except (TimeoutError, sqlite3.DatabaseError) as e:
+            last = e
+            logger.debug("real-profile: immutable read of %s attempt %d: %s", src_file, attempt + 1, e)
+    _discard_partial_db(side)
+    raise last
+
+
+def _stat_key(path: str) -> tuple:
+    st = os.stat(path)
+    return st.st_size, st.st_mtime_ns
+
+
+def _install_side_copy(side: str, dst_file: str) -> None:
+    """Swap a finished side copy in. The old DB's sidecars go first: a journal left beside the new
+    file would be replayed into it on the next open."""
+    for suffix in ("-journal", "-wal", "-shm"):
+        with contextlib.suppress(OSError):
+            os.unlink(dst_file + suffix)
+    os.replace(side, dst_file)
 
 
 def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
@@ -791,6 +871,47 @@ def _copy_profile_tree(src: str, dst: str, source_profile: str) -> None:
             len(multi.args[0]) if multi.args else 0, src, source_profile)
 
 
+# One-shot notes for the model about the snapshot just taken (browser -> text), and the last
+# stale snapshot logged per browser so a long run of stale re-syncs logs once, not per call.
+_snapshot_notes: dict[str, str] = {}
+_stale_logged: dict[str, float] = {}
+
+
+def pop_snapshot_note(browser: str) -> str | None:
+    """The note left by the last ``snapshot_real_profile(browser)``, once."""
+    return _snapshot_notes.pop(browser, None)
+
+
+def _browser_label(browser: str) -> str:
+    return {"chrome": "Chrome", "edge": "Edge", "brave": "Brave", "chromium": "Chromium"}.get(
+        browser, browser.capitalize())
+
+
+def _marker_profile(marker: str) -> str | None:
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _note_stale_snapshot(browser: str, marker: str, failed_dbs: int) -> None:
+    """Record that this launch uses the last complete snapshot: logged once per snapshot, and a
+    short note for the model. Never "close your browser": it is open because the person uses it."""
+    try:
+        taken = os.path.getmtime(marker)
+    except OSError:
+        taken = time.time()
+    when = time.strftime("%H:%M", time.localtime(taken))
+    if _stale_logged.get(browser) != taken:
+        _stale_logged[browser] = taken
+        logger.warning("real-profile: %d auth database(s) of the '%s' profile could not be read while "
+                       "the browser was writing them; using the complete snapshot from %s",
+                       failed_dbs, browser, when)
+    _snapshot_notes[browser] = (f"using your sign-ins from {when}; a newer copy couldn't be read while "
+                                f"{_browser_label(browser)} was writing")
+
+
 def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | None, str | None]:
     """Snapshot ``browser``'s real ACTIVE profile into the hermes copy dir; returns ``(dst, err)``.
     Copies ``Local State`` plus the active profile's auth files into the copy's ``Default``. The
@@ -826,6 +947,7 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     # Only a copy that previously COMPLETED counts as populated; a half-written tree is
     # rebuilt — otherwise a torn first copy poisons freshness forever.
     populated = os.path.isfile(marker)
+    _snapshot_notes.pop(browser, None)
     try:
         os.makedirs(dst, exist_ok=True)
         # Secure the snapshot dir AND its browser-profile parent on EVERY launch so a failed
@@ -837,20 +959,30 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
             _copy_profile_tree(src, dst, source_profile)
         # Both paths: lock-aware auth DB copy into Default — also the per-launch re-sync.
         failed_dbs = _mirror_profile_auth(src, dst, source_profile)
-        if failed_dbs:  # even online-backup failed: never launch a silently signed-out session
-            return None, (f"could not read the '{browser}' profile's login data ({failed_dbs} "
-                          f"database(s) unavailable). Close {browser} and retry, or turn "
-                          "browser.use_real_profile off.")
+        stale = False
+        if failed_dbs:
+            # A copy that failed left the previous one untouched (side copy + rename), so a
+            # snapshot that once COMPLETED for this same profile is still whole and signed in,
+            # only older. Browse on it rather than refuse. A first snapshot has nothing to fall
+            # back on: never launch a silently signed-out session.
+            if not (populated and _marker_profile(marker) == source_profile):
+                return None, (f"could not read the '{browser}' profile's login data ({failed_dbs} "
+                              f"database(s) unavailable while {_browser_label(browser)} was writing "
+                              "them). Retry in a moment, or turn browser.use_real_profile off.")
+            stale = True
+            _note_stale_snapshot(browser, marker, failed_dbs)
         # Never carry live-instance leftovers into the copy.
         for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
             with contextlib.suppress(OSError):
                 os.unlink(os.path.join(dst, leftover))
-        # Mark complete only after everything above succeeded.
-        try:
-            with open(marker, "w", encoding="utf-8") as fh:
-                fh.write(source_profile)
-        except OSError as e:
-            logger.debug("real-profile snapshot: could not write done marker: %s", e)
+        # Mark complete only after everything above succeeded. A stale pass keeps the old marker,
+        # whose mtime is when the sign-ins in use were last copied whole.
+        if not stale:
+            try:
+                with open(marker, "w", encoding="utf-8") as fh:
+                    fh.write(source_profile)
+            except OSError as e:
+                logger.debug("real-profile snapshot: could not write done marker: %s", e)
         # AFTER the marker write so the marker itself is covered; every pass, so old snapshots heal.
         _secure_snapshot(dst, contents=True)
     except OSError as e:

@@ -100,6 +100,32 @@ def _read_devtools_port(data_dir: str) -> Optional[str]:
         return None
 
 
+# How long a browser still running on the copy dir may take to answer DevTools before the
+# acquire gives up (without touching it or its profile).
+_BUSY_BROWSER_WAIT_S = 20.0
+# Notes for the model from the last launch (e.g. "using your sign-ins from 12:39"), taken once.
+_pending_notes: List[str] = []
+
+
+def take_real_profile_note() -> Optional[str]:
+    """The note(s) the last real-profile launch left for the model, once; None when there are none."""
+    if not _pending_notes:
+        return None
+    text = " ".join(dict.fromkeys(_pending_notes))
+    _pending_notes.clear()
+    return text
+
+
+def _await_surviving_chrome_cdp(data_dir: str, wait: Optional[float] = None) -> Optional[str]:
+    """Poll :func:`_surviving_chrome_cdp` until it answers, the browser exits, or ``wait`` runs out."""
+    deadline = time.monotonic() + (_BUSY_BROWSER_WAIT_S if wait is None else wait)
+    while True:
+        cdp = _surviving_chrome_cdp(data_dir)
+        if cdp or not _live_holders(data_dir) or time.monotonic() >= deadline:
+            return cdp
+        time.sleep(0.5)
+
+
 def _surviving_chrome_cdp(data_dir: str) -> Optional[str]:
     """HTTP CDP root of a browser still running on ``data_dir``, or None. ``DevToolsActivePort``
     outlives a crashed browser and its port can be recycled by another local CDP server, so the
@@ -460,6 +486,13 @@ def _own_browser_pids() -> set:
     return {p.pid for p in _bt._real_profile_chrome_procs if p.poll() is None}
 
 
+def _live_holders(copy_dir: str) -> list:
+    """Browser processes on ``copy_dir`` whose owner is alive (ours, or another Hermes's): the ones
+    an orphan sweep leaves running, so the ones a snapshot overlay must never run under."""
+    own = _own_browser_pids()
+    return [p for p in _browsers_on_data_dir(copy_dir) if p.pid in own or not _is_orphan(p)]
+
+
 def _terminate_orphaned_browsers_on_dir(copy_dir: str) -> int:
     """Terminate browsers holding ``copy_dir`` whose launching Hermes died. A holder whose owner is
     alive (another Hermes process sharing this home) is left alone."""
@@ -612,6 +645,18 @@ def _real_profile_cdp() -> tuple:
         # sharing this home) re-attach rather than overlay a live profile.
         _terminate_orphaned_browsers_on_dir(copy_dir)
         surviving = _surviving_chrome_cdp(copy_dir)
+        if not surviving and _live_holders(copy_dir):
+            # Still running, just not answering: a busy Mac or a stalled page holds a live
+            # browser's DevTools past the one- and two-second probes above (measured: a stopped
+            # driven browser fails both while its processes are still on the copy dir). It is
+            # NOT gone, and overlaying the snapshot under it is exactly the CRITICAL case above —
+            # on 2026-09-24 that re-sync ran three times under the live browser and reported
+            # "3 database(s) unavailable". Wait for it, never write under it.
+            surviving = _await_surviving_chrome_cdp(copy_dir)
+            if not surviving and _live_holders(copy_dir):
+                return None, (_RP + f"the agent's browser is still running but has not answered for "
+                              f"{_BUSY_BROWSER_WAIT_S:.0f}s (the Mac may be busy, or a page is stuck). "
+                              "Nothing was changed; retry in a moment.")
         if surviving:
             _fidelity.ensure_keeper(int(surviving.rsplit(":", 1)[1]), lambda: _persons_identity(browser))
             cdp, err = _attach_agent_browser_to_real_profile(int(surviving.rsplit(":", 1)[1]), copy_dir)
@@ -624,6 +669,11 @@ def _real_profile_cdp() -> tuple:
         copy_dir, err = snapshot_real_profile(browser)
         if err or not copy_dir:
             return None, _real_profile_snapshot_error(err)
+        from hermes_cli.browser_connect import pop_snapshot_note
+        note = pop_snapshot_note(browser)
+        _pending_notes.clear()  # only this launch's note is true now
+        if note:
+            _pending_notes.append(note)
         real_binary = chromium_executable(browser)
         if real_binary is None:
             return None, f"{_RP}the real browser binary for '{browser}' could not be found. Reinstall it or turn the toggle off."
