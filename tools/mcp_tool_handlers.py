@@ -724,13 +724,18 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # Composio's expensive defaults, filled in only where the caller left
         # the parameter out. This is the one seam both invocation paths cross:
         # `args` is read exactly once below, at session.call_tool().
-        args, _defaults_note = _apply_composio_defaults(server, tool_name, args)
+        # A Composio tool Hermes offers by name on a multi-account session
+        # (tools/mcp_composio_proxy.py) is sent through the multiplexer; the
+        # defaults below then see it the way they see any muxed call.
+        from tools import mcp_composio_proxy as _proxy
+        call_name, args = _proxy.rewrite(server, tool_name, args)
+        args, _defaults_note = _apply_composio_defaults(server, call_name, args)
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
-                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                    result = await _call_tool_racing_stdio_death(server, server_name, call_name, args)
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy

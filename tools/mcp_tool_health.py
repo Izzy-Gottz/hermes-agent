@@ -138,6 +138,8 @@ class MCPServerHealthMixin:
             old_tool_names = set(self._registered_tool_names)
             async with self._rpc_lock:
                 new_mcp_tools = await _core._paginate_full_list(self.session.list_tools, "tools", self.name)
+                from tools import mcp_composio_proxy as _proxy
+                new_mcp_tools = await _proxy.augment(self, new_mcp_tools)
             # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
             # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
             self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})

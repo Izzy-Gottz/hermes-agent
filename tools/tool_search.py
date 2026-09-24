@@ -521,6 +521,8 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
             errors[name] = (
                 f"'{name}' is not a deferrable tool. If you see it in the tools list "
                 "already, call it directly; otherwise check the spelling against tool_search.")
+        elif _composio_route_hint(name):
+            errors[name] = f"'{name}' is not a tool here." + _composio_route_hint(name)
         else:
             not_found.append(name)
     result: Dict[str, Any] = {"tools": tools}
@@ -530,6 +532,32 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
     if errors:
         result["errors"] = errors
     return json.dumps(result, ensure_ascii=False)
+
+
+def _composio_route_hint(name: str) -> str:
+    """For an unregistered Composio-looking name: the route that does exist.
+
+    Moe ticket #12: asked to send mail, a model called
+    ``mcp__composio__GMAIL_SEND_EMAIL`` three ways -- a slug Composio has but
+    this session never listed -- and was told it was "not a deferrable tool,
+    call it directly", which sent it round in a circle. Every Composio action
+    runs through the server's COMPOSIO_MULTI_EXECUTE_TOOL; say that, with the
+    exact registered name.
+    """
+    slug = str(name or "").rsplit("__", 1)[-1].rsplit("composio_", 1)[-1]
+    if "composio" not in str(name or "").lower() or not slug.isupper():
+        return ""
+    try:
+        from tools.registry import registry
+        muxes = [n for n in registry.get_all_tool_names() if n.endswith("COMPOSIO_MULTI_EXECUTE_TOOL")]
+    except Exception:
+        muxes = []
+    if not muxes:
+        return ""
+    return (f" '{slug}' is a Composio action this session does not list as its own tool: run it "
+            f"through {muxes[0]} with tools=[{{\"tool_slug\": \"{slug}\", \"arguments\": {{...}}, "
+            f"\"account\": \"<the account's email, optional>\"}}]. Its parameters come from "
+            f"COMPOSIO_SEARCH_TOOLS or COMPOSIO_GET_TOOL_SCHEMAS.")
 
 
 def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
@@ -571,6 +599,8 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     name = entries[0]["name"]
     raw_args = entries[0]["arguments"]
     if not is_deferrable_tool_name(name, load_config_readonly().effective_defer_tools):
+        if _registry_entry(name) is None and _composio_route_hint(name):
+            return None, {}, f"'{name}' is not a tool here." + _composio_route_hint(name)
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
