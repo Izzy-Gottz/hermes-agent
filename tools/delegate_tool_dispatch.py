@@ -368,11 +368,18 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         goals=[t["goal"] for t in unit.task_list], context=unit.context,
         toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
         role=unit.top_role, model=unit.creds["model"],
-        runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
+        runner=lambda: _run_detached(unit),
         interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
     )
+
+def _run_detached(unit: _Batch) -> dict:
+    """Run one async unit marked as detached: its children finish after the turn that started them."""
+    from agent.delegation_context import detached_delegation_context
+    with detached_delegation_context():
+        return _execute_and_aggregate(unit, honor_parent_interrupt=False)
+
 
 def _dispatch_background(batch: _Batch) -> str:
     """Dispatch the call as independent async units (see ``_units_of``) and return the tool result JSON. Every unit

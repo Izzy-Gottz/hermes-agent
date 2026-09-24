@@ -45,6 +45,27 @@ def is_delegated_child_context() -> bool:
     return bool(_DELEGATED_CHILD_CONTEXT.get())
 
 
+# Children of a DETACHED (background) delegation: they run after the turn that started them may have
+# ended, with no person waiting, yet inherit that turn's context (platform, turn origin). Set around the
+# async runner so every child copied from it carries it; read by presence checks that must not treat
+# such work as the person's live turn (tools.browser_chrome_extension.local_turn_presence).
+_DETACHED_DELEGATION_CONTEXT: ContextVar[bool] = ContextVar("hermes_detached_delegation_context", default=False)
+
+
+@contextmanager
+def detached_delegation_context() -> Iterator[None]:
+    token = _DETACHED_DELEGATION_CONTEXT.set(True)
+    try:
+        yield
+    finally:
+        _DETACHED_DELEGATION_CONTEXT.reset(token)
+
+
+def is_detached_delegation_context() -> bool:
+    """True inside a background (detached) delegate_task run and everything it spawns."""
+    return bool(_DETACHED_DELEGATION_CONTEXT.get())
+
+
 def enter_non_dispatcher_owned_context() -> Token[bool]:
     """Token form of :func:`non_dispatcher_owned_context` for long try/finally scopes."""
     return _NON_DISPATCHER_OWNED_CONTEXT.set(True)

@@ -178,6 +178,13 @@ def not_connected_error() -> str:
 _UNATTENDED_PLATFORMS = frozenset({"webhook", "msgraph_webhook"})
 #: Surfaces a person drives directly at this machine.
 _LOCAL_SURFACES = frozenset({"cli", "tui", "desktop", "local"})
+#: Chat channels where the message IS the person writing to Moe, now. An ALLOWLIST: email, sms,
+#: homeassistant, wecom_callback, relay and anything new are not live — an inbound email is somebody
+#: else's words, and an unknown platform is not proof of a person.
+_LIVE_CHAT_PLATFORMS = frozenset({
+    "telegram", "whatsapp", "whatsapp_cloud", "signal", "discord", "slack", "matrix", "mattermost",
+    "bluebubbles",
+})
 
 
 def _truthy(value: object) -> bool:
@@ -197,6 +204,14 @@ def local_turn_presence() -> dict:
 
     if _truthy(get_session_env("HERMES_CRON_SESSION", "")):
         return {"live": False, "why": "a scheduled job"}
+    try:
+        from agent.delegation_context import is_delegated_child_context, is_detached_delegation_context
+        if is_detached_delegation_context():
+            # Inherits the starting turn's context but may finish long after it, with nobody there.
+            return {"live": False, "why": "a background helper started earlier"}
+        helper = is_delegated_child_context()
+    except Exception:
+        helper = False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return {"live": False, "why": "a background worker"}
     platform = str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
@@ -206,16 +221,26 @@ def local_turn_presence() -> dict:
     if platform == "api_server":
         origin = get_turn_origin()
         if origin == TURN_ORIGIN_PERSON:
-            return {"live": True, "why": "the person's own turn"}
+            verdict = {"live": True, "why": "the person's own turn"}
+            return _as_helper(verdict) if helper else verdict
         if origin == TURN_ORIGIN_BACKGROUND:
             return {"live": False, "why": "a background note from the app"}
         return {"live": False, "why": "an API turn whose client did not say a person started it"}
     if platform in _LOCAL_SURFACES or (not platform and source in _LOCAL_SURFACES):
-        return {"live": True, "why": "the person's own turn"}
-    if platform:
-        # A human messaging channel (Telegram, WhatsApp, ...): the person's own message.
-        return {"live": True, "why": "the person's message"}
-    return {"live": False, "why": "a turn whose origin could not be established"}
+        verdict = {"live": True, "why": "the person's own turn"}
+    elif platform in _LIVE_CHAT_PLATFORMS:
+        verdict = {"live": True, "why": "the person's message"}
+    elif platform:
+        return {"live": False, "why": f"a {platform.replace('_', ' ')} turn"}
+    else:
+        return {"live": False, "why": "a turn whose origin could not be established"}
+    return _as_helper(verdict) if helper else verdict
+
+
+def _as_helper(verdict: dict) -> dict:
+    """A synchronous helper working inside a person's live turn: an explicit where="chrome" may run
+    (the person is waiting on this very turn), but nothing is routed to their Chrome on a guess."""
+    return {**verdict, "auto": False, "why": "a helper working on the person's turn"}
 
 
 def _in_tools_mcp_server() -> bool:
@@ -237,7 +262,10 @@ def turn_presence() -> dict:
             return {"live": False, "why": "a turn whose origin could not be established (no bridge to the agent)"}
         answer = json.loads(call_bridged_tool(TURN_PRESENCE_QUERY, {}, timeout=15))
         if isinstance(answer, dict) and isinstance(answer.get("live"), bool):
-            return {"live": answer["live"], "why": str(answer.get("why") or "")}
+            out = {"live": answer["live"], "why": str(answer.get("why") or "")}
+            if answer.get("auto") is False:
+                out["auto"] = False
+            return out
     except Exception as exc:
         logger.debug("turn presence query failed: %s", exc)
     return {"live": False, "why": "a turn whose origin could not be established (the agent did not answer)"}
@@ -330,8 +358,8 @@ def choose_lane(where: str, code: str, *, task_id: Optional[str], session: str, 
     if not lane_enabled(browser_cfg):
         return LANE_OWN, "lane disabled"
     presence = turn_presence() if presence is None else presence
-    if not presence.get("live"):
-        # Not a person's own live turn: never open tabs in the person's Chrome on a guess.
+    if not presence.get("live") or presence.get("auto") is False:
+        # Not a person's own live turn (or a helper inside one): never open tabs in their Chrome on a guess.
         return LANE_OWN, f"{presence.get('why') or 'this turn'} never routes to the person's Chrome by itself"
     hosts = hosts_in_code(code)
     if not hosts:

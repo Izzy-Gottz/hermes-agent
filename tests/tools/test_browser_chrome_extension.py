@@ -333,3 +333,71 @@ def test_where_is_in_the_schema_only_when_the_lane_is_on(monkeypatch):
 def test_file_access_on_is_a_warning_for_the_app():
     assert lane.bridge_warnings({"extension": {"fileAccess": False}}) == []
     assert [w["code"] for w in lane.bridge_warnings({"extension": {"fileAccess": True}})] == ["file_access_on"]
+
+
+@pytest.mark.parametrize("platform", ["email", "sms", "relay", "homeassistant", "wecom_callback", "brand_new_platform"])
+def test_unlisted_platforms_are_not_live(platform):
+    bound = _bind(platform, "", "")
+    try:
+        p = lane.local_turn_presence()
+        assert p["live"] is False, p
+        assert choose("", 'new_tab("https://x.com/explore")') == "own"
+    finally:
+        _unbind(bound)
+
+
+def _presence_in_child(detached: bool):
+    """Run a child exactly as delegate_task does: a copy_context() thread inside delegated_child_context,
+    under the detached runner for background units."""
+    import contextvars
+    import threading
+    from agent.delegation_context import delegated_child_context
+    from tools import delegate_tool_dispatch as dispatch
+
+    seen = {}
+
+    def child():
+        with delegated_child_context("child-1"):
+            seen["p"] = lane.local_turn_presence()
+            seen["lane"] = choose("", 'new_tab("https://x.com/explore")')
+
+    def fake_execute(unit, honor_parent_interrupt=True):
+        t = threading.Thread(target=contextvars.copy_context().run, args=(child,))
+        t.start()
+        t.join()
+        return {}
+
+    orig = dispatch._execute_and_aggregate
+    dispatch._execute_and_aggregate = fake_execute
+    try:
+        if detached:
+            dispatch._run_detached(object())   # the background runner _dispatch_unit hands the registry
+        else:
+            fake_execute(object())              # the synchronous path: children joined inside the turn
+    finally:
+        dispatch._execute_and_aggregate = orig
+    return seen
+
+
+def test_a_detached_background_helper_is_not_live():
+    seen = _presence_in_child(detached=True)
+    assert seen["p"] == {"live": False, "why": "a background helper started earlier"}
+    assert seen["lane"] == "own"
+
+
+def test_a_synchronous_helper_of_a_live_turn_never_auto_routes_but_may_ask():
+    seen = _presence_in_child(detached=False)
+    assert seen["p"]["live"] is True and seen["p"]["auto"] is False
+    assert seen["lane"] == "own"                          # no auto-routing from a helper
+    assert lane.choose_lane("chrome", "print(1)", task_id="t", session="", browser_cfg=ON, connected=True,
+                            presence=seen["p"])[0] == "chrome"
+
+
+def test_explicit_chrome_from_a_synchronous_helper_runs(tmp_path, cli):
+    from agent.delegation_context import delegated_child_context
+    _write_bridge(tmp_path)
+    with delegated_child_context("child-1"):
+        out = json.loads(bu.browser_exec('print(1)', task_id="t", where="chrome"))
+        auto = json.loads(bu.browser_exec('new_tab("https://x.com/explore")', task_id="t2"))
+    assert out["lane"] == "chrome"
+    assert auto["lane"] == "own"
