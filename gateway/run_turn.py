@@ -2190,8 +2190,13 @@ class GatewayTurnMixin:
                     # See #60955.
                     fallback_model=self._refresh_fallback_model(),
                 )
+                # Detached, like an async delegate_task: this runs on a copy of the chat's context
+                # (platform, turn origin) but may finish long after the person has gone, so presence
+                # checks (tools.browser_chrome_extension.local_turn_presence) must not call it live.
+                from agent.delegation_context import detached_delegation_context
                 try:
-                    return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
+                    with detached_delegation_context():
+                        return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
                 finally:
                     self._cleanup_agent_resources(agent)
 

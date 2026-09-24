@@ -297,3 +297,46 @@ class TestHandleBtwCommand:
         event = _make_event(text="/btw what?")
         result = await runner._handle_btw_command(event)
         assert "❌" in result
+
+
+# ---------------------------------------------------------------------------
+# /background is detached: never the person's live turn
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_background_task_runs_detached_so_it_never_reaches_the_persons_chrome():
+    """/background copies the chat's context but may finish long after the person has gone; like an
+    async delegate_task it runs detached, so the Chrome lane's presence check says not live."""
+    from agent.delegation_context import is_detached_delegation_context
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.browser_chrome_extension import local_turn_presence
+
+    runner = _make_runner()
+    mock_adapter = AsyncMock()
+    mock_adapter.send = AsyncMock()
+    mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+    mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+    runner.adapters[Platform.TELEGRAM] = mock_adapter
+    source = SessionSource(platform=Platform.TELEGRAM, user_id="12345", chat_id="67890", user_name="testuser")
+    seen = {}
+
+    def run_conversation(**_kw):
+        seen["detached"] = is_detached_delegation_context()
+        seen["presence"] = local_turn_presence()
+        return {"final_response": "done", "messages": []}
+
+    tokens = set_session_vars(platform="telegram")   # the chat it was started from is a live platform
+    try:
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            agent = MagicMock()
+            agent.run_conversation.side_effect = run_conversation
+            MockAgent.return_value = agent
+            await runner._run_background_task("open x.com", source, "bg_detached")
+    finally:
+        clear_session_vars(tokens)
+
+    assert seen.get("detached") is True, seen
+    assert seen["presence"]["live"] is False, seen

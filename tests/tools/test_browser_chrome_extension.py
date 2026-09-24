@@ -367,16 +367,82 @@ def _presence_in_child(detached: bool):
         t.join()
         return {}
 
-    orig = dispatch._execute_and_aggregate
+    import types
+    from tools import async_delegation
+
+    def fake_registry(*, runner, **_kw):
+        # The async registry runs the unit's runner later, on its own thread: whatever _dispatch_unit
+        # wired in is what runs. Unwire _run_detached there and this child reads as the person's turn.
+        t = threading.Thread(target=contextvars.copy_context().run, args=(runner,))
+        t.start()
+        t.join()
+        return {"status": "dispatched"}
+
+    unit = types.SimpleNamespace(children=[(0, {"goal": "g"}, object())], task_list=[{"goal": "g"}],
+                                 context=None, top_role="leaf", creds={"model": "m"})
+    orig, orig_reg = dispatch._execute_and_aggregate, async_delegation.dispatch_async_delegation_batch
     dispatch._execute_and_aggregate = fake_execute
+    async_delegation.dispatch_async_delegation_batch = fake_registry
     try:
         if detached:
-            dispatch._run_detached(object())   # the background runner _dispatch_unit hands the registry
+            dispatch._dispatch_unit(unit, "u1", "slot", {})   # the real background dispatch path
+            assert seen, "the registry never ran the unit"
         else:
             fake_execute(object())              # the synchronous path: children joined inside the turn
     finally:
         dispatch._execute_and_aggregate = orig
+        async_delegation.dispatch_async_delegation_batch = orig_reg
     return seen
+
+
+def _bridge_agent():
+    import contextvars
+    import types
+    agent = types.SimpleNamespace()
+    agent._turn_context = contextvars.copy_context()   # snapshot of a person's live api_server turn
+    return agent
+
+
+def test_presence_through_the_bridge_is_live_only_while_the_turn_runs(monkeypatch):
+    """The claude child outlives the turn; a native background subagent asking after it ended must not
+    read the person's snapshot as live."""
+    from agent import claude_code_runtime as rt
+    from agent.transports.hermes_tool_bridge import TURN_PRESENCE_QUERY
+    agent = _bridge_agent()
+    dispatch = rt.make_tool_bridge_dispatch(agent)
+    seen = {}
+
+    def body(agent, **_kw):
+        seen["during"] = json.loads(dispatch(TURN_PRESENCE_QUERY, {}))
+        return {}
+
+    monkeypatch.setattr(rt, "_run_claude_code_turn_body", body)
+    rt.run_claude_code_turn(agent, user_message="hi", original_user_message="hi", messages=[],
+                            effective_task_id="t")
+    assert seen["during"]["live"] is True
+    after = json.loads(dispatch(TURN_PRESENCE_QUERY, {}))
+    assert after == {"live": False, "why": "a turn that has already ended"}
+
+
+def test_presence_through_the_bridge_fails_closed_when_the_turn_raised(monkeypatch):
+    from agent import claude_code_runtime as rt
+    from agent.transports.hermes_tool_bridge import TURN_PRESENCE_QUERY
+    agent = _bridge_agent()
+
+    def body(agent, **_kw):
+        raise RuntimeError("child died")
+
+    monkeypatch.setattr(rt, "_run_claude_code_turn_body", body)
+    with pytest.raises(RuntimeError):
+        rt.run_claude_code_turn(agent, user_message="hi", original_user_message="hi", messages=[],
+                                effective_task_id="t")
+    assert json.loads(rt.make_tool_bridge_dispatch(agent)(TURN_PRESENCE_QUERY, {}))["live"] is False
+
+
+def test_presence_through_the_bridge_is_not_live_before_any_turn():
+    from agent import claude_code_runtime as rt
+    from agent.transports.hermes_tool_bridge import TURN_PRESENCE_QUERY
+    assert json.loads(rt.make_tool_bridge_dispatch(_bridge_agent())(TURN_PRESENCE_QUERY, {}))["live"] is False
 
 
 def test_a_detached_background_helper_is_not_live():

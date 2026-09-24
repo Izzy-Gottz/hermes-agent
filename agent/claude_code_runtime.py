@@ -1337,6 +1337,10 @@ def make_tool_bridge_dispatch(agent):
             # Asked by the child's MCP server: who started the turn that is running now. Answered
             # from this turn's own contextvars (the snapshot above), never from process env.
             import json as _json
+            if getattr(agent, "_turn_live", False) is not True:
+                # The turn this snapshot belongs to has ended (or never ran here): whoever asks now —
+                # a background subagent of the claude child, say — is not the person's live turn.
+                return _json.dumps({"live": False, "why": "a turn that has already ended"})
             from tools.browser_chrome_extension import local_turn_presence
             return _json.dumps(local_turn_presence())
         from gateway.session_context import session_history_delivery_supported
@@ -1441,7 +1445,22 @@ def _build_session(agent, *, session_key: Optional[str] = _UNSET):
     )
 
 
-def run_claude_code_turn(
+def run_claude_code_turn(agent, **kwargs) -> Dict[str, Any]:
+    """Run one turn through the Claude Code subprocess (see ``_run_claude_code_turn_body``).
+
+    Marks the turn live for its duration and ended in ``finally``: the ``claude`` child outlives the
+    turn, and a native background subagent it started can ask ``__turn_presence__`` after the person
+    has gone. The context snapshot stays (other bridged tools need its session id), but presence then
+    fails closed — see make_tool_bridge_dispatch.
+    """
+    agent._turn_live = True
+    try:
+        return _run_claude_code_turn_body(agent, **kwargs)
+    finally:
+        agent._turn_live = False
+
+
+def _run_claude_code_turn_body(
     agent,
     *,
     user_message: str,
