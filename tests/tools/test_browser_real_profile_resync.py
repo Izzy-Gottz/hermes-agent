@@ -356,6 +356,9 @@ class TestAcquireNeverOverlaysALiveBrowser:
         assert terminated, "our wedged browser was not terminated"
         snapshot.assert_called_once()
         assert err is None and cdp and [a[0] for a in launches] == [base.TestRealProfileCdpLaunch.PERSON, base.TestRealProfileCdpLaunch.DRIVEN]
+        # The model is told its pages are gone, once, so it checks before resubmitting a form.
+        assert bt_real_profile.take_restart_note() == bt_real_profile.RESTART_NOTE
+        assert bt_real_profile.take_restart_note() is None
         self._reset()
 
     def test_a_wedged_browser_that_is_not_ours_is_never_terminated(self, tmp_path):
@@ -371,4 +374,21 @@ class TestAcquireNeverOverlaysALiveBrowser:
             patch("hermes_cli.browser_connect.snapshot_real_profile", snapshot)])
         terminate.assert_not_called()
         snapshot.assert_not_called()
+        assert bt_real_profile.take_restart_note() is None
         assert cdp is None and "still running" in err
+
+
+def test_browser_exec_result_carries_the_restart_note_once(tmp_path, monkeypatch):
+    """The note reaches the model in the browser_exec result right after the restart, and only then."""
+    import json as _json
+    from tests.tools.test_browser_use_cli import _fake_cli
+    from tools import browser_use_cli as bu_cli
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"browser": {"backend": "browser-use"}})
+    monkeypatch.setattr(bu_cli, "_find_cli", lambda: [_fake_cli(tmp_path, 'cat > /dev/null\necho ok\n')])
+    bt_real_profile._restart_notes[:] = [bt_real_profile.RESTART_NOTE]
+    first = _json.loads(bu_cli.browser_exec("print(1)"))
+    second = _json.loads(bu_cli.browser_exec("print(1)"))
+    assert first.get("note") == bt_real_profile.RESTART_NOTE
+    assert "resubmitting" in first["note"]
+    assert "note" not in second
+
