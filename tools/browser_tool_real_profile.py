@@ -103,19 +103,6 @@ def _read_devtools_port(data_dir: str) -> Optional[str]:
 # How long a browser still running on the copy dir may take to answer DevTools before the
 # acquire gives up (without touching it or its profile).
 _BUSY_BROWSER_WAIT_S = 20.0
-# Notes for the model from the last launch (e.g. "using your sign-ins from 12:39"), taken once.
-_pending_notes: List[str] = []
-
-
-def take_real_profile_note() -> Optional[str]:
-    """The note(s) the last real-profile launch left for the model, once; None when there are none."""
-    if not _pending_notes:
-        return None
-    text = " ".join(dict.fromkeys(_pending_notes))
-    _pending_notes.clear()
-    return text
-
-
 def _await_surviving_chrome_cdp(data_dir: str, wait: Optional[float] = None) -> Optional[str]:
     """Poll :func:`_surviving_chrome_cdp` until it answers, the browser exits, or ``wait`` runs out."""
     deadline = time.monotonic() + (_BUSY_BROWSER_WAIT_S if wait is None else wait)
@@ -124,6 +111,13 @@ def _await_surviving_chrome_cdp(data_dir: str, wait: Optional[float] = None) -> 
         if cdp or not _live_holders(data_dir) or time.monotonic() >= deadline:
             return cdp
         time.sleep(0.5)
+
+
+def _await_holders_gone(data_dir: str, wait: float = 10.0) -> None:
+    """Poll until no live browser holds ``data_dir`` (a terminated one takes a moment to exit)."""
+    deadline = time.monotonic() + wait
+    while _live_holders(data_dir) and time.monotonic() < deadline:
+        time.sleep(0.25)
 
 
 def _surviving_chrome_cdp(data_dir: str) -> Optional[str]:
@@ -653,7 +647,18 @@ def _real_profile_cdp() -> tuple:
             # on 2026-09-24 that re-sync ran three times under the live browser and reported
             # "3 database(s) unavailable". Wait for it, never write under it.
             surviving = _await_surviving_chrome_cdp(copy_dir)
-            if not surviving and _live_holders(copy_dir):
+            holders = [] if surviving else _live_holders(copy_dir)
+            own = _own_browser_pids()
+            if any(p.pid in own for p in holders):
+                # OURS and wedged: left alone it would cost every later call the same wait until
+                # Hermes restarts. Restart it (the snapshot + launch below). Never another's.
+                _bt.logger.warning("real-profile: the driven browser on %s has not answered for %.0fs; "
+                                   "restarting it", copy_dir, _BUSY_BROWSER_WAIT_S)
+                _terminate_real_profile_chrome()
+                _bt._real_profile_cdp_cache.pop("cdp", None)
+                _await_holders_gone(copy_dir)
+                holders = _live_holders(copy_dir)
+            if holders:
                 return None, (_RP + f"the agent's browser is still running but has not answered for "
                               f"{_BUSY_BROWSER_WAIT_S:.0f}s (the Mac may be busy, or a page is stuck). "
                               "Nothing was changed; retry in a moment.")
@@ -669,11 +674,6 @@ def _real_profile_cdp() -> tuple:
         copy_dir, err = snapshot_real_profile(browser)
         if err or not copy_dir:
             return None, _real_profile_snapshot_error(err)
-        from hermes_cli.browser_connect import pop_snapshot_note
-        note = pop_snapshot_note(browser)
-        _pending_notes.clear()  # only this launch's note is true now
-        if note:
-            _pending_notes.append(note)
         real_binary = chromium_executable(browser)
         if real_binary is None:
             return None, f"{_RP}the real browser binary for '{browser}' could not be found. Reinstall it or turn the toggle off."

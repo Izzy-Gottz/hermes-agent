@@ -5,9 +5,12 @@ What failed on 2026-09-24 (measured, not assumed): the driven browser stalled fo
 one- and two-second DevTools probes read the stalled-but-alive browser as gone, so the per-launch
 re-sync ran UNDER it. The copy-browser holds its own Login Data / Login Data For Account / Web Data
 in SQLite exclusive locking mode, the destination probe refused all three, and the call failed with
-"3 database(s) unavailable. Close chrome and retry" — three times in four minutes, while a signed-in
-complete snapshot sat right there. These tests use real SQLite locks held by a second connection,
-the way Chrome holds them, not mocks of the copy.
+"3 database(s) unavailable. Close chrome and retry" — three times in four minutes. Those three DBs
+never reach the driven browser anyway: the hand-over reads the COOKIE JAR with the person's own
+browser and then deletes the copy's Cookies / Login Data / Web Data
+(``_forget_keychain_bound_auth_files``); the driven browser recreates its own. So the fixtures run
+that real sequence, and only the jar decides. Real SQLite locks held by a second connection, the
+way Chrome holds them, not mocks of the copy.
 """
 
 import contextlib
@@ -38,6 +41,9 @@ def _read(path):
         return conn.execute("select value from marker").fetchone()[0]
 
 
+JAR = os.path.join("Network", "Cookies")
+
+
 def _profile(root):
     (root / "Default" / "Network").mkdir(parents=True)
     (root / "Local State").write_text(json.dumps({"profile": {"last_used": "Default"}}))
@@ -63,52 +69,61 @@ def _hold(path, *, write):
 
 
 @pytest.fixture
-def first_snapshot(tmp_path, monkeypatch):
+def handed_over(tmp_path, monkeypatch):
+    """The production sequence: first snapshot, the hand-over's forget, then the driven browser
+    recreating its own auth DBs (sealed to its own mock keychain) in the copy."""
     src = _profile(tmp_path / "real")
     home = tmp_path / "hh"
     monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
-    getattr(bc, "_stale_logged", {}).clear()  # getattr: so a revert fails on behaviour, not a name
     dst, err = bc.snapshot_real_profile("chrome", src=str(src))
     assert err is None and dst
-    getattr(bc, "pop_snapshot_note", lambda b: None)("chrome")
+    bt_real_profile._forget_keychain_bound_auth_files(dst)
+    for rel in (JAR, *AUTH_DBS):
+        assert not os.path.exists(os.path.join(dst, "Default", rel)), f"hand-over kept {rel}"
+        _db(os.path.join(dst, "Default", rel), f"DRIVEN-{rel}")
     return src, dst
 
 
 class TestResyncUnderALiveCopyBrowser:
-    def test_copy_held_by_a_browser_that_wrote_it_keeps_the_last_complete_snapshot(self, first_snapshot, caplog):
-        """The incident: all three auth DBs of the COPY held (written) by the live driven browser.
-        Before the fix: "(3 database(s) unavailable). Close chrome and retry". Now: the complete,
-        signed-in snapshot is used, the model gets a one-line note, and nobody is told to close
-        Chrome."""
-        src, dst = first_snapshot
-        for name in AUTH_DBS:
-            _db(src / "Default" / name, f"{name}-v2")  # the person's Chrome moved on
+    def test_copy_browser_holding_its_login_data_does_not_fail_the_launch(self, handed_over, caplog):
+        """The incident's three DBs, write-held by the driven browser. Before: "(3 database(s)
+        unavailable). Close chrome and retry". They are the driven browser's own files and the
+        hand-over discards them, so the re-sync goes on — and claims nothing about them."""
+        src, dst = handed_over
+        _db(src / "Default" / JAR, "cookies-v2")  # the person signed in somewhere new
         holders = [_hold(os.path.join(dst, "Default", name), write=True) for name in AUTH_DBS]
         try:
-            with caplog.at_level("WARNING", logger=bc.logger.name):
+            with caplog.at_level("INFO", logger=bc.logger.name):
                 got, err = bc.snapshot_real_profile("chrome", src=str(src))
-                again, err2 = bc.snapshot_real_profile("chrome", src=str(src))
         finally:
             for h in holders:
                 h.close()
         assert err is None and got == dst, err
-        assert err2 is None and again == dst
-        note = bc.pop_snapshot_note("chrome")
-        taken = time.strftime("%H:%M", time.localtime(os.path.getmtime(os.path.join(dst, bc._SNAPSHOT_DONE_MARKER))))
-        assert note == f"using your sign-ins from {taken}; a newer copy couldn't be read while Chrome was writing"
-        assert "close" not in note.lower()
-        stale_lines = [r for r in caplog.records if "complete snapshot from" in r.getMessage()]
-        assert len(stale_lines) == 1, "logged once, not once per launch"
-        for name in AUTH_DBS:  # untouched: still the signed-in v1 copy, plus the holder's own write
-            assert _read(os.path.join(dst, "Default", name)) == f"{name}-v1"
-        # Cookies are not held and still refresh.
-        assert _read(os.path.join(dst, "Default", "Network", "Cookies")) == "cookies-v1"
+        assert _read(os.path.join(dst, "Default", JAR)) == "cookies-v2", "the jar is the person's, fresh"
+        for name in AUTH_DBS:
+            assert _read(os.path.join(dst, "Default", name)) == f"DRIVEN-{name}"  # untouched
+        assert any("hand-over discards them" in r.getMessage() for r in caplog.records)
+        assert not hasattr(bc, "pop_snapshot_note"), "no note may claim stale sign-ins"
 
-    def test_a_db_the_browser_has_only_read_is_not_replaced_under_it(self, first_snapshot):
+    def test_an_unreadable_cookie_jar_fails_closed_without_close_chrome(self, handed_over):
+        """The jar is the only thing that signs the driven browser in, and after the hand-over
+        there is no older jar of the person's to fall back on (the copy's is the driven browser's
+        own). Unreadable -> fail closed, honestly."""
+        src, dst = handed_over
+        holder = _hold(os.path.join(dst, "Default", JAR), write=True)
+        try:
+            got, err = bc.snapshot_real_profile("chrome", src=str(src))
+        finally:
+            holder.close()
+        assert got is None
+        assert "cookie jar" in err and "close" not in err.lower()
+        assert _read(os.path.join(dst, "Default", JAR)) == f"DRIVEN-{JAR}"
+
+    def test_a_db_the_browser_has_only_read_is_not_replaced_under_it(self, handed_over):
         """SHARED only (Chrome read its Login Data, never wrote it): the old BEGIN IMMEDIATE probe
         passed, and the copy unlinked the file out from under the live browser (measured against a
         real Chrome for Testing on the copy dir). The file the browser has open must stay the file."""
-        src, dst = first_snapshot
+        src, dst = handed_over
         target = os.path.join(dst, "Default", "Login Data")
         inode = os.stat(target).st_ino
         holder = _hold(target, write=False)
@@ -118,51 +133,54 @@ class TestResyncUnderALiveCopyBrowser:
         finally:
             holder.close()
         assert err is None and got == dst
-        assert bc.pop_snapshot_note("chrome")
 
-    def test_a_clean_resync_leaves_no_note_and_refreshes(self, first_snapshot):
-        src, dst = first_snapshot
-        _db(src / "Default" / "Login Data", "Login Data-v2")
+    def test_a_clean_resync_refreshes_the_jar(self, handed_over):
+        src, dst = handed_over
+        _db(src / "Default" / JAR, "cookies-v2")
         got, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None and got == dst
-        assert bc.pop_snapshot_note("chrome") is None
-        assert _read(os.path.join(dst, "Default", "Login Data")) == "Login Data-v2"
+        assert _read(os.path.join(dst, "Default", JAR)) == "cookies-v2"
 
 
-class TestFirstSnapshotStillFails:
-    def test_first_snapshot_that_cannot_read_login_data_fails_closed(self, tmp_path, monkeypatch):
-        """Nothing complete to fall back on: the person's Chrome holds Web Data and every lock-free
-        read of it comes out torn. Fail, as before — a silently signed-out session is worse than an
-        error. Still no "close Chrome"."""
+def _torn(path):
+    """Fill ``path``'s marker table, hold it as Chrome does, and tear a page — what a lock-free
+    reader sees mid-write. Returns the holder (close it)."""
+    with contextlib.closing(sqlite3.connect(path)) as conn, conn:
+        conn.executemany("insert into marker values(?)", [("x" * 500,)] * 200)
+    holder = _hold(path, write=True)
+    with open(path, "r+b") as fh:
+        fh.seek(4096 * 2 + 16)
+        fh.write(os.urandom(2048))
+    return holder
+
+
+class TestFirstSnapshot:
+    def test_first_snapshot_with_an_unreadable_jar_fails_closed(self, tmp_path, monkeypatch):
+        """Nothing to fall back on: the person's Chrome holds its jar and every lock-free read of it
+        comes out torn. Fail — a silently signed-out session is worse than an error. No "close"."""
         src = _profile(tmp_path / "real")
         home = tmp_path / "hh"
         monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
-        web = src / "Default" / "Web Data"
-        with contextlib.closing(sqlite3.connect(web)) as conn, conn:
-            conn.executemany("insert into marker values(?)", [("x" * 500,)] * 200)
-        holder = _hold(web, write=True)
+        holder = _torn(src / "Default" / JAR)
         try:
-            with open(web, "r+b") as fh:  # mid-write, as a lock-free reader sees it
-                fh.seek(4096 * 2 + 16)
-                fh.write(os.urandom(2048))
             dst, err = bc.snapshot_real_profile("chrome", src=str(src))
         finally:
             holder.close()
         assert dst is None
-        assert "1 database(s) unavailable" in err and "close" not in err.lower()
-        assert bc.pop_snapshot_note("chrome") is None
+        assert "cookie jar" in err and "close" not in err.lower()
         assert not (home / "browser-profile" / "chrome" / bc._SNAPSHOT_DONE_MARKER).exists()
 
-    def test_complete_snapshot_of_another_profile_is_not_a_fallback(self, first_snapshot):
-        src, dst = first_snapshot
-        with open(os.path.join(dst, bc._SNAPSHOT_DONE_MARKER), "w") as fh:
-            fh.write("Profile 6")  # the person has since switched profiles
-        holder = _hold(os.path.join(dst, "Default", "Web Data"), write=True)
+    def test_first_snapshot_with_unreadable_web_data_still_launches(self, tmp_path, monkeypatch):
+        src = _profile(tmp_path / "real")
+        home = tmp_path / "hh"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        holder = _torn(src / "Default" / "Web Data")
         try:
-            got, err = bc.snapshot_real_profile("chrome", src=str(src))
+            dst, err = bc.snapshot_real_profile("chrome", src=str(src))
         finally:
             holder.close()
-        assert got is None and "unavailable" in err
+        assert err is None and dst
+        assert _read(os.path.join(dst, "Default", JAR)) == "cookies-v1"
 
 
 class TestCopyOfADbTheBrowserHolds:
@@ -224,6 +242,60 @@ class TestCopyOfADbTheBrowserHolds:
         assert _read(dst) == "committed"
 
 
+    def test_a_source_that_changed_during_a_whole_looking_copy_is_read_again(self, tmp_path):
+        """A lock-free copy can pass the integrity check and still be a mix of before and after (a
+        commit landing between pages). The source changing underneath is the tell: read again."""
+        src, side = tmp_path / "Web Data", tmp_path / "out.side"
+        _db(src, "before")
+        attempts = []
+
+        def backup(query):
+            with contextlib.closing(sqlite3.connect(src.resolve().as_uri() + query, uri=True)) as a, \
+                    contextlib.closing(sqlite3.connect(side)) as b:
+                a.backup(b)
+            attempts.append(query)
+            if len(attempts) == 1:  # the browser commits while the first copy is being taken
+                time.sleep(0.01)
+                _db(src, "after")
+
+        bc._immutable_copy(str(src), str(side), backup)
+        assert len(attempts) == 2
+        assert _read(side) == "after"
+
+    def test_the_copy_is_swapped_in_whole_never_written_into_the_old_file(self, tmp_path):
+        """A reader of the previous copy (an fd opened before the re-sync) must keep seeing that
+        complete file: the new one arrives by rename, never by writing over the old bytes."""
+        src, dst = tmp_path / "Web Data", tmp_path / "out" / "Web Data"
+        dst.parent.mkdir()
+        _db(dst, "old-copy")
+        with contextlib.closing(sqlite3.connect(src)) as conn, conn:
+            conn.execute("create table marker(value)")
+            conn.executemany("insert into marker values(?)", [("new" * 300,)] * 50)
+        old_bytes = dst.read_bytes()
+        with open(dst, "rb") as reader:
+            assert bc._copy_auth_file(str(src), str(dst)) is True
+            reader.seek(0)
+            assert reader.read() == old_bytes
+        assert _read(dst) == "new" * 300
+
+    def test_a_browser_that_opens_the_copy_after_the_probe_is_not_swapped_under(self, tmp_path, monkeypatch):
+        """The probe and the swap are two steps; a browser opening the destination between them
+        must still block the swap (the swap holds the destination's lock itself)."""
+        src, dst = tmp_path / "Web Data", tmp_path / "out" / "Web Data"
+        dst.parent.mkdir()
+        _db(src, "person")
+        _db(dst, "in-use")
+        monkeypatch.setattr(bc, "_db_in_use", lambda path: False)  # it opened after the probe
+        holder = _hold(dst, write=True)
+        try:
+            assert bc._copy_auth_file(str(src), str(dst)) is False
+            inode = os.stat(dst).st_ino
+        finally:
+            holder.close()
+        assert os.stat(dst).st_ino == inode and _read(dst) == "in-use"
+        assert not os.path.exists(str(dst) + bc._SIDE_COPY_SUFFIX)
+
+
 class TestAcquireNeverOverlaysALiveBrowser:
     """``_real_profile_cdp``: a live browser on the copy dir that does not answer DevTools in time
     is waited for, never snapshotted under. Uses the launch harness of the main suite."""
@@ -264,14 +336,39 @@ class TestAcquireNeverOverlaysALiveBrowser:
         snapshot.assert_not_called()
         attach.assert_called_once()
 
-    def test_stale_snapshot_note_reaches_the_model_once(self, tmp_path):
+    def test_our_own_wedged_browser_is_restarted_not_waited_on_forever(self, tmp_path):
+        """OURS (launched by this Hermes) and still silent after the wait: terminate it and launch
+        afresh, or every later call pays the same wait until Hermes restarts."""
         self._reset()
-        bt_real_profile._pending_notes.clear()
-        bc._snapshot_notes["chrome"] = "using your sign-ins from 12:39; a newer copy couldn't be read while Chrome was writing"
+        ours = self._live()
+        alive = {"v": True}
+        terminated = []
+        snapshot = Mock(return_value=(str(tmp_path), None))
+        launches = []
+        cdp, err = self._run(tmp_path, launches=launches, extra_patches=[
+            patch.object(bt_real_profile, "_BUSY_BROWSER_WAIT_S", 0.3),
+            patch.object(bt_real_profile, "_own_browser_pids", side_effect=lambda: {4242} if alive["v"] else set()),
+            patch.object(bt_real_profile, "_browsers_on_data_dir", side_effect=lambda d: [ours] if alive["v"] else []),
+            patch.object(bt_real_profile, "_surviving_chrome_cdp", return_value=None),
+            patch.object(bt_real_profile, "_terminate_real_profile_chrome",
+                         side_effect=lambda: (terminated.append(4242), alive.update(v=False))),
+            patch("hermes_cli.browser_connect.snapshot_real_profile", snapshot)])
+        assert terminated, "our wedged browser was not terminated"
+        snapshot.assert_called_once()
+        assert err is None and cdp and [a[0] for a in launches] == [base.TestRealProfileCdpLaunch.PERSON, base.TestRealProfileCdpLaunch.DRIVEN]
+        self._reset()
+
+    def test_a_wedged_browser_that_is_not_ours_is_never_terminated(self, tmp_path):
+        self._reset()
+        terminate = Mock()
+        snapshot = Mock(return_value=(str(tmp_path), None))
         cdp, err = self._run(tmp_path, extra_patches=[
-            patch("hermes_cli.browser_connect.snapshot_real_profile",
-                  side_effect=lambda b: (str(tmp_path), None))])
-        assert err is None and cdp
-        assert bt_real_profile.take_real_profile_note().startswith("using your sign-ins from 12:39")
-        assert bt_real_profile.take_real_profile_note() is None
-        self._reset()
+            patch.object(bt_real_profile, "_BUSY_BROWSER_WAIT_S", 0.3),
+            patch.object(bt_real_profile, "_own_browser_pids", return_value=set()),
+            patch.object(bt_real_profile, "_browsers_on_data_dir", return_value=[self._live()]),
+            patch.object(bt_real_profile, "_surviving_chrome_cdp", return_value=None),
+            patch.object(bt_real_profile, "_terminate_real_profile_chrome", terminate),
+            patch("hermes_cli.browser_connect.snapshot_real_profile", snapshot)])
+        terminate.assert_not_called()
+        snapshot.assert_not_called()
+        assert cdp is None and "still running" in err

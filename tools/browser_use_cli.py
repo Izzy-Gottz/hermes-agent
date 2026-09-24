@@ -665,9 +665,6 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error(f"Failed to launch browser-use CLI: {e}")
 
     result = {"success": proc.returncode == 0, "exit_code": proc.returncode, "output": proc.stdout}
-    rp_note = _lazy_call("tools.browser_tool_real_profile", "take_real_profile_note", None, "real-profile note lookup failed")
-    if rp_note:
-        result["note"] = rp_note
     if lane == chrome_lane.LANE_CHROME or chrome_lane.lane_enabled(browser_cfg):
         result["lane"] = lane
         if lane == chrome_lane.LANE_CHROME and not where:
