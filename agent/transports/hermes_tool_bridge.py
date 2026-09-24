@@ -218,6 +218,14 @@ class ToolBridge:
         self._fix_key_issued = False
         self._fix_key_trusted = False
 
+    def seal_fix_key(self) -> None:
+        """Hand the fix-signing key to nobody from now on. Called when ``claude`` reports ``init``
+        (its MCP servers have started, so the real server has already asked, and the model has not
+        yet run a command) and on the first bridged tool call. A server that missed the window signs
+        with a key nobody trusts: no Fix card, never a forgeable one."""
+        with self._lock:
+            self._fix_key_issued = True
+
     # ---------- introspection ----------
 
     @property
@@ -586,6 +594,10 @@ class ToolBridge:
                     return {"ok": False, "error": "tool bridge: fix_key was already issued"}
                 self._fix_key_issued = True
             return {"ok": True, "result": self._fix_key.hex()}
+        # A tool call means the model has had a turn: from here on anything asking for the key
+        # could be the model (terminal runs in the server and can read the token), so the window
+        # is shut even if the server never took it — no cards then, rather than forgeable ones.
+        self.seal_fix_key()
         tool = str(payload.get("tool") or "")
         if tool == TURN_PRESENCE_QUERY:
             try:

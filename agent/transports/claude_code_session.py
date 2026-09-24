@@ -2142,6 +2142,12 @@ class _TurnProjector:
             self._s._session_id = sid
             result.session_id = sid
         self._s._init_info = obj
+        # MCP servers have started and no model turn has run: the real hermes-tools server has
+        # taken the fix-signing key by now, so nobody else ever can (the model's native Bash can
+        # read the bridge token). tools/fix_reasons.py, "Proof of origin".
+        bridge = getattr(self._s, "_tool_bridge", None)
+        if bridge is not None and hasattr(bridge, "seal_fix_key"):
+            bridge.seal_fix_key()
         servers = obj.get("mcp_servers") or []
         for server in servers:
             if (

@@ -299,3 +299,41 @@ def test_the_mcp_server_signs_with_the_bridges_key_and_only_once(tmp_path):
         bridge.close()
     # Once the session is gone its key is no longer trusted.
     assert host_fields(_mcp_server_process({}, adopt=False)) == {}
+
+
+def test_the_key_window_shuts_at_the_first_tool_call_even_if_nobody_took_it(tmp_path):
+    """A server that failed to take the key leaves it unissued; once any bridged tool has run, the
+    model could be the one asking (terminal reads the token), so the bridge must refuse."""
+    from agent.transports.hermes_tool_bridge import (
+        BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, ToolBridge, call_bridged_tool, fetch_fix_key)
+    bridge = ToolBridge(lambda tool, args: "ok", directory=str(tmp_path))
+    bridge.start()
+    try:
+        env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
+        tool = sorted(bridge._allowed)[0]
+        call_bridged_tool(tool, {}, env=env)
+        assert fetch_fix_key(env) is None
+        assert host_fields(_mcp_server_process(env, adopt=True)) == {}
+    finally:
+        bridge.close()
+
+
+def test_claudes_init_seals_the_key(tmp_path):
+    """claude's ``init`` comes after its MCP servers started and before the model runs anything:
+    the session seals the key there, so native Bash racing the server's startup gets nothing."""
+    from agent.transports.hermes_tool_bridge import (
+        BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, ToolBridge, fetch_fix_key)
+    from agent.transports import claude_code_session as ccs
+    bridge = ToolBridge(lambda tool, args: "ok", directory=str(tmp_path))
+    bridge.start()
+    try:
+        env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
+        session = types.SimpleNamespace(_tool_bridge=bridge, _session_id=None, _init_info=None,
+                                        _emit=lambda ev: None)
+        handler = object.__new__(ccs._TurnProjector)
+        handler._s = session
+        handler._on_system({"type": "system", "subtype": "init", "session_id": "s"},
+                           types.SimpleNamespace(session_id=None))
+        assert fetch_fix_key(env) is None
+    finally:
+        bridge.close()
