@@ -360,12 +360,31 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
             code = None
         if code:
             source = backend.name
+    mail_note = ""
+    if not code:
+        # The person's own mail, before the person: a site that emails a code is asking them to go
+        # and read it, and Moe already reads their mail (agent/vault_code_sources.py). Only on a turn
+        # a person started live -- a code from someone's inbox can sign in to their account, and an
+        # unattended turn (cron, a relayed message) must not do that on its own.
+        from agent.vault_code_sources import find_code, registered_sources
+        if registered_sources():
+            from tools.browser_chrome_extension import unattended_turn
+            absent = unattended_turn()
+            if absent is None:
+                code, where = find_code(origin)
+                if code:
+                    source = "email (%s)" % where
+                else:
+                    mail_note = "Looked in the person's email first: %s. " % where
+            else:
+                mail_note = "Did not look in the person's email: %s. " % absent
     if not code:
         prompt = get_code_prompt_callback()
         if prompt is None or not can_prompt_here():
             return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                               "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
-                                         "Save an authenticator key for this login so codes can be generated automatically.")})
+                               "error": (f"{mail_note}{site} asks for a one-time code and this session cannot ask the user "
+                                         "(headless/cron/API). Save an authenticator key for this login so codes can be "
+                                         "generated automatically.")})
         code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
         if not code:
             return json.dumps({"success": False, "error_type": "code_declined",
@@ -645,9 +664,11 @@ BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
 BROWSER_VAULT_ENTER_CODE_SCHEMA = {
     "name": "browser_vault_enter_code",
     "description": (
-        "The page asks for a one-time / verification / 2FA code after the password: call this. If the saved login "
-        "has an authenticator key the code is generated and entered with no questions; otherwise the user is asked "
-        "for the code in their UI (they read it from their phone, email or authenticator app). The code never enters "
+        "The page asks for a one-time / verification / 2FA / sign-in code (after a password, or instead of one: "
+        "'we emailed you a code'): call this, right after the site says it sent the code. If the saved login has an "
+        "authenticator key the code is generated; otherwise Hermes reads the person's connected email itself, finds "
+        "the fresh message from this site (waiting up to a minute for it to land) and enters the code; only if none "
+        "arrives is the person asked in their UI. You never need to read the code yourself. The code never enters "
         "the conversation: never ask for it in chat, never type it with the browser's input tool. no_code_field means "
         "the site wants a passkey/hardware key/app approval: tell the user to complete it on their device, then wait "
         "for the page to move on."

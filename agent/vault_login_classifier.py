@@ -73,6 +73,9 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    #: The visible text nearest the control when it has no <label> -- what a person reads to know
+    #: what goes in it ("6-digit code (check your email)" beside a bare <input id="code">).
+    context: str = ""
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "LoginControl":
@@ -86,6 +89,7 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            context=str(raw.get("context") or "")[:300],
         )
 
 
@@ -134,11 +138,25 @@ _RE_OTP = re.compile(
 )
 
 
+#: A field that asks for "a code" or "a PIN", read the way a person reads the page. Moe ticket #13:
+#: a sign-in page's <input type="text" id="code"> under the words "6-digit code (check your email)"
+#: was not a code field to this classifier, because its name said only "code" and the words were
+#: not a <label>. People do not need the word "verification" to know what a code box is for.
+_RE_CODE_WORD = re.compile(r"\b(code|pin|\d\s?digit)\b")
+#: The codes that are not a sign-in: shops, addresses, phones, banks. Any of these anywhere in the
+#: field's name, label or nearby text and the plain-"code" reading stands down.
+_RE_NOT_A_SIGNIN_CODE = re.compile(
+    r"\b(promo|promotion|coupon|discount|gift|voucher|redeem|referral|refer|invite|invitation|zip|zipcode|"
+    r"postal|postcode|post|country|area|dial|dialing|currency|tax|vat|sort|swift|bic|iban|routing|source|"
+    r"product|sku|tracking|booking|confirmation\s+number|member(ship)?|employee|student|cvv|cvc)\b")
+
+
 def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
-    """The controls that take a second-factor code. ``autocomplete=one-time-code`` is authoritative;
-    otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification. Some sites split
-    the code into one input per digit (``maxlength=1`` boxes): they are returned in DOM order and the
-    fill spreads the code across them."""
+    """The controls that take a sign-in or second-factor code. ``autocomplete=one-time-code`` is
+    authoritative (100); a name/label that says OTP/2FA/verification code is strong (70); a short
+    text/tel/number field whose name, label or nearby visible text asks for "a code" or "a PIN", and
+    names no other kind of code, is one too (50). Some sites split the code into one input per digit
+    (``maxlength=1`` boxes): they are returned in DOM order and the fill spreads the code across them."""
     out: List[ClassifiedLoginControl] = []
     for c in controls:
         tokens = c.autocomplete.lower().split()
@@ -147,8 +165,15 @@ def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginC
             continue
         if c.type not in ("text", "tel", "number", "password", ""):
             continue
-        if _RE_OTP.search(_normalize_text(" ".join(p for p in (c.name, c.label) if p))):
+        own = _normalize_text(" ".join(p for p in (c.name, c.label) if p))
+        if _RE_OTP.search(own):
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
+            continue
+        if c.type == "password" or (c.max_length is not None and c.max_length > 12):
+            continue
+        seen = _normalize_text(" ".join(p for p in (c.name, c.label, c.context) if p))
+        if _RE_CODE_WORD.search(seen) and not _RE_NOT_A_SIGNIN_CODE.search(seen):
+            out.append(ClassifiedLoginControl(c, 50, "one-time-code"))
     return out
 
 
@@ -261,6 +286,13 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       .map((id) => { const n = document.getElementById(id); return n ? (n.textContent || "") : ""; })
       .join(" ");
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
+    // The words a person reads for this field when the page gave it no <label>: the nearest
+    // ancestor whose visible text is short enough to be about this field alone.
+    let context = "";
+    for (let node = element.parentElement, depth = 0; node && depth < 4; node = node.parentElement, depth++) {
+      const text = (node.innerText || "").replace(/\\s+/g, " ").trim();
+      if (text) { if (text.length <= 240) context = text; break; }
+    }
     return [{
       autocomplete: element.autocomplete || "",
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
@@ -275,6 +307,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       ].join(" "),
       name: [element.name, element.id].join(" "),
       type: element.tagName === "SELECT" ? "select" : (element.type || ""),
+      context,
     }];
   });
   return JSON.stringify(out);
