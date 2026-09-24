@@ -279,7 +279,9 @@ def _osascript_invocation(argv: list, bodies: list = (), depth: int = 0
     exe = os.path.basename(rest[0])
     if exe in _SHELLS and depth < 3:
         for k, tok in enumerate(rest[1:-1], start=1):
-            if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
+            if not tok.startswith("-"):
+                return None  # a script name: every -c after it is the script's argument, not the shell's
+            if not tok.startswith("--") and "c" in tok[1:]:
                 return _invocation_of(rest[k + 1], depth + 1)
         return None
     if exe != "osascript":
@@ -330,8 +332,9 @@ def _script_targets(inv: Tuple[list, Optional[str], str], cwd: Optional[str]) ->
     return {next(g for g in m.groups() if g) for m in _TELL_APP.finditer(text)}
 
 
-# Every AppleScript runtime error osascript prints: "<pos>: execution error: <message> (<number>)".
-_EXEC_ERROR = re.compile(r"execution error: [^\n]*\((-?\d+)\)")
+# Every AppleScript error osascript prints: "<pos>: execution error: <message> (<number>)", and a
+# compile failure, "<pos>: syntax error: <message> (-2741)".
+_EXEC_ERROR = re.compile(r"(?:execution|syntax) error: [^\n]*\((-?\d+)\)")
 
 
 def automation_denied_in_command(command: str, output: str, cwd: Optional[str] = None) -> Optional[FixMessage]:

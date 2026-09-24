@@ -648,6 +648,7 @@ class TestAutomationShapes:
         "sudo -u bob grep osascript": "sudo -u bob grep -rn osascript /var/log",
         "bash -c without osascript": "bash -c 'grep -n osascript ~/logs/a.log'",
         "a newline, then false": f"osascript -e '{_NOTES_SCRIPT}'\nfalse",
+        "bash with a script whose own argument is -c": f"bash run.sh -c \"osascript -e '{_NOTES_SCRIPT}'\"",
     }
 
     @pytest.mark.parametrize("case", list(POSITIVE))
@@ -664,6 +665,11 @@ class TestAutomationShapes:
         """The review's last false positive: the log holds an old Notes -1743, this run's error is -1728."""
         command = "cat old.log; osascript -e 'tell application \"Notes\" to get foo'"
         out = _finalize(command, "2026-09-01 " + AE_1743 + "\n" + _OTHER_ERROR)
+        assert "code" not in out and out["error"] is None, out
+        # a compile failure this run is an error too
+        syntax = "0:12: syntax error: Expected end of line but found identifier. (-2741)"
+        bad = "cat old.log; osascript -e 'tell application \"Notes\" to get bad syntax here'"
+        out = _finalize(bad, "2026-09-01 " + AE_1743 + "\n" + syntax)
         assert "code" not in out and out["error"] is None, out
         # and the same command with only the refusal still counts
         assert _finalize(command, "0:34: " + AE_1743).get("code") == "tcc_automation"
