@@ -348,6 +348,20 @@ def _check_node_and_browser(should_fix: bool, f: Finding) -> None:
     else:
         check_warn("Node.js not found", "(optional, needed for browser tools)")
     _check_lightpanda()
+    _check_browser_fidelity()
+
+
+def _check_browser_fidelity() -> None:
+    """The real-profile browser's fidelity keeper, as the process running it last reported."""
+    try:
+        from tools.browser_tool_fidelity import status_summary
+        summary = status_summary()
+    except Exception:
+        return
+    if summary is None:
+        return
+    ok, line = summary
+    check_ok(line) if ok else check_warn(line)
 
 
 def _plural(n: int) -> str:

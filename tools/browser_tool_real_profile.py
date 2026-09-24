@@ -303,10 +303,13 @@ def _driven_browser_flags(identity: Optional[Dict[str, Any]], headless: bool) ->
 
 
 def _persons_identity(browser: Optional[str]) -> Optional[Dict[str, Any]]:
-    """The person's browser's brand and version (from its Info.plist), or None."""
+    """The person's browser's brand and version (from its Info.plist; the engine's version when
+    the majors differ), or None."""
     from hermes_cli.browser_connect import chromium_executable
     try:
-        return _fidelity.persons_browser_identity(browser, chromium_executable(browser) if browser else None)
+        driven = driven_browser_executable()
+        return _fidelity.persons_browser_identity(browser, chromium_executable(browser) if browser else None,
+                                                  _fidelity.installed_browser_version(driven) if driven else None)
     except Exception as e:
         _origin().logger.debug("real-profile: browser identity unreadable: %s", e)
         return None
@@ -579,6 +582,8 @@ def _real_profile_cdp() -> tuple:
         _bt._real_profile_last_used = time.time()
         cached = _bt._real_profile_cdp_cache.get("cdp")
         if cached and _cdp_http_ready(cached):
+            # The keeper is checked on EVERY acquire: one that died or stalled is restarted here.
+            _fidelity.ensure_keeper(int(cached.rsplit(":", 1)[1]), lambda: _persons_identity(detect_default_chromium()))
             # Re-claim the shared daemon's socket dir so the orphan reaper's idle clock sees
             # this process still using it (a cache hit never runs a daemon command).
             _session._prepare_session_socket_dir(_bt._REAL_PROFILE_SESSION)
@@ -596,7 +601,7 @@ def _real_profile_cdp() -> tuple:
         copy_dir = real_profile_copy_dir(browser)
         existing = _agent_browser_get_cdp(_bt._REAL_PROFILE_SESSION)
         if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
-            _fidelity.ensure_keeper(int(existing.rsplit(":", 1)[1]), _persons_identity(browser))
+            _fidelity.ensure_keeper(int(existing.rsplit(":", 1)[1]), lambda: _persons_identity(browser))
             _bt._real_profile_cdp_cache["cdp"] = existing
             return existing, None
         if existing:  # stale/wrong-dir session: close it so nothing holds the dir open
@@ -608,7 +613,7 @@ def _real_profile_cdp() -> tuple:
         _terminate_orphaned_browsers_on_dir(copy_dir)
         surviving = _surviving_chrome_cdp(copy_dir)
         if surviving:
-            _fidelity.ensure_keeper(int(surviving.rsplit(":", 1)[1]), _persons_identity(browser))
+            _fidelity.ensure_keeper(int(surviving.rsplit(":", 1)[1]), lambda: _persons_identity(browser))
             cdp, err = _attach_agent_browser_to_real_profile(int(surviving.rsplit(":", 1)[1]), copy_dir)
             if not cdp:
                 return None, err

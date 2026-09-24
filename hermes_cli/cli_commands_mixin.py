@@ -600,6 +600,9 @@ def _browser_status() -> None:
             _pr(*_LOCAL_ENGINE_LINES.get(engine, _LOCAL_ENGINE_LINES["auto"]))
             if engine == "lightpanda":
                 _print_lightpanda_engine_status()
+            fidelity = _probe("tools.browser_tool_fidelity", "status_summary", None)
+            if fidelity is not None:
+                print(f"   {'✓' if fidelity[0] else '⚠'} {fidelity[1]}")
     _say_block("   /browser connect      — connect to your live Chromium-family browser",
                "   /browser disconnect   — revert to default")
 

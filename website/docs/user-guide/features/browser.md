@@ -222,15 +222,34 @@ So by default the real-profile browser reports what is true:
 
 - the user agent and `Sec-CH-UA` brands of **your own installed browser** (on
   macOS the version is read from the app's `Info.plist`; the app is never
-  launched for this), with a truthful platform (macOS, arm64 or x86);
+  launched for this), with a truthful platform (macOS, arm64 or x86). If your
+  browser has updated to a newer major version than Hermes's own Chrome for
+  Testing, the engine's version is claimed instead, so the browser never
+  claims features it doesn't have;
 - `navigator.webdriver` is `false` (`--disable-blink-features=AutomationControlled`);
-- your main display's real size and scale, not 800×600.
+- your main display's real size, scale, menu-bar and Dock insets, and colour
+  depth, not 800×600.
 
-The brands apply to every tab, popup, frame and worker, from the first request.
-Hermes holds one DevTools connection for the browser's lifetime, which
-auto-attaches each new target before it runs. There is no CAPTCHA solving, no
-proxy rotation, no invented or randomised fingerprint, and no script injected
-into pages. Every value is the browser's own or your browser's. To turn it off:
+The brands apply to every tab, popup, frame and worker (dedicated, shared and
+service). Hermes holds one DevTools connection for the browser's lifetime, which
+auto-attaches each new target before it runs. Only one Hermes process holds it
+per browser, so a second process attached to the same browser can't stall it.
+The connection is checked every time the browser is used, and restarted if it
+died or stalled. `/browser status` and `hermes doctor` report when it isn't
+applied. There is no CAPTCHA solving, no proxy rotation, no invented or
+randomised fingerprint, and no script injected into pages. Every value is the
+browser's own or your browser's.
+
+Two limits, both measured:
+
+- A tab created directly at a URL sends its very first request before the
+  brands can be set. Hermes always opens a blank tab and then navigates.
+- While no connection is serving (between a failure and the next browser use),
+  new tabs carry your browser's user-agent string over plain Chromium brands.
+  The user-agent switch stays because it is the only thing that reaches shared
+  and service workers.
+
+To turn it all off:
 
 ```yaml
 # ~/.hermes/config.yaml

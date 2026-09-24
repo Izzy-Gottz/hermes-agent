@@ -14,17 +14,21 @@ values is true of the person the browser acts for. They sign in with their own C
 own Mac, from their own home. This module makes the driven browser report exactly that:
 
 * ``--disable-blink-features=AutomationControlled``: ``navigator.webdriver`` is false.
-* ``--user-agent``: the person's browser's own reduced UA string (read from the installed app's
-  ``Info.plist``, never by launching it). The flag reaches every target the browser creates,
-  including new tabs, popups and workers, with no race.
-* ``--window-size`` / ``--screen-info``: the main display's real size and scale.
+* ``--window-size`` / ``--screen-info``: the main display's real size, scale, menu-bar and Dock
+  insets and colour depth.
+* ``--user-agent``: the person's browser's own UA string (brand and version read from the
+  installed app's ``Info.plist``, never by launching it; the ENGINE's version whenever the majors
+  differ). It is the only thing that reaches ``navigator.userAgent`` in shared and service
+  workers (measured; see :func:`launch_flags`).
 * Brands: there is no switch for ``Sec-CH-UA``, so a :class:`FidelityKeeper` holds one
   browser-level DevTools connection for the browser's lifetime. It auto-attaches every target
   paused at start (``waitForDebuggerOnStart``), applies ``Emulation.setUserAgentOverride`` (pages,
   frames) or ``Network.setUserAgentOverride`` (workers) with the matching
   ``userAgentMetadata``, and only then resumes the target. A DevTools override lasts only as long
   as the session that set it, which is why the keeper stays connected rather than applying
-  the override once and leaving.
+  the override once and leaving. One keeper per browser across processes (a pause can only be
+  released by the client that set it), checked and restarted on every acquire, with a watchdog
+  that drops a stalled keeper's connection so Chrome lets its targets run.
 
 What it does NOT do, by design: no CAPTCHA solving, no proxy, no randomised or invented
 fingerprint, and no JavaScript patching of page globals. Every value is either the browser's own
@@ -101,16 +105,20 @@ def installed_browser_version(binary: str) -> Optional[str]:
     return version if re.fullmatch(r"\d+(\.\d+){3}", version) else None
 
 
-def persons_browser_identity(browser: Optional[str], binary: Optional[str]) -> Optional[Dict[str, Any]]:
+def persons_browser_identity(browser: Optional[str], binary: Optional[str],
+                             engine_version: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """``{"brand", "ua_suffix", "full_version", "major"}`` of the person's browser, or None when its
-    version cannot be read. The identity is theirs; nothing here is invented."""
+    version cannot be read. The brand is theirs. The version is theirs too unless ``engine_version``
+    (the driven browser's) has a different major, in which case it is the engine's: see
+    :func:`with_engine_version`."""
     if browser not in _BRAND_BY_BROWSER or not binary:
         return None
     version = installed_browser_version(binary)
     if not version:
         return None
     brand, suffix = _BRAND_BY_BROWSER[browser]
-    return {"brand": brand, "ua_suffix": suffix, "full_version": version, "major": int(version.split(".")[0])}
+    identity = {"brand": brand, "ua_suffix": suffix, "full_version": version, "major": int(version.split(".")[0])}
+    return with_engine_version(identity, engine_version)
 
 
 # ---------------------------------------------------------------------------
@@ -188,54 +196,77 @@ def user_agent_metadata(identity: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def main_display() -> Optional[Tuple[int, int, float]]:
-    """``(width, height, scale)`` of the main display in points, from CoreGraphics (no window,
-    no permission needed), or None off macOS / on failure."""
+# The display probe runs in a child process: it loads AppKit (NSScreen.visibleFrame is the only
+# source of the menu-bar and Dock insets), and a framework load must never be able to take the
+# Hermes process down with it.
+_DISPLAY_PROBE = r"""
+import ctypes, ctypes.util, json
+class P(ctypes.Structure): _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+class S(ctypes.Structure): _fields_ = [("w", ctypes.c_double), ("h", ctypes.c_double)]
+class R(ctypes.Structure): _fields_ = [("o", P), ("s", S)]
+objc = ctypes.CDLL(ctypes.util.find_library("objc"))
+ctypes.CDLL("/System/Library/Frameworks/AppKit.framework/AppKit")
+objc.objc_getClass.restype = ctypes.c_void_p
+objc.sel_registerName.restype = ctypes.c_void_p
+msg = objc.objc_msgSend
+msg.restype = ctypes.c_void_p
+msg.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+rect = ctypes.CFUNCTYPE(R, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+dbl = ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+screen = msg(objc.objc_getClass(b"NSScreen"), objc.sel_registerName(b"mainScreen"))
+f, v = rect(screen, objc.sel_registerName(b"frame")), rect(screen, objc.sel_registerName(b"visibleFrame"))
+scale = dbl(screen, objc.sel_registerName(b"backingScaleFactor"))
+print(json.dumps({"width": f.s.w, "height": f.s.h, "scale": scale,
+                  "top": (f.o.y + f.s.h) - (v.o.y + v.s.h), "bottom": v.o.y - f.o.y}))
+"""
+
+
+def main_display() -> Optional[Dict[str, float]]:
+    """The main display in points: ``{"width", "height", "scale", "top", "bottom"}``. ``top`` and
+    ``bottom`` are the menu-bar and Dock insets (measured on this MacBook: 1470x956 @2x, 33 top,
+    72 bottom). None off macOS or on any failure. Nothing is guessed."""
     if sys.platform != "darwin":
         return None
+    import subprocess
     try:
-        import ctypes
-        import ctypes.util
-        cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics") or
-                         "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
-        cg.CGMainDisplayID.restype = ctypes.c_uint32
-        cg.CGDisplayPixelsWide.restype = ctypes.c_size_t
-        cg.CGDisplayPixelsHigh.restype = ctypes.c_size_t
-        cg.CGDisplayCopyDisplayMode.restype = ctypes.c_void_p
-        cg.CGDisplayCopyDisplayMode.argtypes = [ctypes.c_uint32]
-        cg.CGDisplayModeGetPixelWidth.restype = ctypes.c_size_t
-        cg.CGDisplayModeGetPixelWidth.argtypes = [ctypes.c_void_p]
-        cg.CGDisplayModeRelease.argtypes = [ctypes.c_void_p]
-        display = cg.CGMainDisplayID()
-        width, height = int(cg.CGDisplayPixelsWide(display)), int(cg.CGDisplayPixelsHigh(display))
-        scale = 1.0
-        mode = cg.CGDisplayCopyDisplayMode(display)
-        if mode:
-            pixel_width = int(cg.CGDisplayModeGetPixelWidth(mode))
-            cg.CGDisplayModeRelease(mode)
-            if width and pixel_width:
-                scale = round(pixel_width / width, 2)
-        return (width, height, scale) if width > 0 and height > 0 else None
+        out = subprocess.run([sys.executable, "-c", _DISPLAY_PROBE], capture_output=True, text=True,
+                             timeout=10, stdin=subprocess.DEVNULL).stdout
+        d = json.loads(out.strip().splitlines()[-1])
+        if d["width"] > 0 and d["height"] > 0 and d["scale"] > 0:
+            return {k: float(d[k]) for k in ("width", "height", "scale", "top", "bottom")}
     except Exception as e:  # never let a display probe fail a launch
         logger.debug("fidelity: main display probe failed: %s", e)
-        return None
+    return None
 
 
 def launch_flags(identity: Optional[Dict[str, Any]], headless: bool,
-                 display: Optional[Tuple[int, int, float]] = None) -> List[str]:
-    """Switches for the driven browser. Always ``AutomationControlled`` off. The person's UA
-    when their browser's identity is known. With headless, the main display's real size, because
-    headless otherwise reports an 800x600 screen and a 0x0 outer window."""
+                 display: Optional[Dict[str, float]] = None) -> List[str]:
+    """Switches for the driven browser: ``AutomationControlled`` always off; the person's UA string
+    when their identity is known; with headless and a known display, that display's real geometry
+    (headless otherwise reports an 800x600 screen).
+
+    Why ``--user-agent`` stays, although the keeper's override also sets the UA string:
+    measured 2026-09-23 on CfT 153, neither ``Emulation`` nor ``Network.setUserAgentOverride``
+    changes ``navigator.userAgent`` inside a SHARED or SERVICE worker. Their brands follow the
+    override, but their UA stays ``HeadlessChrome/153``. Only the switch reaches them. Without it,
+    every site that runs a service worker would see a headless UA next to Google Chrome brands.
+    The cost is the case the reviewer found: while NO keeper serves, a new tab has the switch's
+    UA over Chromium brands with empty high-entropy hints. :func:`ensure_keeper` runs on every
+    acquire, restarts a dead or stalled keeper, and reports the gap to status/doctor, so that
+    window stays short and visible."""
     flags = ["--disable-blink-features=AutomationControlled"]
     if identity:
         flags.append(f"--user-agent={user_agent(identity)}")
-    if headless:
-        width, height, scale = display or (1440, 900, 2.0)
-        win_w, win_h = default_window_size(width, height)
+    if headless and display:
+        scale = display["scale"]
+        px = lambda points: round(points * scale)  # --screen-info is in device pixels (measured)
+        win_w, win_h = default_window_size(int(display["width"]), int(display["height"]))
         flags.append(f"--window-size={win_w},{win_h}")
-        # --screen-info takes the size in device pixels: {1470x956 devicePixelRatio=2} reads back as
-        # a 735x478 screen (measured), so the point size is scaled up here.
-        flags.append(f"--screen-info={{{round(width * scale)}x{round(height * scale)} devicePixelRatio={scale:g}}}")
+        # {W x H devicePixelRatio workAreaTop workAreaBottom colorDepth}: all in device pixels.
+        # Measured: {2940x1912 devicePixelRatio=2 workAreaTop=66 workAreaBottom=144 colorDepth=30}
+        # reads back as screen 1470x956, availTop 33, availHeight 851, colorDepth 30.
+        flags.append(f"--screen-info={{{px(display['width'])}x{px(display['height'])} devicePixelRatio={scale:g} "
+                     f"workAreaTop={px(display['top'])} workAreaBottom={px(display['bottom'])} colorDepth=30}}")
     return flags
 
 
@@ -253,12 +284,22 @@ def default_window_size(width: int, height: int) -> Tuple[int, int]:
 _PAGE_LIKE = ("page", "iframe", "webview")  # browser_ui / other: Chrome's own UI, only resumed
 _WORKER_LIKE = ("worker", "service_worker", "shared_worker", "shared_storage_worklet", "auction_worklet")
 
+# A keeper whose loop has not ticked for this long is wedged. It closes its own connection:
+# Chrome releases every target it holds paused, and they run as plain Chrome for Testing.
+STALL_SECONDS = 3.0
+# How stale another process's keeper heartbeat may be before status reports it stalled.
+HOLDER_STALE_SECONDS = 5.0
+
 
 def commands_for_attached_target(params: Dict[str, Any], ua: str, metadata: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
     """The commands, in order, for one ``Target.attachedToTarget`` event: the override first, then
     auto-attach one level down (dedicated workers, out-of-process frames), then resume. A target
-    paused by ``waitForDebuggerOnStart`` runs no script and sends no request before the resume,
-    so the first request it sends already carries the brands. Commands on one session run in order."""
+    paused by ``waitForDebuggerOnStart`` runs no script before the resume, so its first script
+    already sees the brands. Commands on one session run in order.
+
+    The pause holds the RENDERER, not a navigation the browser has already started. A tab
+    created straight at a URL (``Target.createTarget({url})``) sends its first request before any
+    of this runs. That is why every tab Hermes opens starts at ``about:blank`` and then navigates."""
     kind = (params.get("targetInfo") or {}).get("type", "")
     override = {"userAgent": ua, "userAgentMetadata": metadata}
     cmds: List[Tuple[str, Dict[str, Any]]] = []
@@ -273,24 +314,61 @@ def commands_for_attached_target(params: Dict[str, Any], ua: str, metadata: Dict
     return cmds
 
 
+def _engine_version(browser_field: str) -> Optional[str]:
+    """``153.0.8010.52`` from ``/json/version``'s ``Browser`` (``HeadlessChrome/153.0.8010.52``)."""
+    m = re.search(r"/(\d+\.\d+\.\d+\.\d+)", browser_field or "")
+    return m.group(1) if m else None
+
+
+def _lock_path(port: int, browser_ws: str) -> str:
+    """One lock per browser INSTANCE (its devtools browser id), shared by every Hermes process."""
+    import tempfile
+    guid = re.sub(r"[^A-Za-z0-9-]", "", browser_ws.rsplit("/", 1)[-1])[:64] or "unknown"
+    return os.path.join(tempfile.gettempdir(), f"hermes-browser-fidelity-{port}-{guid}.lock")
+
+
+def holder_is_stale(lock_path: str, now: Optional[float] = None) -> bool:
+    """True when the process holding ``lock_path`` has stopped refreshing its heartbeat."""
+    import time
+    try:
+        return ((now or time.time()) - os.stat(lock_path).st_mtime) > HOLDER_STALE_SECONDS
+    except OSError:
+        return False
+
+
 class FidelityKeeper(threading.Thread):
     """One browser-level DevTools connection that puts the person's brands on every target.
 
-    Daemon thread: it never keeps Hermes alive, and it ends when the browser's socket closes
-    (the browser was terminated) or :meth:`stop` is called. ``applied`` counts overrides sent,
-    per target type, for tests and logs."""
+    Only ONE keeper pauses a given browser, across every Hermes process: it holds an exclusive
+    ``flock`` for the browser instance. A pause set by one DevTools client can be released only by
+    that client (measured: a healthy client's ``runIfWaitingForDebugger`` does not release a
+    target another client holds). So a second keeper would only add a second way to wedge every
+    new tab. A process that finds the lock taken becomes a ``follower``: it adds no pauses, and it
+    retries the lock on its next acquire (the holder may have exited).
 
-    def __init__(self, port: int, ua: str, metadata: Dict[str, Any], connect=None):
+    Daemon thread: it never keeps Hermes alive. It ends when the browser's socket closes, when
+    :meth:`stop` is called, or when its own loop stalls (a watchdog closes the socket, which makes
+    Chrome release everything it held). ``state`` is one of ``starting``, ``serving``,
+    ``follower``, ``stalled``, ``failed`` or ``stopped``."""
+
+    def __init__(self, port: int, identity: Dict[str, Any], connect=None):
         super().__init__(name=f"hermes-browser-fidelity-{port}", daemon=True)
-        self.port, self.ua, self.metadata = port, ua, metadata
+        self.port, self.identity = port, identity
+        self.ua, self.metadata = user_agent(identity), user_agent_metadata(identity)
         self._connect = connect
         self._ws = None
         self._halt = threading.Event()
         self.ready = threading.Event()
         self.applied: Dict[str, int] = {}
         self.error: Optional[str] = None
+        self.state = "starting"
+        self.lock_path: Optional[str] = None
+        self._lock_fd: Optional[int] = None
+        self._beat = 0.0
         self._next_id = 0
         self._send_lock = threading.Lock()
+
+    # -- plumbing -------------------------------------------------------------------------------
 
     def _send(self, method: str, params: Dict[str, Any], session: Optional[str] = None) -> None:
         with self._send_lock:
@@ -300,19 +378,52 @@ class FidelityKeeper(threading.Thread):
                 msg["sessionId"] = session
             self._ws.send(json.dumps(msg))
 
+    def _claim(self, lock_path: str) -> bool:
+        """Take the per-browser lock; False when another live process holds it."""
+        import fcntl
+        self.lock_path = lock_path
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        self._lock_fd = fd
+        return True
+
+    def _release(self) -> None:
+        if self._lock_fd is not None:
+            try:
+                os.close(self._lock_fd)  # closing drops the flock
+            except OSError:
+                pass
+            self._lock_fd = None
+
     def _open(self):
+        """Connect, adopt the ENGINE's version when it differs from the person's browser, and
+        claim the browser. Returns the socket, or None as a follower."""
         if self._connect is not None:
             return self._connect(self.port)
         import requests
         from websockets.sync.client import connect
+        version: Dict[str, Any] = {}
         # A browser that has just written its port can take a few seconds to answer under load.
         for attempt in range(4):
             try:
-                ws_url = requests.get(f"http://127.0.0.1:{self.port}/json/version", timeout=3).json()["webSocketDebuggerUrl"]
+                version = requests.get(f"http://127.0.0.1:{self.port}/json/version", timeout=3).json()
                 break
             except requests.RequestException:
                 if attempt == 3 or self._halt.is_set():
                     raise
+        reconciled = with_engine_version(self.identity, _engine_version(version.get("Browser", "")))
+        if reconciled != self.identity:
+            self.identity = reconciled
+            self.ua, self.metadata = user_agent(reconciled), user_agent_metadata(reconciled)
+        ws_url = version["webSocketDebuggerUrl"]
+        if not self._claim(_lock_path(self.port, ws_url)):
+            return None
         return connect(ws_url, max_size=None, open_timeout=10, close_timeout=2)
 
     def handle(self, msg: Dict[str, Any]) -> None:
@@ -328,58 +439,130 @@ class FidelityKeeper(threading.Thread):
             # A target that went away between attach and override answers with an error; harmless.
             logger.debug("fidelity: command %s failed: %s", msg.get("id"), msg["error"])
 
-    def run(self) -> None:
-        try:
-            self._ws = self._open()
-            # Browser level: attach every existing and future top-level target, paused at start.
-            self._send("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True})
-            self.ready.set()
-            while not self._halt.is_set():
-                try:
-                    raw = self._ws.recv(timeout=1.0)
-                except TimeoutError:
-                    continue
-                self.handle(json.loads(raw))
-        except Exception as e:  # the browser went away, or never answered
-            if not self._halt.is_set():
-                self.error = f"{type(e).__name__}: {e}"
-                logger.info("fidelity keeper for port %s ended: %s", self.port, self.error)
-        finally:
-            self.ready.set()
+    def _tick(self) -> None:
+        import time
+        self._beat = time.monotonic()
+        if self.lock_path and self._lock_fd is not None:
             try:
-                if self._ws is not None:
-                    self._ws.close()
-            except Exception:
+                os.utime(self.lock_path)  # cross-process heartbeat
+            except OSError:
                 pass
 
-    def stop(self) -> None:
-        self._halt.set()
+    def _watchdog(self) -> None:
+        import time
+        while not self._halt.wait(0.5):
+            if self.state == "serving" and time.monotonic() - self._beat > STALL_SECONDS:
+                self.state, self.error = "stalled", f"keeper loop stalled > {STALL_SECONDS:.0f}s"
+                logger.warning("fidelity: %s; closing its connection so Chrome releases every paused target", self.error)
+                self._close_ws()
+                return
+
+    def _close_ws(self) -> None:
         try:
             if self._ws is not None:
                 self._ws.close()
         except Exception:
             pass
 
+    def run(self) -> None:
+        try:
+            self._ws = self._open()
+            if self._ws is None:
+                self.state = "follower"
+                logger.info("fidelity: browser on port %s is served by another Hermes process's keeper (%s)",
+                            self.port, self.lock_path)
+                return
+            # Browser level: attach every existing and future top-level target, paused at start.
+            self._send("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True})
+            self._tick()
+            self.state = "serving"
+            self.ready.set()
+            threading.Thread(target=self._watchdog, name=f"{self.name}-watchdog", daemon=True).start()
+            while not self._halt.is_set():
+                try:
+                    raw = self._ws.recv(timeout=1.0)
+                except TimeoutError:
+                    self._tick()
+                    continue
+                self.handle(json.loads(raw))
+                self._tick()
+        except Exception as e:  # the browser went away, never answered, or the watchdog closed us
+            if not self._halt.is_set() and self.state != "stalled":
+                self.state, self.error = "failed", f"{type(e).__name__}: {e}"
+                logger.warning("fidelity keeper for port %s ended: %s", self.port, self.error)
+        finally:
+            if self._halt.is_set():
+                self.state = "stopped"
+            self._release()
+            self.ready.set()
+            self._close_ws()
+            write_status()
+
+    def healthy(self) -> bool:
+        """Serving, and its loop ticked recently."""
+        import time
+        return self.is_alive() and self.state == "serving" and time.monotonic() - self._beat <= STALL_SECONDS
+
+    def stop(self) -> None:
+        self._halt.set()
+        self._close_ws()
+
+    def describe(self) -> Dict[str, Any]:
+        d = {"port": self.port, "state": self.state, "pid": os.getpid(), "applied": dict(self.applied),
+             "error": self.error, "claims": self.ua and f"{self.identity.get('brand') or 'Chromium'} {self.identity['full_version']}"}
+        if self.state == "follower" and self.lock_path:
+            d["holder_stale"] = holder_is_stale(self.lock_path)
+        return d
+
+
+def with_engine_version(identity: Dict[str, Any], engine_version: Optional[str]) -> Dict[str, Any]:
+    """The identity to claim on an engine of ``engine_version``. The brand is the person's; the
+    version must be the engine's whenever the majors differ. Chrome auto-updates before Chrome for
+    Testing does, and claiming 154 on a 153 engine is a lie a feature probe can catch."""
+    if not engine_version:
+        return identity
+    engine_major = int(engine_version.split(".")[0])
+    if engine_major == identity["major"]:
+        return identity
+    logger.info("fidelity: %s is %s but the engine is %s; claiming the engine's version",
+                identity.get("brand") or "the browser", identity["full_version"], engine_version)
+    return {**identity, "full_version": engine_version, "major": engine_major}
+
 
 _keepers: Dict[int, FidelityKeeper] = {}
 _keepers_lock = threading.Lock()
 
 
-def ensure_keeper(port: int, identity: Optional[Dict[str, Any]], wait: float = 15.0) -> Optional[FidelityKeeper]:
-    """Start (once per debug port) the keeper that puts the person's brands on every target.
-    Returns the keeper, or None when fidelity is off or the identity is unknown."""
-    if not identity or not fidelity_enabled():
+def ensure_keeper(port: int, identity, wait: float = 15.0) -> Optional[FidelityKeeper]:
+    """Make sure a keeper serves the browser on ``port``: start one, or restart one that died,
+    stalled or was a follower last time. Called on EVERY acquire of the real-profile browser,
+    the cache-hit path included. ``identity`` is a dict or a zero-argument callable returning one.
+    None when fidelity is off or the identity is unknown."""
+    if not fidelity_enabled():
         return None
     with _keepers_lock:
         keeper = _keepers.get(port)
-        if keeper is not None and keeper.is_alive():
+        if keeper is not None and keeper.healthy():
             return keeper
-        keeper = FidelityKeeper(port, user_agent(identity), user_agent_metadata(identity))
+    if callable(identity):  # resolved only when a keeper has to start: the cache-hit path stays cheap
+        identity = identity()
+    if not identity:
+        return None
+    with _keepers_lock:
+        keeper = _keepers.get(port)
+        if keeper is not None and keeper.healthy():
+            return keeper
+        if keeper is not None and keeper.state not in ("follower", "starting"):
+            logger.warning("fidelity: keeper for port %s was %s (%s); restarting it", port, keeper.state, keeper.error)
+        if keeper is not None:
+            keeper.stop()
+        keeper = FidelityKeeper(port, identity)
         _keepers[port] = keeper
         keeper.start()
     keeper.ready.wait(wait)
-    if keeper.error:
-        logger.warning("fidelity: brands not applied (%s); the UA string and webdriver switches still are", keeper.error)
+    if keeper.state == "failed":
+        logger.warning("fidelity: brands not applied (%s); the browser reports itself as plain Chrome for Testing", keeper.error)
+    write_status()
     return keeper
 
 
@@ -390,3 +573,59 @@ def stop_keepers() -> None:
         _keepers.clear()
     for keeper in keepers:
         keeper.stop()
+    for keeper in keepers:  # let each finish its own last status write before ours
+        if keeper is not threading.current_thread():
+            keeper.join(2)
+    write_status()
+
+
+# ---------------------------------------------------------------------------
+# Status, for /browser status and hermes doctor (which run in other processes)
+# ---------------------------------------------------------------------------
+
+def _status_path() -> str:
+    from hermes_cli.config import get_hermes_home
+    return str(get_hermes_home() / "browser-fidelity-status.json")
+
+
+def write_status() -> None:
+    """This process's keepers, written where another process can read them. Best effort."""
+    try:
+        with _keepers_lock:
+            keepers = [k.describe() for k in _keepers.values()]
+        path = _status_path()
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            import time
+            json.dump({"pid": os.getpid(), "updated": time.time(), "keepers": keepers}, fh)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.debug("fidelity: status not written: %s", e)
+
+
+def status_summary() -> Optional[Tuple[bool, str]]:
+    """``(ok, line)`` for status/doctor, or None when fidelity has nothing to report."""
+    if not fidelity_enabled():
+        return True, "Browser fidelity: off (browser.stealth_fidelity: false)"
+    try:
+        with open(_status_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    try:
+        import psutil
+        if not psutil.pid_exists(int(data.get("pid") or 0)):
+            return None  # the process that wrote it is gone, and so is its browser
+    except Exception:
+        pass
+    keepers = data.get("keepers") or []
+    if not keepers:
+        return None
+    k = keepers[-1]
+    if k.get("state") == "serving":
+        return True, f"Browser fidelity: serving, claiming {k.get('claims')} ({sum((k.get('applied') or {}).values())} target(s))"
+    if k.get("state") == "follower" and not k.get("holder_stale"):
+        return True, "Browser fidelity: served by another Hermes process"
+    why = "the serving process has stopped responding" if k.get("state") == "follower" else (k.get("error") or k.get("state"))
+    return False, (f"Browser fidelity: NOT applied ({why}). The browser reports itself as plain Chrome for Testing; "
+                   f"it recovers on the next browser use")
