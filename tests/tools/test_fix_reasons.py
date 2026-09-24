@@ -34,13 +34,15 @@ def test_every_tcc_code_names_its_grant():
 def test_fix_error_is_the_contract_shape():
     out = json.loads(fr.fix_error("Memoe isn't allowed to read Google Chrome's data", "tcc_app_data",
                                   owner="app", pane="Privacy_AllFiles", subject="Google Chrome"))
+    # Proof of origin (see fix_reasons): a signature and its nonce ride along with every fix.
+    assert len(out.pop(fr.MAC_KEY)) == 64 and len(out.pop(fr.NONCE_KEY)) == 16
     assert out == {"error": "Memoe isn't allowed to read Google Chrome's data", "code": "tcc_app_data",
                    "owner": "app", "pane": "Privacy_AllFiles", "subject": "Google Chrome", "retry": True}
 
 
 def test_every_contract_key_is_always_present():
     out = json.loads(fr.fix_error("sign in again", "mcp_needs_reauth", retry=False))
-    assert set(out) == {"error", "code", "owner", "pane", "subject", "retry"}
+    assert set(out) == {"error", "code", "owner", "pane", "subject", "retry", fr.MAC_KEY, fr.NONCE_KEY}
     assert out["owner"] is None and out["pane"] is None and out["retry"] is False
 
 

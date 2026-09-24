@@ -209,6 +209,14 @@ class ToolBridge:
         self._in_flight_lock = threading.Lock()
         self._workers: "set[threading.Thread]" = set()
         self._held: "set[socket.socket]" = set()
+        # The key the child's MCP server signs fixable-failure fields with
+        # (tools/fix_reasons.py, "Proof of origin"). Trusted in this process
+        # from start() to close(); handed out ONCE, to the first caller of
+        # op "fix_key" — the server, at its own startup, before the model has
+        # a turn. Never in an environment, a file or a log.
+        self._fix_key = secrets.token_bytes(32)
+        self._fix_key_issued = False
+        self._fix_key_trusted = False
 
     # ---------- introspection ----------
 
@@ -283,6 +291,10 @@ class ToolBridge:
             if self._closed:
                 raise BridgeError("tool bridge is closed")
             self._token = secrets.token_hex(32)
+            if not self._fix_key_trusted:
+                from tools.fix_reasons import trust_key
+                trust_key(self._fix_key)
+                self._fix_key_trusted = True
             sock, failures = None, []
             for candidate in self._candidate_paths():
                 trial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -364,6 +376,10 @@ class ToolBridge:
             if self._closed:
                 return
             self._closed = True
+            if self._fix_key_trusted:
+                from tools.fix_reasons import untrust_key
+                untrust_key(self._fix_key)
+                self._fix_key_trusted = False
             sock, self._sock = self._sock, None
             workers = list(self._workers)
             held, self._held = list(self._held), set()
@@ -563,6 +579,13 @@ class ToolBridge:
         # for, answering a `claude` that has already been killed.
         if self._closed:
             return self._closed_reply()
+        if str(payload.get("op") or "") == "fix_key":
+            with self._lock:
+                if self._fix_key_issued:
+                    logger.warning("tool bridge refused a second fix_key request")
+                    return {"ok": False, "error": "tool bridge: fix_key was already issued"}
+                self._fix_key_issued = True
+            return {"ok": True, "result": self._fix_key.hex()}
         tool = str(payload.get("tool") or "")
         if tool == TURN_PRESENCE_QUERY:
             try:
@@ -656,6 +679,33 @@ def bridge_timeout(env: Optional[dict] = None) -> float:
     except (TypeError, ValueError):
         return DEFAULT_TIMEOUT_SECONDS
     return value if value > 0 else DEFAULT_TIMEOUT_SECONDS
+
+
+def fetch_fix_key(env: Optional[dict] = None, *, timeout: float = 5.0) -> Optional[bytes]:
+    """The fix-signing key, from this process's bridge — once per bridge; ``None`` without one or
+    when it was already taken. The MCP server calls this at startup (tools/fix_reasons.py)."""
+    path, token = bridge_address(env)
+    if not path:
+        return None
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    try:
+        conn.connect(path)
+        _write_message(conn, {"token": token, "op": "fix_key"})
+        reply = _read_message(conn, ends_at=time.monotonic() + timeout)
+    except (OSError, ValueError, socket.timeout):
+        return None
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+    if not reply.get("ok"):
+        return None
+    try:
+        return bytes.fromhex(str(reply.get("result") or ""))
+    except ValueError:
+        return None
 
 
 def call_bridged_tool(

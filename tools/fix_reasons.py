@@ -41,7 +41,13 @@ emits the full contract when ``err`` carries fields and a plain ``{"error": ...}
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
+import secrets
+import threading
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 # macOS privacy grants
@@ -121,9 +127,14 @@ def fix_fields(code: str, *, owner: Optional[str] = None, pane: Optional[str] = 
         raise ValueError(f"unknown owner {owner!r}; expected one of {sorted(OWNERS)}")
     if pane is not None and pane not in PANES:
         raise ValueError(f"unknown pane {pane!r}; expected one of {sorted(PANES)}")
-    if clash := _CONTRACT_KEYS & extra.keys():
+    if clash := (_CONTRACT_KEYS | {MAC_KEY, NONCE_KEY}) & extra.keys():
         raise ValueError(f"extras may not override contract keys: {sorted(clash)}")
-    return {"code": code, "owner": owner, "pane": pane, "subject": subject, "retry": bool(retry), **extra}
+    fields = {"code": code, "owner": owner, "pane": pane, "subject": subject, "retry": bool(retry), **extra}
+    # A nonce, so the same failure twice is two signatures and the one-use rule (_SEEN) only ever
+    # refuses a copy, never a second genuine failure.
+    fields[NONCE_KEY] = secrets.token_hex(8)
+    fields[MAC_KEY] = _mac(_signing_key(), fields)
+    return fields
 
 
 class FixMessage(str):
@@ -181,22 +192,93 @@ def as_tool_error(err: Any, **extra: Any) -> str:
     return tool_error(str(err), **{**extra, **fields_of(err)})
 
 
-#: The most a host is handed of one extra's text: extras are identifiers and short facts ("path",
-#: "window_id", "consent"), never a transcript, and a frame on the wire is not the place for one.
-_HOST_EXTRA_LIMIT = 512
+# ── Proof of origin: only Hermes's own code makes a fix ──────────────────────
+#
+# A host app turns ``fix`` into a card with an Open Settings button, so a code in a tool result is
+# only believed when Hermes's own code built it. Parsing the text is not enough: anything the model
+# or a web page can put in a tool result (a shell's stdout, a connector's answer, ``execute_code``'s
+# output) can spell ``{"code": "tcc_app_data", ...}``. So ``fix_fields`` — which every producer goes
+# through — signs the fields with a key the model cannot read, and ``host_fields`` believes a
+# result only when that signature checks out against a key this process trusts.
+#
+# - In this process (the HTTP tool loop) the key is ``_PROCESS_KEY``: random, in memory, never in
+#   the environment, trusted from the start.
+# - Under the Claude Code runtime the tools run in the hermes-tools MCP server, a separate process.
+#   Its ``ToolBridge`` (agent/transports/hermes_tool_bridge.py) mints a key, trusts it here, and
+#   hands it to that server exactly once, at the server's startup, over the bridge socket; the
+#   server signs with it (``use_signing_key``). The model can read the bridge's address and token
+#   (terminal runs inside that server) but the key is already spent by then, and it is never in
+#   an environment a child process inherits. A server that did not get it signs with its own
+#   random key, which nobody trusts: no card, rather than a card anyone could make.
+# - ``execute_code`` runs in its own process with its own random key: whatever it prints is
+#   never believed.
+# - A signature is accepted once (``_SEEN``): a genuine failure's JSON echoed back later — by a
+#   shell, a file, a page — is not a second card.
+
+MAC_KEY = "fix_mac"
+NONCE_KEY = "fix_nonce"
+#: What the signature covers. Anything else in the dict (a layer's own ``output``, ``exit_code``)
+#: is not the fix's, and is never handed to a host.
+_SIGNED_KEYS = ("code", "owner", "pane", "subject", "retry", "restart", "consent", "also_pane", "path",
+                NONCE_KEY)
+#: A subject is a name ("Google Chrome", "Desktop", "Notes"), never a sentence.
+SUBJECT_LIMIT = 60
+_PATH_LIMIT = 512
+
+_PROCESS_KEY = secrets.token_bytes(32)
+_lock = threading.Lock()
+_signing: list = [_PROCESS_KEY]
+_trusted: Dict[bytes, int] = {_PROCESS_KEY: 1}
+_SEEN: "OrderedDict[str, None]" = OrderedDict()
+_SEEN_LIMIT = 4096
 
 
-def host_fields(result: Any) -> Dict[str, Any]:
-    """The contract fields a FINISHED tool's result carries, for a host app's tool-progress frame; ``{}``
-    when it carries none.
+def _signing_key() -> bytes:
+    return _signing[0]
 
-    ``result`` is whatever the tool loop handed ``tool_complete_callback``: the JSON string
-    ``tool_error`` / ``fix_error`` returned (the HTTP loop), the same string with the ``"[error] "``
-    prefix the Claude Code child's transcript gets when a result is flagged ``is_error``
-    (``agent/transports/claude_code_session.py``), or an already-decoded dict. ``error`` is left out:
-    it is the model's words and the model already has it; the host shows its own. Only a code in
-    ``CODES`` counts, so a tool that happens to return ``{"code": ...}`` of its own is not a Fix card.
-    Scalar extras pass through (strings capped); anything nested is dropped."""
+
+def use_signing_key(key: bytes) -> None:
+    """Sign every fix from now on with ``key`` (the MCP server, with its bridge's key)."""
+    if not isinstance(key, (bytes, bytearray)) or len(key) < 16:
+        raise ValueError("a fix signing key is at least 16 bytes")
+    with _lock:
+        _signing[0] = bytes(key)
+
+
+def trust_key(key: bytes) -> None:
+    """Believe fixes signed with ``key`` (a ``ToolBridge``, for the server it hands the key to)."""
+    with _lock:
+        _trusted[bytes(key)] = _trusted.get(bytes(key), 0) + 1
+
+
+def untrust_key(key: bytes) -> None:
+    with _lock:
+        n = _trusted.get(bytes(key), 0) - 1
+        if n > 0:
+            _trusted[bytes(key)] = n
+        elif bytes(key) != _PROCESS_KEY:
+            _trusted.pop(bytes(key), None)
+
+
+def _canonical(fields: Dict[str, Any]) -> bytes:
+    return json.dumps({k: fields.get(k) for k in _SIGNED_KEYS if k in fields},
+                      sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str).encode()
+
+
+def _mac(key: bytes, fields: Dict[str, Any]) -> str:
+    return hmac.new(key, _canonical(fields), hashlib.sha256).hexdigest()
+
+
+def _signed_by_trusted(fields: Dict[str, Any]) -> bool:
+    mac = fields.get(MAC_KEY)
+    if not isinstance(mac, str) or len(mac) != 64:
+        return False
+    with _lock:
+        keys = list(_trusted)
+    return any(hmac.compare_digest(mac, _mac(k, fields)) for k in keys)
+
+
+def _decode(result: Any) -> Optional[Dict[str, Any]]:
     obj: Any = result
     if isinstance(obj, (bytes, bytearray)):
         obj = obj.decode("utf-8", "replace")
@@ -205,20 +287,51 @@ def host_fields(result: Any) -> Dict[str, Any]:
         if text.startswith("[error]"):
             text = text[len("[error]"):].strip()
         if not text.startswith("{"):
-            return {}
+            return None
         try:
-            import json
             obj = json.loads(text)
         except (ValueError, TypeError):
+            return None
+    return obj if isinstance(obj, dict) else None
+
+
+def host_fields(result: Any) -> Dict[str, Any]:
+    """The contract fields a FINISHED tool's result carries, for a host app's tool-progress frame; ``{}``
+    unless Hermes's own code made them.
+
+    ``result`` is whatever the tool loop handed ``tool_complete_callback``: the JSON string a tool
+    returned (the HTTP loop), the same string with the ``"[error] "`` prefix the Claude Code child's
+    transcript gets when a result is flagged ``is_error`` (``agent/transports/claude_code_session.py``),
+    or a decoded dict. Believed only when (see the block above) its signature is from a trusted key and
+    has not been seen before, and its fields pass ``fix_fields``'s own validation again (a known code;
+    an owner and pane that agree with ``GRANTS`` / ``PANES``). ``error`` is left out: it is the model's
+    words. ``subject`` is capped at ``SUBJECT_LIMIT``; only the signed keys are handed over."""
+    obj = _decode(result)
+    if obj is None or obj.get("code") not in CODES or not _signed_by_trusted(obj):
+        return {}
+    mac = obj[MAC_KEY]
+    with _lock:
+        if mac in _SEEN:
             return {}
-    if not isinstance(obj, dict) or obj.get("code") not in CODES:
+        _SEEN[mac] = None
+        while len(_SEEN) > _SEEN_LIMIT:
+            _SEEN.popitem(last=False)
+    signed = {k: obj[k] for k in _SIGNED_KEYS if k in obj and k != NONCE_KEY}
+    try:
+        extras = {k: v for k, v in signed.items() if k not in _CONTRACT_KEYS}
+        fix_fields(signed["code"], owner=signed.get("owner"), pane=signed.get("pane"),
+                   subject=signed.get("subject"), retry=bool(signed.get("retry")), **extras)
+    except (ValueError, TypeError, KeyError):
+        return {}
+    for key in ("owner", "pane", "also_pane"):
+        if key in signed and signed[key] is not None and not isinstance(signed[key], str):
+            return {}
+    if signed.get("also_pane") is not None and signed["also_pane"] not in PANES:
         return {}
     out: Dict[str, Any] = {}
-    for key, value in obj.items():
-        if key in ("error", "success", "data"):
-            continue
+    for key, value in signed.items():
         if isinstance(value, str):
-            out[key] = value[:_HOST_EXTRA_LIMIT]
+            out[key] = value[:SUBJECT_LIMIT if key == "subject" else _PATH_LIMIT]
         elif value is None or isinstance(value, (bool, int, float)):
             out[key] = value
     return out

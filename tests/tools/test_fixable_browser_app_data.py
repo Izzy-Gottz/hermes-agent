@@ -110,6 +110,7 @@ def chmod():
 def _assert_tcc_app_data(err, src):
     assert err, "expected an error"
     fields = fix_reasons.fields_of(err)
+    assert fields.pop(fix_reasons.MAC_KEY) and fields.pop(fix_reasons.NONCE_KEY)
     assert fields == {"code": "tcc_app_data", "owner": "app", "pane": "Privacy_AllFiles",
                       "subject": "Google Chrome", "retry": True, "browser": "chrome", "path": str(src)}
     text = str(err)

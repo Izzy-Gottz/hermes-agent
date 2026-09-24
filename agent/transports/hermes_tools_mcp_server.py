@@ -765,6 +765,20 @@ def _build_server(profile: Optional[str] = None) -> Any:
     return mcp
 
 
+def adopt_fix_key(env: Optional[dict] = None) -> bool:
+    """Take the bridge's fix-signing key; True when it was given."""
+    try:
+        from agent.transports.hermes_tool_bridge import fetch_fix_key
+        from tools.fix_reasons import use_signing_key
+        key = fetch_fix_key(env)
+        if key:
+            use_signing_key(key)
+            return True
+    except Exception:
+        logger.debug("no fix-signing key from the bridge", exc_info=True)
+    return False
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """Entry point for `python -m agent.transports.hermes_tools_mcp_server`."""
     argv = argv or sys.argv[1:]
@@ -785,6 +799,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     scrubbed = scrub_environment()
     if scrubbed:
         logger.info("scrubbed %s from the server environment", ",".join(scrubbed))
+    # Before any tool can run: the key fixable failures are signed with, so the
+    # host believes a Fix card from Hermes's own code and nothing else
+    # (tools/fix_reasons.py, "Proof of origin"). One per bridge; without it,
+    # fixes are signed with this process's own key, which nobody trusts.
+    adopt_fix_key()
     if (os.environ.get(PROFILE_ENV) or "").strip().lower() == CLAUDE_CODE_PROFILE:
         hooks = prepare_claude_code_profile()
         logger.info("claude-code profile: %d config hook(s) registered; headless approval", len(hooks))
