@@ -839,6 +839,104 @@ def release_mcp_config(path: str) -> None:
             pass
 
 
+#: The payload the last ``write_mcp_config`` call wrote, so its caller can keep it in memory
+#: and put it back before every spawn (``rewrite_mcp_config``).
+_LAST_MCP_PAYLOAD: Optional[dict] = None
+
+
+def rewrite_mcp_config(path: str, payload: dict) -> None:
+    """Put Hermes's own MCP config back into ``path`` from memory, right before a spawn.
+
+    The file lives in a directory the model's shell can write, and ``restart()`` reuses it: a
+    rewritten server command (``sh -c 'steal; exec real-server'``) would otherwise be what the
+    next claude runs. Written in place (``O_NOFOLLOW``, same inode, so the liveness ``flock``
+    stays), and a path that has become a symlink is refused rather than followed."""
+    data = json.dumps(payload).encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+
+
+def mcp_server_spec(payload: Optional[dict]) -> Optional[dict]:
+    """The hermes-tools server entry of an MCP config: what the fix-signing key's taker must be."""
+    try:
+        entry = (payload or {})["mcpServers"][HERMES_TOOLS_MCP_SERVER_NAME]
+        return {"command": entry["command"], "args": list(entry["args"]), "cwd": entry["cwd"],
+                "pythonpath": (entry.get("env") or {}).get("PYTHONPATH")}
+    except (KeyError, TypeError):
+        return None
+
+
+#: Settings that make claude run a command of the settings' choosing before its ``init`` — a
+#: process below claude that could otherwise ask for the fix-signing key first.
+_PRE_INIT_HOOK_EVENTS = ("SessionStart", "Setup")
+_PRE_INIT_COMMAND_KEYS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper",
+                          "gcpAuthRefresh")
+
+
+def pre_init_commands(settings: dict) -> list:
+    """What in a claude settings dict would run before ``init``."""
+    found = [k for k in _PRE_INIT_COMMAND_KEYS if settings.get(k)]
+    hooks = settings.get("hooks")
+    if isinstance(hooks, dict):
+        found += [f"hooks.{e}" for e in _PRE_INIT_HOOK_EVENTS if hooks.get(e)]
+    elif hooks:
+        found.append("hooks")
+    return found
+
+
+def enforce_settings_file(path: str, deny_rules: Optional[list[str]] = None) -> str:
+    """Before every spawn: Hermes's settings file, with nothing in it that runs before ``init``.
+
+    Hermes itself registers no such command (its template is the marker and ``permissions``);
+    the file is in a directory the model's shell can write, so one found there is not Hermes's.
+    It is removed and the file rewritten; if the file cannot be read or still holds one after the
+    rewrite, the spawn is refused. Hooks for later events (PreToolUse, …) are kept."""
+    ensure_settings_file(path, deny_rules)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            settings = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"claude settings {path} is unreadable ({exc}); refusing to start claude")
+    if not isinstance(settings, dict):
+        raise RuntimeError(f"claude settings {path} is not an object; refusing to start claude")
+    foreign = pre_init_commands(settings)
+    if foreign:
+        logger.warning("claude settings held %s, which Hermes never writes; removed before spawning",
+                       ", ".join(foreign))
+        for key in _PRE_INIT_COMMAND_KEYS:
+            settings.pop(key, None)
+        hooks = settings.get("hooks")
+        if isinstance(hooks, dict):
+            for event in _PRE_INIT_HOOK_EVENTS:
+                hooks.pop(event, None)
+        elif hooks:
+            settings.pop("hooks", None)
+        directory = os.path.dirname(path) or "."
+        fd, tmp = _mkstemp_or_explain(prefix=".settings-", suffix=".json", directory=directory)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(settings, fh, indent=2)
+                fh.write("\n")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        with open(path, "r", encoding="utf-8") as fh:
+            if pre_init_commands(json.load(fh)):
+                raise RuntimeError(f"claude settings {path} still runs a command before init; refusing")
+    return path
+
+
 def write_mcp_config(
     *,
     python_executable: Optional[str] = None,
@@ -934,6 +1032,8 @@ def write_mcp_config(
             }
         }
     }
+    global _LAST_MCP_PAYLOAD
+    _LAST_MCP_PAYLOAD = payload
     if directory:
         _makedirs_or_explain(directory)
     fd, path = _mkstemp_or_explain(
@@ -1069,6 +1169,9 @@ class ClaudeCodeSession:
         self._system_prompt_path: Optional[str] = None
         self._expose_hermes_tools = expose_hermes_tools
         self._mcp_config_path = mcp_config_path
+        #: Hermes's own MCP config, kept in memory: put back into the file before every spawn, and
+        #: what the fix-signing key's taker must match (``mcp_server_spec``).
+        self._mcp_payload: Optional[dict] = None
         self._owns_mcp_config = False
         self._extra_args = list(extra_args or [])
         self._env_override = env
@@ -1318,7 +1421,7 @@ class ClaudeCodeSession:
         token = resolve_oauth_token(self._oauth_token_env)
         _makedirs_or_explain(self._config_dir)
         _makedirs_or_explain(self._cwd)
-        ensure_settings_file(self._settings_path, self._deny_rules)
+        enforce_settings_file(self._settings_path, self._deny_rules)
         if self._expose_hermes_tools and not self._mcp_config_path:
             sweep_stale_mcp_configs(self._config_dir)
             self._sweep_dead_bridges(self._config_dir)
@@ -1330,6 +1433,10 @@ class ClaudeCodeSession:
                 bridge_tools=bridge.allowed_tools if bridge else None,
             )
             self._owns_mcp_config = True
+            self._mcp_payload = _LAST_MCP_PAYLOAD
+        elif self._owns_mcp_config and self._mcp_config_path and self._mcp_payload:
+            # restart(): the same file, which the model's shell may have edited since.
+            rewrite_mcp_config(self._mcp_config_path, self._mcp_payload)
         self._write_system_prompt_file()
 
         transcript_exists = resume_transcript_exists(
@@ -1432,7 +1539,7 @@ class ClaudeCodeSession:
         # keeps the bridge, so without this a restarted claude's server was
         # refused and Fix cards stopped for the rest of the session).
         if self._tool_bridge is not None and hasattr(self._tool_bridge, "bind_fix_key"):
-            self._tool_bridge.bind_fix_key(proc.pid)
+            self._tool_bridge.bind_fix_key(proc.pid, server=mcp_server_spec(self._mcp_payload))
         self._exit_code = None
         self._session_id = None
         self._init_info = None

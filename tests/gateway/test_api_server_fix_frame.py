@@ -263,20 +263,38 @@ def test_a_validly_signed_but_invalid_owner_or_pane_is_refused():
         assert host_fields(obj) == {}, bad
 
 
-def _mcp_server_process(env: dict, *, adopt: bool) -> str:
-    """A real, separate process standing in for the hermes-tools MCP server: take the bridge's key
-    (or not), then fail the way a tool does and hand back what the CLI would get."""
-    import subprocess
-    import sys
-    code = ("import sys\n"
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _server_code(adopt: bool = True, fixes: int = 1) -> str:
+    """What a stand-in hermes-tools server runs: take the bridge's key (or not), then fail the way
+    a tool does and print what the CLI would get."""
+    return ("import sys\n"
             "from agent.transports.hermes_tools_mcp_server import adopt_fix_key, to_mcp_content\n"
             "from tools.fix_reasons import fix_error\n"
             f"ok = adopt_fix_key() if {adopt!r} else False\n"
             "sys.stderr.write('adopted=%s' % ok)\n"
-            "print(to_mcp_content(fix_error('x', 'tcc_app_data', subject='Google Chrome')))\n")
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
-                         cwd=root, env={**os.environ, **env, "PYTHONPATH": root})
+            f"for _ in range({fixes}):\n"
+            "    print(to_mcp_content(fix_error('x', 'tcc_app_data', subject='Google Chrome')), flush=True)\n")
+
+
+def _spec(code: str) -> dict:
+    """The server command the bridge is bound to: exactly how _server_argv launches it."""
+    import sys
+    return {"command": sys.executable, "args": ["-c", code], "cwd": _ROOT, "pythonpath": _ROOT}
+
+
+def _server_env(env: dict) -> dict:
+    return {**{k: v for k, v in os.environ.items() if k != "PYTHONPATH"}, **env, "PYTHONPATH": _ROOT}
+
+
+def _mcp_server_process(env: dict, *, adopt: bool) -> str:
+    """A real, separate process standing in for the hermes-tools MCP server, launched exactly as
+    ``_spec(_server_code(adopt))`` says, as a child of this test (which stands in for claude)."""
+    import subprocess
+    import sys
+    out = subprocess.run([sys.executable, "-c", _server_code(adopt)], capture_output=True, text=True,
+                         check=True, cwd=_ROOT, env=_server_env(env))
     return out.stdout.strip()
 
 
@@ -288,7 +306,7 @@ def test_the_mcp_server_signs_with_the_bridges_key_and_only_once(tmp_path):
         BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, ToolBridge, fetch_fix_key)
     bridge = ToolBridge(lambda tool, args: "ok", directory=str(tmp_path))
     bridge.start()
-    bridge.bind_fix_key(os.getpid())   # this test stands in for claude
+    bridge.bind_fix_key(os.getpid(), server=_spec(_server_code(True)))   # this test stands in for claude
     try:
         env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
         genuine = _mcp_server_process(env, adopt=True)
@@ -309,7 +327,7 @@ def test_the_key_window_shuts_at_the_first_tool_call_even_if_nobody_took_it(tmp_
         BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, ToolBridge, call_bridged_tool, fetch_fix_key)
     bridge = ToolBridge(lambda tool, args: "ok", directory=str(tmp_path))
     bridge.start()
-    bridge.bind_fix_key(os.getpid())   # this test stands in for claude
+    bridge.bind_fix_key(os.getpid(), server=_spec(_server_code(True)))   # this test stands in for claude
     try:
         env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
         tool = sorted(bridge._allowed)[0]
@@ -328,7 +346,7 @@ def test_claudes_init_seals_the_key(tmp_path):
     from agent.transports import claude_code_session as ccs
     bridge = ToolBridge(lambda tool, args: "ok", directory=str(tmp_path))
     bridge.start()
-    bridge.bind_fix_key(os.getpid())   # this test stands in for claude
+    bridge.bind_fix_key(os.getpid(), server=_spec(_server_code(True)))   # this test stands in for claude
     try:
         env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
         session = types.SimpleNamespace(_tool_bridge=bridge, _session_id=None, _init_info=None,
@@ -342,26 +360,18 @@ def test_claudes_init_seals_the_key(tmp_path):
         bridge.close()
 
 
-_SERVER_CODE = ("import sys\n"
-                "from agent.transports.hermes_tools_mcp_server import adopt_fix_key, to_mcp_content\n"
-                "from tools.fix_reasons import fix_error\n"
-                "sys.stderr.write('adopted=%s' % adopt_fix_key())\n"
-                "for _ in range(2):\n"
-                "    print(to_mcp_content(fix_error('x', 'tcc_app_data', subject='Google Chrome')), flush=True)\n")
-
-
-def _fake_claude(env: dict):
-    """A stand-in ``claude``: a process that, when told to, starts the hermes-tools server as its
-    own child (as the real claude does) and relays the two fixes that server signs."""
+def _fake_claude(env: dict, *, before: str = ""):
+    """A stand-in ``claude``: a shell that, when told to, runs ``before`` (anything a rewritten
+    config or a SessionStart hook would start below claude) and then the hermes-tools server
+    exactly as Hermes built it, relaying what that server prints."""
+    import shlex
     import subprocess
     import sys
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    launcher = ("import subprocess, sys\n"
-                "sys.stdin.readline()\n"
-                f"out = subprocess.run([sys.executable, '-c', {_SERVER_CODE!r}], capture_output=True, text=True)\n"
-                "sys.stdout.write(out.stdout)\n")
-    return subprocess.Popen([sys.executable, "-c", launcher], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            text=True, cwd=root, env={**os.environ, **env, "PYTHONPATH": root})
+    code = _server_code(True, fixes=2)
+    real = " ".join(shlex.quote(a) for a in [sys.executable, "-c", code])
+    script = f"read x; {before} {real}"
+    return subprocess.Popen(["/bin/sh", "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            text=True, cwd=_ROOT, env=_server_env(env)), _spec(code)
 
 
 def _run(claude) -> list:
@@ -369,23 +379,45 @@ def _run(claude) -> list:
     return [line for line in out.splitlines() if line.strip()]
 
 
-def test_a_process_that_is_not_claudes_cannot_take_the_key_first(tmp_path):
-    """The reviewer's race: a process the model left running (not below this claude) watches the
-    MCP config for the token and asks for the key before the real server has finished importing.
-    It must be refused, the real server must still get the key, and a fix the racer signs with
-    what it has must not be believed."""
-    from agent.transports.hermes_tool_bridge import (
-        BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, ToolBridge, fetch_fix_key)
+def _bridge(tmp_path):
+    from agent.transports.hermes_tool_bridge import BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, ToolBridge
     bridge = ToolBridge(lambda tool, args: "ok", directory=str(tmp_path))
     bridge.start()
+    return bridge, {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
+
+
+def test_a_process_that_is_not_claudes_cannot_take_the_key_first(tmp_path):
+    """The reviewer's first race: a process the model left running (not below this claude)
+    asks for the key before the real server has finished importing. Refused; the real server
+    still gets it."""
+    from agent.transports.hermes_tool_bridge import fetch_fix_key
+    bridge, env = _bridge(tmp_path)
     try:
-        env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
-        claude = _fake_claude(env)
-        bridge.bind_fix_key(claude.pid)
-        stolen = fetch_fix_key(env)                      # the racer: this test, not below claude
-        assert stolen is None, "a process outside claude's tree was handed the fix key"
+        claude, spec = _fake_claude(env)
+        bridge.bind_fix_key(claude.pid, server=spec)
+        assert fetch_fix_key(env) is None, "a process outside claude's tree was handed the fix key"
         genuine = _run(claude)
         assert host_fields(genuine[0]).get("code") == "tcc_app_data", "claude's own server was refused"
+    finally:
+        bridge.close()
+
+
+def test_a_rewritten_server_command_below_claude_cannot_take_the_key(tmp_path):
+    """race3: the config's server command rewritten to ``sh -c 'steal; exec real-server'`` (or a
+    SessionStart hook — the same shape: a process below claude, before init). The stealer is
+    below claude, so only matching the exact server Hermes built refuses it."""
+    import shlex
+    import sys
+    bridge, env = _bridge(tmp_path)
+    try:
+        steal = " ".join(shlex.quote(a) for a in [
+            sys.executable, "-c",
+            "from agent.transports.hermes_tool_bridge import fetch_fix_key as f; print('stolen=%s' % bool(f()))"])
+        claude, spec = _fake_claude(env, before=f"{steal};")
+        bridge.bind_fix_key(claude.pid, server=spec)
+        out = _run(claude)
+        assert out[0] == "stolen=False", out
+        assert host_fields(out[1]).get("code") == "tcc_app_data", "the real server was refused"
     finally:
         bridge.close()
 
@@ -393,27 +425,16 @@ def test_a_process_that_is_not_claudes_cannot_take_the_key_first(tmp_path):
 def test_a_restarted_claude_gets_a_fresh_key_and_the_old_one_is_retired(tmp_path):
     """restart() keeps the bridge and spawns a new claude: its server must get a key (cards go on),
     and what the previous spawn's server signed is no longer believed."""
-    from agent.transports.hermes_tool_bridge import BRIDGE_SOCKET_ENV, BRIDGE_TOKEN_ENV, ToolBridge
-    bridge = ToolBridge(lambda tool, args: "ok", directory=str(tmp_path))
-    bridge.start()
+    bridge, env = _bridge(tmp_path)
     try:
-        env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
-        first = _fake_claude(env)
-        bridge.bind_fix_key(first.pid)
+        first, spec = _fake_claude(env)
+        bridge.bind_fix_key(first.pid, server=spec)
         a1, a2 = _run(first)
         assert host_fields(a1).get("code") == "tcc_app_data"
-        second = _fake_claude(env)
-        bridge.bind_fix_key(second.pid)                  # what _spawn does on every spawn
+        second, spec = _fake_claude(env)
+        bridge.bind_fix_key(second.pid, server=spec)     # what _spawn does on every spawn
         b1, _ = _run(second)
         assert host_fields(b1).get("code") == "tcc_app_data", "the restarted claude's server got no key"
         assert host_fields(a2) == {}, "the previous spawn's key is still trusted"
     finally:
         bridge.close()
-
-
-def test_spawn_binds_the_key_to_the_new_claude(tmp_path, monkeypatch):
-    """ClaudeCodeSession._spawn hands the bridge each new claude's pid (first start and restart)."""
-    from agent.transports import claude_code_session as ccs
-    src = open(ccs.__file__).read()
-    spawn = src[src.index("    def _spawn(self"):src.index("    def restart(self")]
-    assert "bind_fix_key(proc.pid)" in spawn

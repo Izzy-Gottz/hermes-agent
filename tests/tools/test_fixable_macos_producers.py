@@ -796,3 +796,14 @@ def test_a_script_that_names_no_app_cannot_name_one_on_a_card(monkeypatch):
     # The native backend's own script: the same rule.
     assert frm.automation_denied_in_text(line, 'error "x" number -1743') is None
     assert frm.automation_denied_in_text(line, 'tell application "Terminal" to activate') is not None
+
+
+def test_a_1744_from_the_models_own_script_makes_no_card(monkeypatch):
+    """-1744 is "not yet asked", which is true of any app never automated: from a terminal
+    osascript (the model's script) it makes no card; Hermes's own script still reports it."""
+    import tools.fix_reasons_macos as frm
+    monkeypatch.setattr(frm, "_is_darwin", lambda: True)
+    line = "0:40: execution error: Not authorized to send Apple events to Notes. (-1744)"
+    script = "osascript -e 'tell application \"Notes\" to get name of every note'"
+    assert frm.automation_denied_in_command(script, line) is None
+    assert frm.automation_denied_in_text(line, 'tell application "Notes" to activate') is not None

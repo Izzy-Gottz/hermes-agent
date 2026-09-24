@@ -369,6 +369,12 @@ def automation_denied_in_command(command: str, output: str, cwd: Optional[str] =
     targets = _script_targets(inv, cwd)
     if refusals[0].group("app").strip() not in targets:
         return None
+    # -1744 ("macOS needed to ask and couldn't") from the model's own script is not shown: the
+    # app confirms a card with macOS, and "not yet asked" is true of every app the person has
+    # never automated — a script telling any such app would get a card. Hermes's own scripts
+    # (the native backend) still report it.
+    if (refusals[0].group("num") or "-1743") == "-1744":
+        return None
     # Targets were checked above against the script itself (a file's text, too).
     return automation_denied_in_text(refusals[0].group(0))
 

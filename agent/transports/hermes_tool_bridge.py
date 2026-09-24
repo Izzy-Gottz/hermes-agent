@@ -223,8 +223,12 @@ class ToolBridge:
         #: The pid of the ``claude`` whose server may take the key (``bind_fix_key``); until one is
         #: bound, nobody may.
         self._fix_key_owner: Optional[int] = None
+        #: The server command Hermes built for that claude (``mcp_server_spec``): executable, argv,
+        #: cwd and PYTHONPATH. The taker must be exactly that process, not merely below claude —
+        #: a hook or an edited config can start anything below claude.
+        self._fix_key_server: Optional[dict] = None
 
-    def bind_fix_key(self, claude_pid: int) -> None:
+    def bind_fix_key(self, claude_pid: int, server: Optional[dict] = None) -> None:
         """A new ``claude`` was spawned (first start, or ``restart()`` after the system prompt
         changed): mint a fresh key for the server IT starts, handed only to a descendant of
         ``claude_pid``, and retire the previous spawn's key so what that server signed is no
@@ -234,6 +238,7 @@ class ToolBridge:
             old, trusted = self._fix_key, self._fix_key_trusted
             self._fix_key = secrets.token_bytes(32)
             self._fix_key_owner = int(claude_pid)
+            self._fix_key_server = dict(server) if server else None
             self._fix_key_issued = False
             if trusted:
                 untrust_key(old)
@@ -614,14 +619,20 @@ class ToolBridge:
                 if self._fix_key_issued:
                     logger.warning("tool bridge refused a second fix_key request")
                     return {"ok": False, "error": "tool bridge: fix_key was already issued"}
-                owner = self._fix_key_owner
+                owner, server = self._fix_key_owner, self._fix_key_server
                 # Only the hermes-tools server THIS spawn of claude started: a
                 # process below claude's pid. The token alone is not enough — it
                 # sits in the MCP config on disk before claude starts, and a
                 # process the model left running from an earlier turn (reparented
                 # to launchd when its claude went) can watch for it and ask first.
+                why = None
                 if owner is None or peer_pid is None or not _is_descendant(peer_pid, owner):
-                    logger.warning("tool bridge refused fix_key to pid %s (claude is %s)", peer_pid, owner)
+                    why = "not below this claude"
+                else:
+                    why = _not_the_server(peer_pid, server)
+                if why:
+                    logger.warning("tool bridge refused fix_key to pid %s (claude is %s): %s",
+                                   peer_pid, owner, why)
                     return {"ok": False, "error": "tool bridge: fix_key is for claude's own server"}
                 self._fix_key_issued = True
                 key = self._fix_key
@@ -751,6 +762,38 @@ def _parent_pid(pid: int) -> Optional[int]:
         return int(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
+
+
+#: Environment that would make the expected argv run other code.
+_FOREIGN_CODE_ENV = ("PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "DYLD_INSERT_LIBRARIES",
+                     "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "LD_PRELOAD", "LD_LIBRARY_PATH")
+
+
+def _not_the_server(pid: int, server: Optional[dict]) -> Optional[str]:
+    """``None`` when ``pid`` is exactly the hermes-tools server Hermes built — same executable,
+    argv, working directory (``-m`` imports from it) and PYTHONPATH, with nothing in its
+    environment that loads other code; otherwise why not."""
+    if not server:
+        return "no server command bound"
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        cmdline, exe, cwd, env = proc.cmdline(), proc.exe(), proc.cwd(), proc.environ()
+    except Exception as exc:  # psutil missing, the process gone, or not ours to read
+        return f"cannot read the process ({type(exc).__name__})"
+    command = server.get("command") or ""
+    if cmdline != [command, *server.get("args", [])]:
+        return f"argv {cmdline[:4]!r} is not the server's"
+    if os.path.realpath(exe) != os.path.realpath(command):
+        return f"executable {exe!r} is not {command!r}"
+    if os.path.realpath(cwd) != os.path.realpath(server.get("cwd") or ""):
+        return f"cwd {cwd!r} is not the server's"
+    if (env.get("PYTHONPATH") or None) != (server.get("pythonpath") or None):
+        return "PYTHONPATH is not the server's"
+    loaded = [k for k in _FOREIGN_CODE_ENV if env.get(k)]
+    if loaded:
+        return f"environment sets {loaded}"
+    return None
 
 
 def _is_descendant(pid: int, ancestor: int) -> bool:
