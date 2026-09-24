@@ -207,6 +207,11 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # Grace window after a success in which a failure counts as a flake; kept short
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
+# Level of the "check_fn X returned False" line (a tool whose requirements are not met, e.g. a
+# connector never set up). WARNING by default; a process that probes every tool on each start
+# (the hermes-tools MCP server, one per claude-code session) lowers it to INFO, so errors.log is
+# not 20-odd lines of expected absence per start. A check_fn that RAISES stays at WARNING.
+CHECK_FN_FALSE_LOG_LEVEL = logging.WARNING
 _CHECK_FN_CACHE_MAX = 512
 _check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
 _check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
@@ -352,7 +357,8 @@ def _check_fn_cached(fn: Callable) -> bool:
 
         # No recent success (or grace expired) — honor the failure; logged so silent tool
         # loss in quiet mode (subagents) is diagnosable.
-        logger.warning(
+        logger.log(
+            CHECK_FN_FALSE_LOG_LEVEL if outcome == "returned False" else logging.WARNING,
             "check_fn %s %s; dependent tools will be unavailable this turn", _fn_label(fn), outcome)
         _check_fn_cache[cache_key] = (now, False)
         return False

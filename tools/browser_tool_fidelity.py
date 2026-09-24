@@ -45,6 +45,7 @@ mode measured never to show a pixel or take focus. So this module makes headless
 than trading the owner's rule ("out of sight") for a window.
 """
 
+import glob
 import json
 import logging
 import os
@@ -970,18 +971,46 @@ def stop_keepers() -> None:
 # Status, for /browser status and hermes doctor (which run in other processes)
 # ---------------------------------------------------------------------------
 
-def _status_path() -> str:
+_STATUS_PREFIX = "browser-fidelity-status"
+
+
+def _status_path(pid: Optional[int] = None) -> str:
+    """This process's status file. One per process: every process with a monitor rewrites its
+    own every tick, and a shared file would flip between them and let a process with no keepers
+    write ``keepers: []`` over another's failure. Readers merge every live one."""
     from hermes_cli.config import get_hermes_home
-    return str(get_hermes_home() / "browser-fidelity-status.json")
+    return str(get_hermes_home() / f"{_STATUS_PREFIX}.{pid or os.getpid()}.json")
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def write_status() -> None:
-    """This process's keepers, written where another process can read them. Best effort."""
+    """This process's keepers, written where another process can read them. Best effort. A
+    process with no keepers writes nothing, and removes a file it wrote before (its keepers were
+    stopped with their browser), so it can never mask another process's report."""
     try:
         with _keepers_lock:
             keepers = [k.describe() for k in _keepers.values()]
         path = _status_path()
-        tmp = f"{path}.{os.getpid()}.tmp"
+        if not keepers:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return
+        tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             import time
             json.dump({"pid": os.getpid(), "updated": time.time(), "keepers": keepers}, fh)
@@ -990,32 +1019,57 @@ def write_status() -> None:
         logger.debug("fidelity: status not written: %s", e)
 
 
+def read_statuses() -> List[Dict[str, Any]]:
+    """Every live process's status, oldest first. A file whose writer is gone is removed (its
+    browser went with it), as is the single shared file older builds wrote."""
+    from hermes_cli.config import get_hermes_home
+    home = str(get_hermes_home())
+    out: List[Dict[str, Any]] = []
+    for path in glob.glob(os.path.join(glob.escape(home), f"{_STATUS_PREFIX}*.json")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            pid = int(data.get("pid") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if not _pid_alive(pid):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        out.append(data)
+    out.sort(key=lambda d: d.get("updated") or 0)
+    return out
+
+
+def _keeper_problem(k: Dict[str, Any]) -> Optional[str]:
+    state = k.get("state")
+    if state == "serving" or (state == "follower" and not k.get("holder_stale")):
+        return None
+    if state == "follower":
+        return "the serving process has stopped responding"
+    return k.get("error") or state or "unknown"
+
+
 def status_summary() -> Optional[Tuple[bool, str]]:
-    """``(ok, line)`` for status/doctor, or None when fidelity has nothing to report."""
+    """``(ok, line)`` for status/doctor, or None when fidelity has nothing to report. Merges every
+    live process's keepers; any keeper's failure is reported, whichever process holds it."""
     if not fidelity_enabled():
         return True, "Browser fidelity: off (browser.stealth_fidelity: false)"
-    try:
-        with open(_status_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    try:
-        import psutil
-        if not psutil.pid_exists(int(data.get("pid") or 0)):
-            return None  # the process that wrote it is gone, and so is its browser
-    except Exception:
-        pass
-    keepers = data.get("keepers") or []
+    keepers = [k for data in read_statuses() for k in (data.get("keepers") or [])]
     if not keepers:
         return None
-    k = keepers[-1]
-    if k.get("state") == "serving":
+    for k in keepers:
+        why = _keeper_problem(k)
+        if why:
+            return False, (f"Browser fidelity: NOT applied ({why}). The browser reports itself as plain Chrome for Testing; "
+                           f"it recovers on the next browser use")
+    serving = [k for k in keepers if k.get("state") == "serving"]
+    if serving:
+        k = serving[-1]
         return True, f"Browser fidelity: serving, claiming {k.get('claims')} ({sum((k.get('applied') or {}).values())} target(s))"
-    if k.get("state") == "follower" and not k.get("holder_stale"):
-        return True, "Browser fidelity: served by another Hermes process"
-    why = "the serving process has stopped responding" if k.get("state") == "follower" else (k.get("error") or k.get("state"))
-    return False, (f"Browser fidelity: NOT applied ({why}). The browser reports itself as plain Chrome for Testing; "
-                   f"it recovers on the next browser use")
+    return True, "Browser fidelity: served by another Hermes process"
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "keeper":

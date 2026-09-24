@@ -807,6 +807,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         setup_logging()
     except Exception:
         logger.debug("hermes-tools MCP server: file logging not set up", exc_info=True)
+    try:
+        # Every start probes every tool; a tool that is simply not set up is not an error here.
+        import tools.registry as _registry
+        _registry.CHECK_FN_FALSE_LOG_LEVEL = logging.INFO
+    except Exception:
+        logger.debug("hermes-tools MCP server: registry not importable", exc_info=True)
     # Credentials that belong to the spawning CLI, not to Hermes' tools
     # (CLAUDE_CODE_OAUTH_TOKEN): drop them before any tool can spawn a shell.
     scrubbed = scrub_environment()

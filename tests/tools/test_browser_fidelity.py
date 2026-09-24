@@ -72,7 +72,10 @@ class TestWhatItSends:
         # Measured: navigator.userAgentData.brands on CfT 153 = "Chromium;153, Not_A Brand;8"
         assert fid.brand_list(None, 153, "153") == [
             {"brand": "Chromium", "version": "153"}, {"brand": "Not_A Brand", "version": "8"}]
-        # ...and its fullVersionList = "Chromium;153.0.8010.52, Not_A Brand;8.0.0.0"
+        # Measured by the reviewer: CfT 154 natively = "Not A(Brand;99, Chromium;154"
+        assert fid.brand_list(None, 154, "154") == [
+            {"brand": "Not A(Brand", "version": "99"}, {"brand": "Chromium", "version": "154"}]
+        # CfT 153 fullVersionList = "Chromium;153.0.8010.52, Not_A Brand;8.0.0.0"
         assert fid.brand_list(None, 153, "153.0.8010.52") == [
             {"brand": "Chromium", "version": "153.0.8010.52"}, {"brand": "Not_A Brand", "version": "8.0.0.0"}]
 
@@ -611,6 +614,16 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
         self._send("ok", "text/plain")
 
 
+# The live tests claim what a real acquire claims: the person's brand at the ENGINE's version
+# (with_engine_version), so they hold on whichever Chrome for Testing is installed. Set by the
+# live_browser fixture; the expected brand strings are derived from it, not written down.
+_LIVE_ID = dict(CHROME_153)
+
+
+def _live_brands(brand="Google Chrome"):
+    return ",".join(b["brand"] for b in fid.brand_list(brand, _LIVE_ID["major"], str(_LIVE_ID["major"])))
+
+
 @pytest.fixture
 def live_browser(tmp_path):
     """(cdp_call, keeper, server_port, recorder_log). The whole browser process tree is killed after."""
@@ -621,6 +634,8 @@ def live_browser(tmp_path):
     binary = rp.driven_browser_executable()
     if not binary:
         pytest.skip("no packaged Chrome for Testing")
+    global _LIVE_ID
+    _LIVE_ID = fid.with_engine_version(CHROME_153, fid.installed_browser_version(binary))
     _Recorder.log = []
 
     class _TS(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -630,7 +645,7 @@ def live_browser(tmp_path):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     udd = tmp_path / "udd"
     udd.mkdir()
-    flags = [*rp._REAL_PROFILE_CHROME_FLAGS, *rp._mock_keychain_flags(), *fid.launch_flags(CHROME_153, True, MACBOOK), "--headless=new"]
+    flags = [*rp._REAL_PROFILE_CHROME_FLAGS, *rp._mock_keychain_flags(), *fid.launch_flags(_LIVE_ID, True, MACBOOK), "--headless=new"]
     proc = subprocess.Popen([binary, f"--user-data-dir={udd}", *flags], stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True)
     ws = None
@@ -644,7 +659,7 @@ def live_browser(tmp_path):
                 time.sleep(0.25)
         assert port, "browser never exposed a debug port"
         with patch.object(fid, "fidelity_enabled", return_value=True):
-            keeper = fid.ensure_keeper(port, CHROME_153)
+            keeper = fid.ensure_keeper(port, _LIVE_ID)
         assert keeper is not None and keeper.state == "serving", keeper and keeper.error
         ws = connect(requests.get(f"http://127.0.0.1:{port}/json/version", timeout=5).json()["webSocketDebuggerUrl"],
                      max_size=None)
@@ -739,11 +754,12 @@ class TestLiveBrowser:
         assert _wait_for(lambda: all(_report(log, w) for w in ("page", "dw", "shw", "sw"))), f"missing reports: {log}"
         first = next(h for verb, path, h in log if verb == "GET" and path == "/page?first")
         assert first["user-agent"] == keeper.ua
-        assert '"Google Chrome";v="153"' in first["sec-ch-ua"] and first["sec-ch-ua-platform"] == '"macOS"'
+        major = _LIVE_ID["major"]
+        assert f'"Google Chrome";v="{major}"' in first["sec-ch-ua"] and first["sec-ch-ua-platform"] == '"macOS"'
         for where in ("page", "dw", "shw", "sw"):
             r = _report(log, where)
             assert r["ua"] == keeper.ua, where
-            assert r["brands"] == "Google Chrome,Not_A Brand,Chromium", where
+            assert r["brands"] == _live_brands(), where
             assert r.get("arch") and r.get("pv"), where  # high-entropy hints are present, not empty
 
     def test_a_popup_is_covered(self, live_browser):
@@ -753,7 +769,7 @@ class TestLiveBrowser:
         call("Runtime.evaluate", {"expression": f"window.open('http://localhost:{sp}/page?popup'); 1",
                                   "userGesture": True}, s)
         got = _wait_for(lambda: _report(log, "page"))
-        assert got and got["brands"] == "Google Chrome,Not_A Brand,Chromium" and got["ua"] == keeper.ua
+        assert got and got["brands"] == _live_brands() and got["ua"] == keeper.ua
         assert _wait_for(lambda: keeper.applied.get("page", 0) >= 3, secs=5)  # counters reach status each second
 
     @pytest.mark.xfail(strict=True, reason="KNOWN LIMIT: waitForDebuggerOnStart holds the renderer, not the "
@@ -780,14 +796,14 @@ class TestLiveBrowser:
         assert not ok and "NOT applied" in line
         _blank_then_navigate(call, f"http://localhost:{sp}/page?dead")
         got = _wait_for(lambda: _report(log, "page"))
-        assert got["brands"] == "Chromium,Not_A Brand"  # measured degraded state, documented
+        assert got["brands"] == _live_brands(None)  # measured degraded state, documented
         with patch.object(fid, "fidelity_enabled", return_value=True):
-            again = fid.ensure_keeper(port, CHROME_153)
+            again = fid.ensure_keeper(port, _LIVE_ID)
         assert again is not keeper and again.state == "serving"
         log.clear()
         _blank_then_navigate(call, f"http://localhost:{sp}/page?back")
         got = _wait_for(lambda: _report(log, "page"))
-        assert got["brands"] == "Google Chrome,Not_A Brand,Chromium"
+        assert got["brands"] == _live_brands()
 
     def test_a_stopped_second_process_cannot_wedge_new_tabs(self, live_browser):
         """The reviewer's case: another Hermes process attaches to the same browser, and is then
@@ -803,7 +819,7 @@ import sys, time; sys.path.insert(0, {fork_root!r})
 from unittest.mock import patch
 from tools import browser_tool_fidelity as fid
 with patch.object(fid, "fidelity_enabled", return_value=True):
-    k = fid.ensure_keeper({keeper.port}, {CHROME_153!r})
+    k = fid.ensure_keeper({keeper.port}, {_LIVE_ID!r})
 print(k.state, flush=True)
 time.sleep(120)
 """], stdout=subprocess.PIPE, text=True)
@@ -813,7 +829,7 @@ time.sleep(120)
             t0 = time.time()
             _blank_then_navigate(call, f"http://localhost:{sp}/page?stopped")
             got = _wait_for(lambda: _report(log, "page"), secs=10)
-            assert got and got["brands"] == "Google Chrome,Not_A Brand,Chromium"
+            assert got and got["brands"] == _live_brands()
             assert time.time() - t0 < 8
         finally:
             os.kill(child.pid, signal.SIGCONT)
@@ -829,7 +845,7 @@ time.sleep(120)
         import sys
         call, keeper, sp, log = live_browser
         _blank_then_navigate(call, f"http://localhost:{sp}/page?t1")
-        assert _wait_for(lambda: _report(log, "page"))["brands"] == "Google Chrome,Not_A Brand,Chromium"
+        assert _wait_for(lambda: _report(log, "page"))["brands"] == _live_brands()
         # A peer process opens a tab during the stall, against its own server (ours is stalled too).
         child = subprocess.Popen([sys.executable, "-c", _PEER_TAB % {"port": keeper.port}],
                                  stdout=subprocess.PIPE, text=True)
@@ -839,7 +855,7 @@ time.sleep(120)
         stall = time.monotonic() - t0
         peer = json.loads(child.communicate(timeout=60)[0].strip().splitlines()[-1])
         assert stall >= 3.5, stall
-        assert peer["brands"] == "Google Chrome,Not_A Brand,Chromium", peer
+        assert peer["brands"] == _live_brands(), peer
         assert peer["secs"] < stall, peer  # it did not wait for the gateway
         log.clear()
         s = _blank_then_navigate(call, f"http://localhost:{sp}/plain")
@@ -849,7 +865,7 @@ time.sleep(120)
         t = time.monotonic()
         brands = call("Runtime.evaluate", {"expression": "navigator.userAgentData.brands.map(b=>b.brand).join()",
                                            "returnByValue": True}, s1)["result"]["value"]
-        assert brands == "Google Chrome,Not_A Brand,Chromium"  # the open tab kept them
+        assert brands == _live_brands()  # the open tab kept them
         assert time.monotonic() - t < 2  # and answers at once (no 20 s hang)
         assert keeper.healthy()
 
@@ -870,7 +886,7 @@ time.sleep(120)
         time.sleep(0.5)
         brands = call("Runtime.evaluate", {"expression": "navigator.userAgentData.brands.map(b=>b.brand).join()",
                                            "returnByValue": True}, s1)["result"]["value"]
-        assert brands == "Google Chrome,Not_A Brand,Chromium"
+        assert brands == _live_brands()
 
 
 _PEER_TAB = r'''
@@ -925,7 +941,7 @@ import sys, time; sys.path.insert(0, {fork_root!r})
 from unittest.mock import patch
 from tools import browser_tool_fidelity as fid
 with patch.object(fid, "fidelity_enabled", return_value=True):
-    k = fid.ensure_keeper({port}, {CHROME_153!r})
+    k = fid.ensure_keeper({port}, {_LIVE_ID!r})
 print(k.state, k.proc.pid, flush=True)
 time.sleep(120)
 """], stdout=subprocess.PIPE, text=True)
@@ -1032,3 +1048,78 @@ class TestResumeFailures:
             keeper._tick()
         assert len(self._resumes(ws, "s2")) == 1 and keeper.snapshot()["pending"] == 0
         assert keeper.resume_retries == keeper.unresumed == 0
+
+
+class TestStatusAcrossProcesses:
+    """Two MCP servers (measured: two live on the owner's Mac) share one HERMES_HOME. Each writes
+    its own file; the reader merges the live ones, so neither can erase the other's report."""
+
+    @staticmethod
+    def _write(pid, keepers):
+        path = fid._status_path(pid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump({"pid": pid, "updated": time.time(), "keepers": keepers}, fh)
+        return path
+
+    @pytest.fixture
+    def other_process(self):
+        import subprocess
+        import sys
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        yield p.pid
+        p.kill()
+        p.wait(5)
+
+    def test_a_process_without_keepers_does_not_erase_anothers_failure(self, other_process):
+        theirs = self._write(other_process, [{"state": "failed", "error": "ConnectionRefusedError: gone"}])
+        assert not fid._keepers
+        fid.write_status()  # this process has no keepers: it writes nothing
+        assert not os.path.exists(fid._status_path())
+        with patch.object(fid, "fidelity_enabled", return_value=True):
+            ok, line = fid.status_summary()
+        assert os.path.exists(theirs)
+        assert not ok and "NOT applied" in line and "gone" in line
+
+    def test_two_processes_are_merged_and_a_failure_wins(self, other_process):
+        self._write(other_process, [{"state": "failed", "error": "ConnectionRefusedError: gone"}])
+        _BeatingFake.made = []
+        with patch.object(fid, "KeeperProcess", _BeatingFake), patch.object(fid, "_ensure_monitor"):
+            fid._start_keeper(5000, CHROME_153)
+            for _ in range(3):  # tick after tick: the report does not flap
+                fid._monitor_once()
+                with patch.object(fid, "fidelity_enabled", return_value=True):
+                    ok, line = fid.status_summary()
+                assert not ok and "gone" in line
+        mine = fid._status_path()
+        with open(mine) as fh:
+            assert json.load(fh)["keepers"][0]["port"] == 5000
+        assert {d["pid"] for d in fid.read_statuses()} == {os.getpid(), other_process}
+
+    def test_a_healthy_pair_reports_serving(self, other_process):
+        self._write(other_process, [{"state": "follower", "holder_stale": False}])
+        self._write(os.getpid(), [{"state": "serving", "claims": "Google Chrome 154.0.8037.57", "applied": {"page": 1}}])
+        with patch.object(fid, "fidelity_enabled", return_value=True):
+            ok, line = fid.status_summary()
+        assert ok and "serving" in line and "154" in line
+
+    def test_a_dead_processs_file_is_ignored_and_removed(self):
+        import subprocess
+        import sys
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait(10)
+        dead = self._write(p.pid, [{"state": "failed", "error": "old news"}])
+        legacy = os.path.join(os.path.dirname(dead), "browser-fidelity-status.json")
+        with open(legacy, "w") as fh:
+            json.dump({"pid": p.pid, "updated": 1, "keepers": [{"state": "failed"}]}, fh)
+        with patch.object(fid, "fidelity_enabled", return_value=True):
+            assert fid.status_summary() is None
+        assert not os.path.exists(dead) and not os.path.exists(legacy)
+
+    def test_stopping_the_keepers_removes_this_processs_file(self):
+        with patch.object(fid, "KeeperProcess", _BeatingFake), patch.object(fid, "_ensure_monitor"):
+            fid._start_keeper(5100, CHROME_153)
+            fid.write_status()
+            assert os.path.exists(fid._status_path())
+            fid.stop_keepers()
+        assert not os.path.exists(fid._status_path())

@@ -695,39 +695,101 @@ class TheRealServerMarksEveryToolAlwaysLoad:
 
 
 
-class TestFileLogging:
-    def test_main_sends_warnings_to_the_hermes_logs(self, monkeypatch):
-        """Under the claude-code runtime this process owns the driven browser: the fidelity
-        keeper's warnings must land in HERMES_HOME/logs, redacted, not only on stderr."""
-        import logging
-        from pathlib import Path
-        import hermes_logging
-        import agent.transports.hermes_tools_mcp_server as m
+import logging as _logging
 
-        class FakeServer:
-            def run(self):
-                raise KeyboardInterrupt()
 
-        root = logging.getLogger()
-        before, level = list(root.handlers), root.level
+@pytest.fixture
+def _clean_logging(monkeypatch):
+    """Yields a runner for main() that starts from none of the root's handlers (pytest adds its
+    capture handlers at call time, so this runs inside the test), so basicConfig really installs
+    its stderr handler as in the real process. Everything is put back afterwards."""
+    import hermes_logging
+    import agent.transports.hermes_tools_mcp_server as m
+
+    class FakeServer:
+        def run(self):
+            raise KeyboardInterrupt()
+
+    root = _logging.getLogger()
+    saved = {}
+
+    def run(argv):
+        saved["handlers"], saved["level"] = list(root.handlers), root.level
+        for h in saved["handlers"]:
+            root.removeHandler(h)
+        root.setLevel(_logging.NOTSET)
         hermes_logging._logging_initialized = False
         hermes_logging._reset_queued_handlers()
-        monkeypatch.setattr(m, "_build_server", lambda: FakeServer())
+        return m.main(argv)
+
+    monkeypatch.setattr(m, "_build_server", lambda: FakeServer())
+    try:
+        yield run
+    finally:
+        before, level = saved.get("handlers", list(root.handlers)), saved.get("level", root.level)
+        hermes_logging._reset_queued_handlers()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            if h not in before:
+                h.close()
+        for h in before:
+            root.addHandler(h)
+        root.setLevel(level)
+        hermes_logging._logging_initialized = False
+
+
+class TestFileLogging:
+    def test_main_sends_warnings_to_the_hermes_logs(self, _clean_logging):
+        """Under the claude-code runtime this process owns the driven browser: the fidelity
+        keeper's warnings must land in HERMES_HOME/logs, redacted, not only on stderr."""
+        from pathlib import Path
+        import hermes_logging
         secret = "sk-ant-api03-" + "Q" * 60
+        assert _clean_logging([]) == 0
+        _logging.getLogger("tools.browser_tool_fidelity").warning(
+            "fidelity: keeper for port 1 silent for 12s; replacing it now %s", secret)
+        hermes_logging._reset_queued_handlers()  # drains the async queue to disk
+        logs = Path(os.environ["HERMES_HOME"]) / "logs"
+        for name in ("agent.log", "errors.log"):
+            text = (logs / name).read_text()
+            assert "replacing it now" in text and secret not in text
+
+    def test_stderr_stays_at_warning(self, _clean_logging, capsys):
+        """setup_logging lowers the root to INFO for agent.log; stderr must not follow it."""
+        assert _clean_logging([]) == 0
+        log = _logging.getLogger("tools.browser_tool_fidelity")
+        log.info("an info line for the file only")
+        log.warning("a warning line for stderr too")
+        err = capsys.readouterr().err
+        assert "a warning line for stderr too" in err
+        assert "an info line for the file only" not in err
+
+
+class TestQuietToolProbes:
+    def test_a_tool_not_set_up_is_info_not_a_warning_in_this_process(self, _clean_logging, caplog):
+        """Each MCP server start probed every tool and put ~22 'check_fn ... returned False'
+        WARNINGs in errors.log. Here they are INFO; a check_fn that raises is still a WARNING."""
+        import tools.registry as reg
+        old = reg.CHECK_FN_FALSE_LOG_LEVEL
         try:
-            assert m.main([]) == 0
-            logging.getLogger("tools.browser_tool_fidelity").warning(
-                "fidelity: keeper for port 1 silent for 12s; replacing it now %s", secret)
-            hermes_logging._reset_queued_handlers()  # drains the async queue to disk
-            logs = Path(os.environ["HERMES_HOME"]) / "logs"
-            for name in ("agent.log", "errors.log"):
-                text = (logs / name).read_text()
-                assert "replacing it now" in text and secret not in text
+            assert _clean_logging([]) == 0
+            root = _logging.getLogger()
+            root.addHandler(caplog.handler)
+            try:
+                def not_set_up():
+                    return False
+
+                def broken():
+                    raise RuntimeError("boom")
+                reg.invalidate_check_fn_cache()
+                with caplog.at_level("INFO", logger=reg.logger.name):
+                    reg._check_fn_cached(not_set_up)
+                    reg._check_fn_cached(broken)
+            finally:
+                root.removeHandler(caplog.handler)
+            seen = [(r.levelname, "returned False" in r.getMessage()) for r in caplog.records
+                     if r.getMessage().startswith("check_fn ")]
+            assert sorted(seen) == [("INFO", True), ("WARNING", False)], seen
         finally:
-            hermes_logging._reset_queued_handlers()
-            for h in list(root.handlers):
-                if h not in before:
-                    root.removeHandler(h)
-                    h.close()
-            root.setLevel(level)
-            hermes_logging._logging_initialized = False
+            reg.CHECK_FN_FALSE_LOG_LEVEL = old
+            reg.invalidate_check_fn_cache()
