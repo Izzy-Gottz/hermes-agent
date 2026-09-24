@@ -113,6 +113,18 @@ def _await_surviving_chrome_cdp(data_dir: str, wait: Optional[float] = None) -> 
         time.sleep(0.5)
 
 
+# Told to the model on the next browser_exec result after a wedged own browser was restarted:
+# its tabs are gone, and a form it submitted may already have gone through.
+RESTART_NOTE = ("the browser stopped answering and was restarted; pages you had open are gone, "
+                "so check before resubmitting anything")
+_restart_notes: List[str] = []
+
+
+def take_restart_note() -> Optional[str]:
+    """The restart note, once (None when the browser was not restarted since the last call)."""
+    return _restart_notes.pop() if _restart_notes else None
+
+
 def _await_holders_gone(data_dir: str, wait: float = 10.0) -> None:
     """Poll until no live browser holds ``data_dir`` (a terminated one takes a moment to exit)."""
     deadline = time.monotonic() + wait
@@ -656,6 +668,7 @@ def _real_profile_cdp() -> tuple:
                                    "restarting it", copy_dir, _BUSY_BROWSER_WAIT_S)
                 _terminate_real_profile_chrome()
                 _bt._real_profile_cdp_cache.pop("cdp", None)
+                _restart_notes[:] = [RESTART_NOTE]  # the model must not assume its pages survived
                 _await_holders_gone(copy_dir)
                 holders = _live_holders(copy_dir)
             if holders:
