@@ -179,3 +179,46 @@ def as_tool_error(err: Any, **extra: Any) -> str:
     """Tool-boundary JSON for ``err``: the full contract when it carries fix fields, else plain."""
     from tools.registry import tool_error
     return tool_error(str(err), **{**extra, **fields_of(err)})
+
+
+#: The most a host is handed of one extra's text: extras are identifiers and short facts ("path",
+#: "window_id", "consent"), never a transcript, and a frame on the wire is not the place for one.
+_HOST_EXTRA_LIMIT = 512
+
+
+def host_fields(result: Any) -> Dict[str, Any]:
+    """The contract fields a FINISHED tool's result carries, for a host app's tool-progress frame; ``{}``
+    when it carries none.
+
+    ``result`` is whatever the tool loop handed ``tool_complete_callback``: the JSON string
+    ``tool_error`` / ``fix_error`` returned (the HTTP loop), the same string with the ``"[error] "``
+    prefix the Claude Code child's transcript gets when a result is flagged ``is_error``
+    (``agent/transports/claude_code_session.py``), or an already-decoded dict. ``error`` is left out:
+    it is the model's words and the model already has it; the host shows its own. Only a code in
+    ``CODES`` counts, so a tool that happens to return ``{"code": ...}`` of its own is not a Fix card.
+    Scalar extras pass through (strings capped); anything nested is dropped."""
+    obj: Any = result
+    if isinstance(obj, (bytes, bytearray)):
+        obj = obj.decode("utf-8", "replace")
+    if isinstance(obj, str):
+        text = obj.strip()
+        if text.startswith("[error]"):
+            text = text[len("[error]"):].strip()
+        if not text.startswith("{"):
+            return {}
+        try:
+            import json
+            obj = json.loads(text)
+        except (ValueError, TypeError):
+            return {}
+    if not isinstance(obj, dict) or obj.get("code") not in CODES:
+        return {}
+    out: Dict[str, Any] = {}
+    for key, value in obj.items():
+        if key in ("error", "success", "data"):
+            continue
+        if isinstance(value, str):
+            out[key] = value[:_HOST_EXTRA_LIMIT]
+        elif value is None or isinstance(value, (bool, int, float)):
+            out[key] = value
+    return out

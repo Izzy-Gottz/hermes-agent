@@ -548,8 +548,18 @@ class OpenAICompatRoutesMixin:
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put_threadsafe(("__tool_progress__", {
-                    "tool": function_name, "toolCallId": tool_call_id, "status": "completed"}))
+                frame = {"tool": function_name, "toolCallId": tool_call_id, "status": "completed"}
+                # A failure the person can fix says which one (tools/fix_reasons.py), so the host
+                # app can show the fix instead of the model guessing a cause. Additive: a client
+                # that does not know "fix" sees the frame exactly as before.
+                try:
+                    from tools.fix_reasons import host_fields
+                    fix = host_fields(function_result)
+                except Exception:
+                    fix = {}
+                if fix:
+                    frame["fix"] = fix
+                _stream_q.put_threadsafe(("__tool_progress__", frame))
 
             def _on_status(event_type, message):
                 """Queue one lifecycle status as an SSE event.
