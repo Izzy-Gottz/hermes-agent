@@ -174,6 +174,15 @@ def _no_keepers_left():
     fid.stop_keepers()
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _no_files_left():
+    """Nothing this module creates may stay in $TMPDIR: lock files of gone browsers and status
+    files of gone keepers are swept once the module is done (``now`` is pushed past the 60 s
+    grace a live gateway's files get)."""
+    yield
+    fid.sweep_lock_files(now=time.time() + 120)
+
+
 class TestKeeper:
     UA = fid.user_agent(CHROME_153)
 
@@ -326,10 +335,10 @@ class TestOneKeeperPerBrowser:
         import sys
         lock = str(tmp_path / "k.lock")
         holder = subprocess.Popen([sys.executable, "-c", f"""
-import fcntl, os, time  # {fid._KEEPER_MARK} keeper (stand-in)
+import fcntl, os, time
 fd = os.open({lock!r}, os.O_RDWR | os.O_CREAT); fcntl.flock(fd, fcntl.LOCK_EX)
 os.write(fd, str(os.getpid()).encode()); print("held", flush=True); time.sleep(60)
-"""], stdout=subprocess.PIPE, text=True)
+""", fid._KEEPER_MARK, "keeper", "9"], stdout=subprocess.PIPE, text=True)  # argv of a keeper for port 9
         try:
             assert holder.stdout.readline().strip() == "held"
             b = fid.FidelityKeeper(9, CHROME_153)
@@ -342,6 +351,69 @@ os.write(fd, str(os.getpid()).encode()); print("held", flush=True); time.sleep(6
         finally:
             holder.kill()
             holder.wait(5)
+
+    def test_a_keeper_for_another_port_is_never_killed(self, tmp_path):
+        """Same pid in the lock file, a real keeper command line, but for port 9999: not ours."""
+        import subprocess
+        import sys
+        lock = str(tmp_path / "k.lock")
+        holder = subprocess.Popen([sys.executable, "-c", f"""
+import fcntl, os, time
+fd = os.open({lock!r}, os.O_RDWR | os.O_CREAT); fcntl.flock(fd, fcntl.LOCK_EX)
+os.write(fd, str(os.getpid()).encode()); print("held", flush=True); time.sleep(60)
+""", fid._KEEPER_MARK, "keeper", "9999"], stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            old = time.time() - 60
+            os.utime(lock, (old, old))
+            assert fid.FidelityKeeper(9, CHROME_153)._claim(lock) is False
+            assert holder.poll() is None
+        finally:
+            holder.kill()
+            holder.wait(5)
+
+    def test_a_keeper_for_this_port_that_does_not_hold_the_lock_is_never_killed(self, tmp_path):
+        import subprocess
+        import sys
+        lock = tmp_path / "k.lock"
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", fid._KEEPER_MARK, "keeper", "9"])
+        try:
+            lock.write_text(str(other.pid))  # a pid file that points at it, but no lock and no open file
+            old = time.time() - 60
+            os.utime(lock, (old, old))
+            import fcntl
+            fd = os.open(str(lock), os.O_RDWR)
+            fcntl.flock(fd, fcntl.LOCK_EX)  # someone else (this test) holds it
+            try:
+                assert fid.FidelityKeeper(9, CHROME_153)._claim(str(lock)) is False
+            finally:
+                os.close(fd)
+            assert other.poll() is None
+        finally:
+            other.kill()
+            other.wait(5)
+
+    def test_sweep_removes_only_unheld_locks_of_gone_browsers(self, tmp_path):
+        import fcntl
+        gone = tmp_path / "hermes-browser-fidelity-1-deadbeef.lock"
+        held = tmp_path / "hermes-browser-fidelity-2-cafe.lock"
+        gone.write_text("1")
+        held.write_text("2")
+        fd = os.open(str(held), os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        old_status = tmp_path / "hermes-fidelity-1-abc.json"
+        old_status.write_text(json.dumps({"pid": 999999}))  # a keeper that no longer exists
+        live_status = tmp_path / "hermes-fidelity-2-def.json"
+        live_status.write_text(json.dumps({"pid": os.getpid()}))
+        for f in (old_status, live_status):
+            os.utime(f, (time.time() - 120, time.time() - 120))
+        try:
+            with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+                assert fid.sweep_lock_files() == 2
+            assert not gone.exists() and held.exists()
+            assert not old_status.exists() and live_status.exists()
+        finally:
+            os.close(fd)
 
     def test_a_stale_holder_that_is_not_a_keeper_is_never_killed(self, tmp_path):
         import subprocess
@@ -562,8 +634,8 @@ def live_browser(tmp_path):
     proc = subprocess.Popen([binary, f"--user-data-dir={udd}", *flags], stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True)
     ws = None
+    port = None
     try:
-        port = None
         for _ in range(120):
             try:
                 port = int((udd / "DevToolsActivePort").read_text().splitlines()[0])
@@ -621,6 +693,12 @@ def live_browser(tmp_path):
                     p.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
+        # The browser is gone, so its lock file must go too: nothing may pile up in $TMPDIR.
+        import glob
+        import tempfile
+        fid.sweep_lock_files()
+        if port:
+            assert not glob.glob(os.path.join(tempfile.gettempdir(), f"hermes-browser-fidelity-{port}-*.lock"))
 
 
 def _wait_for(pred, secs=15):
@@ -826,3 +904,45 @@ for _ in range(100):
 b = call("Runtime.evaluate", {"expression": "navigator.userAgentData.brands.map(b=>b.brand).join()", "returnByValue": True}, s)["result"]["value"]
 print(json.dumps({"brands": b, "secs": time.monotonic() - t0}), flush=True)
 '''
+
+
+@LIVE
+@pytest.mark.live_system_guard_bypass
+def test_the_keeper_dies_with_the_gateway(live_browser):
+    """The incident class of 2026-09-20: something of ours outliving its owner. A gateway (a child
+    process here) starts a keeper and is SIGKILLed. The keeper must be gone within 2 s: it watches
+    its stdin, which the kernel closes when the gateway dies."""
+    import signal
+    import subprocess
+    import sys
+    import psutil
+    call, keeper, sp, log = live_browser
+    port = keeper.port
+    fid.stop_keepers()  # hand the browser to the child's keeper (only one may serve it)
+    fork_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    gateway = subprocess.Popen([sys.executable, "-c", f"""
+import sys, time; sys.path.insert(0, {fork_root!r})
+from unittest.mock import patch
+from tools import browser_tool_fidelity as fid
+with patch.object(fid, "fidelity_enabled", return_value=True):
+    k = fid.ensure_keeper({port}, {CHROME_153!r})
+print(k.state, k.proc.pid, flush=True)
+time.sleep(120)
+"""], stdout=subprocess.PIPE, text=True)
+    try:
+        state, pid = gateway.stdout.readline().split()
+        assert state == "serving"
+        keeper_proc = psutil.Process(int(pid))
+        os.kill(gateway.pid, signal.SIGKILL)
+        gateway.wait(5)
+        t0 = time.monotonic()
+        try:
+            keeper_proc.wait(2)
+        except psutil.TimeoutExpired:
+            keeper_proc.kill()
+            pytest.fail("the keeper outlived its gateway by more than 2 s")
+        assert time.monotonic() - t0 < 2
+    finally:
+        if gateway.poll() is None:
+            gateway.kill()
+            gateway.wait(5)

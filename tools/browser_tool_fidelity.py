@@ -330,6 +330,85 @@ def _lock_path(port: int, browser_ws: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"hermes-browser-fidelity-{port}-{guid}.lock")
 
 
+def _is_keeper_for(proc, port: int, lock_path: str) -> bool:
+    """True only for the keeper invocation for THIS port (``-m tools.browser_tool_fidelity keeper
+    <port>``) that also has THIS lock file open. Anything else, including a keeper for another
+    port that happens to have written the same pid, is never killed."""
+    try:
+        argv = proc.cmdline()
+        i = argv.index("keeper")
+        if _KEEPER_MARK not in argv or argv[i + 1] != str(port):
+            return False
+        want = os.path.realpath(lock_path)
+        return any(os.path.realpath(f.path) == want for f in proc.open_files())
+    except Exception:
+        return False
+
+
+def sweep_lock_files(now: Optional[float] = None) -> int:
+    """Remove lock files of browsers that are gone. A lock is removed only when nobody holds it
+    AND its port no longer serves that browser id (a new browser always has a new id, so the path
+    is never reused). Returns how many were removed."""
+    import fcntl
+    import glob
+    import tempfile
+    removed = 0
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "hermes-browser-fidelity-*.lock")):
+        m = re.match(r"hermes-browser-fidelity-(\d+)-(.+)\.lock$", os.path.basename(path))
+        if not m:
+            continue
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            continue  # held: its keeper is alive
+        try:
+            try:
+                import requests
+                ws = requests.get(f"http://127.0.0.1:{m.group(1)}/json/version", timeout=1,
+                                  proxies={"http": None, "https": None}).json().get("webSocketDebuggerUrl", "")
+            except Exception:
+                ws = ""
+            if _lock_path(int(m.group(1)), ws) != path:
+                os.unlink(path)
+                removed += 1
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    removed += _sweep_status_files(now)
+    return removed
+
+
+def _sweep_status_files(now: Optional[float] = None) -> int:
+    """Remove keeper status files whose keeper process is gone (older than a minute)."""
+    import glob
+    import tempfile
+    import time
+    removed = 0
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "hermes-fidelity-*.json")):
+        try:
+            if (now or time.time()) - os.stat(path).st_mtime < 60:
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    pid = int(json.load(fh).get("pid") or 0)
+            except (OSError, ValueError):
+                pid = 0
+            import psutil
+            if pid and psutil.pid_exists(pid):
+                continue
+            os.unlink(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def holder_is_stale(lock_path: str, now: Optional[float] = None) -> bool:
     """True when the process holding ``lock_path`` has stopped refreshing its heartbeat."""
     import time
@@ -411,7 +490,7 @@ class FidelityKeeper(threading.Thread):
         try:
             pid = int(open(lock_path, encoding="utf-8").read().strip() or 0)
             import psutil
-            if pid <= 1 or pid == os.getpid() or _KEEPER_MARK not in " ".join(psutil.Process(pid).cmdline()):
+            if pid <= 1 or pid == os.getpid() or not _is_keeper_for(psutil.Process(pid), self.port, lock_path):
                 return False
             logger.warning("fidelity: keeper pid %s stopped heartbeating; taking the browser over", pid)
             os.kill(pid, 9)
@@ -422,12 +501,31 @@ class FidelityKeeper(threading.Thread):
         return True
 
     def _release(self) -> None:
+        if self._lock_fd is not None and self.lock_path and not self._browser_alive():
+            # The browser this lock names is gone, and its id never comes back: remove the file
+            # while still holding the lock, so nobody can be mid-claim on it.
+            try:
+                os.unlink(self.lock_path)
+            except OSError:
+                pass
         if self._lock_fd is not None:
             try:
                 os.close(self._lock_fd)  # closing drops the flock
             except OSError:
                 pass
             self._lock_fd = None
+
+    def _browser_alive(self) -> bool:
+        """True while the browser instance this keeper's lock names still answers on its port."""
+        if self._connect is not None:
+            return True
+        try:
+            import requests
+            ws = requests.get(f"http://127.0.0.1:{self.port}/json/version", timeout=2,
+                              proxies={"http": None, "https": None}).json().get("webSocketDebuggerUrl", "")
+            return bool(self.lock_path) and _lock_path(self.port, ws) == self.lock_path
+        except Exception:
+            return False
 
     def _open(self):
         """Connect, adopt the ENGINE's version when it differs from the person's browser, and
@@ -568,12 +666,15 @@ def _keeper_main(argv: List[str]) -> int:
         except OSError:
             pass
 
+    orphaned = threading.Event()
+
     def parent_gone():
         try:
             while sys.stdin.buffer.read(1):
                 pass
         except Exception:
             pass
+        orphaned.set()
         keeper.stop()
 
     signal.signal(signal.SIGTERM, lambda *_: keeper.stop())
@@ -584,7 +685,14 @@ def _keeper_main(argv: List[str]) -> int:
     while keeper.is_alive():
         write()
         keeper.join(1.0)
-    write()
+    if orphaned.is_set():  # nobody is left to read it
+        for path in (status_path, f"{status_path}.tmp"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    else:
+        write()
     return 0
 
 
@@ -672,6 +780,16 @@ class KeeperProcess:
         except subprocess.TimeoutExpired:
             self.kill()
             self.proc.wait(2)
+        self._discard_status()
+
+    def _discard_status(self) -> None:
+        """The status file outlives nothing: remove it once the process is gone."""
+        if self.proc.poll() is not None:
+            for path in (self.status_path, f"{self.status_path}.tmp"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def describe(self) -> Dict[str, Any]:
         snap = self._snap()
@@ -756,6 +874,9 @@ def ensure_keeper(port: int, identity, wait: float = 15.0) -> Optional["KeeperPr
                 if keeper.state not in ("follower",):
                     logger.warning("fidelity: keeper for port %s was %s (%s); restarting it", port, keeper.state, keeper.error)
                 keeper.stop()
+                keeper.join(3)
+            else:
+                sweep_lock_files()  # first keeper for this port in this process: tidy up old ones
             keeper = _start_keeper(port, identity)
     keeper.wait_ready(wait)
     if keeper.state == "failed":
