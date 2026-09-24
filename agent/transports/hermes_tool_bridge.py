@@ -109,6 +109,12 @@ DEFAULT_TIMEOUT_SECONDS = 1500.0
 HOME_ONLY_TOOLS: tuple[str, ...] = ("cronjob_manage",)
 BRIDGED_TOOLS: tuple[str, ...] = ("todo_list", "memory", "session_search", "delegate_task",
                                   *HOME_ONLY_TOOLS)
+#: Not a tool: a question the MCP server asks the process that owns the turn — "was this turn started
+#: by a person, live?" Only that process knows (session platform, cron origin, the client's declared
+#: X-Hermes-Turn-Origin all live in the turn's contextvars); the MCP server's own environment is set
+#: once at spawn and says nothing true about the current turn. Answered by
+#: ``make_tool_bridge_dispatch`` inside the turn's context; never advertised, never metered.
+TURN_PRESENCE_QUERY = "__turn_presence__"
 
 #: One line of JSON per message, both directions. A tool result can be large
 #: (a fan-out's aggregated JSON); the cap is a sanity bound, not a budget.
@@ -558,6 +564,11 @@ class ToolBridge:
         if self._closed:
             return self._closed_reply()
         tool = str(payload.get("tool") or "")
+        if tool == TURN_PRESENCE_QUERY:
+            try:
+                return {"ok": True, "result": str(self._dispatch(tool, {}))}
+            except Exception as exc:
+                return {"ok": False, "error": _error_text(exc)}
         if tool not in self._allowed:
             return {"ok": False, "error": f"tool bridge: {tool!r} is not bridged"}
         args = payload.get("args")

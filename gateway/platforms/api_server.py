@@ -47,6 +47,9 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None)
 _api_request_browser_control_principal: ContextVar[str] = ContextVar(
     "api_server_browser_control_principal", default="")
+#: X-Hermes-Turn-Origin for this request ("person" | "background" | ""), bound for the agent's turn.
+_api_request_turn_origin: ContextVar[str] = ContextVar("api_server_turn_origin", default="")
+_TURN_ORIGIN_HEADER = "X-Hermes-Turn-Origin"
 _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
     "api_server_browser_control_transport_family", default="")
 
@@ -1666,9 +1669,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         self._derive_browser_control_principal(resolved_profile))
                     family_token = _api_request_browser_control_transport_family.set(
                         self._browser_control_transport_family(request))
+                    raw_origin = request.headers.get(_TURN_ORIGIN_HEADER, "").strip().lower()
+                    origin_token = _api_request_turn_origin.set(
+                        raw_origin if raw_origin in ("person", "background") else "")
                     try:
                         return await handler(request)
                     finally:
+                        _api_request_turn_origin.reset(origin_token)
                         _api_request_browser_control_transport_family.reset(family_token)
                         _api_request_browser_control_principal.reset(principal_token)
             finally:
@@ -3849,8 +3856,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         request_profile = _api_request_profile.get()
         request_browser_control_principal = _api_request_browser_control_principal.get()
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
+        request_turn_origin = _api_request_turn_origin.get()
 
         def _run():
+            from gateway.session_context import reset_turn_origin, set_turn_origin
+            # The client's own declaration of who started this turn (X-Hermes-Turn-Origin): the
+            # Chrome-extension browser lane acts on the person's screen only in a "person" turn.
+            # Reset after: executor threads are reused, and a stale "person" must never leak.
+            origin_token = set_turn_origin(request_turn_origin)
+            try:
+                return _run_bound()
+            finally:
+                reset_turn_origin(origin_token)
+
+        def _run_bound():
             from gateway.session_context import clear_session_vars
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(

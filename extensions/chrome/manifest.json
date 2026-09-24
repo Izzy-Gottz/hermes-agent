@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Memoe — Moe in your Chrome",
+  "short_name": "Memoe",
+  "version": "0.2.1",
+  "description": "Lets Moe, your Memoe assistant, work in a tab group of its own in your Chrome — never in your tabs.",
+  "minimum_chrome_version": "125",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0FjJj98k2p1DZ59bVxkFSXkvEcIk1U6a0ngWZBklesWrFvXk8UjSeFrBivclPu3uL0Up0XfveAdVV/aI3XJmkuMLuQtNbGEai689lN+ZoC6FsmZcARsGadPIrtQwlgJl1wpXT4U/pEXIMxREytJw8lNOVu6yIJ5W/XV7jdjKZWSoI3NGbZY0ogcjTaDEfbiCUCP2RSH6YNBBs/fRNhK5RJZGE527VSCtKzw1qaGv67irr6i1whllo8c8DMfVXheiSp1aQvNs+vTwrsOG7cu7crsJPNAaeAQqseiI6BdXEh/m0faxSSF1Ex73ZiAK4Grb4qA/xV9QrLjAhRjWWXhVMQIDAQAB",
+  "background": { "service_worker": "background.js", "type": "module" },
+  "permissions": ["debugger", "tabGroups", "nativeMessaging", "storage"],
+  "action": { "default_title": "Moe works in the Moe tab group" }
+}

@@ -12,6 +12,8 @@ PLAN_CODES = {
     "tcc_microphone", "tcc_calendar", "tcc_reminders", "tcc_contacts", "driver_not_running",
     "window_other_space", "mcp_needs_reauth", "mcp_not_connected", "claude_login_expired",
     "claude_usage_cap", "browser_missing", "profile_locked",
+    # chrome-extension-lane: the app still has to learn this one (Connections → Chrome install button).
+    "browser_extension_missing",
 }
 
 

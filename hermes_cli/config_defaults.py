@@ -446,6 +446,16 @@ DEFAULT_CONFIG = {
         # registration also requires the API server bearer key. developer_mode gates the privileged
         # browser_cdp / browser_evaluate capabilities.
         "extension_control": {"enabled": False, "developer_mode": False},
+        # browser_exec's second lane: Moe's own tab group in the owner's REAL Chrome, through the
+        # Memoe extension (extensions/chrome) and its native-messaging host. Off by default; when on,
+        # browser_exec gains `where` ("own" | "chrome"). auto_route sends calls that open a host known
+        # to block the own browser (built-in list + `sites` + hosts that returned a bot wall) to Chrome
+        # when the extension is connected — never in a turn with no person present (cron, -q, Kanban);
+        # allow_unattended lets an explicit where="chrome" run there. NOT a security gate: browser_exec
+        # runs arbitrary Python that could open the bridge socket itself; the native host's allowlist and
+        # URL policy are the boundary, and with enabled off the host serves no socket at all.
+        # See tools/browser_chrome_extension.py and tools/browser_chrome_bridge.py.
+        "chrome_extension": {"enabled": False, "auto_route": True, "sites": [], "allow_unattended": False},
     },
     # Filesystem checkpoints: snapshot the working directory once per turn (on the first
     # write_file/patch call); restore with /rollback. Opt-in via `hermes chat --checkpoints` or

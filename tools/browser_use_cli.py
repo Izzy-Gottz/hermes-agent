@@ -579,8 +579,11 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
 
 
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
-                 task_id: Optional[str] = None, local: bool = False):
-    """Run Python code through the browser-use CLI, and return its output"""
+                 task_id: Optional[str] = None, local: bool = False, where: str = ""):
+    """Run Python code through the browser-use CLI, and return its output.
+
+    ``where`` picks the lane (tools.browser_chrome_extension): "own" = Hermes' own browser
+    (default), "chrome" = Moe's tab group in the owner's real Chrome via the Memoe extension."""
     from tools.registry import tool_error, tool_result
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
@@ -601,16 +604,44 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
                               "dashes, or underscores (e.g. 'r7k2').")
         env["BU_NAME"] = session
-    route_err = _route_backend(env, session, task_id, bool(local))
-    if route_err:
-        from tools.fix_reasons import as_tool_error
-        return as_tool_error(route_err)  # keeps a fixable cause's code (tools.fix_reasons)
-    _attach_vault_supervisor(env, task_id)
+    from tools import browser_chrome_extension as chrome_lane
+    browser_cfg = _read_browser_cfg()
+    where = str(where or "").strip().lower()
+    if where not in ("", chrome_lane.LANE_OWN, chrome_lane.LANE_CHROME):
+        return tool_error(f"Invalid where={where!r}: use \"own\" (Moe's own browser) or \"chrome\" (the owner's Chrome).")
+    if where == chrome_lane.LANE_CHROME and local:
+        return tool_error("where=\"chrome\" already is the owner's real browser; drop local=true.")
+    bridge = chrome_lane.read_bridge() if chrome_lane.lane_enabled(browser_cfg) or where == chrome_lane.LANE_CHROME else None
+    # Who started this turn, asked once per call (over the tool bridge under claude-code).
+    presence = chrome_lane.turn_presence() if chrome_lane.lane_enabled(browser_cfg) else {"live": False, "why": ""}
+    lane, lane_reason = chrome_lane.choose_lane(where, code, task_id=task_id, session=session,
+                                                browser_cfg=browser_cfg, connected=bridge is not None,
+                                                presence=presence)
+    if lane == chrome_lane.LANE_CHROME:
+        # Fail closed: an explicit (or routed) Chrome call never quietly runs somewhere else.
+        if not chrome_lane.lane_enabled(browser_cfg):
+            return tool_error("The Chrome-extension lane is off (browser.chrome_extension.enabled). "
+                              "Nothing ran; use where=\"own\".")
+        if not presence.get("live") and chrome_lane.chrome_extension_config(browser_cfg).get("allow_unattended") is not True:
+            return tool_error(f"This is {presence.get('why') or 'a turn nobody started live'}, not the person's own live "
+                              "turn, so Moe does not open tabs in the person's Chrome. Nothing ran; use where=\"own\" "
+                              "and report the block instead.")
+        if bridge is None:
+            return chrome_lane.not_connected_error()  # fixable: code browser_extension_missing
+        chrome_lane.chrome_lane_env(env, bridge, session)
+    else:
+        route_err = _route_backend(env, session, task_id, bool(local))
+        if route_err:
+            from tools.fix_reasons import as_tool_error
+            return as_tool_error(route_err)  # keeps a fixable cause's code (tools.fix_reasons)
+        _attach_vault_supervisor(env, task_id)
+    chrome_lane.record_lane(task_id, session, lane)
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
-    # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
+    # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with. The Chrome
+    # lane's daemon is always named, and named daemons open their own dedicated tab already.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
-    if session and not private_browser:
+    if session and not private_browser and lane != chrome_lane.LANE_CHROME:
         code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
@@ -634,6 +665,26 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error(f"Failed to launch browser-use CLI: {e}")
 
     result = {"success": proc.returncode == 0, "exit_code": proc.returncode, "output": proc.stdout}
+    if lane == chrome_lane.LANE_CHROME or chrome_lane.lane_enabled(browser_cfg):
+        result["lane"] = lane
+        if lane == chrome_lane.LANE_CHROME and not where:
+            result["lane_reason"] = lane_reason
+    if lane == chrome_lane.LANE_OWN:
+        blocked_by = chrome_lane.detect_block(proc.stdout)
+        if blocked_by:
+            result["blocked_by"] = blocked_by
+            if chrome_lane.lane_enabled(browser_cfg):
+                wall = chrome_lane.wall_host(proc.stdout)  # the host that served the wall, signature-grade only
+                if wall:
+                    chrome_lane.remember_blocking_host(wall[1])
+                if not presence.get("live"):
+                    result["hint"] = (f"This site blocks Moe's own browser, and this is {presence.get('why') or 'a turn nobody started live'}, "
+                                      "not the person's own live turn, so it was not retried in the person's Chrome. Report the block.")
+                elif bridge is not None:
+                    result["hint"] = ("This site blocks Moe's own browser. Run the same code again with where=\"chrome\" "
+                                      "— it runs in Moe's own tab group in the owner's real Chrome.")
+                else:
+                    result["hint"] = "This site blocks Moe's own browser. " + chrome_lane.not_connected_message()
     if workspace:
         result["workspace"] = workspace
     if session:
@@ -730,6 +781,21 @@ def _dynamic_schema_overrides() -> dict:
                             "accounts, their sessions. No-op when the backend is already local. Default false."),
         }
         overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
+    # ``where`` exists ONLY when the Chrome-extension lane is enabled (same rule as ``local``).
+    from tools.browser_chrome_extension import lane_enabled
+    if lane_enabled(_read_browser_cfg()):
+        params = overrides.get("parameters") or BROWSER_EXEC_SCHEMA["parameters"]
+        props = dict(params["properties"])
+        props["where"] = {
+            "type": "string", "enum": ["own", "chrome"],
+            "description": ("Which browser runs the code. Omit it and Hermes picks: Moe's own browser, except "
+                            "sites known to block it, which go to the owner's Chrome. \"own\" = Moe's own "
+                            "browser (background work). \"chrome\" = a tab in Moe's own tab group in the owner's "
+                            "real Chrome, via the Memoe extension — use it when a result says blocked_by, or when "
+                            "the owner asks you to work in their Chrome. It never touches the owner's other tabs. "
+                            "Keep the same where for every call of one task."),
+        }
+        overrides["parameters"] = {**params, "properties": props}
     return overrides
 
 
@@ -763,7 +829,7 @@ registry.register(
     handler=lambda args, **kw: browser_exec(
         code=args.get("code", ""), session=args.get("session", "") or "",
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
-        local=bool(args.get("local", False)),
+        local=bool(args.get("local", False)), where=str(args.get("where", "") or ""),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,

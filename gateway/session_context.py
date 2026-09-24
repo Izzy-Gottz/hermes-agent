@@ -47,6 +47,33 @@ _SESSION_VARS = (
     "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID",
 ))
 
+# Who started THIS turn, as its client declared it: "person" (someone typed or spoke it, now) or
+# "background" (the client's own silent turns — meeting notes carrying other people's words, nudges,
+# restart notes). ``""``/_UNSET = not declared. Separate from _SESSION_VARS on purpose: it belongs to
+# one request, and only producers that know the answer set it (api_server, from X-Hermes-Turn-Origin).
+# Read by the browser Chrome-extension lane, which may open windows on the person's screen only in a
+# person's own live turn (tools.browser_chrome_extension.turn_presence).
+TURN_ORIGIN_PERSON = "person"
+TURN_ORIGIN_BACKGROUND = "background"
+_TURN_ORIGIN = ContextVar("HERMES_TURN_ORIGIN", default=_UNSET)
+
+
+def set_turn_origin(origin: str):
+    """Bind this turn's declared origin; returns the token for ``reset_turn_origin``."""
+    value = origin if origin in (TURN_ORIGIN_PERSON, TURN_ORIGIN_BACKGROUND) else ""
+    return _TURN_ORIGIN.set(value)
+
+
+def reset_turn_origin(token) -> None:
+    _TURN_ORIGIN.reset(token)
+
+
+def get_turn_origin() -> str:
+    """The declared origin of the current turn, or ``""`` when nobody declared one (no env fallback)."""
+    value = _TURN_ORIGIN.get()
+    return "" if value is _UNSET else str(value or "")
+
+
 # Whether this channel can route an ASYNC completion back AFTER the turn ends (see
 # ``async_delivery_supported()``).  _UNSET => supported (CLI, contextvar-unaware paths); stateless
 # adapters (API server, Kanban workers) opt OUT via ``supports_async_delivery = False`` at bind.

@@ -1331,7 +1331,14 @@ def make_tool_bridge_dispatch(agent):
         return _dispatch_in_context(tool, args)
 
     def _dispatch_in_context(tool: str, args: dict) -> str:
-        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS
+        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS, TURN_PRESENCE_QUERY
+
+        if tool == TURN_PRESENCE_QUERY:
+            # Asked by the child's MCP server: who started the turn that is running now. Answered
+            # from this turn's own contextvars (the snapshot above), never from process env.
+            import json as _json
+            from tools.browser_chrome_extension import local_turn_presence
+            return _json.dumps(local_turn_presence())
         from gateway.session_context import session_history_delivery_supported
         from tools.delegate_tool import forced_synchronous_delegation
 
