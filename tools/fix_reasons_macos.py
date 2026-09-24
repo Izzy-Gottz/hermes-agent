@@ -44,10 +44,13 @@ PROTECTED_FOLDERS: Tuple[Tuple[str, str, str], ...] = (
     ("iCloud Drive", os.path.join("Library", "Mobile Documents"), "Privacy_AllFiles"),
 )
 
-#: How every grant message ends. Nothing watches for the grant yet, so promising to carry on would let
-#: the turn end on a promise; the person asks again. Slice 4 (GrantWatch) changes this one line to
-#: "then I'll carry on", once the app watches the grant and resumes the task.
-THEN = "then ask me to try again"
+#: How every grant message ends. True since slice 4: once the pane is opened, the Memoe app watches the
+#: grant (GrantWatch) and, when it flips, sends one background note that resumes the task — so the
+#: person does not have to ask again.
+THEN = "then I'll carry on"
+#: A fix that needs Memoe quit and reopened ends the turn with the app, so nothing is left to carry on:
+#: the person asks again.
+THEN_AFTER_RELAUNCH = "then ask me to try again"
 
 _PANE_WORDS = {
     "Privacy_FilesAndFolders": "Files & Folders",
@@ -496,7 +499,7 @@ def driver_not_running_message(detail: Optional[str] = None, *, reset: bool = Fa
             DRIVER_NOT_RUNNING, subject=DRIVER_NAME, retry=True, **extra)
     return fix_message(
         f"The screen helper ({DRIVER_NAME}) isn't running, so I can't see or use your screen right now. "
-        f"Quitting and reopening {app} starts it again; {THEN}.",
+        f"Quitting and reopening {app} starts it again; {THEN_AFTER_RELAUNCH}.",
         DRIVER_NOT_RUNNING, subject=DRIVER_NAME, retry=False, **extra)
 
 

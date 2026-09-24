@@ -140,7 +140,7 @@ class TestTccFiles:
         assert out["pane"] == "Privacy_FilesAndFolders" and out["subject"] == "Desktop"
         assert out["retry"] is True and out["path"] == str(f)
         assert "Memoe isn't allowed into your Desktop folder" in out["error"]
-        assert out["error"].endswith("then ask me to try again.")
+        assert out["error"].endswith("then I'll carry on.")
         assert "content" not in out
 
     def test_native_eperm_is_not_misreported_as_the_shell(self, home, darwin, deny_file):
@@ -478,7 +478,7 @@ class TestComputerUse:
         assert (out["code"], out["owner"], out["pane"], out["subject"]) == (code, "driver", pane, "CuaDriver")
         assert out["retry"] is True and words in out["detail"] and out["restart"] == "driver"
         assert ("also_pane" in out) is both
-        assert out["error"].count("then ask me to try again") == 1
+        assert out["error"].count("then I'll carry on") == 1
         assert "CuaDriver's own switch, not Memoe's" in out["error"]
         assert cu.released == ["s1"]  # relaunched on the next call, so the new grant applies
 
