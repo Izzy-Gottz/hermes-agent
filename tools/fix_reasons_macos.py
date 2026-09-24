@@ -224,6 +224,7 @@ def files_denied_in_text(text: str, cwd: Optional[str] = None, command: str = ""
 _AE_REFUSED = re.compile(
     r"Not authori[sz]ed to send Apple events to (?P<app>[^\n]+?)\.?\s*(?:\((?P<num>-174[34])\)|$)", re.M)
 _AE_NUMBER = re.compile(r"\((?P<num>-174[34])\)")
+_TELL_APP_BARE = re.compile(r"""tell\s+application\s+([A-Za-z][\w.]*)\b""", re.I)
 _TELL_APP = re.compile(r"""tell\s+application\s+(?:id\s+)?["“]([^"”]+)["”]|Application\(\s*['"]([^'"]+)['"]\s*\)""", re.I)
 
 
@@ -329,7 +330,11 @@ def _script_targets(inv: Tuple[list, Optional[str], str], cwd: Optional[str]) ->
             text = raw.decode("utf-8") if b"\0" not in raw else ""  # a compiled .scpt is binary
         except (OSError, UnicodeDecodeError):
             text = ""
-    return {next(g for g in m.groups() if g) for m in _TELL_APP.finditer(text)}
+    told = {next(g for g in m.groups() if g) for m in _TELL_APP.finditer(text)}
+    # A script that went through ``bash -c "…"`` reaches osascript with its inner quotes eaten by
+    # the outer shell: ``tell application Notes``. Still a named target.
+    told |= {m.group(1) for m in _TELL_APP_BARE.finditer(text)}
+    return told
 
 
 # Every AppleScript error osascript prints: "<pos>: execution error: <message> (<number>)", and a
@@ -347,8 +352,10 @@ def automation_denied_in_command(command: str, output: str, cwd: Optional[str] =
       (the terminal merges stdout and stderr, so an old refusal printed by an earlier ``cat`` cannot
       be told apart from a new one; two lines is ambiguity, not evidence), and no OTHER osascript
       ``execution error`` line: a -1728 beside an old -1743 means the -1743 is not this run's;
-    - when the script's text is readable (``-e``, a heredoc, a plain-text file), the refused app is
-      one it tells.
+    - the script's text is readable (``-e``, a heredoc, a plain-text file) and the refused app is one
+      it tells (``tell application "X"`` / JXA ``Application("X")``). A script that names no app —
+      ``osascript -e 'error "Not authorized to send Apple events to X." number -1743'`` — can print
+      the refusal for any X it likes, and a genuinely signed card would then name it.
     """
     inv = _invocation_of(command)
     if inv is None:
@@ -360,9 +367,10 @@ def automation_denied_in_command(command: str, output: str, cwd: Optional[str] =
     if any("Not authori" not in m.group(0) for m in _EXEC_ERROR.finditer(text)):
         return None
     targets = _script_targets(inv, cwd)
-    if targets and refusals[0].group("app").strip() not in targets:
+    if refusals[0].group("app").strip() not in targets:
         return None
-    return automation_denied_in_text(refusals[0].group(0), command)
+    # Targets were checked above against the script itself (a file's text, too).
+    return automation_denied_in_text(refusals[0].group(0))
 
 
 def automation_denied_in_text(text: str, script: str = "") -> Optional[FixMessage]:
@@ -386,6 +394,12 @@ def automation_denied_in_text(text: str, script: str = "") -> Optional[FixMessag
         return None
     if not target and script and (t := _TELL_APP.search(script)) is not None:
         target = next(g for g in t.groups() if g)
+    if script:
+        # With the script in hand, the refused app must be one it tells: its own text can raise
+        # a -1743 naming any app at all.
+        told = {next(g for g in m.groups() if g) for m in _TELL_APP.finditer(script)}
+        if not target or target not in told:
+            return None
     target = target or "that app"
     app = host_app_name()
     if num == "-1744":

@@ -1427,6 +1427,12 @@ class ClaudeCodeSession:
             ) from exc
         self._proc = proc
         self._pid = proc.pid
+        # This claude's hermes-tools server — and nothing else — may take a
+        # fresh fix-signing key; the previous spawn's is retired (restart()
+        # keeps the bridge, so without this a restarted claude's server was
+        # refused and Fix cards stopped for the rest of the session).
+        if self._tool_bridge is not None and hasattr(self._tool_bridge, "bind_fix_key"):
+            self._tool_bridge.bind_fix_key(proc.pid)
         self._exit_code = None
         self._session_id = None
         self._init_info = None

@@ -338,9 +338,17 @@ class TestTerminal:
         assert "Automation" not in (out.get("hint") or "")
 
     def test_jxa_and_script_files_count(self, darwin):
-        for command in ("osascript -l JavaScript -e 'Application(\"Notes\").notes()'", "osascript ./sync.scpt",
-                        "/usr/bin/osascript sync.applescript"):
-            assert _finalize(command, "0:1: " + AE_1743).get("code") == "tcc_automation", command
+        assert _finalize("osascript -l JavaScript -e 'Application(\"Notes\").notes()'",
+                         "0:1: " + AE_1743).get("code") == "tcc_automation"
+        # A script file counts when its text tells the refused app; one that cannot be read (or a
+        # compiled .scpt) names no target, so it is no evidence of which app refused.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "sync.applescript"), "w") as fh:
+                fh.write('tell application "Notes" to get name of every note\n')
+            assert _finalize("/usr/bin/osascript sync.applescript", "0:1: " + AE_1743,
+                             cwd=d).get("code") == "tcc_automation"
+        assert "code" not in _finalize("osascript ./missing.scpt", "0:1: " + AE_1743)
 
     def test_a_folder_named_only_inside_a_longer_argument(self, home, darwin, deny, probes):
         """``tail ~/Documents/build.log`` is not an operation on ~/Documents, whatever its output lists."""
@@ -769,3 +777,22 @@ def test_every_computer_use_route_delivers_the_contract(route, cu, monkeypatch):
     assert {k: out.get(k) for k in ("code", "owner", "pane", "subject", "retry", "restart")} == {
         "code": "tcc_driver_screen", "owner": "driver", "pane": "Privacy_ScreenCapture", "subject": "CuaDriver",
         "retry": True, "restart": "driver"}, f"{route} dropped the contract: {out}"
+
+
+def test_a_script_that_names_no_app_cannot_name_one_on_a_card(monkeypatch):
+    """``osascript -e 'error "Not authorized to send Apple events to X." number -1743'`` prints a real
+    refusal line for any X it chooses; with no ``tell application`` in the script there is no
+    evidence it was X that refused, so no tcc_automation — and one that tells a different app is
+    refused too. A script that really tells the refused app still gets its fix."""
+    import tools.fix_reasons_macos as frm
+    monkeypatch.setattr(frm, "_is_darwin", lambda: True)
+    line = "0:67: execution error: Not authorized to send Apple events to Terminal. (-1743)"
+    forged = "osascript -e 'error \"Not authorized to send Apple events to Terminal.\" number -1743'"
+    assert frm.automation_denied_in_command(forged, line) is None
+    other = "osascript -e 'tell application \"Notes\" to error \"Not authorized to send Apple events to Terminal.\" number -1743'"
+    assert frm.automation_denied_in_command(other, line) is None
+    real = "osascript -e 'tell application \"Terminal\" to get name of front window'"
+    assert frm.automation_denied_in_command(real, line) is not None
+    # The native backend's own script: the same rule.
+    assert frm.automation_denied_in_text(line, 'error "x" number -1743') is None
+    assert frm.automation_denied_in_text(line, 'tell application "Terminal" to activate') is not None

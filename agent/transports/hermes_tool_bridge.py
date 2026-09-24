@@ -69,6 +69,9 @@ import secrets
 import shutil
 import socket
 import stat
+import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -217,6 +220,24 @@ class ToolBridge:
         self._fix_key = secrets.token_bytes(32)
         self._fix_key_issued = False
         self._fix_key_trusted = False
+        #: The pid of the ``claude`` whose server may take the key (``bind_fix_key``); until one is
+        #: bound, nobody may.
+        self._fix_key_owner: Optional[int] = None
+
+    def bind_fix_key(self, claude_pid: int) -> None:
+        """A new ``claude`` was spawned (first start, or ``restart()`` after the system prompt
+        changed): mint a fresh key for the server IT starts, handed only to a descendant of
+        ``claude_pid``, and retire the previous spawn's key so what that server signed is no
+        longer believed."""
+        from tools.fix_reasons import trust_key, untrust_key
+        with self._lock:
+            old, trusted = self._fix_key, self._fix_key_trusted
+            self._fix_key = secrets.token_bytes(32)
+            self._fix_key_owner = int(claude_pid)
+            self._fix_key_issued = False
+            if trusted:
+                untrust_key(old)
+                trust_key(self._fix_key)
 
     def seal_fix_key(self) -> None:
         """Hand the fix-signing key to nobody from now on. Called when ``claude`` reports ``init``
@@ -512,7 +533,8 @@ class ToolBridge:
                 if str(payload.get("op") or "") == "hold":
                     self._serve_hold(conn, payload)
                     return
-                reply = self._handle(payload)
+                peer = _peer_pid(conn) if str(payload.get("op") or "") == "fix_key" else None
+                reply = self._handle(payload, peer_pid=peer)
             except BaseException as exc:
                 # BaseException, not Exception: a SystemExit or a
                 # cancellation-shaped exception out of a tool would otherwise
@@ -576,7 +598,7 @@ class ToolBridge:
                 self._holds -= 1
                 self._last_active = time.monotonic()
 
-    def _handle(self, payload: dict) -> dict:
+    def _handle(self, payload: dict, *, peer_pid: Optional[int] = None) -> dict:
         token = str(payload.get("token") or "")
         if not self._token or not hmac.compare_digest(token, self._token):
             logger.warning("tool bridge rejected a call with a bad token")
@@ -592,8 +614,18 @@ class ToolBridge:
                 if self._fix_key_issued:
                     logger.warning("tool bridge refused a second fix_key request")
                     return {"ok": False, "error": "tool bridge: fix_key was already issued"}
+                owner = self._fix_key_owner
+                # Only the hermes-tools server THIS spawn of claude started: a
+                # process below claude's pid. The token alone is not enough — it
+                # sits in the MCP config on disk before claude starts, and a
+                # process the model left running from an earlier turn (reparented
+                # to launchd when its claude went) can watch for it and ask first.
+                if owner is None or peer_pid is None or not _is_descendant(peer_pid, owner):
+                    logger.warning("tool bridge refused fix_key to pid %s (claude is %s)", peer_pid, owner)
+                    return {"ok": False, "error": "tool bridge: fix_key is for claude's own server"}
                 self._fix_key_issued = True
-            return {"ok": True, "result": self._fix_key.hex()}
+                key = self._fix_key
+            return {"ok": True, "result": key.hex()}
         # A tool call means the model has had a turn: from here on anything asking for the key
         # could be the model (terminal runs in the server and can read the token), so the window
         # is shut even if the server never took it — no cards then, rather than forgeable ones.
@@ -691,6 +723,45 @@ def bridge_timeout(env: Optional[dict] = None) -> float:
     except (TypeError, ValueError):
         return DEFAULT_TIMEOUT_SECONDS
     return value if value > 0 else DEFAULT_TIMEOUT_SECONDS
+
+
+def _peer_pid(conn: socket.socket) -> Optional[int]:
+    """The pid of the process at the other end of a unix socket, from the kernel."""
+    try:
+        if sys.platform == "darwin":
+            # SOL_LOCAL = 0, LOCAL_PEERPID = 0x002 (<sys/un.h>)
+            return struct.unpack("i", conn.getsockopt(0, 0x002, struct.calcsize("i")))[0]
+        so_peercred = getattr(socket, "SO_PEERCRED", 17)
+        pid, _uid, _gid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, so_peercred,
+                                                               struct.calcsize("3i")))
+        return pid
+    except (OSError, struct.error):
+        return None
+
+
+def _parent_pid(pid: int) -> Optional[int]:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return int(fh.read().rsplit(b")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=5)
+        return int(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _is_descendant(pid: int, ancestor: int) -> bool:
+    """True when ``pid`` is ``ancestor`` or below it in the process tree."""
+    seen = 0
+    while pid and pid > 1 and seen < 64:
+        if pid == ancestor:
+            return True
+        pid = _parent_pid(pid) or 0
+        seen += 1
+    return False
 
 
 def fetch_fix_key(env: Optional[dict] = None, *, timeout: float = 5.0) -> Optional[bytes]:
