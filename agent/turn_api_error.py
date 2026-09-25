@@ -20,8 +20,9 @@ from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
     _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, interruptible_backoff_sleep,
     log_api_error_attempt,
-    max_retries_exhausted_result, nonretryable_client_error_result, recover_after_classification,
-    recover_before_classification, route_classified_error,
+    max_retries_exhausted_result, nonretryable_client_error_result, rate_limit_beyond_retry,
+    recover_after_classification, recover_before_classification, route_classified_error,
+    usage_limit_result,
 )
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -233,6 +234,10 @@ _RETRYABLE_CLIENT_REASONS = frozenset({
     FailoverReason.payload_too_large, FailoverReason.long_context_tier, FailoverReason.thinking_signature,
 })
 
+# Rate limits whose provider-stated wait may outlast the retry cap. Billing (402) is not
+# one — it has its own terminal path and wording.
+_LONG_LIMIT_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.upstream_rate_limit})
+
 
 @dataclass
 class UnrecoveredErrorVerdict:
@@ -321,6 +326,27 @@ def settle_unrecovered_error(
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model,
         ))
+
+    # A rate limit that outlasts any retry (a spent subscription window, a Retry-After of
+    # hours) is not a burst: sleeping on the clamped wait and retrying only burns the turn
+    # and tells the person a number nobody stated. Fall back if a chain exists, else end
+    # the turn now with the provider's own reset time. Checked before max-retries so the
+    # last attempt is not reported as "rate-limited, try again in a moment" either.
+    if classified.reason in _LONG_LIMIT_REASONS:
+        _long_wait = rate_limit_beyond_retry(api_error)
+        if _long_wait is not None:
+            if agent._has_pending_fallback():
+                agent._buffer_status("⚠️ Usage limit reached — trying fallback...")
+            if agent._try_activate_fallback(reason=classified.reason):
+                # Same load-bearing break as below: the preflight re-runs for the fallback.
+                active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+                retry_count = compression_attempts = 0
+                return _verdict("break")
+            return _verdict("return", usage_limit_result(
+                agent, api_error, classified, _long_wait, messages=messages,
+                conversation_history=conversation_history, api_call_count=api_call_count,
+                provider=_provider, base_url=_base, model=_model,
+            ))
 
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for

@@ -1089,6 +1089,217 @@ def rate_limit_sentence(provider: Any, wait_time: float) -> str:
             % (_provider_in_words(provider), _wait_in_words(wait_time)))
 
 
+#: The longest provider-stated wait the retry loop will sit through (#26293:
+#: Anthropic Tier 1 buckets reset in ~171s, so a 120s cap re-tripped them).
+#:
+#: A wait LONGER than this is not a burst the loop can ride out, and it must
+#: not be clamped to this number and slept on. Measured 2026-09-25 on a Claude
+#: subscription whose plan usage was spent: a 429 whose real wait was hours,
+#: clamped to 600s, slept on three times over against a limit that had not
+#: moved, and a person on Telegram told "I'll answer ... in about 10 minutes" —
+#: the clamp read aloud as though it were the provider's word.
+#: See `rate_limit_beyond_retry`.
+RATE_LIMIT_RETRY_CAP_S = 600.0
+
+
+def _clock() -> float:
+    """Wall-clock seconds; one seam so tests can fix "now" without freezing the whole turn."""
+    return time.time()
+
+#: Anthropic's subscription ("unified") rate-limit headers. The names and their
+#: meaning are Claude Code's own, not invented here: its client derives
+#: ``retry-after = reset - now`` exactly when ``-status`` is ``rejected`` and
+#: ``-overage-status`` is absent or ``rejected``, with ``-reset`` in epoch
+#: seconds. `provider_stated_wait` applies that same rule.
+_UNIFIED_STATUS = "anthropic-ratelimit-unified-status"
+_UNIFIED_OVERAGE_STATUS = "anthropic-ratelimit-unified-overage-status"
+_UNIFIED_RESET = "anthropic-ratelimit-unified-reset"
+
+
+@dataclass(frozen=True)
+class ProviderWait:
+    """How long the provider itself says to wait — never clamped.
+
+    ``seconds`` / ``reset_at`` (epoch) are both None when the provider said the
+    limit is a hard stop (a rejected subscription window) without saying when
+    it lifts. Nobody may put a number on that for it.
+    """
+
+    seconds: Optional[float]
+    reset_at: Optional[float]
+
+
+def _header_value(headers: Any, name: str) -> Optional[str]:
+    """Case-insensitive single header read from a dict or an httpx.Headers."""
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter(name)
+        if value is None and hasattr(headers, "items"):
+            value = next((v for k, v in headers.items() if str(k).lower() == name), None)
+    except Exception:
+        return None
+    return None if value is None else str(value).strip()
+
+
+def provider_stated_wait(api_error: Exception, *, now: Optional[float] = None) -> Optional[ProviderWait]:
+    """The wait the provider stated for this error, uncapped; None when it stated none.
+
+    Sources: Anthropic's unified subscription window (its reset instant is the
+    authoritative answer when the window is rejected), then ``Retry-After`` —
+    the header, or the ``retry_after`` body field some providers use instead.
+    """
+    from agent.retry_utils import parse_retry_after_seconds
+
+    now = _clock() if now is None else now
+    headers = getattr(getattr(api_error, "response", None), "headers", None)
+    retry_after = parse_retry_after_seconds(headers) if headers is not None else None
+    if retry_after is None:
+        body = getattr(api_error, "body", None)
+        if isinstance(body, dict):
+            nested = body.get("error")
+            payload = nested if isinstance(nested, dict) else body
+            retry_after = parse_retry_after_seconds(payload.get("retry_after"))
+
+    status = (_header_value(headers, _UNIFIED_STATUS) or "").lower()
+    overage = (_header_value(headers, _UNIFIED_OVERAGE_STATUS) or "").lower()
+    if status == "rejected" and overage in ("", "rejected"):
+        try:
+            reset_at: Optional[float] = float(_header_value(headers, _UNIFIED_RESET) or "")
+        except ValueError:
+            reset_at = None
+        if reset_at is not None and math.isfinite(reset_at) and reset_at > 0:
+            return ProviderWait(max(0.0, reset_at - now), reset_at)
+        if retry_after is not None and retry_after > 0:
+            return ProviderWait(retry_after, now + retry_after)
+        # A rejected plan window with no instant: long, and of unknown length.
+        return ProviderWait(None, None)
+
+    if retry_after is None:
+        return None
+    return ProviderWait(retry_after, now + retry_after)
+
+
+def rate_limit_beyond_retry(api_error: Exception, *, now: Optional[float] = None) -> Optional[ProviderWait]:
+    """The provider's wait when it is too long to retry through, else None.
+
+    None means "a short burst — today's backoff applies". Anything returned is a
+    limit the loop must not sleep on: a stated wait over `RATE_LIMIT_RETRY_CAP_S`,
+    or a rejected subscription window with no stated end.
+    """
+    wait = provider_stated_wait(api_error, now=now)
+    if wait is None:
+        return None
+    if wait.seconds is None or wait.seconds > RATE_LIMIT_RETRY_CAP_S:
+        return wait
+    return None
+
+
+def _long_wait_in_words(seconds: float) -> str:
+    """"in about 5 hours" / "in about 2 days"; minutes below ninety of them."""
+    if seconds < 90 * 60:
+        return _wait_in_words(seconds)
+    hours = seconds / 3600.0
+    if hours < 36:
+        n = int(round(hours))
+        return "in about an hour" if n <= 1 else "in about %d hours" % n
+    return "in about %d days" % int(round(hours / 24.0))
+
+
+def _clock_in_words(when: Any, today: Any) -> str:
+    """"around 3:40 PM", "tomorrow around 9:05 AM", "on Saturday around …", "on October 3 around …"."""
+    hour = when.hour % 12 or 12
+    clock = "%d:%02d %s" % (hour, when.minute, "AM" if when.hour < 12 else "PM")
+    days = (when.date() - today.date()).days
+    if days <= 0:
+        return "around %s" % clock
+    if days == 1:
+        return "tomorrow around %s" % clock
+    if days < 7:
+        return "on %s around %s" % (when.strftime("%A"), clock)
+    return "on %s %d around %s" % (when.strftime("%B"), when.day, clock)
+
+
+def usage_limit_sentence(provider: Any, reset_at: Optional[float], *, now: Optional[float] = None) -> str:
+    """What a person is told when their provider's limit outlasts any retry.
+
+    The voice of `rate_limit_sentence` — whose limit, when, and what they can
+    do — with the one difference that matters: this turn is over, so it never
+    promises an answer. The clock is in the person's timezone as Hermes knows
+    it (`hermes_time`: HERMES_TIMEZONE, then config ``timezone``, then the
+    machine's). An unknown reset is said to be unknown, never given a number
+    nobody stated.
+    """
+    who = _provider_in_words(provider)
+    switch = "switch Moe to another plan or key in Settings › Brain to keep going now."
+    if reset_at is None:
+        return ("I've hit the usage limit on %s. It resets later, and I can't tell exactly "
+                "when — %s" % (who, switch))
+    from datetime import datetime
+
+    now = _clock() if now is None else now
+    try:
+        import hermes_time
+        tz = hermes_time.get_timezone()
+    except Exception:
+        tz = None
+    if tz is not None:
+        when, today = datetime.fromtimestamp(reset_at, tz), datetime.fromtimestamp(now, tz)
+    else:
+        when = datetime.fromtimestamp(reset_at).astimezone()
+        today = datetime.fromtimestamp(now).astimezone()
+    return ("I've hit the usage limit on %s. It resets %s, %s — or %s"
+            % (who, _clock_in_words(when, today), _long_wait_in_words(max(0.0, reset_at - now)), switch))
+
+
+def usage_limit_result(
+    agent: Any, api_error: Exception, classified: Any, wait: ProviderWait, *,
+    messages: List[Dict[str, Any]], conversation_history: Any, api_call_count: int,
+    provider: Any, base_url: Any, model: Any,
+) -> Dict[str, Any]:
+    """Terminal result for a rate limit that outlasts any retry, once no fallback is left.
+
+    The honest sentence IS the turn's ``final_response``: that is what a gateway
+    delivers to the chat (and it does not match the gateway's provider-error
+    envelope, so it is not rewritten into "wait a moment and try again"). It is
+    not also emitted as a status, which would say it twice on a phone.
+    """
+    _summary = agent._summarize_api_error(api_error)
+    # Terminal — the same flush as the other terminal paths, so what was tried is visible.
+    agent._flush_status_buffer()
+    _vlines(
+        agent,
+        f"⏱️ Usage limit: {_summary}",
+        f"   🔌 Provider: {provider}  Model: {model}",
+        "   ⏳ Provider-stated wait: "
+        + (f"{wait.seconds:.0f}s" if wait.seconds is not None else "unknown")
+        + f" (over the {RATE_LIMIT_RETRY_CAP_S:.0f}s retry cap) — not retrying.",
+    )
+    logger.warning(
+        "%sUsage limit outlasts the retry cap: wait=%s reset_at=%s cap=%ss provider=%s model=%s "
+        "— ending the turn instead of sleeping. error=%s",
+        agent.log_prefix, wait.seconds, wait.reset_at, RATE_LIMIT_RETRY_CAP_S, provider, model, _summary,
+    )
+    agent._persist_session(messages, conversation_history)
+    # A Claude subscription signed in with a setup-token runs as provider "anthropic",
+    # which reads as "Anthropic" — a service. It is the person's plan, and it is the
+    # plan's usage that ran out; the agent already knows which (``_is_anthropic_oauth``).
+    _whose = provider
+    if str(provider or "") == "anthropic" and getattr(agent, "_is_anthropic_oauth", False) is True:
+        _whose = "claude-code-cli"
+    result = _failed_turn_result(
+        usage_limit_sentence(_whose, wait.reset_at), messages, api_call_count, _summary,
+    )
+    result.update({
+        "failure_reason": classified.reason.value,
+        # Retrying before the reset is exactly what must not happen.
+        "failure_retryable": False,
+        "rate_limit_reset_at": wait.reset_at,
+    })
+    return result
+
+
 def compute_error_backoff(
     agent: Any, api_error: Exception, *, retry_count: int, max_retries: int, is_rate_limited: bool,
     is_zai_coding_overload: bool, base_url: Any, model: Any,
@@ -1121,7 +1332,9 @@ def compute_error_backoff(
         # Cap at 10 minutes. Anthropic Tier 1 input-token buckets reset in ~171s, so a 120s cap
         # caused us to retry before the actual reset window and re-trip the limit. 600s covers all
         # realistic provider reset windows while still rejecting pathological values. (#26293)
-        _retry_after = min(_retry_after, 600)
+        # A rate limit whose stated wait exceeds the cap never gets here: settle_unrecovered_error
+        # falls back or ends the turn instead of sleeping on the clamp (rate_limit_beyond_retry).
+        _retry_after = min(_retry_after, RATE_LIMIT_RETRY_CAP_S)
         if _retry_after <= 0:
             # A zero/expired cooldown (retry-after: 0, or an HTTP-date in the
             # past, which the parser clamps to 0.0) carries no usable wait —
