@@ -13,6 +13,9 @@ state, bounded by _HUMAN_WAIT_MAX_SESSIONS.
 """
 
 import contextlib
+import contextvars
+import json
+import os
 import threading
 import time
 
@@ -167,3 +170,146 @@ def human_wait_seconds(session_key: str | None = None) -> float:
         if state.window_started is not None:
             total += _clamped_window_seconds(state.window_started, now, ceiling)
         return total
+
+
+
+
+#: The CLI's tool_use id for the tool call running in this context, when the MCP server was told it
+#: (``_meta["claudecode/toolUseId"]`` on the MCP request). Set by hermes_tools_mcp_server around each
+#: dispatch; read by :func:`waiting_on_person` to bind a wait to its own call's turn — explicitly,
+#: never by asking which turn is live.
+CURRENT_TOOL_USE_ID: "contextvars.ContextVar[str]" = contextvars.ContextVar("hermes_tool_use_id", default="")
+
+
+@contextlib.contextmanager
+def bound_tool_use(tool_use_id: str):
+    token = CURRENT_TOOL_USE_ID.set(str(tool_use_id or ""))
+    try:
+        yield
+    finally:
+        CURRENT_TOOL_USE_ID.reset(token)
+
+
+#: How often :func:`waiting_on_person` stamps the activity clock (outside the MCP server).
+HUMAN_WAIT_PING_INTERVAL_S = 20.0
+#: How often it asks whether its call's turn is still the live one. Short, so a card whose turn
+#: ended, was interrupted or was switched away from is withdrawn within seconds.
+HUMAN_WAIT_CHECK_INTERVAL_S = 3.0
+
+
+def _ping_the_turn(label: str, tool_use_id: str):
+    """From inside the hermes-tools MCP server: "ok", "ended" or "unknown". No bridge, a bridge
+    that does not answer, or anything malformed is "unknown" — never "ended": an unknown is never
+    a reason to withdraw a card a person may be reading."""
+    try:
+        from agent.transports.hermes_tool_bridge import HUMAN_WAIT_PING, bridge_available, call_bridged_tool
+
+        if not bridge_available():
+            return "unknown"
+        raw = call_bridged_tool(HUMAN_WAIT_PING, {"label": label, "tool_use_id": tool_use_id}, timeout=5)
+        state = json.loads(raw).get("state")
+    except Exception:
+        return "unknown"
+    return state if state in ("ok", "ended", "unknown") else "unknown"
+
+
+@contextlib.contextmanager
+def waiting_on_person(label: str, *, on_turn_gone=None,
+                      interval: float = HUMAN_WAIT_PING_INTERVAL_S,
+                      check_interval: float = HUMAN_WAIT_CHECK_INTERVAL_S,
+                      session_key: str | None = None):
+    """For code OUTSIDE :mod:`tools.approval` that parks a tool call on a person — a plugin's own
+    confirmation dialog (Moe's send card) is the case this was written for.
+
+    While the block runs:
+
+    * a :func:`human_wait_window`, so a concurrent batch deadline does not count the wait;
+    * inside the MCP server the claude-code runtime spawns, a ping to the turn's own process every
+      ``check_interval`` s naming THIS call by its tool_use id (:data:`CURRENT_TOOL_USE_ID`). The
+      agent stamps its activity clock only if that call belongs to the live turn, and answers
+      "ended" once that turn has finished — then ``on_turn_gone(reason)`` is called once and the
+      caller withdraws its question. With no tool_use id there is no binding and nothing is pinged:
+      no heartbeat is better than a heartbeat for somebody else's turn;
+    * outside the MCP server, the activity callback bound on the ENTERING thread every ``interval``
+      s, and the entering thread's interrupt bit (``tools.interrupt``) as "the turn is gone".
+
+    The first check runs BEFORE the block is entered, so a caller whose turn has already gone hears
+    so before it starts anything (``on_turn_gone`` is called synchronously).
+
+    Moe, 2026-09-25: without the heartbeat a cron job waiting on its card read as idle and was
+    killed with the card still up; without the watch, a card outlived the turn that asked for it.
+    """
+    try:
+        from tools.environments.base import get_activity_callback
+        callback = get_activity_callback()
+    except Exception:  # pragma: no cover - minimal tool-only environments
+        callback = None
+    in_server = bool(os.environ.get("HERMES_MCP_TOOL_PROFILE"))
+    tool_use_id = CURRENT_TOOL_USE_ID.get()
+    entering = threading.current_thread().ident
+    stop = threading.Event()
+    told = threading.Event()
+
+    def gone(reason: str) -> None:
+        if told.is_set():
+            return
+        told.set()
+        if on_turn_gone is not None:
+            try:
+                on_turn_gone(reason)
+            except Exception:
+                pass
+
+    def check() -> bool:
+        """One look. True when the turn is gone (and the caller has been told)."""
+        if in_server:
+            if tool_use_id and _ping_the_turn(label, tool_use_id) == "ended":
+                gone("the turn that asked has ended")
+                return True
+            return False
+        try:
+            from tools.interrupt import is_thread_interrupted
+            if is_thread_interrupted(entering):
+                gone("the turn was interrupted")
+                return True
+        except Exception:
+            pass
+        return False
+
+    if check():
+        # Gone before anything started: nothing to watch.
+        yield
+        return
+
+    def beat() -> None:
+        last_stamp = time.monotonic()
+        while not stop.wait(min(interval, check_interval)):
+            if check():
+                return
+            if not in_server and callback is not None and time.monotonic() - last_stamp >= interval:
+                last_stamp = time.monotonic()
+                try:
+                    callback(label)
+                except Exception:
+                    pass
+
+    thread = None
+    if not in_server or tool_use_id:
+        thread = threading.Thread(target=beat, name="human-wait-heartbeat", daemon=True)
+        thread.start()
+    try:
+        try:
+            window = human_wait_window(session_key)
+            window.__enter__()
+        except Exception:
+            window = None
+        try:
+            yield
+        finally:
+            if window is not None:
+                with contextlib.suppress(Exception):
+                    window.__exit__(None, None, None)
+    finally:
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=2.0)

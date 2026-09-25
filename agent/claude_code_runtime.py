@@ -1181,6 +1181,12 @@ def make_claude_code_event_bridge(agent) -> Callable[[dict], None]:
                 agent._current_tool = name
             except Exception:
                 pass
+            # Which turn this tool call belongs to, by the CLI's own tool_use id — the id it also
+            # sends the MCP server as ``_meta["claudecode/toolUseId"]``. HUMAN_WAIT_PING binds a
+            # waiting card to its turn through this, never through "whatever turn is live now".
+            call_id = str(event.get("call_id") or "")
+            if call_id:
+                _note_turn_tool_call(agent, call_id)
             _stamp(f"running {name}")
             _call("tool_progress_callback", "tool.started", name, event.get("preview"), args)
             _call("tool_start_callback", event.get("call_id"), name, args)
@@ -1288,6 +1294,111 @@ def bridged_tools_for(agent) -> tuple:
     return tuple(name for name in BRIDGED_TOOLS if name in valid or name in deferred)
 
 
+#: How many finished turns' tool_use ids a session remembers, to answer "ended" for them.
+_ENDED_TOOL_CALLS_KEPT = 512
+
+
+class _TurnLedger:
+    """Which tool calls belong to which turn — kept on the SESSION, not on the AIAgent.
+
+    api_server builds a fresh AIAgent per request and ``session.rebind`` moves dispatch to it, so
+    anything kept on the agent is gone the moment the next request arrives: turn A's card, pinging
+    after the rebind, would be answered by an agent that never heard of A ("unknown") and would never
+    be withdrawn. The session (one per registry entry, shared by every agent that drives it) is what
+    outlives the request, so the ledger lives there. An agent with no session keeps its own.
+    """
+
+    __slots__ = ("lock", "token", "live", "current", "ended", "stamped")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.token = ""
+        self.live = False
+        self.current: set = set()
+        self.ended: tuple = ()
+        self.stamped = 0.0
+
+    def retire_current_locked(self) -> None:
+        self.ended = tuple((list(self.ended) + list(self.current))[-_ENDED_TOOL_CALLS_KEPT:])
+        self.current = set()
+
+
+def _turn_ledger(agent) -> _TurnLedger:
+    owner = getattr(agent, "_claude_code_session", None)
+    if owner is None:
+        owner = agent
+    ledger = getattr(owner, "_hermes_turn_ledger", None)
+    if not isinstance(ledger, _TurnLedger):
+        ledger = _TurnLedger()
+        try:
+            setattr(owner, "_hermes_turn_ledger", ledger)
+        except Exception:
+            setattr(agent, "_hermes_turn_ledger", ledger)
+    return ledger
+
+
+def _note_turn_tool_call(agent, call_id: str) -> None:
+    """Record ``call_id`` as belonging to the turn that is live now."""
+    ledger = _turn_ledger(agent)
+    with ledger.lock:
+        if ledger.live:
+            ledger.current.add(call_id)
+
+
+def _human_wait_state(agent, call: str, label: str) -> str:
+    if not call:
+        return "unknown"
+    ledger = _turn_ledger(agent)
+    stamp = False
+    with ledger.lock:
+        if ledger.live and call in ledger.current:
+            now = time.monotonic()
+            if now - ledger.stamped >= 15.0:
+                ledger.stamped = now
+                stamp = True
+            state = "ok"
+        elif call in ledger.ended or (not ledger.live and call in ledger.current):
+            state = "ended"
+        else:
+            state = "unknown"
+    if stamp:
+        touch = getattr(agent, "_touch_activity", None)
+        if callable(touch):
+            touch((label or "waiting for the person")[:120])
+    return state
+
+
+def _turn_begins(agent) -> str:
+    """Mark a turn live — called only once its session's turn lock is held. Returns the owner token."""
+    token = uuid.uuid4().hex
+    ledger = _turn_ledger(agent)
+    with ledger.lock:
+        # A previous turn's calls are ended now, whoever was meant to say so.
+        ledger.retire_current_locked()
+        ledger.token = token
+        ledger.live = True
+        ledger.stamped = 0.0
+    agent._turn_id = token
+    agent._turn_live = True
+    # The ledger this turn began on, so it is the one ended even if the session is retired (and
+    # agent._claude_code_session cleared) before the turn's finally runs.
+    agent._hermes_turn_ledger_in_use = ledger
+    return token
+
+
+def _turn_ends(agent, token: str) -> None:
+    """Mark the turn ended — only by the owner that began it (``token``)."""
+    ledger = getattr(agent, "_hermes_turn_ledger_in_use", None)
+    if not isinstance(ledger, _TurnLedger):
+        ledger = _turn_ledger(agent)
+    with ledger.lock:
+        if ledger.token == token:
+            ledger.live = False
+            ledger.retire_current_locked()
+    if getattr(agent, "_turn_id", None) == token:
+        agent._turn_live = False
+
+
 def make_tool_bridge_dispatch(agent):
     """Run one bridged tool call on ``agent`` and return its result string.
 
@@ -1331,7 +1442,22 @@ def make_tool_bridge_dispatch(agent):
         return _dispatch_in_context(tool, args)
 
     def _dispatch_in_context(tool: str, args: dict) -> str:
-        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS, TURN_APPROVAL_QUERY, TURN_PRESENCE_QUERY
+        from agent.transports.hermes_tool_bridge import (
+            BRIDGED_TOOLS, HUMAN_WAIT_PING, TURN_APPROVAL_QUERY, TURN_PRESENCE_QUERY,
+        )
+
+        if tool == HUMAN_WAIT_PING:
+            # A person is being asked something for a tool call (a plugin's confirmation card). The
+            # ping names that call by the CLI's tool_use id. Three answers:
+            #   ok      — the call belongs to the turn that is live now: stamp it (≤ 1 per 15 s);
+            #   ended   — the call belongs to a turn that has finished, or no turn is live and the call
+            #             is one this agent saw: the caller withdraws its card;
+            #   unknown — anything else (no id, an id not seen yet): stamp nothing, withdraw nothing.
+            # So a card from turn A can neither keep turn B alive nor outlive A, and a call made after
+            # its turn ended is never bound to whichever turn happens to be live (Moe, 2026-09-25).
+            import json as _json
+            call = str((args or {}).get("tool_use_id") or "")
+            return _json.dumps({"state": _human_wait_state(agent, call, str((args or {}).get("label") or ""))})
 
         if tool == TURN_APPROVAL_QUERY:
             return _answer_approval_query(agent, args)
@@ -1503,11 +1629,20 @@ def run_claude_code_turn(agent, **kwargs) -> Dict[str, Any]:
     has gone. The context snapshot stays (other bridged tools need its session id), but presence then
     fails closed — see make_tool_bridge_dispatch.
     """
-    agent._turn_live = True
+    # Marked live only once the body holds the session's turn lock (it calls ``_on_locked``), and
+    # unmarked here only by that same owner (the token): a turn refused with "another turn is still
+    # running" must neither mark nor unmark the one that is.
+    token = None
+
+    def _on_locked() -> None:
+        nonlocal token
+        token = _turn_begins(agent)
+
     try:
-        return _run_claude_code_turn_body(agent, **kwargs)
+        return _run_claude_code_turn_body(agent, _on_locked=_on_locked, **kwargs)
     finally:
-        agent._turn_live = False
+        if token is not None:
+            _turn_ends(agent, token)
 
 
 def _run_claude_code_turn_body(
@@ -1518,6 +1653,7 @@ def _run_claude_code_turn_body(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    _on_locked: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Run one turn through the Claude Code subprocess.
 
@@ -1577,6 +1713,8 @@ def _run_claude_code_turn_body(
         tool_bridge_tools=bridged_tools_for(agent),
     )
     agent._claude_code_session = session
+    if _on_locked is not None:
+        _on_locked()
     try:
         # The system prompt (Hermes' cached prompt + the gateway's ephemeral
         # prompt) is baked into the process at spawn. If either changed —

@@ -93,6 +93,31 @@ _JSON_TO_PY = {
 }
 
 
+#: The keyword the MCP SDK hands the request context to (found by its annotation; never in the
+#: tool's schema; the SDK refuses a leading underscore, so it is a name no schema here uses).
+_REQUEST_CONTEXT_PARAM = "hermes_request_context"
+try:  # pragma: no cover - depends on the installed SDK
+    from mcp.server.mcpserver import Context as _REQUEST_CONTEXT_TYPE
+except Exception:  # pragma: no cover
+    try:
+        from mcp.server.fastmcp import Context as _REQUEST_CONTEXT_TYPE
+    except Exception:
+        _REQUEST_CONTEXT_TYPE = None
+
+
+def tool_use_id_of(context: Any) -> str:
+    """The CLI's tool_use id from an MCP request context, or "" — never raises."""
+    try:
+        meta = context.request_context.meta
+    except Exception:
+        return ""
+    try:
+        value = meta.get("claudecode/toolUseId") if isinstance(meta, dict) else getattr(meta, "claudecode/toolUseId", None)
+    except Exception:
+        return ""
+    return str(value or "")[:128]
+
+
 def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict[str, type]]:
     """Build a Python function signature and annotations from a JSON schema.
 
@@ -681,8 +706,17 @@ def _build_server(profile: Optional[str] = None) -> Any:
             sig, annots = _signature_from_schema(schema)
 
             bridged = tool_name in bridged_names
+            # The request context, for the CLI's tool_use id (_meta["claudecode/toolUseId"]):
+            # what binds a wait on a person to its own call's turn (tools.approval_human_wait).
+            if (not bridged and _REQUEST_CONTEXT_TYPE is not None
+                    and _REQUEST_CONTEXT_PARAM not in sig.parameters):
+                sig = sig.replace(parameters=[*sig.parameters.values(), inspect.Parameter(
+                    _REQUEST_CONTEXT_PARAM, inspect.Parameter.KEYWORD_ONLY,
+                    annotation=Optional[_REQUEST_CONTEXT_TYPE], default=None)])
+                annots = {**annots, _REQUEST_CONTEXT_PARAM: Optional[_REQUEST_CONTEXT_TYPE]}
 
             def _dispatch(**kwargs: Any) -> Any:
+                tool_use_id = tool_use_id_of(kwargs.pop(_REQUEST_CONTEXT_PARAM, None))
                 try:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
@@ -696,7 +730,8 @@ def _build_server(profile: Optional[str] = None) -> Any:
                     # at claude_code.silence_timeout. Cheap insurance: one
                     # AF_UNIX connect per call, and measured on 2.1.252 the
                     # CLI keeps streaming during a tool call anyway.
-                    with bridge_hold():
+                    from tools.approval_human_wait import bound_tool_use
+                    with bridge_hold(), bound_tool_use(tool_use_id):
                         return to_mcp_content(handle_function_call(tool_name, args or {}))
                 except BridgeError as exc:
                     # Not an exception the model should read as a crash: the

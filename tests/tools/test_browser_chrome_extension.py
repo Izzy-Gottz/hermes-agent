@@ -413,6 +413,7 @@ def test_presence_through_the_bridge_is_live_only_while_the_turn_runs(monkeypatc
     seen = {}
 
     def body(agent, **_kw):
+        _kw["_on_locked"]()   # the real body calls this once it holds the turn lock
         seen["during"] = json.loads(dispatch(TURN_PRESENCE_QUERY, {}))
         return {}
 
@@ -430,6 +431,7 @@ def test_presence_through_the_bridge_fails_closed_when_the_turn_raised(monkeypat
     agent = _bridge_agent()
 
     def body(agent, **_kw):
+        _kw["_on_locked"]()
         raise RuntimeError("child died")
 
     monkeypatch.setattr(rt, "_run_claude_code_turn_body", body)

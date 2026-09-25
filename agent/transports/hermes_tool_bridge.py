@@ -127,6 +127,14 @@ TURN_PRESENCE_QUERY = "__turn_presence__"
 #: ``make_tool_bridge_dispatch``; only while the turn is live; never advertised, never metered.
 #: What comes back is the gate's own result shape, as JSON.
 TURN_APPROVAL_QUERY = "__request_tool_approval__"
+#: Not a tool either: "a person is being asked something on this turn's behalf — the turn is not idle."
+#: Sent every ~20 s by :func:`tools.approval_human_wait.waiting_on_person` from inside the MCP server,
+#: where a plugin's own confirmation (Moe's send card) parks a tool call on a human. Under this runtime
+#: the CLI owns the loop and nothing stamps the agent's activity clock while a tool is out, so a cron
+#: job waiting on a person read as idle and its 600 s watchdog killed it with the card still up (Moe,
+#: 2026-09-25). Answered by ``make_tool_bridge_dispatch`` only while the turn is live, so it cannot
+#: keep an ended turn warm. Never advertised, never metered.
+HUMAN_WAIT_PING = "__human_wait__"
 
 #: One line of JSON per message, both directions. A tool result can be large
 #: (a fan-out's aggregated JSON); the cap is a sanity bound, not a budget.
@@ -663,6 +671,14 @@ class ToolBridge:
             args = payload.get("args")
             try:
                 return {"ok": True, "result": str(self._dispatch(tool, args if isinstance(args, dict) else {}))}
+            except Exception as exc:
+                return {"ok": False, "error": _error_text(exc)}
+        if tool == HUMAN_WAIT_PING:
+            ping_args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+            label = str(ping_args.get("label") or "")[:120]
+            call = str(ping_args.get("tool_use_id") or "")[:128]
+            try:
+                return {"ok": True, "result": str(self._dispatch(tool, {"label": label, "tool_use_id": call}))}
             except Exception as exc:
                 return {"ok": False, "error": _error_text(exc)}
         if tool not in self._allowed:
