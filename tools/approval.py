@@ -976,7 +976,7 @@ def _request_tool_approval_over_bridge(tool_name: str, description: str, rule_ke
         logger.warning("plugin approval for %s over the tool bridge: %s — blocked", tool_name, why)
         return {"approved": False, "message": f"BLOCKED: {tool_name} needs your approval, but {why}; "
                                               "nothing was done.",
-                "pattern_key": f"plugin_rule:{rule_key}", "description": description}
+                "pattern_key": f"plugin_rule:{rule_key}", "description": description, "outcome": "unattended"}
 
     try:
         from agent.transports.hermes_tool_bridge import TURN_APPROVAL_QUERY, bridge_address, call_bridged_tool
@@ -992,8 +992,13 @@ def _request_tool_approval_over_bridge(tool_name: str, description: str, rule_ke
         return blocked(f"the question could not reach you ({type(exc).__name__}: {exc})")
     if not isinstance(answer, dict) or answer.get("approved") is not True:
         message = answer.get("message") if isinstance(answer, dict) else None
-        return {"approved": False, "message": str(message or f"BLOCKED: {tool_name} was not approved"),
-                "pattern_key": f"plugin_rule:{rule_key}", "description": description}
+        out = {"approved": False, "message": str(message or f"BLOCKED: {tool_name} was not approved"),
+               "pattern_key": f"plugin_rule:{rule_key}", "description": description}
+        # The gate's own outcome ("denied" by the person, "timeout", …), so a caller can say which.
+        outcome = answer.get("outcome") if isinstance(answer, dict) else None
+        if isinstance(outcome, str) and outcome:
+            out["outcome"] = outcome
+        return out
     return {"approved": True, "message": None, "user_approved": True, "description": description}
 
 

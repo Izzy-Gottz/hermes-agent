@@ -1400,8 +1400,10 @@ def _answer_approval_query(agent, args: dict) -> str:
     tool_name = str((args or {}).get("tool_name") or "tool")
 
     def refused(why: str) -> str:
-        return _json.dumps({"approved": False, "message": f"BLOCKED: {tool_name} needs your approval, but {why}; "
-                                                         "nothing was done."})
+        # outcome "unattended": nobody was asked. Not "denied" — a caller that tells the person
+        # "you did not approve it" about a question they never saw is telling them something false.
+        return _json.dumps({"approved": False, "outcome": "unattended",
+                            "message": f"BLOCKED: {tool_name} needs your approval, but {why}; nothing was done."})
 
     if getattr(agent, "_turn_live", False) is not True:
         return refused("the turn that asked has already ended")
@@ -1419,8 +1421,8 @@ def _answer_approval_query(agent, args: dict) -> str:
     except Exception:
         logger.warning("claude-code: approval asked over the tool bridge failed", exc_info=True)
         return refused("the approval gate failed while asking")
-    return _json.dumps({"approved": bool(result.get("approved")), "message": result.get("message")},
-                       default=str)
+    return _json.dumps({"approved": bool(result.get("approved")), "message": result.get("message"),
+                        "outcome": result.get("outcome")}, default=str)
 
 
 def _build_session(agent, *, session_key: Optional[str] = _UNSET):

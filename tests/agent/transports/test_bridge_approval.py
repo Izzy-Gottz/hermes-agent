@@ -93,10 +93,17 @@ def test_the_question_goes_home_whole_and_the_yes_comes_back(home, monkeypatch):
 
 def test_a_no_comes_back_as_a_no_with_the_gates_words(home, monkeypatch):
     _as_mcp_server(monkeypatch, home.bridge)
-    home.verdict.update(approved=False, message="BLOCKED: User denied. Do NOT retry.")
+    home.verdict.update(approved=False, message="BLOCKED: User denied. Do NOT retry.", outcome="denied")
     out = _forward("gmail_send", "hi", "moe-send:ask-1")
     assert out["approved"] is False
     assert out["message"] == "BLOCKED: User denied. Do NOT retry."
+    assert out["outcome"] == "denied", "the person's no must stay distinguishable from nobody being asked"
+
+
+def test_a_refusal_nobody_was_asked_about_says_so_in_its_outcome(home, monkeypatch):
+    _as_mcp_server(monkeypatch, home.bridge)
+    home.agent._turn_live = False
+    assert _forward("gmail_send", "hi", "moe-send:x")["outcome"] == "unattended"
 
 
 def test_request_tool_approval_itself_routes_home_in_the_mcp_server(monkeypatch, tmp_path):
