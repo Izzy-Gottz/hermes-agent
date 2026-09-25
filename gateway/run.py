@@ -582,11 +582,27 @@ def _redact_approval_command(cmd: "str | None") -> str:
     return redact_sensitive_text(str(cmd or ""), force=True)
 
 
+#: ``tools.approval.request_tool_approval``'s display target — a plugin escalation, not a command.
+_PLUGIN_APPROVAL_TARGET = re.compile(r"<([^<>\n]{1,200})> \(plugin approval rule\)")
+
+
 def _format_exec_approval_fallback(
     command: str, description: str, command_prefix: str, *, allow_permanent: bool = True,
     allow_session: bool = True, smart_denied: bool = False) -> str:
-    """Render the text fallback from approval capabilities, not platform names."""
+    """Render the text fallback from approval capabilities, not platform names.
+
+    Only the COMMAND is previewed short. The description is the part a plugin's approval puts the
+    whole question in — a send gate's recipient and every word of the message — and it is never
+    cut here: a person must not approve words they were not shown. The relay chunks a long prompt
+    at the platform's limit, so length costs extra messages, not missing text."""
     cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    plugin_rule = _PLUGIN_APPROVAL_TARGET.fullmatch(command or "")
+    if plugin_rule and not smart_denied:
+        # `request_tool_approval` (a plugin's gate, not a shell command): the question is the
+        # description, and "Dangerous command" over a message somebody is about to send reads as
+        # an alarm about the wrong thing.
+        choices = [f"Reply `{command_prefix}approve` to allow it this once", f"or `{command_prefix}deny` to cancel"]
+        return (f"⚠️ **Approval needed** (`{plugin_rule.group(1)}`)\n\n{description}\n\n" + ", ".join(choices) + ".")
     heading = ("⚠️ **Smart DENY — owner override for one operation:**" if smart_denied
                else "⚠️ **Dangerous command requires approval:**")
 

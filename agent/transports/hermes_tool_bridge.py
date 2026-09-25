@@ -118,6 +118,15 @@ BRIDGED_TOOLS: tuple[str, ...] = ("todo_list", "memory", "session_search", "dele
 #: once at spawn and says nothing true about the current turn. Answered by
 #: ``make_tool_bridge_dispatch`` inside the turn's context; never advertised, never metered.
 TURN_PRESENCE_QUERY = "__turn_presence__"
+#: Not a tool either: "put this question to the person, and tell me what they said". The approval
+#: gate (``tools.approval.request_tool_approval``) needs the turn's session to know WHO to ask and
+#: over which channel, and in the hermes-tools MCP server there is no session — only the
+#: ``HERMES_SINGLE_QUERY_SESSION`` marker, under which every plugin ``approve`` directive was refused
+#: without anyone being asked. So the question goes home, like presence, and is asked from inside
+#: the turn's own context by the process that holds the channel. Answered by
+#: ``make_tool_bridge_dispatch``; only while the turn is live; never advertised, never metered.
+#: What comes back is the gate's own result shape, as JSON.
+TURN_APPROVAL_QUERY = "__request_tool_approval__"
 
 #: One line of JSON per message, both directions. A tool result can be large
 #: (a fan-out's aggregated JSON); the cap is a sanity bound, not a budget.
@@ -645,6 +654,15 @@ class ToolBridge:
         if tool == TURN_PRESENCE_QUERY:
             try:
                 return {"ok": True, "result": str(self._dispatch(tool, {}))}
+            except Exception as exc:
+                return {"ok": False, "error": _error_text(exc)}
+        if tool == TURN_APPROVAL_QUERY:
+            # Not in `_allowed` and not metered, like presence: it is a question about the turn, not
+            # a tool. What it may do is decided at the far end (make_tool_bridge_dispatch), which
+            # asks only inside a live turn and only through the ordinary approval gate.
+            args = payload.get("args")
+            try:
+                return {"ok": True, "result": str(self._dispatch(tool, args if isinstance(args, dict) else {}))}
             except Exception as exc:
                 return {"ok": False, "error": _error_text(exc)}
         if tool not in self._allowed:

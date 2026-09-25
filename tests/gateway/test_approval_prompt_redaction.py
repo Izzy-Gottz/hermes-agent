@@ -138,3 +138,32 @@ class TestApprovalTextFallbackContract:
         assert "approve session" not in text
         assert "approve always" not in text
 
+
+
+# ── a plugin's approval: the whole question, under a heading that fits it ─────────────────────────
+
+_LONG_SEND = ("Send this Gmail message?\n\nTO (checked): dad@example.com\n\nMESSAGE (as written, not checked):\n"
+              + ("Every word of this has to be in front of the person who approves it. " * 80)
+              + "\nTHE LAST LINE.")
+
+
+def test_a_plugin_approval_carries_every_word_of_its_description():
+    """The relay has no buttons, so this text IS the prompt on Telegram. Moe's send gate puts the
+    recipient and the whole message in the description; cutting it would ask a person to approve
+    words they were never shown."""
+    from gateway.run import _format_exec_approval_fallback
+
+    msg = _format_exec_approval_fallback("<gmail_send> (plugin approval rule)", _LONG_SEND, "/")
+    assert _LONG_SEND in msg
+    assert msg.index("THE LAST LINE.") > msg.index("dad@example.com")
+    assert "Dangerous command" not in msg
+    assert "/approve" in msg and "/deny" in msg
+    assert "(plugin approval rule)" not in msg
+
+
+def test_a_shell_command_keeps_its_own_prompt():
+    from gateway.run import _format_exec_approval_fallback
+
+    msg = _format_exec_approval_fallback("rm -rf /tmp/x", "recursive delete", "/")
+    assert msg.startswith("⚠️ **Dangerous command requires approval:**")
+    assert "`/approve always`" in msg

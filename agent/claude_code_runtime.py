@@ -1331,8 +1331,10 @@ def make_tool_bridge_dispatch(agent):
         return _dispatch_in_context(tool, args)
 
     def _dispatch_in_context(tool: str, args: dict) -> str:
-        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS, TURN_PRESENCE_QUERY
+        from agent.transports.hermes_tool_bridge import BRIDGED_TOOLS, TURN_APPROVAL_QUERY, TURN_PRESENCE_QUERY
 
+        if tool == TURN_APPROVAL_QUERY:
+            return _answer_approval_query(agent, args)
         if tool == TURN_PRESENCE_QUERY:
             # Asked by the child's MCP server: who started the turn that is running now. Answered
             # from this turn's own contextvars (the snapshot above), never from process env.
@@ -1373,6 +1375,52 @@ def make_tool_bridge_dispatch(agent):
         return agent._invoke_tool(tool, payload, task_id, call_id)
 
     return _dispatch
+
+
+def _answer_approval_query(agent, args: dict) -> str:
+    """Ask the person, from the turn's own context, on behalf of the child's MCP server.
+
+    The hermes-tools MCP server runs every Hermes and MCP tool under this runtime, so it is where a
+    plugin ``pre_tool_call`` escalates a call and where a plugin asks a person before a send. It has
+    no session: nothing there knows which chat this turn came from, and it runs with
+    ``HERMES_SINGLE_QUERY_SESSION`` set, under which the approval gate refuses without asking. This
+    process has both, inside ``agent._turn_context`` (the dispatch runs in a copy of it).
+
+    Fails closed, and says why, on everything that is not a person's live turn:
+
+    * the turn has ended (or never ran here) — whoever asks now is not the person's live turn;
+    * a scheduled job — nobody is there, and ``approvals.cron_mode: approve`` must not turn a
+      question meant for a person into an automatic yes;
+    * anything the gate itself refuses (no channel, a timeout, a denial), in the gate's own words.
+
+    Returns the gate's result shape as JSON. Never raises for an ordinary refusal.
+    """
+    import json as _json
+
+    tool_name = str((args or {}).get("tool_name") or "tool")
+
+    def refused(why: str) -> str:
+        return _json.dumps({"approved": False, "message": f"BLOCKED: {tool_name} needs your approval, but {why}; "
+                                                         "nothing was done."})
+
+    if getattr(agent, "_turn_live", False) is not True:
+        return refused("the turn that asked has already ended")
+    try:
+        from tools.approval_context import _is_cron_approval_context
+        if _is_cron_approval_context():
+            return refused("this is a scheduled job and nobody is there to ask")
+    except Exception:
+        return refused("who started this turn could not be established")
+    try:
+        from tools.approval import request_tool_approval
+        result = request_tool_approval(
+            tool_name, str((args or {}).get("reason") or ""),
+            rule_key=str((args or {}).get("rule_key") or ""))
+    except Exception:
+        logger.warning("claude-code: approval asked over the tool bridge failed", exc_info=True)
+        return refused("the approval gate failed while asking")
+    return _json.dumps({"approved": bool(result.get("approved")), "message": result.get("message")},
+                       default=str)
 
 
 def _build_session(agent, *, session_key: Optional[str] = _UNSET):

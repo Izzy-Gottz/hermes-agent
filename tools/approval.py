@@ -941,6 +941,8 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
     description = reason or f"Plugin requires approval for {tool_name}"
     if not rule_key:
         rule_key = f"{tool_name}:{hashlib.sha256(description.encode('utf-8')).hexdigest()[:12]}"
+    if approval_callback is None and _in_tools_mcp_server():
+        return _request_tool_approval_over_bridge(tool_name, description, rule_key)
     subject = f"Tool '{tool_name}' requires approval ({description})"
     return _run_approval_gate(
         # Namespaced so plugin-rule approvals share the allowlist machinery without ever colliding with a real
@@ -953,6 +955,46 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
         no_human_block_message=(f"BLOCKED: {subject} but no interactive user or gateway is present "
                                 "to approve it. A plugin flagged this action for human confirmation."),
     )
+
+
+def _in_tools_mcp_server() -> bool:
+    """True inside the hermes-tools MCP server a CLI runtime (claude-code, codex) spawned."""
+    return bool(os.environ.get("HERMES_MCP_TOOL_PROFILE"))
+
+
+def _request_tool_approval_over_bridge(tool_name: str, description: str, rule_key: str) -> dict:
+    """:func:`request_tool_approval`, asked by the process that owns the turn.
+
+    In the hermes-tools MCP server there is no session to ask in — the CLI spawned it once, and it
+    runs with ``HERMES_SINGLE_QUERY_SESSION`` so no prompt ever waits here — so the gate below
+    refused every plugin escalation without asking anybody. The turn's own process has the session
+    and the channel, and answers ``TURN_APPROVAL_QUERY`` from inside the turn's context
+    (``claude_code_runtime._answer_approval_query``). No bridge (codex has none), a bridge that
+    does not answer, or an answer that is not the gate's shape: blocked, never approved.
+    """
+    def blocked(why: str) -> dict:
+        logger.warning("plugin approval for %s over the tool bridge: %s — blocked", tool_name, why)
+        return {"approved": False, "message": f"BLOCKED: {tool_name} needs your approval, but {why}; "
+                                              "nothing was done.",
+                "pattern_key": f"plugin_rule:{rule_key}", "description": description}
+
+    try:
+        from agent.transports.hermes_tool_bridge import TURN_APPROVAL_QUERY, bridge_address, call_bridged_tool
+    except Exception:
+        return blocked("the approval route to the conversation is not available here")
+    if not bridge_address()[0]:
+        return blocked("there is no way to ask you from this process")
+    try:
+        import json
+        answer = json.loads(call_bridged_tool(
+            TURN_APPROVAL_QUERY, {"tool_name": tool_name, "reason": description, "rule_key": rule_key}))
+    except Exception as exc:
+        return blocked(f"the question could not reach you ({type(exc).__name__}: {exc})")
+    if not isinstance(answer, dict) or answer.get("approved") is not True:
+        message = answer.get("message") if isinstance(answer, dict) else None
+        return {"approved": False, "message": str(message or f"BLOCKED: {tool_name} was not approved"),
+                "pattern_key": f"plugin_rule:{rule_key}", "description": description}
+    return {"approved": True, "message": None, "user_approved": True, "description": description}
 
 
 # --- Combined pre-exec guard (tirith + dangerous command detection) -------------------------------------------------
