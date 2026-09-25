@@ -1572,12 +1572,16 @@ class TestSignInRefresh:
         assert bt_real_profile._real_profile_cdp() == (self.CDP, None)
         assert self.launches == [] and self.calls == []
 
-    def test_an_old_hand_over_is_refreshed_even_if_the_file_looks_old(self):
-        """Chrome writes its cookie file lazily: past a minute the jar is re-taken regardless."""
-        now = self._handed_over(ago=bt_real_profile._COOKIE_REFRESH_MAX_AGE_S + 5)
-        self._touch_jar(now - 3600)
-        bt_real_profile._real_profile_cdp()
-        assert len(self.launches) == 1 and len(self._set_cookie_calls()) == 1
+    def test_an_old_but_unchanged_jar_is_not_refreshed(self):
+        """No timer: every refresh starts a hidden second instance of the person's own browser (on
+        2026-09-20 one hijacked its Launch Services identity). An hour-old hand-over whose source file
+        has not changed since must not start it."""
+        now = self._handed_over(ago=3600, attempt_ago=3600)
+        self._touch_jar(now - 7200)
+        for _ in range(3):
+            assert bt_real_profile._real_profile_cdp() == (self.CDP, None)
+        assert self.launches == [] and self.calls == []
+        assert bt_real_profile.take_restart_note() is None
 
     def test_a_burst_of_calls_starts_the_persons_browser_once(self):
         now = self._handed_over(ago=30)

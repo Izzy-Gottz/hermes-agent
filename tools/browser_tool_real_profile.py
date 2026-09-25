@@ -485,11 +485,13 @@ def _import_cookies_into_driven_browser(port: int, cookies: List[Dict[str, Any]]
 # Ticket #18: the hand-over ran only when the driven browser was launched, so a sign-in the person
 # made in their own browser afterwards never reached it -- one hand-over at 21:25, a sign-in at
 # ~21:31, and calls at 21:33 reused the 21:25 jar. A reused browser now re-takes the jar when the
-# person's cookie file has changed since the last hand-over, or that hand-over is older than
-# _COOKIE_REFRESH_MAX_AGE_S (Chrome writes its cookie file lazily, so the file's time can lag a
-# sign-in). Google account sessions are the exception no refresh fixes: see GOOGLE_SESSION_NOTE.
+# person's cookie file has changed since the last hand-over -- and ONLY then (or on the first call into
+# a browser whose jar's age is unknown). No timer: every refresh starts a hidden second instance of the
+# person's own browser, and on 2026-09-20 one hijacked that browser's Launch Services identity. Once per
+# launch is accepted; once a minute of browsing when nothing changed is not. Chrome writes its cookie
+# file lazily, so a sign-in can take a little while to show. Google account sessions are the exception
+# no refresh fixes: see GOOGLE_SESSION_NOTE.
 
-_COOKIE_REFRESH_MAX_AGE_S = 60.0
 #: Never more often than this, however many calls arrive: a burst of browser_exec calls must not start
 #: the person's browser for every one.
 _COOKIE_REFRESH_MIN_INTERVAL_S = 15.0
@@ -614,10 +616,9 @@ def _refresh_jar_if_due(cdp: str) -> None:
         return
     browser = str(_handover["browser"])
     try:
-        if now - float(_handover.get("at") or 0) <= _COOKIE_REFRESH_MAX_AGE_S:
-            src, profile = _persons_jar(browser)
-            if not src or not profile or _jar_mtime(src, profile) <= float(_handover["at"]):
-                return  # nothing new since the last hand-over
+        src, profile = _persons_jar(browser)
+        if not src or not profile or _jar_mtime(src, profile) <= float(_handover.get("at") or 0):
+            return  # nothing new since the last hand-over: never start the person's browser for nothing
         _handover["attempt"] = now
         why = _refresh_jar_now(int(cdp.rsplit(":", 1)[1]), browser, now)
     except Exception as e:
