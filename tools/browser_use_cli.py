@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
+from tools import browser_exec_health as exec_health
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -496,8 +497,11 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
         policy, timeout_s = _get_dialog_policy_config()
-        SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=_resolve_cdp_override(cdp),
-                                         dialog_policy=policy, dialog_timeout_s=timeout_s)
+        policy = exec_health.exec_dialog_policy(policy)  # no browser_dialog tool → never hold a page 300 s for one
+        sup = SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=_resolve_cdp_override(cdp),
+                                               dialog_policy=policy, dialog_timeout_s=timeout_s)
+        if sup is not None and getattr(sup, "dialog_policy", policy) != policy:
+            sup.dialog_policy = policy  # a supervisor started earlier keeps running: correct it in place
     except Exception as exc:
         logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
 
@@ -643,6 +647,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
     if session and not private_browser and lane != chrome_lane.LANE_CHROME:
         code = _OWN_TAB_PREAMBLE + code
+    # Every lane: a page that does not answer gets 30 s (not 5) and an honest error (ticket #16).
+    code = exec_health.harness_patch_preamble() + code
 
     workspace = _workspace_dir(task_id)
     if workspace:
@@ -654,6 +660,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         env["BU_AUTOSPAWN"] = "1"
 
     timeout = _clamp_timeout(timeout_s)
+    exec_health.exec_env(env, timeout_s=timeout, session=session, own_lane=lane == chrome_lane.LANE_OWN)
+    unresumed_before = exec_health.fidelity_unresumed()
     started = time.time()
     try:
         proc = _run_cli_killing_process_group(cmd, code, env, timeout)
@@ -665,6 +673,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error(f"Failed to launch browser-use CLI: {e}")
 
     result = {"success": proc.returncode == 0, "exit_code": proc.returncode, "output": proc.stdout}
+    exec_health.annotate(result, task_id=task_id, started=started, unresumed_before=unresumed_before)
     restart_note = _lazy_call("tools.browser_tool_real_profile", "take_restart_note", None, "restart note lookup failed")
     if restart_note:
         result["note"] = restart_note

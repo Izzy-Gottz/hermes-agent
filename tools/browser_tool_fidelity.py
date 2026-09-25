@@ -760,6 +760,28 @@ def _keeper_main(argv: List[str]) -> int:
     return 0
 
 
+KEEPER_LOG_NAME = "browser-fidelity-keeper.log"
+
+
+def _keeper_log():
+    """Append handle on ``<hermes home>/logs/browser-fidelity-keeper.log`` for a keeper's stderr, or None.
+    Its warnings (a target not resumed, a keeper that ended) went to /dev/null before ticket #16."""
+    try:
+        from hermes_constants import get_hermes_home
+        log_dir = get_hermes_home() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / KEEPER_LOG_NAME
+        try:
+            if path.stat().st_size > 5 * 1024 * 1024:  # rotated on each keeper start: one old copy kept
+                os.replace(path, f"{path}.1")
+        except OSError:
+            pass
+        return open(path, "ab")
+    except Exception as e:
+        logger.debug("fidelity: keeper log unavailable: %s", e)
+        return None
+
+
 class KeeperProcess:
     """The gateway's handle on one keeper process. The same surface the tests and callers use:
     ``port``, ``ua``, ``state``, ``applied``, ``error``, ``healthy()``, ``stop()``, ``join()``."""
@@ -774,9 +796,14 @@ class KeeperProcess:
         os.unlink(self.status_path)
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env = dict(os.environ, PYTHONPATH=root + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""))
-        self.proc = _Popen([sys.executable, "-m", _KEEPER_MARK, "keeper", str(port), json.dumps(identity),
-                                      self.status_path], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, env=env, close_fds=True)
+        log = _keeper_log()
+        try:
+            self.proc = _Popen([sys.executable, "-m", _KEEPER_MARK, "keeper", str(port), json.dumps(identity),
+                                self.status_path], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                               stderr=log if log is not None else subprocess.DEVNULL, env=env, close_fds=True)
+        finally:
+            if log is not None:
+                log.close()  # the child holds its own copy of the descriptor
         self._stopped = False
 
     def _snap(self) -> Dict[str, Any]:
@@ -1073,5 +1100,6 @@ def status_summary() -> Optional[Tuple[bool, str]]:
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "keeper":
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING,
+                        format="%(asctime)s keeper[%(process)d] %(levelname)s %(name)s: %(message)s")
     sys.exit(_keeper_main(sys.argv[2:]))

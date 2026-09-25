@@ -924,7 +924,9 @@ class TestBrowserExec:
         result = json.loads(bu_cli.browser_exec('print("hi")'))
         assert result["success"] is True
         assert result["exit_code"] == 0
-        assert 'got:print("hi")' in result["output"]
+        # the harness patch (tools/browser_exec_health.py) is one line in front of the model's code
+        assert result["output"].startswith("got:exec(compile(")
+        assert result["output"].rstrip().endswith('\nprint("hi")')
         assert "session" not in result
 
     def test_session_sets_bu_name(self, tmp_path, monkeypatch):
