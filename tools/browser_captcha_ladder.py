@@ -20,8 +20,10 @@ Rungs in this slice (tier A -- nothing is solved, nothing leaves the Mac):
 * PerimeterX "Press & Hold": press and keep holding while the page is polled -- released when the page
   says it is done or gave up, never after a fixed time.
 
-Tier C (a recognition solver for image grids) is a seam only (tools/browser_captcha_solver.py); with
-none configured an image challenge goes to the person.
+Tier C: a reCAPTCHA v2 / hCaptcha image grid is solved with a recognition solver the owner configured
+with their own key (``browser.captcha.solver``, tools/browser_captcha_solvers.py): the solver sees only
+the pixels and the instruction, and the ladder clicks the tiles itself (tools/browser_captcha_grid.py).
+With no solver, no key, or any other kind of puzzle, the image challenge goes to the person.
 
 Hard stops -- always the person, never automated, and never retried by the engine in this task:
 a ticketing site (US BOTS Act), DataDome ``t=bv`` (the IP is banned), and the same challenge having
@@ -129,6 +131,8 @@ def _clear_failures(task_id: Optional[str], ch: bc.Challenge) -> None:
 def reset_failures() -> None:
     with _lock:
         _failures.clear()
+    from tools.browser_captcha_grid import reset_solves
+    reset_solves()
 
 
 # ---- the outcome ---------------------------------------------------------------------------------------
@@ -145,11 +149,15 @@ class Outcome:
     hard_stop: str = ""
     steps: List[str] = field(default_factory=list)
     url: str = ""
+    solver: str = ""                 # tier C: the provider asked (never its key)
+    rounds: Optional[int] = None     # tier C: image challenges attempted
+    solves: Optional[int] = None     # tier C: recognition requests spent
 
     def to_dict(self) -> Dict[str, Any]:
         d = {"kind": self.kind, "host": self.host, "outcome": self.outcome, "reason": self.reason,
              "attempts": self.attempts, "tier": self.tier, "delivery": self.delivery,
-             "hard_stop": self.hard_stop, "steps": self.steps, "url": self.url}
+             "hard_stop": self.hard_stop, "steps": self.steps, "url": self.url, "solver": self.solver,
+             "rounds": self.rounds, "solves": self.solves}
         return {k: v for k, v in d.items() if v not in ("", [], None) or k in ("attempts",)}
 
 
@@ -166,6 +174,14 @@ class Surface:
 
     def delivery(self) -> Tuple[Delivery, str]:
         raise NotImplementedError
+
+    def grid(self, ch: bc.Challenge) -> Any:
+        """Tier C: the visible image grid (tools.browser_captcha_grid.Grid), or None."""
+        return None
+
+    def screenshot(self, box: Box) -> Optional[bytes]:
+        """Tier C: a PNG of ``box`` (top-level viewport CSS px), or None."""
+        return None
 
 
 class Ladder:
@@ -254,7 +270,7 @@ class Ladder:
 
         # 4. Image / puzzle stages: tier C, or the person.
         if budget is None or budget.attempts == 0 or ch.stage in ("image", "slider"):
-            return self._tier_c(ch, steps)
+            return self._tier_c(surface, ch, steps, task_id)
 
         # 5. Tier A inputs.
         delivery, why = surface.delivery()
@@ -293,8 +309,8 @@ class Ladder:
                     return self.run(surface, now, task_id)
                 if now.stage in ("image", "slider"):
                     steps.append(f"escalated to {now.kind} {now.stage}")
-                    out = self._tier_c(now, steps)
-                    out.attempts, out.tier, out.delivery = attempts, out.tier or "A", delivery.name
+                    out = self._tier_c(surface, now, steps, task_id)
+                    out.attempts, out.tier, out.delivery = attempts, out.tier or "A", out.delivery or delivery.name
                     return out
                 if now.kind != ch.kind:
                     steps.append(f"page now shows {now.kind}")
@@ -321,16 +337,19 @@ class Ladder:
             return False
         return None
 
-    def _tier_c(self, ch: bc.Challenge, steps: List[str]) -> Outcome:
+    def _tier_c(self, surface: Surface, ch: bc.Challenge, steps: List[str], task_id: Optional[str] = None) -> Outcome:
         solver, why = solver_for(ch.kind, self.cfg)
+        what = {"image": "an image puzzle", "slider": "a slider puzzle"}.get(ch.stage, "a puzzle")
         if solver is None:
             steps.append(f"tier C: {why}")
-            what = {"image": "an image puzzle", "slider": "a slider puzzle"}.get(ch.stage, "a puzzle")
             return self._out(ch, NEEDS_PERSON, f"the {ch.kind} check is {what}, and {why}", tier="C", steps=steps)
-        # A configured solver exists but driving the grid is the next slice: say so, never half-do it.
-        steps.append(f"tier C: solver {why} configured; grid driving is not built yet")
-        return self._out(ch, NEEDS_PERSON, f"the {ch.kind} check is a puzzle; solving it in the engine is not built yet",
-                         tier="C", steps=steps)
+        from tools import browser_captcha_grid as grid
+        if ch.kind not in grid.GRID_KINDS or ch.stage != "image":
+            steps.append(f"tier C: Moe solves reCAPTCHA / hCaptcha image grids only, not {ch.kind}")
+            return self._out(ch, NEEDS_PERSON, f"the {ch.kind} check is {what}, which Moe does not solve",
+                             tier="C", steps=steps)
+        steps.append(f"tier C: {why}")
+        return grid.solve_grid(self, surface, ch, solver, why, steps, task_id)
 
 
 # ---- CDP plumbing (a browser on THIS Mac only) --------------------------------------------------------------
@@ -510,6 +529,14 @@ class CdpSurface(Surface):
                     except Exception:
                         pass
         return None
+
+    def grid(self, ch: bc.Challenge) -> Any:
+        from tools.browser_captcha_grid import read_grid_cdp
+        return read_grid_cdp(self, ch)
+
+    def screenshot(self, box: Box) -> Optional[bytes]:
+        from tools.browser_captcha_grid import screenshot_cdp
+        return screenshot_cdp(self.page, box)
 
     def delivery(self) -> Tuple[Delivery, str]:
         if self._delivery is None:

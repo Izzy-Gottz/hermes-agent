@@ -5,9 +5,11 @@ instruction* (or *what does this image say*) -- and the ladder does every click 
 own browser, from the owner's own IP. The solver never sees a cookie, a URL beyond the image, or the
 page; it gets pixels and an instruction and returns indices.
 
-Bring your own key: a provider (CapSolver, NopeCHA, a local model) is registered with
-:func:`register_solver` and chosen by ``browser.captcha.solver.provider``. None ships in this slice, so
-:func:`solver_for` returns None and the ladder hands the image challenge to the person.
+Bring your own key: a provider is registered with :func:`register_solver` and chosen by
+``browser.captcha.solver`` -- ``capsolver`` | ``nopecha`` | ``none`` (the default), or the older dict form
+``{provider: ...}``. The two built in (tools/browser_captcha_solvers.py) read their key from the env /
+``~/.hermes/.env`` (``CAPSOLVER_API_KEY``, ``NOPECHA_API_KEY``); with no key :func:`solver_for` returns
+None and the ladder hands the image challenge to the person, exactly as with no solver at all.
 
 Two refusals are structural, not configurable:
 
@@ -15,6 +17,9 @@ Two refusals are structural, not configurable:
   ruled out sending Cloudflare challenge / ``cf_clearance`` work to a third party.
 * No solver is ever asked for audio or an accessibility route; :class:`SolveRequest` has no field that
   could carry one.
+
+A solver never sees the page URL, the sitekey, a cookie or the owner's IP: only the pixels and the
+instruction. It never mints a token either -- the ladder clicks the answer itself.
 """
 
 from __future__ import annotations
@@ -35,6 +40,15 @@ class SolveRequest:
     image_png: bytes
     instruction: str                 # the challenge's own words, e.g. "Select all images with buses"
     grid: Tuple[int, int] = (3, 3)   # rows, cols; (1, 1) for a single text image
+    tiles_png: Tuple[bytes, ...] = ()  # the same grid as one image per tile, row-major (hCaptcha's shape)
+
+
+class SolverError(RuntimeError):
+    """The provider could not answer (network, credit, rejected image). Its message never holds a key."""
+
+
+class SolverUnsupported(SolverError):
+    """The provider does not know this challenge (e.g. an object it has no class for): a new challenge may do."""
 
 
 @dataclass(frozen=True)
@@ -76,9 +90,12 @@ def solver_for(kind: str, browser_cfg: Optional[dict]) -> Tuple[Optional[Recogni
     if kind not in SOLVABLE_KINDS:
         return None, f"{kind} is not a recognition task"
     cfg = captcha_config(browser_cfg).get("solver")
+    if isinstance(cfg, str):
+        cfg = {"provider": cfg}
     provider = str((cfg or {}).get("provider") or "").strip().lower() if isinstance(cfg, dict) else ""
-    if not provider:
-        return None, "no recognition solver is configured (browser.captcha.solver.provider)"
+    if provider in ("", "none", "off", "false", "no"):
+        return None, "no recognition solver is configured (browser.captcha.solver)"
+    _load_builtin()
     factory = _REGISTRY.get(provider)
     if factory is None:
         return None, f"recognition solver {provider!r} is not installed"
@@ -89,6 +106,17 @@ def solver_for(kind: str, browser_cfg: Optional[dict]) -> Tuple[Optional[Recogni
     if not solver.supports(kind):
         return None, f"recognition solver {provider!r} does not handle {kind}"
     return solver, provider
+
+
+_builtin_loaded = False
+
+
+def _load_builtin() -> None:
+    """Register the built-in providers (tools/browser_captcha_solvers.py) on first use."""
+    global _builtin_loaded
+    if not _builtin_loaded:
+        _builtin_loaded = True
+        import tools.browser_captcha_solvers  # noqa: F401 -- registers capsolver + nopecha
 
 
 def validate_answer(answer: SolveAnswer, grid: Tuple[int, int]) -> List[int]:

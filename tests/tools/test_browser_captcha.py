@@ -419,14 +419,14 @@ def test_solver_answers_are_validated_and_the_request_has_no_audio_route():
     with pytest.raises(ValueError):
         bs.validate_answer(bs.SolveAnswer(tiles=(9,)), (3, 3))
     fields = set(bs.SolveRequest.__dataclass_fields__)
-    assert fields == {"kind", "image_png", "instruction", "grid"}
+    assert fields == {"kind", "image_png", "instruction", "grid", "tiles_png"}   # pixels only: no audio, no URL
 
 
-def test_a_configured_solver_still_hands_over_until_grid_driving_exists():
+def test_a_configured_solver_hands_over_a_grid_it_cannot_read():
     bs.register_solver("fake", lambda cfg: _Solver())
     try:
         out, s, _ = run(lambda st, dt: hc(image=True), cfg={"captcha": {"solver": {"provider": "fake"}}})
-        assert out.outcome == bl.NEEDS_PERSON and out.tier == "C" and "not built yet" in out.reason
+        assert out.outcome == bl.NEEDS_PERSON and out.tier == "C" and "could not be read" in out.reason
     finally:
         bs.unregister_solver("fake")
 
