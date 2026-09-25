@@ -952,6 +952,14 @@ def handle_function_call(
                                enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
         duration_ms = _elapsed_ms(start)
         _emit(result, duration_ms=duration_ms)
+        # What this lookup returned, for the send gate's recipient grounding: a recipient is only
+        # ever one the person named or one a tool returned in this conversation, never one from
+        # memory (agent/recipient_grounding.py). Best effort; never raises.
+        try:
+            from agent.recipient_grounding import current_key, record_result
+            record_result(current_key(session_id), function_name, function_args, result)
+        except Exception:
+            pass
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
 
     except Exception as e:

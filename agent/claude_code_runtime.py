@@ -1761,6 +1761,15 @@ def _run_claude_code_turn_body(
         # run_conversation before dispatch). Do not append it again.
         try:
             session.ensure_started()
+            # The person's words for this turn, filed under the key the MCP
+            # server's tool calls (and so the send gate) are filed under —
+            # they carry no session id of their own. See
+            # agent/recipient_grounding.py.
+            try:
+                from agent.recipient_grounding import record_words
+                record_words(getattr(session, "grounding_key", "") or "", messages, user_message)
+            except Exception:
+                logger.debug("claude-code: recording the turn's words failed", exc_info=True)
             # A turn's first words never carry the break a previous turn
             # may have left armed (a turn that ended on a tool call).
             agent._stream_needs_break = False

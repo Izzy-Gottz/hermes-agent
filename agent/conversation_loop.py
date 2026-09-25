@@ -1502,6 +1502,14 @@ def _run_conversation_turn(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
+    # The person's words for this conversation, for the send gate's recipient grounding
+    # (agent/recipient_grounding.py): keyed by session id, which is what the gate sees for
+    # tools this process runs. The claude_code runtime records them again under its own key.
+    try:
+        from agent.recipient_grounding import record_words
+        record_words(str(getattr(agent, "session_id", "") or ""), s.messages, s.user_message)
+    except Exception:
+        pass
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
     if agent.api_mode == "codex_app_server":

@@ -946,6 +946,7 @@ def write_mcp_config(
     bridge_socket: Optional[str] = None,
     bridge_token: Optional[str] = None,
     bridge_tools: Optional["tuple[str, ...] | list[str]"] = None,
+    grounding_key: Optional[str] = None,
 ) -> str:
     """Write the ``--mcp-config`` JSON that launches ``hermes_tools_mcp_server``.
 
@@ -1013,6 +1014,14 @@ def write_mcp_config(
         # two ceilings that have to disagree — this one and MCP_TOOL_TIMEOUT
         # in the CLI's own environment — are visible in the same artefact.
         server_env[BRIDGE_TIMEOUT_ENV] = str(int(DEFAULT_TIMEOUT_SECONDS))
+    if grounding_key:
+        # The key the send gate's recipient grounding is filed under
+        # (agent/recipient_grounding.py). The server's tool calls carry no
+        # session id, so without it the lookups the model makes here and the
+        # words this process records for the turn could never be joined.
+        from agent.recipient_grounding import GROUNDING_KEY_ENV
+
+        server_env[GROUNDING_KEY_ENV] = grounding_key
     payload = {
         "mcpServers": {
             HERMES_TOOLS_MCP_SERVER_NAME: {
@@ -1207,6 +1216,11 @@ class ClaudeCodeSession:
             tuple(tool_bridge_tools) if tool_bridge_tools is not None else None
         )
         self._tool_bridge: Optional[Any] = None
+        # One per session, for recipient grounding: the MCP server files its
+        # tool results under it and the runtime files the person's words under
+        # it at every turn (agent/recipient_grounding.py). Random, not the
+        # CLI session id, so it names nothing on its own.
+        self._grounding_key = "cc:" + uuid.uuid4().hex
         self._resumed = False
         self._notice_emitted = False
 
@@ -1431,6 +1445,7 @@ class ClaudeCodeSession:
                 bridge_socket=bridge.socket_path if bridge else None,
                 bridge_token=bridge.token if bridge else None,
                 bridge_tools=bridge.allowed_tools if bridge else None,
+                grounding_key=self._grounding_key,
             )
             self._owns_mcp_config = True
             self._mcp_payload = _LAST_MCP_PAYLOAD
@@ -1700,6 +1715,11 @@ class ClaudeCodeSession:
             return None
         self._tool_bridge = bridge
         return bridge
+
+    @property
+    def grounding_key(self) -> str:
+        """Where this session's recipient-grounding ledger is filed."""
+        return self._grounding_key
 
     def __enter__(self) -> "ClaudeCodeSession":
         return self
