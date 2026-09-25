@@ -100,7 +100,7 @@ class TestDetection:
         ("Insert your security key and touch it", "passkey", {"title": "Security key"}),
         ("Please verify you are human", "captcha", {"buttons": ["Continue"]}),
         ("Verify it's you\nTo help keep your account safe", "identity_check", {"headings": ["Verify it's you"]}),
-        ("Confirm your identity to continue", "identity_check", {"title": "Account security"}),
+        ("Confirm your identity to continue", "identity_check", {"title": "Confirm your identity"}),
         # Common phrasings (review round 3)
         ("Use your face, fingerprint, PIN or security key", "passkey", {"title": "Sign in to your account"}),
         ("Use Touch ID or your passkey", "passkey", {"buttons": ["Use another method"]}),
@@ -108,13 +108,13 @@ class TestDetection:
         ("A verification code has been sent to your Apple devices", "device_prompt", {"title": "Apple Account"}),
         ("Allow this sign in on your iPhone", "device_prompt", {"headings": ["Sign in with Apple"]}),
         ("Utilisez votre clé d'accès pour vous connecter", "passkey", {"title": "Connexion"}),
-        ("Confirmez qu'il s'agit bien de vous", "identity_check", {"headings": ["Vérification"]}),
+        ("Confirmez qu'il s'agit bien de vous", "identity_check", {"headings": ["Confirmez qu'il s'agit bien de vous"]}),
         ("Verwenden Sie Ihren Passkey", "passkey", {"buttons": ["Andere Methode"]}),
-        ("Bestätigen Sie, dass Sie es sind", "identity_check", {"title": "Anmelden"}),
+        ("Bestätigen Sie, dass Sie es sind", "identity_check", {"headings": ["Bestätigen Sie, dass Sie es sind"]}),
         ("Usa tu llave de acceso", "passkey", {"title": "Iniciar sesión"}),
-        ("Verifica tu identidad", "identity_check", {"headings": ["Verificación"]}),
+        ("Verifica tu identidad", "identity_check", {"headings": ["Verifica tu identidad"]}),
         ("השתמש במפתח הגישה שלך", "passkey", {"title": "התחברות"}),
-        ("אימות זהות", "identity_check", {"headings": ["אימות"]}),
+        ("אימות זהות", "identity_check", {"headings": ["אימות זהות"]}),
     ])
     def test_imperative_kinds_in_a_challenge_context(self, text, kind, ctx):
         assert (ps.classify_page(text, **ctx) or {}).get("kind") == kind
@@ -129,6 +129,13 @@ class TestDetection:
         ("Use your passkey to confirm it's you", {}),
         # "Verify your identity" on a cart page: a Continue button is not an identity-check context
         ("Verify your identity\nYour cart (2 items)", {"title": "Your cart - Shop", "buttons": ["Continue"]}),
+        # Review, final round: generic context words are not an identity-check title
+        ("Verify your identity", {"title": "Security settings", "headings": ["Account security"]}),
+        ("Confirm your identity", {"headings": ["Confirm your order"], "buttons": ["Continue"]}),
+        # The reviewer's short help page: a heading, one paragraph, a Continue button
+        ("Sign in with a passkey\nWith a passkey you can sign in with your fingerprint, face or screen lock. "
+         "Use your passkey to sign in to your account on any of your devices.\nContinue",
+         {"headings": ["Sign in with a passkey"], "buttons": ["Continue"]}),
         ("Welcome back! Your dashboard is ready.", {"title": "Sign in"}),
         ("", {}),
     ])
@@ -179,8 +186,8 @@ const S = %s;
 const withStyle = (o, style) => Object.assign(o, {nodeType: 1, style: style || {}});
 const rectOf = ([x, y, w, h]) => () => ({left: x, top: y, width: w, height: h, right: x + w, bottom: y + h});
 const mkInput = (i) => {
-  const parent = withStyle({parentElement: null, getAttribute: (n) => (n === "aria-hidden" && i.parentAriaHidden) ? "true" : null},
-                           i.parentStyle);
+  const parent = withStyle({parentElement: null, getAttribute: (n) => (n === "aria-hidden" && i.parentAriaHidden) ? "true" : null,
+                            getBoundingClientRect: rectOf(i.parentRect || [0, 0, 800, 600])}, i.parentStyle);
   return withStyle({parentElement: parent, tagName: (i.tag || "INPUT").toUpperCase(), type: i.type || "text",
     name: i.name || "", id: i.id || "", placeholder: i.placeholder || "", disabled: !!i.disabled, readOnly: !!i.readOnly,
     getAttribute: (n) => n === "aria-hidden" ? (i.ariaHidden ? "true" : null) : (n === "role" ? (i.role || null) : null),
@@ -188,13 +195,14 @@ const mkInput = (i) => {
 };
 const frames = (S.frames || []).map(([src, w, h]) => withStyle({src, getBoundingClientRect: rectOf([0, 0, w, h])}, {}));
 const inputs = (S.inputs || []).map(mkInput);
-const paras = (S.paragraphs || []).map((t) => ({textContent: t}));
+const paras = (S.paragraphs || []).map((p) => typeof p === "string" ? {textContent: p}
+  : {textContent: p.text, closest: (sel) => (p.footer && /footer/.test(sel)) ? {} : null});
 const heads = (S.headings || []).map((t) => ({textContent: t}));
 const buttons = (S.buttons || []).map((t) => ({innerText: t, textContent: t}));
 const articles = S.article ? [{}] : [];
-globalThis.window = globalThis; globalThis.scrollX = 0; globalThis.scrollY = 0;
+globalThis.window = globalThis; globalThis.scrollX = 0; globalThis.scrollY = 0; globalThis.innerWidth = 1280;
 globalThis.location = {href: "https://accounts.example/x"};
-globalThis.document = {title: S.title || "", body: {innerText: S.body},
+globalThis.document = {title: S.title || "", body: {innerText: S.body}, documentElement: {scrollWidth: 1280},
   querySelectorAll: (sel) => sel === "iframe" ? frames : sel.startsWith("input") ? inputs : sel === "p" ? paras
     : sel === "article" ? articles : sel.startsWith("h1") ? heads : sel.startsWith("button") ? buttons : []};
 globalThis.getComputedStyle = (n) => Object.assign({visibility: "visible", display: "block", opacity: "1",
@@ -237,6 +245,8 @@ class TestTheProbeInJavaScript:
         {"tag": "select", "type": "select-one", "name": "hl"},                     # the language picker
         {"type": "text", "name": "q", "placeholder": "Search"},                    # a search box
         {"type": "text", "role": "searchbox"},
+        {"type": "email", "rect": [5000, 10, 300, 40]},                          # off screen to the right
+        {"type": "text", "parentStyle": {"overflow": "hidden"}, "parentRect": [0, 0, 800, 0]},  # 0-height clip box
     ])
     def test_fields_not_really_on_screen_do_not_stop_it(self, tmp_path, hidden):
         """Review round 3, measured: each of these left the old "rect > 0" rule counting a field. Revert
@@ -262,6 +272,22 @@ class TestTheProbeInJavaScript:
         assert _run_js(tmp_path, "Use your passkey to sign in", title="Sign in with a passkey - Help",
                        article=True) is None
 
+    def test_footer_paragraphs_do_not_make_a_challenge_page_an_article(self, tmp_path):
+        foot = {"text": "Privacy Policy. Terms of Service. Help. This site is protected and the Privacy Policy "
+                        "and Terms of Service apply.", "footer": True}
+        got = _run_js(tmp_path, GOOGLE_PK_BODY, paragraphs=[foot, foot, foot], **GOOGLE_CTX)
+        assert got and got["kind"] == "passkey"
+
+    @pytest.mark.parametrize("body,ctx", [
+        ("Verify your identity", {"title": "Security settings", "headings": ["Account security"]}),
+        ("Confirm your identity", {"headings": ["Confirm your order"], "buttons": ["Continue"]}),
+        ("Sign in with a passkey\nWith a passkey you can sign in with your fingerprint, face or screen lock. Use your "
+         "passkey to sign in to your account on any of your devices.\nContinue",
+         {"headings": ["Sign in with a passkey"], "buttons": ["Continue"]}),
+    ])
+    def test_the_final_round_s_three_false_positives_stay_quiet(self, tmp_path, body, ctx):
+        assert _run_js(tmp_path, body, **ctx) is None
+
     def test_the_words_alone_without_a_challenge_context_are_not(self, tmp_path):
         assert _run_js(tmp_path, "Use your passkey to confirm it's you", title="My notes") is None
 
@@ -273,7 +299,7 @@ class TestTheProbeInJavaScript:
         ("Authenticate with a passkey", {"headings": ["Two-factor authentication"]}, "passkey"),
         ("Utilisez votre clé d'accès", {"title": "Connexion"}, "passkey"),
         ("השתמש במפתח הגישה שלך", {"title": "התחברות"}, "passkey"),
-        ("Verifica tu identidad", {"headings": ["Verificación"]}, "identity_check"),
+        ("Verifica tu identidad", {"headings": ["Verifica tu identidad"]}, "identity_check"),
     ])
     def test_common_and_other_language_phrasings(self, tmp_path, body, ctx, kind):
         assert (_run_js(tmp_path, body, **ctx) or {}).get("kind") == kind
@@ -303,27 +329,49 @@ class TestAtThisMac:
         _live_turn_at_the_mac.unlink()
         assert lane.at_this_mac()[0] is False
 
+    OK = {"active": False, "locked": False, "asleep": False, "display_asleep": False}
+
     @pytest.mark.parametrize("stamp,started_ago,here", [
-        ({"active": False, "locked": False, "asleep": False, "idle": 400}, 60, True),       # waiting, hands off
-        ({"active": False, "locked": False, "asleep": False, "idle": 400}, None, True),     # in progress, no start
-        ({"active": False, "locked": False, "asleep": False, "idle": 2000}, 20 * 60, False),  # grace is over
-        ({"active": False, "locked": True, "asleep": False, "idle": 5}, 60, False),        # locked: never
-        ({"active": False, "locked": False, "asleep": True, "idle": 5}, 60, False),        # asleep: never
-        ({"active": False, "idle": 400}, 60, False),        # an older app that does not say: absent is the safe answer
+        ({**OK, "idle": 120}, 90, True),                        # asked 90 s ago, touched 2 min ago: waiting
+        ({**OK, "idle": 150}, 90, True),                        # the minute of slack
+        ({**OK, "idle": 151}, 90, False),                       # not touched around when they asked
+        ({**OK, "idle": 200}, 179, True),
+        ({**OK, "idle": 200}, 181, False),                      # 180 s is the whole grace
+        ({**OK, "idle": 5}, None, False),                       # start unknown: no grace (fail closed)
+        ({**OK, "locked": True, "idle": 5}, 30, False),         # locked: never
+        ({**OK, "asleep": True, "idle": 5}, 30, False),         # asleep: never
+        ({**OK, "display_asleep": True, "idle": 5}, 30, False),  # the display asleep: away
+        ({"active": False, "locked": False, "asleep": False, "idle": 5}, 30, False),  # does not say display: absent
+        ({"active": True, "display_asleep": True, "idle": 5}, 30, False),             # active but display off: away
+        ({"active": True, "idle": 5}, None, True),              # active is here, whatever the turn
     ])
-    def test_a_person_waiting_at_the_mac_stays_at_the_mac_for_their_turn(self, _live_turn_at_the_mac,
-                                                                          stamp, started_ago, here):
+    def test_the_reviewer_s_rule_for_a_person_waiting_at_the_mac(self, _live_turn_at_the_mac, stamp, started_ago, here):
         _live_turn_at_the_mac.write_text(json.dumps({**stamp, "at": time.time() - 5}))
         presence = {"live": True, "why": "", "surface": "local"}
         if started_ago is not None:
             presence["turn_started_at"] = time.time() - started_ago
         assert lane.at_this_mac(presence)[0] is here
-        assert lane.LOCAL_TURN_GRACE_SECONDS == 15 * 60
+        assert (lane.LOCAL_TURN_GRACE_SECONDS, lane.LOCAL_TURN_TOUCH_SLACK_SECONDS) == (180, 60)
 
     def test_the_grace_needs_a_fresh_stamp(self, _live_turn_at_the_mac):
-        _live_turn_at_the_mac.write_text(json.dumps({"active": False, "locked": False, "asleep": False,
-                                                     "at": time.time() - 600}))
+        _live_turn_at_the_mac.write_text(json.dumps({**self.OK, "idle": 1, "at": time.time() - 600}))
         assert lane.at_this_mac({"live": True, "surface": "local", "turn_started_at": time.time()})[0] is False
+
+    def test_the_native_runtime_stamps_its_turn_start(self, monkeypatch):
+        from agent import conversation_loop as cl
+        from gateway.session_context import get_turn_started_at
+        monkeypatch.setattr(cl, "_run_conversation_turn", lambda *a, **k: {"seen": get_turn_started_at()})
+        monkeypatch.setattr("agent.turn_context.export_current_turn_boundary", lambda agent, result, msg: result)
+        before = time.time()
+        out = cl.run_conversation(object(), "hi")
+        assert before <= out["seen"] <= time.time()
+        assert before <= lane.local_turn_presence()["turn_started_at"] <= time.time()
+
+    def test_a_local_turn_with_no_stamped_start_carries_none(self):
+        import contextvars
+        ctx = contextvars.Context()   # a turn that never went through run_conversation
+        got = ctx.run(lambda: (_bind(), lane.local_turn_presence())[1])
+        assert got["live"] is True and "turn_started_at" not in got
 
     def test_the_owner_texting_from_their_phone_is_live_but_not_here(self):
         bound = _bind(platform="telegram", origin="")
@@ -535,6 +583,14 @@ class TestHandoff:
         assert state.get("show_calls") is None and state["opened"] == [] and state["chrome"] == []
         assert "accounts.google.com/pk" in out["tell_owner"] and "confirm the passkey" in out["tell_owner"]
         assert "phone" not in out["tell_owner"]
+
+    def test_asked_from_the_mac_but_gone_goes_to_their_channels(self, handoff, _live_turn_at_the_mac):
+        bh, state = handoff
+        _stamp(_live_turn_at_the_mac, active=False)
+        state["pages"] = [{"id": "1", "url": "https://accounts.google.com/pk", "title": "", "ws": ""}]
+        out = json.loads(bh.browser_handoff(reason="confirm the passkey", task_id="t"))
+        assert out["code"] == "person_needed" and "reach_owner(text)" in out["error"]
+        assert "waiting in Moe's browser on your Mac" in out["tell_owner"] and state.get("show_calls") is None
 
     def test_a_locked_mac_gets_no_window(self, handoff, _live_turn_at_the_mac):
         bh, state = handoff
@@ -833,3 +889,19 @@ def test_the_bridge_says_when_the_live_turn_began(monkeypatch):
     rt.run_claude_code_turn(agent, user_message="hi", original_user_message="hi", messages=[], effective_task_id="t")
     assert seen["during"]["live"] is True and before <= seen["during"]["turn_started_at"] <= time.time()
     assert seen["during"]["surface"] == "local"
+
+
+def test_asked_from_the_mac_but_gone_reaches_their_channels_from_exec_and_the_ladder(cli, monkeypatch,
+                                                                                     _live_turn_at_the_mac):
+    """The person asked from the Mac, then walked away: the reply lands on an island nobody watches, so
+    the words go to reach_owner (their phone and chats), from browser_exec's note and the ladder alike."""
+    from tools import browser_captcha_ladder as bl
+    _stamp(_live_turn_at_the_mac, active=False)
+    _probe_returns(monkeypatch, cli, PASSKEY_PROBE)
+    cli["stdout"] = GOOGLE_PASSKEY_STDOUT
+    out = json.loads(bu.browser_exec('print(1)', task_id="t"))
+    assert out["needs_person"]["code"] == "person_needed" and "reach_owner(text)" in out["hint"]
+    assert "browser_handoff(" not in out["hint"]
+    o = bl.Outcome(kind="recaptcha_v2", host="forms.example", outcome=bl.NEEDS_PERSON, reason="an image puzzle", tier="C")
+    step = bl.next_step(o, {"live": True, "why": "", "surface": "local"})
+    assert "reach_owner" in step and "waiting in Moe's browser on their Mac" in step and "browser_handoff" not in step

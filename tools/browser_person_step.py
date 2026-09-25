@@ -55,11 +55,14 @@ KINDS = (DEVICE_PROMPT, PASSKEY, CAPTCHA, IDENTITY_CHECK)
 #      Hebrew lines -- other languages are not recognised, an honest gap);
 #   2. challenge context: the title or a heading reads like a sign-in / verification step, or a
 #      button offers the way out challenge pages offer ("Try another way", "Use another method",
-#      "Continue"); an identity check needs the title or heading;
+#      "Continue"); an identity check needs a title or heading that itself says identity / "it's
+#      you" (IDENTITY_TITLE); and the challenge line is a line of its own, headline-length
+#      (CHALLENGE_LINE_CHARS) -- the same words inside a help paragraph do not count;
 #   3. no other way forward: no field a person could fill that is really on screen (see the
 #      visibility rules in PROBE_JS: hidden, off-screen, transparent, clipped, aria-hidden, disabled,
 #      read-only fields, search boxes and <select> language pickers do not count);
-#   4. not an article: short visible text, no <article>, not paragraph after paragraph.
+#   4. not an article: short visible text, no <article>, not paragraph after paragraph (a footer's or
+#      nav's paragraphs are not counted).
 
 #: ``(kind, pattern)``, most specific first: imperative challenge phrasing only. Written in the regex
 #: subset Python and JavaScript share (no lookbehind, no inline flags): PROBE_JS runs the same strings.
@@ -97,7 +100,14 @@ CONTEXT_TITLE = (r"sign[- ]?in|log[- ]?in|verif|confirm|security|2-step|two[- ]s
 CONTEXT_BUTTON = (r"^(?:continue|next|try another way|use another (?:method|way|option)|use a different (?:method|option)"
                   r"|more ways to (?:verify|sign in)|sign in another way|other ways to sign in|cancel|continuer"
                   r"|essayer une autre méthode|weiter|andere methode|continuar|probar otra manera|המשך|נסה דרך אחרת)$")
+#: An identity check's own title or heading must say "identity" / "it's you" -- the generic context
+#: words (confirm, verif, security) are on order, settings and cart pages too.
+IDENTITY_TITLE = (r"it['’]?s (?:really )?you|identity|identit[äé]t|identité|identidad|eres tú|bien de vous"
+                  r"|dass sie es sind|זהות|שזה את")
+#: A challenge line is a line of its own, headline-length; the same words inside a help paragraph are not.
+CHALLENGE_LINE_CHARS = 100
 _CONTEXT_TITLE = re.compile(CONTEXT_TITLE, re.I)
+_IDENTITY_TITLE = re.compile(IDENTITY_TITLE, re.I)
 _CONTEXT_BUTTON = re.compile(CONTEXT_BUTTON, re.I)
 
 #: A challenge page is short; an article or a dashboard is not. Visible text above this is not one.
@@ -144,14 +154,21 @@ def classify_page(text: str, *, fillable_inputs: int = 0, title: str = "", headi
     text = text or ""
     if article or len(text) > SHORT_PAGE_CHARS or fillable_inputs > 0:
         return None
-    titled = any(_CONTEXT_TITLE.search(t or "") for t in [title, *headings])
+    heads = [title, *headings]
+    titled = any(_CONTEXT_TITLE.search(t or "") for t in heads)
+    identity_titled = any(_IDENTITY_TITLE.search(t or "") for t in heads)
     buttoned = any(_CONTEXT_BUTTON.search(" ".join(str(b or "").split())) for b in buttons)
     for kind, pattern in _COMPILED:
         m = pattern.search(text)
         if not m:
             continue
-        if titled or (buttoned and kind != IDENTITY_CHECK):
-            return {"kind": kind, "page_says": _line_around(text, m.start())}
+        says = _line_around(text, m.start())
+        if len(says) > CHALLENGE_LINE_CHARS:
+            return None  # the words inside a paragraph: a help page, not a prompt
+        if kind == IDENTITY_CHECK:
+            return {"kind": kind, "page_says": says} if identity_titled else None
+        if titled or buttoned:
+            return {"kind": kind, "page_says": says}
         return None
     return None
 
@@ -194,6 +211,8 @@ PROBE_JS = """(() => {
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) return false;                        // sr-only, 1x1 clipped
     if (r.right + (window.scrollX || 0) <= 0 || r.bottom + (window.scrollY || 0) <= 0) return false;  // off screen
+    const docW = Math.max(window.innerWidth || 0, (document.documentElement && document.documentElement.scrollWidth) || 0);
+    if (docW && r.left + (window.scrollX || 0) >= docW) return false;     // off screen to the right
     for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
       const s = getComputedStyle(n);
       if (s.display === "none" || s.visibility === "hidden" || s.visibility === "collapse") return false;
@@ -201,23 +220,32 @@ PROBE_JS = """(() => {
       if (n.getAttribute && n.getAttribute("aria-hidden") === "true") return false;
       if (s.clip && /rect\\(\\s*0(?:px)?[ ,]+0(?:px)?[ ,]+0(?:px)?[ ,]+0/.test(s.clip)) return false;
       if (s.clipPath && /inset\\(\\s*(?:50|100)%|circle\\(\\s*0/.test(s.clipPath)) return false;
+      if (n !== el && /hidden|clip/.test(s.overflow || "") && n.getBoundingClientRect) {
+        const pr = n.getBoundingClientRect();                             // a 0-height box that clips its fields
+        if (pr.height < 2 || pr.width < 2) return false;
+      }
     }
     return true;
   };
   const fillable = Array.from(document.querySelectorAll("input, textarea, select")).filter(onScreen).length;
-  const long = Array.from(document.querySelectorAll("p")).filter((p) => (p.textContent || "").trim().length > __PARA__).length;
+  const long = Array.from(document.querySelectorAll("p")).filter((p) =>
+    !(p.closest && p.closest("footer, nav, [role=contentinfo]")) && (p.textContent || "").trim().length > __PARA__).length;
   const article = document.querySelectorAll("article").length > 0 || long >= __PARAS__;
   if (article || text.length > __SHORT__ || fillable > 0) return null;
   const heads = [document.title || ""].concat(Array.from(document.querySelectorAll("h1, h2, [role=heading]"),
     (h) => h.textContent || ""));
   const titled = heads.some((h) => new RegExp(__CTITLE__, "i").test(h));
+  const identityTitled = heads.some((h) => new RegExp(__ITITLE__, "i").test(h));
   const buttoned = Array.from(document.querySelectorAll("button, [role=button], input[type=submit], input[type=button]"),
     (b) => ((b.innerText || b.textContent || b.value || "") + "").replace(/\\s+/g, " ").trim())
     .some((b) => new RegExp(__CBUTTON__, "i").test(b));
   for (const [kind, src] of P) {
     const m = new RegExp(src, "im").exec(text);
     if (!m) continue;
-    if (titled || (buttoned && kind !== "identity_check")) return out(kind, line(m.index), "imperative");
+    const says = line(m.index);
+    if (says.length > __CLINE__) return null;                             // inside a paragraph: a help page
+    if (kind === "identity_check") return identityTitled ? out(kind, says, "imperative") : null;
+    if (titled || buttoned) return out(kind, says, "imperative");
     return null;
   }
   return null;
@@ -229,7 +257,8 @@ def probe_js() -> str:
             .replace("__FRAME__", json.dumps(CHALLENGE_FRAME)).replace("__SELECTOR__", json.dumps(CHALLENGE_SELECTOR))
             .replace("__LIMIT__", str(_SAYS_LIMIT)).replace("__SHORT__", str(SHORT_PAGE_CHARS))
             .replace("__PARA__", str(ARTICLE_PARAGRAPH_CHARS)).replace("__PARAS__", str(ARTICLE_PARAGRAPHS))
-            .replace("__CTITLE__", json.dumps(CONTEXT_TITLE)).replace("__CBUTTON__", json.dumps(CONTEXT_BUTTON)))
+            .replace("__CTITLE__", json.dumps(CONTEXT_TITLE)).replace("__CBUTTON__", json.dumps(CONTEXT_BUTTON))
+            .replace("__ITITLE__", json.dumps(IDENTITY_TITLE)).replace("__CLINE__", str(CHALLENGE_LINE_CHARS)))
 
 
 def parse_probe(raw) -> Optional[Dict[str, str]]:

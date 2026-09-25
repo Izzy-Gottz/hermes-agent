@@ -641,9 +641,12 @@ def next_step(out: Outcome, presence: Optional[dict]) -> str:
                 f"{(presence or {}).get('why') or 'a turn nobody started live'}: report that this step is waiting "
                 "for them, and stop there." + stop)
     if away:
-        return (f"The page needs the person ({out.reason}), and {away}: tell them in your reply that the "
-                f"{out.kind.replace('_', ' ')} check on {out.host} is waiting in Moe's browser on their Mac, and stop "
-                "there." + stop)
+        waiting = (f"the {out.kind.replace('_', ' ')} check on {out.host} is waiting in Moe's browser on their Mac")
+        if (presence or {}).get("surface") == "local":
+            return (f"The page needs the person ({out.reason}); they asked from the Mac but {away}: pass reach_owner "
+                    f"(text) that {waiting} if you have that tool, say it in your reply too, and stop there." + stop)
+        return (f"The page needs the person ({out.reason}), and {away}: tell them in your reply that {waiting}, "
+                "and stop there." + stop)
     if handoff_available():
         return (f"The page needs the person ({out.reason}). Call browser_handoff(reason=\"complete the "
                 f"{out.kind.replace('_', ' ')} check on {out.host}\") to put it in front of them, then wait." + stop)

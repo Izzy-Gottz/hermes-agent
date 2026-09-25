@@ -1602,7 +1602,9 @@ def run_conversation(
     addresses, after every history rewrite including post-turn micro-compaction.
     """
     from agent.turn_context import export_current_turn_boundary
+    from gateway.session_context import mark_turn_started
 
+    mark_turn_started()  # the in-process runtimes' turn start (browser hand-over's at-the-Mac grace)
     result = _run_conversation_turn(
         agent,
         user_message,

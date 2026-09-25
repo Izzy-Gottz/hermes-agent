@@ -212,12 +212,14 @@ def local_turn_presence() -> dict:
         origin = get_turn_origin()
         if origin == TURN_ORIGIN_PERSON:
             verdict = {"live": True, "why": "the person's own turn", "surface": SURFACE_LOCAL}
+            _add_turn_start(verdict)
             return _as_helper(verdict) if helper else verdict
         if origin == TURN_ORIGIN_BACKGROUND:
             return {"live": False, "why": "a background note from the app"}
         return {"live": False, "why": "an API turn whose client did not say a person started it"}
     if platform in _LOCAL_SURFACES or (not platform and source in _LOCAL_SURFACES):
         verdict = {"live": True, "why": "the person's own turn", "surface": SURFACE_LOCAL}
+        _add_turn_start(verdict)
     elif platform in _LIVE_CHAT_PLATFORMS:
         verdict = {"live": True, "why": f"the person's message on {platform.replace('_', ' ')}",
                    "surface": SURFACE_CHAT, "platform": platform}
@@ -226,6 +228,17 @@ def local_turn_presence() -> dict:
     else:
         return {"live": False, "why": "a turn whose origin could not be established"}
     return _as_helper(verdict) if helper else verdict
+
+
+def _add_turn_start(verdict: dict) -> None:
+    """The in-process turn's start (gateway.session_context.mark_turn_started), when one was stamped."""
+    try:
+        from gateway.session_context import get_turn_started_at
+        started = get_turn_started_at()
+    except Exception:
+        started = None
+    if started is not None:
+        verdict["turn_started_at"] = started
 
 
 def _as_helper(verdict: dict) -> dict:
@@ -291,10 +304,13 @@ def _presence_file() -> Optional[Path]:
     return legacy / PRESENCE_FILENAME if legacy.exists() else None
 
 
-#: A person who asked from the Mac and is waiting for the answer often touches nothing: the app's idle
-#: timer then reads "away" although they are sitting there. A live local turn keeps them "at the Mac"
-#: this long after it started -- unless the stamp says the screen is locked or the Mac asleep.
-LOCAL_TURN_GRACE_SECONDS = 15 * 60
+#: A person who asked from the Mac and is waiting for the answer often touches nothing, and the app's
+#: idle timer then reads "away". The grace is narrow on purpose (reviewer's rule, 2026-09-25): the turn
+#: began less than this long ago, AND the Mac's last input is no older than the turn plus a minute --
+#: they touched it around when they asked -- AND the stamp says explicitly: not locked, not asleep,
+#: display not asleep. Anything else is away, and the step goes to their channels instead.
+LOCAL_TURN_GRACE_SECONDS = 180
+LOCAL_TURN_TOUCH_SLACK_SECONDS = 60
 
 
 def _read_stamp(now: float) -> Tuple[Optional[dict], str]:
@@ -331,11 +347,9 @@ def at_this_mac(presence: Optional[dict] = None, *, now: Optional[float] = None)
     surfaces (not a chat app -- the owner texting from their phone is live but not here) AND, when
     the host keeps a presence stamp, a fresh one saying unlocked, awake and in use.
 
-    "In use" is lenient for the turn itself: a person who asked by voice or in the app's chat and is
-    now waiting without touching anything still counts, for LOCAL_TURN_GRACE_SECONDS after the turn
-    began (in progress with no known start counts too), as long as the stamp says explicitly that the
-    screen is not locked and the Mac not asleep. A stamp that does not say so (an older app) is not
-    enough: absent is the safe answer."""
+    "In use" is lenient only for the turn itself: see LOCAL_TURN_GRACE_SECONDS. A turn whose start is
+    unknown gets no grace, and a stamp that does not say locked/asleep/display_asleep explicitly (an
+    older app) is not enough: absent is the safe answer."""
     now = time.time() if now is None else now
     presence = turn_presence() if presence is None else presence
     if not presence.get("live"):
@@ -347,17 +361,25 @@ def at_this_mac(presence: Optional[dict] = None, *, now: Optional[float] = None)
         return True, "the person's own turn, at the machine"
     if not data:
         return False, why
-    if data.get("active") is True:
+    if data.get("active") is True and data.get("display_asleep") is not True:
         return True, "the person's own turn, at the Mac"
-    if data.get("locked") is False and data.get("asleep") is False:
-        started = presence.get("turn_started_at")
-        if not isinstance(started, (int, float)) or 0 <= now - float(started) <= LOCAL_TURN_GRACE_SECONDS:
-            return True, "the person's own turn at the Mac, waiting on the answer"
-        return False, "the Mac has not been touched since this turn began a while ago"
     if data.get("locked") is True:
         return False, "the Mac's screen is locked"
     if data.get("asleep") is True:
         return False, "the Mac is asleep"
+    if data.get("display_asleep") is True:
+        return False, "the Mac's display is asleep"
+    if data.get("locked") is False and data.get("asleep") is False and data.get("display_asleep") is False:
+        started = presence.get("turn_started_at")
+        idle = data.get("idle")
+        if not isinstance(started, (int, float)):
+            return False, "the Mac has not been touched for a while (and when this turn began is unknown)"
+        since = now - float(started)
+        if not (0 <= since < LOCAL_TURN_GRACE_SECONDS):
+            return False, "the Mac has not been touched since this turn began a while ago"
+        if not isinstance(idle, (int, float)) or float(idle) > since + LOCAL_TURN_TOUCH_SLACK_SECONDS:
+            return False, "the Mac was not touched around when this turn began"
+        return True, "the person's own turn at the Mac, waiting on the answer"
     return False, "the Mac is locked, asleep or idle"
 
 

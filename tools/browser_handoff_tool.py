@@ -109,7 +109,10 @@ def _needs_person(reason: str, url: str, presence: dict, why: str, step: Optiona
     host = host_of(url)
     what = describe(step) if step else reason
     tell = owner_message(reason, url, step)
-    if presence.get("live"):
+    if presence.get("live") and presence.get("surface") == "local":
+        next_step = ("They asked from the Mac but are not at it now: pass tell_owner to reach_owner(text) if you have "
+                     "that tool (it reaches their phone and chats), say it in your reply too, then stop.")
+    elif presence.get("live"):
         where = presence.get("platform") or "a chat"
         next_step = (f"They are writing from {where.replace('_', ' ')}, away from the Mac: tell them tell_owner in your "
                      "reply, then stop -- do not keep working the page.")

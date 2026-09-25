@@ -629,7 +629,11 @@ def _note_person_step(result: dict, step: dict, presence: Optional[dict]) -> Non
         from tools.browser_handoff_tool import owner_message
         result["needs_person"]["code"] = "person_needed"
         result["needs_person"]["tell_owner"] = owner_message(what, step.get("url") or "", step)
-        if presence.get("live"):
+        if presence.get("live") and presence.get("surface") == "local":
+            hint = (f"The page needs the person: {what}. They asked from the Mac but {why or 'are not at it now'}: pass "
+                    "needs_person.tell_owner to reach_owner(text) if you have that tool (it reaches their phone and "
+                    "chats), say it in your reply too, and stop there. " + ps.GROUNDING_RULE)
+        elif presence.get("live"):
             hint = (f"The page needs the person: {what}. {why or 'They are away from the Mac'}, so nothing can be shown "
                     "to them: say needs_person.tell_owner in your reply and stop there. " + ps.GROUNDING_RULE)
         else:

@@ -68,6 +68,21 @@ def reset_turn_origin(token) -> None:
     _TURN_ORIGIN.reset(token)
 
 
+_TURN_STARTED_AT = ContextVar("HERMES_TURN_STARTED_AT", default=_UNSET)
+
+
+def mark_turn_started(at: float | None = None):
+    """Stamp when the turn now starting began (epoch seconds); returns the reset token. Read by
+    browser hand-over's "is the person at the Mac" grace (tools.browser_chrome_extension.at_this_mac)."""
+    import time as _time
+    return _TURN_STARTED_AT.set(float(_time.time() if at is None else at))
+
+
+def get_turn_started_at() -> float | None:
+    value = _TURN_STARTED_AT.get()
+    return None if value is _UNSET else float(value)
+
+
 def get_turn_origin() -> str:
     """The declared origin of the current turn, or ``""`` when nobody declared one (no env fallback)."""
     value = _TURN_ORIGIN.get()
