@@ -33,6 +33,27 @@ def _clean_caches():
     _reset_caches()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_home_or_install(tmp_path, monkeypatch):
+    """_find_agent_browser's not-found branch lazily runs scripts/install.sh --ensure browser, which can
+    download Node and re-point $HOME/.local/bin/{node,npm,npx}. The global conftest isolates HERMES_HOME but
+    not HOME, so pin HOME to tmp and fail loudly if any test here reaches the real installer."""
+    home = tmp_path / "home"
+    (home / ".local" / "bin").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    reached = []
+
+    def _refuse(*args, **kwargs):
+        # Recorded as well as raised: _find_agent_browser swallows exceptions from the lazy install.
+        reached.append(args)
+        raise AssertionError(f"test reached the real dependency installer: {args!r}")
+
+    monkeypatch.setattr("hermes_cli.dep_ensure.subprocess.run", _refuse)
+    yield
+    assert not reached, f"test reached the real dependency installer: {reached!r}"
+
+
 # ---------------------------------------------------------------------------
 # Dead code removal
 # ---------------------------------------------------------------------------
@@ -79,6 +100,7 @@ class TestFindAgentBrowserCache:
 
         with patch("shutil.which", return_value=None), \
              patch("os.path.isdir", return_value=False), \
+             patch("hermes_cli.dep_ensure.ensure_dependency", return_value=False), \
              patch.object(Path, "exists", mock_exists):
             with pytest.raises(FileNotFoundError):
                 bt_install._find_agent_browser()

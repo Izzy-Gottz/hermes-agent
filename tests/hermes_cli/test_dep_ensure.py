@@ -109,6 +109,7 @@ def test_ensure_dependency_uses_powershell_on_windows(tmp_path):
          patch("hermes_cli.dep_ensure._find_install_script", return_value=(scripts_dir / "install.ps1", "powershell")), \
          patch("hermes_cli.dep_ensure.shutil") as mock_shutil, \
          patch("hermes_constants.get_hermes_home", return_value=tmp_path / "fakehome"), \
+         patch("hermes_cli.dep_ensure._install_script_allowed", return_value=True), \
          patch("subprocess.run") as mock_run, \
          patch("sys.stdin") as mock_stdin:
         mock_shutil.which.side_effect = lambda name: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" if name == "powershell" else None
@@ -121,3 +122,31 @@ def test_ensure_dependency_uses_powershell_on_windows(tmp_path):
         assert cmd[cmd.index("-Ensure") + 1] == "node"
         assert "-HermesHome" in cmd
         assert str(tmp_path / "fakehome") in cmd
+
+
+def test_ensure_dependency_never_runs_installer_under_test_isolation(tmp_path, monkeypatch):
+    """Regression: a pytest run reached ensure_dependency("browser"), which ran the real install.sh with the
+    tmp HERMES_HOME but the REAL HOME, re-pointing ~/.local/bin/{node,npm,npx} at a pytest temp dir.
+    The fake installer below does exactly that write, against a tmp HOME; under the isolation marker
+    (exported by tests/conftest.py) it must never run."""
+    import os
+    from hermes_cli import dep_ensure
+
+    home = tmp_path / "home"
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    victim = tmp_path / "real-node"
+    victim.write_text("")
+    (local_bin / "node").symlink_to(victim)
+    escaped = tmp_path / "pytest-hermes-home" / "node" / "bin" / "node"
+    script = tmp_path / "scripts" / "install.sh"
+    script.parent.mkdir()
+    script.write_text(f'#!/bin/bash\nln -sf "{escaped}" "$HOME/.local/bin/node"\n')
+
+    monkeypatch.setenv("HOME", str(home))
+    assert os.environ.get("HERMES_TEST_ISOLATION"), "tests/conftest.py must export the isolation marker"
+    monkeypatch.setitem(dep_ensure._DEP_CHECKS, "browser", lambda: False)
+    monkeypatch.setattr(dep_ensure, "_find_install_script", lambda *a, **k: (script, "bash"))
+
+    assert dep_ensure.ensure_dependency("browser", interactive=False) is False
+    assert os.readlink(local_bin / "node") == str(victim)

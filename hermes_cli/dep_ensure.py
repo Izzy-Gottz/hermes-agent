@@ -2,6 +2,7 @@
 instant, Python-controlled UX); install.sh / install.ps1 remain the *installation* backend."""
 from __future__ import annotations
 
+import os
 import platform
 import shutil
 import subprocess
@@ -73,11 +74,25 @@ def _find_install_script(package_dir: Path | None = None, repo_root: Path | None
     return None, None
 
 
+#: Exported by tests/conftest.py (see hermes_state_guard): this process tree runs under test isolation.
+_TEST_ISOLATION_MARKER_ENV = "HERMES_TEST_ISOLATION"
+
+
+def _install_script_allowed() -> bool:
+    """False under Hermes test isolation. The install script is a real installer: it downloads Node into
+    $HERMES_HOME and re-points ``$HOME/.local/bin/{node,npm,npx}`` at it. The test conftest redirects
+    HERMES_HOME to a tmp dir but deliberately leaves HOME alone, so a test that reached this path re-pointed
+    the developer's real ~/.local/bin links at a pytest temp dir that is deleted moments later."""
+    return not os.environ.get(_TEST_ISOLATION_MARKER_ENV)
+
+
 def ensure_dependency(dep: str, interactive: bool = True) -> bool:
     """Ensure a non-Python dependency is available. Returns True if available."""
     check = _DEP_CHECKS.get(dep)
     if check is None or check():  # unknown dep — don't silently forward to install script
         return check is not None
+    if not _install_script_allowed():
+        return False
     script, shell = _find_install_script()
     desc = _DEP_DESCRIPTIONS.get(dep, dep)
     if script is None:
