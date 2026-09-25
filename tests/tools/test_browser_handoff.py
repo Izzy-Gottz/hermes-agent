@@ -425,6 +425,31 @@ class TestBrowserExec:
         assert "browser_handoff" in out["hint"]
         assert "phone" not in out["hint"].replace("their phone or another device", "")  # the rule, not a claim
 
+    def test_a_google_sign_in_wall_says_google_sessions_stay_in_the_persons_chrome(self, cli, monkeypatch):
+        """Ticket #18: every Google session cookie was handed over and sent, and Google still asked for the
+        passkey -- it ties the session to the person's own Chrome. The result says so, in words to pass on."""
+        from tools.browser_tool_real_profile import GOOGLE_SESSION_NOTE
+        _probe_returns(monkeypatch, cli, PASSKEY_PROBE)
+        cli["stdout"] = GOOGLE_PASSKEY_STDOUT
+        out = json.loads(bu.browser_exec('print(js("document.body.innerText"))', task_id="t"))
+        assert out["google_sign_in"] == GOOGLE_SESSION_NOTE
+        assert "ties them to the person's own Chrome" in out["google_sign_in"]
+
+    def test_the_signed_out_google_account_page_says_so_too(self, cli, monkeypatch):
+        _probe_returns(monkeypatch, cli, None)
+        cli["stdout"] = "{'url': 'https://myaccount.google.com/intro/security', 'title': 'Google Account'}\n"
+        out = json.loads(bu.browser_exec('print(page_info())', task_id="t"))
+        assert "google_sign_in" in out
+
+    def test_other_pages_and_signed_in_google_pages_carry_no_google_note(self, cli, monkeypatch):
+        _probe_returns(monkeypatch, cli, None)
+        for stdout in ("{'url': 'https://fazier.com/dashboard', 'title': 'Fazier'}\n",
+                       "{'url': 'https://myaccount.google.com/security', 'title': 'Security'}\n",
+                       "{'url': 'https://www.google.com/search?q=signin', 'title': 'signin - Google Search'}\n"):
+            cli["stdout"] = stdout
+            out = json.loads(bu.browser_exec('print(page_info())', task_id="t"))
+            assert "google_sign_in" not in out, stdout
+
     def test_the_output_alone_is_never_the_verdict(self, cli, monkeypatch):
         """github.com/login prints "Sign in with a passkey"; the page itself says there is a password form."""
         _probe_returns(monkeypatch, cli, None)
