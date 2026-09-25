@@ -21,6 +21,23 @@ from tools import browser_tool_session as bt_session
 from tools import browser_tool_install as bt_install
 
 
+@pytest.fixture(autouse=True)
+def _never_launch_a_real_browser(monkeypatch):
+    """No test in this file may start a real Chrome: one that did leaked five
+    Chrome for Testing processes that outlived pytest by a day. Tests that fake
+    Popen themselves still override this; a test that reaches the real one with
+    a real browser binary fails loudly instead."""
+    import subprocess as _sp
+    real_popen = _sp.Popen
+
+    def _guarded(argv, *a, **k):
+        exe = str(argv[0] if isinstance(argv, (list, tuple)) else argv)
+        if "chrom" in exe.lower() and os.path.exists(exe):
+            raise AssertionError(f"test tried to launch a real browser ({exe}); stub the launcher")
+        return real_popen(argv, *a, **k)
+    monkeypatch.setattr(bt_real_profile.subprocess, "Popen", _guarded)
+
+
 def _auth_db(path, value=None):
     """Store/read a marker in a real auth DB so snapshot fixtures exercise SQLite."""
     import sqlite3
@@ -1231,7 +1248,12 @@ class TestReviewRound3:
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch.object(bt.subprocess, "run", return_value=proc), \
-             patch.object(bt_cloud, "_is_headed_mode", return_value=False):
+             patch.object(bt_cloud, "_is_headed_mode", return_value=False), \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/bin/true"), \
+             patch.object(bt_real_profile, "driven_browser_executable", return_value="/bin/true"), \
+             patch.object(bt_real_profile, "_export_cookies_from_persons_browser", return_value=([], None)), \
+             patch.object(bt_real_profile, "_launch_driven_browser", return_value=(9251, None)), \
+             patch.object(bt_real_profile, "_import_cookies_into_driven_browser", return_value=None):
             cdp, err = bt_real_profile._real_profile_cdp()
         assert err is None
         snap.assert_called_once()
