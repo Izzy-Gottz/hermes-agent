@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 ENV_DEADLINE = "HERMES_BU_DEADLINE"      # epoch seconds the whole call must finish by
 ENV_TAB_CAP = "HERMES_BU_TAB_CAP"        # keep at most this many Hermes-opened tabs (unset = no cap)
 ENV_TAB_LEDGER = "HERMES_BU_TAB_LEDGER"  # JSON file listing the tabs the harness opened, oldest first
+ENV_CURRENT_TAB = "HERMES_BU_CURRENT_TAB"  # JSON file the harness writes on exit: the tab it is attached to
 
 PAGE_BUDGET_S = 30.0
 TAB_CAP = 6
@@ -190,10 +191,28 @@ def _hermes_patch_harness():
             print(f"hermes: closed {len(closed)} old tab(s) Hermes had opened (keeps the newest {cap})",
                   file=sys.stderr)
 
+    def _record_current_tab():
+        # The tab this call left the harness attached to: the page the model is working on. The vault
+        # binds a login to THIS tab rather than to whichever tab happens to hold a password field
+        # (Moe ticket #17). Daemon-local meta call: no page is asked, so a busy page cannot stall it.
+        path = os.environ.get("HERMES_BU_CURRENT_TAB") or ""
+        if not path:
+            return
+        try:
+            tab = _orig_send({"meta": "current_tab"}, response_timeout=3.0) or {}
+            record = {"targetId": tab.get("targetId") or "", "url": tab.get("url") or "", "at": time.time()}
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(record, fh)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
     _h._send, _h._runtime_evaluate = _send, _runtime_evaluate
     _h.PageDidNotAnswer = PageDidNotAnswer
     _h._hermes_patched = True
     atexit.register(_cap_tabs)
+    atexit.register(_record_current_tab)  # atexit is LIFO: recorded before any tab is closed
 _hermes_patch_harness()
 del _hermes_patch_harness
 '''.replace("PAGE_BUDGET_S", repr(PAGE_BUDGET_S))
@@ -204,9 +223,47 @@ def harness_patch_preamble() -> str:
     return f"exec(compile({HARNESS_PATCH_SOURCE!r}, '<hermes-harness-patch>', 'exec'))\n"
 
 
-def exec_env(env: dict, *, timeout_s: float, session: str, own_lane: bool) -> None:
-    """The env the patch reads: the call's deadline always; the tab cap and its ledger only in
-    Moe's own browser (the person's Chrome is theirs, whatever Hermes opened there)."""
+def _safe(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(name or "default"))[:80] or "default"
+
+
+def current_tab_path(task_id: Optional[str]) -> Optional[str]:
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home() / "cache" / "browser-use" / f"current-tab-{_safe(task_id or 'default')}.json")
+    except Exception:
+        return None
+
+
+#: How long the harness's record of its tab is believed: a record from an old call may name a tab
+#: the model has long since left.
+CURRENT_TAB_FRESH_SECONDS = 30 * 60
+
+
+def current_tab(task_id: Optional[str], *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """``{"targetId", "url", "at"}``: the tab the last browser_exec call of ``task_id`` left the
+    harness attached to, in Moe's own browser. None when unknown or stale."""
+    path = current_tab_path(task_id)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    now = time.time() if now is None else now
+    if not isinstance(data, dict) or not data.get("targetId"):
+        return None
+    at = data.get("at")
+    if not isinstance(at, (int, float)) or not (0 <= now - float(at) <= CURRENT_TAB_FRESH_SECONDS):
+        return None
+    return data
+
+
+def exec_env(env: dict, *, timeout_s: float, session: str, own_lane: bool, task_id: Optional[str] = None) -> None:
+    """The env the patch reads: the call's deadline always; the tab cap, its ledger and the
+    current-tab record only in Moe's own browser (the person's Chrome is theirs, whatever Hermes
+    opened there, and the vault never fills there)."""
     env[ENV_DEADLINE] = f"{time.time() + float(timeout_s):.3f}"
     if not own_lane:
         return
@@ -214,6 +271,9 @@ def exec_env(env: dict, *, timeout_s: float, session: str, own_lane: bool) -> No
         from hermes_constants import get_hermes_home
         d = get_hermes_home() / "cache" / "browser-use"
         d.mkdir(parents=True, exist_ok=True)
+        path = current_tab_path(task_id)
+        if path:
+            env[ENV_CURRENT_TAB] = path
         # One ledger per daemon name AND browser: two tasks' default sessions can drive two browsers.
         browser = hashlib.sha1(str(env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or "").encode()).hexdigest()[:10]
         env[ENV_TAB_LEDGER] = str(d / f"tabs-{session or 'default'}-{browser}.json")

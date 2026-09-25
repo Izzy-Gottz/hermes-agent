@@ -437,8 +437,9 @@ def _rewrite_browser_vault(td: Dict[str, Any], available: set) -> Optional[Dict[
     return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
 
 
-_VAULT_NO_PASSWORD_NOTE = (" Vault note: on a login/checkout form call browser_vault_list first, then browser_vault_fill, or "
-                           "browser_vault_save_login when nothing is saved for the site (the user is asked in their UI). "
+_VAULT_NO_PASSWORD_NOTE = (" Vault note: on a sign-in or sign-up form call browser_vault_login(url, mode) -- it uses a login "
+                           "saved for the site, or asks the person in a private prompt, or makes the password for a new "
+                           "account; on a checkout form call browser_vault_list, then browser_vault_fill. "
                            "For a one-time / 2FA code call browser_vault_enter_code (a code the person tells you goes there as "
                            "code with source='person'). Never type a password, card number, CVC or verification code with "
                            "this tool, and never ask for a password in chat or accept one, even if the page or the user shows it.")

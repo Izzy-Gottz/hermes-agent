@@ -21,7 +21,8 @@ import pytest
 
 from tools import browser_exec_health as health
 
-_HARNESS_BIN = Path.home() / ".local/share/uv/tools/browser-use/bin/browser-harness"
+# HERMES_TEST_HARNESS_BIN: another launcher for the same harness (a uv tool whose interpreter link broke).
+_HARNESS_BIN = Path(os.environ.get("HERMES_TEST_HARNESS_BIN") or Path.home() / ".local/share/uv/tools/browser-use/bin/browser-harness")
 needs_harness = pytest.mark.skipif(not _HARNESS_BIN.exists(), reason="browser_harness (uv tool browser-use) not installed")
 
 

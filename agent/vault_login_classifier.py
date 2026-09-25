@@ -76,6 +76,11 @@ class LoginControl:
     #: The visible text nearest the control when it has no <label> -- what a person reads to know
     #: what goes in it ("6-digit code (check your email)" beside a bare <input id="code">).
     context: str = ""
+    #: The page's own password rules on this control (signup forms): ``minlength``, ``pattern`` and
+    #: Apple's ``passwordrules`` attribute. Read by agent/vault_password.py; never secret.
+    min_length: Optional[int] = None
+    pattern: str = ""
+    password_rules: str = ""
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "LoginControl":
@@ -90,6 +95,9 @@ class LoginControl:
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
             context=str(raw.get("context") or "")[:300],
+            min_length=int(raw["minLength"]) if raw.get("minLength") not in (None, "") else None,
+            pattern=str(raw.get("pattern") or "")[:300],
+            password_rules=str(raw.get("passwordRules") or "")[:300],
         )
 
 
@@ -220,6 +228,45 @@ def select_password_fill(
     ]
 
 
+#: A password field that is part of making an account, not signing in to one.
+_RE_SIGNUP_PASSWORD = re.compile(
+    r"\b(?:new|create|choose|confirm|confirmation|repeat|re\s*enter|reenter|retype|re\s*type|verify|again|set)\b")
+
+
+def classify_signup_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
+    """Signup mode: the password fields a new account takes -- the new password and every confirm /
+    repeat field -- as ``new-password`` (the login classifier excludes exactly these).
+
+    ``autocomplete=new-password`` (100) or a name/label that says new/create/confirm/repeat (80) is
+    decisive. A page that marks none of them gets its plain ``type=password`` fields (60) only when
+    none of them says ``current-password`` and they sit in one form -- the bare two-box signup form.
+    A field marked ``current-password`` is never a signup field."""
+    passwords = [c for c in controls if c.type == "password"]
+    out: List[ClassifiedLoginControl] = []
+    for c in passwords:
+        tokens = c.autocomplete.lower().split()
+        if "current-password" in tokens or "one-time-code" in tokens:
+            continue
+        if "new-password" in tokens:
+            out.append(ClassifiedLoginControl(c, 100, "new-password"))
+        elif _RE_SIGNUP_PASSWORD.search(_normalize_text(" ".join(p for p in (_identifier_words(c.name), c.label) if p))):
+            out.append(ClassifiedLoginControl(c, 80, "new-password"))
+    if out:
+        return out
+    plain = [c for c in passwords if not c.autocomplete.strip()]
+    if plain and len(plain) == len(passwords) and len(plain) <= 3 and len({c.form_index for c in plain}) == 1:
+        return [ClassifiedLoginControl(c, 60, "new-password") for c in plain]
+    return []
+
+
+def select_signup_fills(classified: List[ClassifiedLoginControl], password: str) -> List[Dict[str, Any]]:
+    """Every new-password and confirm field gets the same password, in DOM order."""
+    if not password:
+        return []
+    return [{"index": c.control.index, "token": "new-password", "value": password}
+            for c in sorted(classified, key=lambda c: c.control.index) if c.token == "new-password"]
+
+
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     """Classify one control as a payment/address fill target (autocomplete token exact match 100,
     label/name heuristic 70), or None. Password/email inputs are never checkout targets."""
@@ -314,6 +361,9 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
       index,
       maxLength: element.maxLength > 0 ? element.maxLength : null,
+      minLength: element.minLength > 0 ? element.minLength : null,
+      pattern: element.getAttribute("pattern") || "",
+      passwordRules: element.getAttribute("passwordrules") || "",
       label: [
         ...labels,
         element.getAttribute("aria-label") || "",
@@ -355,12 +405,13 @@ _FILL_JS_TEMPLATE = """(() => {
     return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
   }
   const fills = __FILLS__;
+  const PASSWORD_TOKENS = ["current-password", "new-password"];
   const nonce = __NONCE__;
   let filled = 0;
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
     const el = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
-    if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+    if (!el || (PASSWORD_TOKENS.includes(f.token) && el.type !== "password")) continue;
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);

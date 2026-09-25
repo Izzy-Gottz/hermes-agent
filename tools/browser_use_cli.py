@@ -723,7 +723,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         env["BU_AUTOSPAWN"] = "1"
 
     timeout = _clamp_timeout(timeout_s)
-    exec_health.exec_env(env, timeout_s=timeout, session=session, own_lane=lane == chrome_lane.LANE_OWN)
+    exec_health.exec_env(env, timeout_s=timeout, session=session, own_lane=lane == chrome_lane.LANE_OWN,
+                         task_id=task_id)
     unresumed_before = exec_health.fidelity_unresumed()
     started = time.time()
     try:

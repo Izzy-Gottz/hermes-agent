@@ -257,13 +257,20 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             value = result_obj.get("description") or result_obj.get("unserializableValue")
         return {"ok": True, "result": value, "result_type": result_type}
 
-    def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
+    def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0,
+                   target_id: Optional[str] = None) -> Dict[str, Any]:
         """Re-attach the supervisor's page session to an open page target on ``origin``
         (``scheme://host[:port]``). The initial attach picks the FIRST page target, but tools
         that open their own tabs (browser_exec) put the login form somewhere else. With
         ``accept`` (a JS expression) the first same-origin tab where it evaluates truthy wins,
         so a login and a checkout tab on one site resolve to the right one. Returns
-        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays."""
+        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays.
+
+        ``target_id`` narrows the search to that one tab (the tab browser_exec is attached to).
+        ``origin=""`` (find the form before its origin is known) no longer means "the first tab with
+        one": when accepted tabs span more than one origin the answer is ambiguous and the result is
+        ``{"ok": False, "ambiguous": [origins...]}`` -- Moe ticket #17, where a stale indiehackers.com
+        tab won over the fazier.com page the model was on and the login was saved to the wrong site."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
@@ -284,18 +291,38 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 try:
                     # origin="" = any http(s) page (used to FIND the login tab before its origin is known)
                     if t.get("type") == "page" and url.startswith(("http://", "https://")) \
+                            and (not target_id or t.get("targetId") == target_id) \
                             and (not origin or normalize_origin(url) == origin):
                         candidates.append((t["targetId"], url))
                 except Exception:
                     continue
-            for target_id, url in candidates:
-                sid = await _attach(target_id)
+            accepted = []  # (sid, url, origin)
+            for cand_id, url in candidates:
+                sid = await _attach(cand_id)
                 if accept:
                     probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
                                             session_id=sid, timeout=timeout)
                     if not probe.get("result", {}).get("result", {}).get("value"):
                         await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
                         continue
+                try:
+                    cand_origin = normalize_origin(url)
+                except Exception:
+                    cand_origin = url
+                accepted.append((sid, url, cand_origin))
+                if origin or target_id:
+                    break  # the origin (or the tab) is already pinned: the first match is the match
+            origins = list(dict.fromkeys(a[2] for a in accepted))
+            if len(origins) > 1:
+                for sid, _u, _o in accepted:
+                    await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
+                out = _fail("several open pages have the form: " + ", ".join(origins))
+                out["ambiguous"] = origins
+                return out
+            if accepted:
+                sid, url, _o = accepted[0]
+                for extra, _u, _o2 in accepted[1:]:
+                    await self._cdp("Target.detachFromTarget", {"sessionId": extra}, timeout=timeout)
                 with self._state_lock:
                     self._page_session_id = sid
                 return {"ok": True, "url": url}

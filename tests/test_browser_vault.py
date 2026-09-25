@@ -240,7 +240,9 @@ class TestClassifier:
         assert "data-vault-secret" not in js
         assert "elements[f.index]" not in js
         assert "[data-hermes-vault-slot=" in js and "nonce + ':' + f.index" in js
-        assert 'f.token === "current-password" && el.type !== "password"' in js  # a password fill never lands in a text box
+        # a password fill (sign-in or sign-up) never lands in a text box
+        assert 'PASSWORD_TOKENS.includes(f.token) && el.type !== "password"' in js
+        assert 'const PASSWORD_TOKENS = ["current-password", "new-password"]' in js
         assert js.index('removeAttribute("data-hermes-vault-slot")') > js.index("setter.set.call")
 
     def test_build_fill_js_asserts_origin_before_any_write(self):
@@ -650,11 +652,16 @@ class TestSaveLoginPrompt:
             unlock_mod.set_save_login_prompt_callback(lambda origin, site: None)
             with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True):
                 declined = json.loads(browser_vault_tool.browser_vault_save_login())
-            with patch("agent.vault_backends.unlock.can_prompt_here", return_value=False):
+            with patch("agent.vault_backends.unlock.can_prompt_here", return_value=False), \
+                 patch("tools.browser_chrome_extension.unattended_turn", return_value=None):
                 headless = json.loads(browser_vault_tool.browser_vault_save_login())
+            with patch("agent.vault_backends.unlock.can_prompt_here", return_value=False), \
+                 patch("tools.browser_chrome_extension.unattended_turn", return_value="a scheduled job"):
+                unattended = json.loads(browser_vault_tool.browser_vault_save_login())
             unlock_mod.set_save_login_prompt_callback(None)
         assert declined["error_type"] == "save_declined"
         assert headless["error_type"] == "prompt_unavailable"
+        assert unattended["code"] == "person_needed" and unattended["outcome"] == "needs_person"
         assert store.list_items() == []
 
 

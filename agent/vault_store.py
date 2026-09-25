@@ -21,6 +21,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -32,6 +33,9 @@ from urllib.parse import urlsplit
 from hermes_constants import get_hermes_home
 
 VAULT_KINDS = ("login", "payment", "address")
+
+#: A generated signup password nobody confirmed within a day is pruned (browser_vault_confirm).
+PENDING_MAX_AGE_S = 24 * 60 * 60
 
 LOGIN_IDENTIFIER_TYPES = ("email", "phone", "username")
 
@@ -166,6 +170,11 @@ class VaultItemMeta:
     identifier_type: Optional[str] = None
     identifier: Optional[str] = None
     has_otp: bool = False  # a TOTP seed is stored: 2FA codes can be minted without asking the user
+    #: A login whose password Hermes generated for a signup that has not been confirmed yet
+    #: (browser_vault_confirm). Pending items may be regenerated, and are pruned when stale.
+    pending: bool = False
+    #: Hermes made the password itself (browser_vault_save_login generate=True); nobody ever saw it.
+    generated: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -180,6 +189,10 @@ class VaultItemMeta:
             out["identifier_type"] = self.identifier_type
         if self.has_otp:
             out["has_otp"] = True
+        if self.pending:
+            out["pending"] = True
+        if self.generated:
+            out["generated"] = True
         return out
 
 
@@ -309,6 +322,9 @@ class VaultStore:
         label: str,
         secret: Dict[str, Any],
         origin: Optional[str] = None,
+        *,
+        pending: bool = False,
+        generated: bool = False,
     ) -> VaultItemMeta:
         """Add an item. ``secret`` is the sensitive payload (encrypted at rest).
 
@@ -365,6 +381,11 @@ class VaultStore:
             "identifier": identifier,
             "secret": dict(secret),
         }
+        if generated:
+            record["generated"] = True
+        if pending:
+            record["pending"] = True
+            record["pending_since"] = time.time()
         with self._locked():
             items = self._read_all()
             items.append(record)
@@ -391,6 +412,45 @@ class VaultStore:
                 return False
             self._write_all(remaining)
             return True
+
+    def confirm_item(self, item_id: str) -> Optional[VaultItemMeta]:
+        """A pending (generated, unconfirmed) login becomes final. None when there is no such pending item."""
+        with self._locked():
+            items = self._read_all()
+            for rec in items:
+                if rec.get("id") == item_id and rec.get("pending"):
+                    rec.pop("pending", None)
+                    rec.pop("pending_since", None)
+                    self._write_all(items)
+                    return self._meta(rec)
+        return None
+
+    def replace_pending_password(self, item_id: str, password: str) -> Optional[VaultItemMeta]:
+        """Swap the password of a PENDING login (the site rejected the generated one). A confirmed login
+        is never rewritten this way: None, and nothing changes."""
+        if not password:
+            raise VaultError("password is required")
+        with self._locked():
+            items = self._read_all()
+            for rec in items:
+                if rec.get("id") == item_id and rec.get("pending") and rec.get("kind") == "login":
+                    rec["secret"] = {**(rec.get("secret") or {}), "password": password}
+                    rec["pending_since"] = time.time()
+                    self._write_all(items)
+                    return self._meta(rec)
+        return None
+
+    def prune_pending(self, max_age_s: float = PENDING_MAX_AGE_S, *, now: Optional[float] = None) -> int:
+        """Drop pending logins older than ``max_age_s``: a signup that never got confirmed is not an
+        account anyone can use, and a stale one would be offered as a saved login forever."""
+        now = time.time() if now is None else now
+        with self._locked():
+            items = self._read_all()
+            keep = [rec for rec in items
+                    if not (rec.get("pending") and now - float(rec.get("pending_since") or 0) > max_age_s)]
+            if len(keep) != len(items):
+                self._write_all(keep)
+            return len(items) - len(keep)
 
     def get_meta(self, item_id: str) -> Optional[VaultItemMeta]:
         with self._locked():
@@ -423,6 +483,8 @@ class VaultStore:
             identifier_type=rec.get("identifier_type") if identifier else None,
             identifier=identifier or None,
             has_otp=bool((rec.get("secret") or {}).get("otp_secret")),
+            pending=bool(rec.get("pending")),
+            generated=bool(rec.get("generated")),
         )
 
 

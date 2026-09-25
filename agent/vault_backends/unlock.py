@@ -159,8 +159,13 @@ def is_unlocked(backend: str) -> bool:
     return _live(backend, touch=False) is not None
 
 
-def can_prompt_here() -> bool:
-    """False in contexts where no human can answer (cron, webhook, api_server, -q)."""
+_CALLBACK_GETTERS = {"unlock": lambda: get_unlock_prompt_callback(), "login": lambda: get_save_login_prompt_callback(),
+                     "code": lambda: get_code_prompt_callback()}
+
+
+def _in_process_prompt_ok(kind: Optional[str] = None) -> bool:
+    """A surface in THIS process installed the prompt for ``kind`` (any of them when None), and the
+    context is one a human can answer (not cron, webhook, api_server or -q)."""
     from tools.approval_context import (
         _is_cron_approval_context,
         _is_single_query_approval_context,
@@ -168,4 +173,80 @@ def can_prompt_here() -> bool:
     )
     if _is_cron_approval_context() or _is_unattended_platform_approval_context() or _is_single_query_approval_context():
         return False
-    return get_unlock_prompt_callback() is not None
+    kinds = [kind] if kind in _CALLBACK_GETTERS else list(_CALLBACK_GETTERS)
+    return any(_CALLBACK_GETTERS[k]() is not None for k in kinds)
+
+
+def can_prompt_here(kind: Optional[str] = None) -> bool:
+    """Whether the person can be asked for a secret here: an in-process surface prompt for ``kind``
+    (``unlock`` / ``login`` / ``code``; any when None), or the host's own prompt program
+    (agent/vault_backends/secret_prompt.py) with the person live at this Mac. False where no human can
+    answer (cron, a relayed message, a turn from the person's phone)."""
+    if _in_process_prompt_ok(kind):
+        return True
+    from agent.vault_backends.secret_prompt import external_prompt_ready
+    return external_prompt_ready()[0]
+
+
+def _external(kind: str):
+    from agent.vault_backends.secret_prompt import external_prompt_ready, run_prompt
+    ready, why = external_prompt_ready()
+    return (run_prompt if ready else None), why
+
+
+def _site(origin: str) -> str:
+    return (origin or "").split("://", 1)[-1]
+
+
+def resolve_save_login_prompt(*, label: str = "", username: str = "", message: str = "") -> tuple:
+    """``(prompt, why)``: a ``SaveLoginPrompt`` (origin, host) -> {"identifier", "password"} | None,
+    or ``(None, why nobody can be asked)``. The surface's own prompt first, then the host's program."""
+    cb = get_save_login_prompt_callback()
+    if cb is not None and can_prompt_here("login"):
+        return cb, ""
+    run, why = _external("login")
+    if run is None:
+        return None, why
+
+    def ask(origin: str, host: str) -> Optional[Dict[str, str]]:
+        answer = run("login", origin=origin, label=label or host or _site(origin), username=username,
+                     message=message or (f"Type your login for {host or _site(origin)}. It is saved straight "
+                                         "into your saved passwords; the assistant never sees it."))
+        if not answer.get("ok"):
+            return None
+        out = {"identifier": answer.pop("username"), "password": answer.pop("password")}
+        answer.clear()
+        return out
+    return ask, ""
+
+
+def resolve_code_prompt(*, message: str = "") -> tuple:
+    """``(prompt, why)``: a ``CodePrompt`` (site, hint) -> code ("" = declined), or ``(None, why)``."""
+    cb = get_code_prompt_callback()
+    if cb is not None and can_prompt_here("code"):
+        return cb, ""
+    run, why = _external("code")
+    if run is None:
+        return None, why
+
+    def ask(site: str, hint: str) -> str:
+        answer = run("code", origin=f"https://{site}" if site and "://" not in site else site, label=site,
+                     message=message or hint or f"Type the code {site} sent you. It goes straight into the page; the assistant never sees it.")
+        return str(answer.get("code") or "") if answer.get("ok") else ""
+    return ask, ""
+
+
+def resolve_unlock_prompt() -> tuple:
+    """``(prompt, why)``: an ``UnlockPrompt`` (backend, display_name) -> master password, or ``(None, why)``."""
+    cb = get_unlock_prompt_callback()
+    if cb is not None and can_prompt_here("unlock"):
+        return cb, ""
+    run, why = _external("unlock")
+    if run is None:
+        return None, why
+
+    def ask(backend: str, display_name: str) -> str:
+        answer = run("unlock", label=display_name,
+                     message=f"Unlock {display_name} so your saved logins can be used. The assistant never sees the password.")
+        return str(answer.pop("password", "") or "") if answer.get("ok") else ""
+    return ask, ""
