@@ -14,6 +14,7 @@ PLAN_CODES = {
     "claude_usage_cap", "browser_missing", "profile_locked",
     # chrome-extension-lane: the app still has to learn this one (Connections → Chrome install button).
     "browser_extension_missing",
+    "person_needed",
 }
 
 

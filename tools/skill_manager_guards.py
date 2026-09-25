@@ -310,3 +310,51 @@ def _org_mirror_write_guard(name: str, skill_path: Path, action: str) -> Optiona
     except Exception:
         logger.debug("org mirror guard lookup failed for %s", name, exc_info=True)
     return None
+
+
+# ── Claims a skill must not keep ─────────────────────────────────────────────
+#
+# A skill is read on every later turn, for every site. On 2026-09-24 the background review wrote into
+# a launch skill that a passkey challenge "on the user's own device" is expected, "so ... wait for the
+# user to approve it on their device" -- and Moe then told its owner to approve things on his phone
+# that no site had sent to any phone. Whether a step waits on a device is a fact about ONE page at ONE
+# moment, known only from what that page said (tools/browser_person_step.py: page_says); a skill that
+# states it as procedure is a standing false claim. So a write that ADDS such a sentence is refused,
+# whoever makes it; a sentence already there is left for the person to remove (their skills are
+# theirs), and edits that keep it pass.
+
+import re as _re
+
+_DEVICE_WORDS = _re.compile(
+    r"\b(?:on|from|with|via|using)\s+(?:the\s+|their\s+|your\s+|his\s+|her\s+)?"
+    r"(?:(?:user|person|owner|customer|human)(?:'s|s'|s)?\s+)?(?:own\s+|other\s+|mobile\s+)?"
+    r"(?:phone|device|iphone|android|mobile)\b", _re.I)
+_APPROVAL_WORDS = _re.compile(r"\b(?:approv\w*|confirm\w*|tap\w*|wait\w*|accept\w*|allow\w*|complet\w*|finish\w*|"
+                              r"authori[sz]\w*|respond\w*)\b", _re.I)
+_SENTENCE_SPLIT = _re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def device_approval_claims(text: str) -> list:
+    """The sentences of ``text`` that say a step waits on the person's phone or device."""
+    out = []
+    for sentence in _SENTENCE_SPLIT.split(text or ""):
+        s = " ".join(sentence.split())
+        if s and _DEVICE_WORDS.search(s) and _APPROVAL_WORDS.search(s):
+            out.append(s)
+    return out
+
+
+def _device_claim_write_guard(old: Optional[str], new: str, label: str) -> Optional[Dict[str, Any]]:
+    """Refuse a write that adds a device-approval claim ``old`` did not already hold."""
+    before = set(device_approval_claims(old or ""))
+    added = [s for s in device_approval_claims(new) if s not in before]
+    if not added:
+        return None
+    quote = added[0] if len(added[0]) <= 220 else added[0][:217] + "..."
+    return _refusal(
+        f"Refused: this write to {label} adds a claim that a step waits on the person's phone or device "
+        f"(\"{quote}\"). A skill is read for every later site and turn, but whether a site sent anything to a "
+        "device is only known from that page, at that moment. Write the general rule instead: when a page needs "
+        "the person (a passkey, a security key, a CAPTCHA, an approval), call browser_handoff so they can see it, "
+        "and tell them only what the page itself says.",
+        error_type="ungrounded_device_claim")

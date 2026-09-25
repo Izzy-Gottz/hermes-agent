@@ -70,12 +70,16 @@ CLAUDE_USAGE_CAP = "claude_usage_cap"
 BROWSER_MISSING = "browser_missing"
 PROFILE_LOCKED = "profile_locked"                    # a real browser profile lock: Windows only
 BROWSER_EXTENSION_MISSING = "browser_extension_missing"  # Moe's Chrome extension not installed / not connected
+# Not a setting at all: a page step only the person can take (a passkey, a CAPTCHA, an identity check),
+# met on a turn nobody is at. The job reports it; nothing on this Mac fixes it (tools/browser_handoff_tool.py).
+PERSON_NEEDED = "person_needed"
 
 CODES = frozenset({
     TCC_APP_DATA, TCC_FILES, TCC_AUTOMATION, TCC_DRIVER_ACCESSIBILITY, TCC_DRIVER_SCREEN,
     TCC_MICROPHONE, TCC_CALENDAR, TCC_REMINDERS, TCC_CONTACTS,
     DRIVER_NOT_RUNNING, WINDOW_OTHER_SPACE, MCP_NEEDS_REAUTH, MCP_NOT_CONNECTED,
     CLAUDE_LOGIN_EXPIRED, CLAUDE_USAGE_CAP, BROWSER_MISSING, PROFILE_LOCKED, BROWSER_EXTENSION_MISSING,
+    PERSON_NEEDED,
 })
 
 OWNER_APP = "app"

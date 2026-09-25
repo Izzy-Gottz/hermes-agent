@@ -596,6 +596,37 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
+def _person_step(stdout: str, env: dict) -> Optional[dict]:
+    """A person-only step the page shows: in what the code printed, else in the page itself (a local
+    browser's open tabs, probed briefly). None when there is none, or nothing could be read."""
+    from tools import browser_person_step as ps
+    found = ps.classify_text(stdout or "")
+    if found:
+        return found
+    cdp = env.get("BU_CDP_URL") or ""
+    return _quiet(lambda: ps.probe_pages(cdp), None, "person-step probe failed") if cdp else None
+
+
+def _note_person_step(result: dict, step: dict, presence: Optional[dict]) -> None:
+    """Put ``needs_person`` on a browser_exec result, and the next move: browser_handoff on a person's live
+    turn, a report on a turn nobody is at. ``presence`` None = ask now."""
+    from tools import browser_person_step as ps
+    if presence is None:
+        from tools.browser_chrome_extension import turn_presence
+        presence = _quiet(turn_presence, {"live": False, "why": ""}, "turn presence lookup failed")
+    result["needs_person"] = {k: v for k, v in step.items() if v}
+    what = ps.describe(step)
+    if presence.get("live"):
+        hint = (f"The page needs the person: {what}. Moe's browser is out of sight, so they cannot do it yet: call "
+                "browser_handoff(reason=...) to put the page in front of them, then wait for them. " + ps.GROUNDING_RULE)
+    else:
+        result["needs_person"]["code"] = "person_needed"
+        hint = (f"The page needs the person: {what}. This is {presence.get('why') or 'a turn nobody started live'}, "
+                "so nobody can do it now: report that this step is waiting for them, and stop there. "
+                + ps.GROUNDING_RULE)
+    result["hint"] = (result["hint"] + " " + hint) if result.get("hint") else hint
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False, where: str = ""):
     """Run Python code through the browser-use CLI, and return its output.
@@ -716,6 +747,13 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                                       "— it runs in Moe's own tab group in the owner's real Chrome.")
                 else:
                     result["hint"] = "This site blocks Moe's own browser. " + chrome_lane.not_connected_message()
+    if lane == chrome_lane.LANE_OWN and not (result.get("blocked_by") and bridge is not None and presence.get("live")):
+        # Moe's own browser is out of sight: a passkey, a CAPTCHA or an identity check there can only be
+        # done by the person, and only once they can see it (tools/browser_handoff_tool.py). A bot wall
+        # with the Chrome lane available keeps the where="chrome" hint above instead.
+        step = _person_step(proc.stdout, env)
+        if step:
+            _note_person_step(result, step, presence if chrome_lane.lane_enabled(browser_cfg) else None)
     if workspace:
         result["workspace"] = workspace
     if session:
@@ -784,7 +822,10 @@ _HELPERS_DIGEST = (
     "cdp('Accessibility.getFullAXTree')['nodes'] lists every element's role/name/backendDOMNodeId (filter "
     "in Python before printing; it is thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) "
     "gives click coordinates. ensure_real_tab() recovers from a stale/internal tab. Login walls: never guess "
-    "credentials; see the vault note below if present, otherwise stop and ask the user."
+    "credentials; see the vault note below if present, otherwise stop and ask the user. This browser is out of "
+    "the person's sight: a passkey, security key, CAPTCHA or identity check (a result's needs_person), or the "
+    "person asking to see the page, is browser_handoff -- never tell them to check their phone or another "
+    "device unless the page itself says so."
 )
 
 

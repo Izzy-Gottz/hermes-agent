@@ -151,6 +151,21 @@ _RE_NOT_A_SIGNIN_CODE = re.compile(
     r"product|sku|tracking|booking|confirmation\s+number|member(ship)?|employee|student|cvv|cvc)\b")
 
 
+#: Words a code field's own name/id is made of, glued the way markup glues them: ``otpCode``,
+#: ``verification_code``, ``emailcode``, ``mfa-pin``. Split before any reading, so "verificationcode"
+#: and "otpCode" read as the two words they are (2026-09-25: a camelCase id was not a code field).
+_RE_GLUED_CODE = re.compile(r"\b(otp|totp|mfa|2fa|verification|verify|passcode|auth|login|signin|email|sms|"
+                            r"security|onetime)(code|pin)\b")
+#: An identifier that is itself a code word needs no "code" beside it (id="otp", name="verification").
+_RE_CODE_IDENTIFIER = re.compile(r"\b(?:otp|totp|mfa|2fa|passcode|verification|one time code|onetimecode)\b")
+
+
+def _identifier_words(raw: str) -> str:
+    """A control's name/id as words: camelCase and glued ``<kind>code`` split, then normalised."""
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw or "")
+    return _RE_GLUED_CODE.sub(r"\1 \2", _normalize_text(spaced))
+
+
 def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
     """The controls that take a sign-in or second-factor code. ``autocomplete=one-time-code`` is
     authoritative (100); a name/label that says OTP/2FA/verification code is strong (70); a short
@@ -165,13 +180,14 @@ def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginC
             continue
         if c.type not in ("text", "tel", "number", "password", ""):
             continue
-        own = _normalize_text(" ".join(p for p in (c.name, c.label) if p))
-        if _RE_OTP.search(own):
+        ident = _identifier_words(c.name)
+        own = " ".join(p for p in (ident, _normalize_text(c.label)) if p)
+        if _RE_OTP.search(own) or (_RE_CODE_IDENTIFIER.search(ident) and not _RE_NOT_A_SIGNIN_CODE.search(own)):
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
             continue
         if c.type == "password" or (c.max_length is not None and c.max_length > 12):
             continue
-        seen = _normalize_text(" ".join(p for p in (c.name, c.label, c.context) if p))
+        seen = " ".join(p for p in (own, _normalize_text(c.context)) if p)
         if _RE_CODE_WORD.search(seen) and not _RE_NOT_A_SIGNIN_CODE.search(seen):
             out.append(ClassifiedLoginControl(c, 50, "one-time-code"))
     return out

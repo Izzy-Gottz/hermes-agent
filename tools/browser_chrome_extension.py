@@ -369,7 +369,19 @@ def choose_lane(where: str, code: str, *, task_id: Optional[str], session: str, 
 
 def record_lane(task_id: Optional[str], session: str, lane: str) -> None:
     with _sticky_lock:
-        _sticky[(str(task_id or ""), str(session or ""))] = lane
+        key = (str(task_id or ""), str(session or ""))
+        _sticky.pop(key, None)  # re-insert: the dict's order is then most-recent-last
+        _sticky[key] = lane
+
+
+def last_lane(task_id: Optional[str]) -> Optional[str]:
+    """The lane this task's most recent browser_exec call ran in (any session), or None."""
+    task = str(task_id or "")
+    with _sticky_lock:
+        for (t, _session), lane in reversed(list(_sticky.items())):
+            if t == task:
+                return lane
+    return None
 
 
 def reset_sticky_lanes() -> None:
