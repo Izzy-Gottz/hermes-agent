@@ -756,7 +756,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                                       "— it runs in Moe's own tab group in the owner's real Chrome.")
                 else:
                     result["hint"] = "This site blocks Moe's own browser. " + chrome_lane.not_connected_message()
-    if lane == chrome_lane.LANE_OWN and not (result.get("blocked_by") and bridge is not None and presence.get("live")):
+    if lane == chrome_lane.LANE_OWN and not result.get("captcha") \
+            and not (result.get("blocked_by") and bridge is not None and presence.get("live")):
+        # A CAPTCHA is the ladder's (tools/browser_captcha_ladder.py): it already said what to do.
         # Moe's own browser is out of sight: a passkey, a CAPTCHA or an identity check there can only be
         # done by the person, and only once they can see it (tools/browser_handoff_tool.py). A bot wall
         # with the Chrome lane available keeps the where="chrome" hint above instead.

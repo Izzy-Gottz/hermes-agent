@@ -224,8 +224,7 @@ class TestKeeper:
             by_session.setdefault(msg.get("sessionId"), []).append(msg)
         for s in ("tab1", "pop1", "frm1"):
             assert [m["method"] for m in by_session[s]] == [
-                "Emulation.setUserAgentOverride", "Page.addScriptToEvaluateOnNewDocument", "Target.setAutoAttach",
-                "Runtime.runIfWaitingForDebugger"], s
+                "Emulation.setUserAgentOverride", "Target.setAutoAttach", "Runtime.runIfWaitingForDebugger"], s
         assert [m["method"] for m in by_session["wrk1"]] == ["Network.setUserAgentOverride", "Runtime.runIfWaitingForDebugger"]
         for s in ("shw1", "sw1"):
             assert [m["method"] for m in by_session[s]] == [

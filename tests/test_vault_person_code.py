@@ -7,6 +7,7 @@ it on their device" -- which it turned into "approve it on your phone".
 """
 
 import json
+import time
 import re
 from unittest.mock import patch
 
@@ -61,7 +62,8 @@ def _enter(controls, *, live=True, code="", source="", prompt=None, probe=None, 
     return raw, seen.get("expr", ""), asked
 
 
-def _ledger(monkeypatch, tmp_path, *, text, sender=None, origin="person", module=True, stamp_active=True):
+def _ledger(monkeypatch, tmp_path, *, text, sender=None, origin="person", module=True, stamp_active=True,
+            updated_ago=1):
     """This turn, as the recipient-grounding ledger (fork branch recipient-ground) files it:
     ``current`` = the words that started the turn, with who sent them. ``module=False``: a Hermes
     without that module at all."""
@@ -77,8 +79,8 @@ def _ledger(monkeypatch, tmp_path, *, text, sender=None, origin="person", module
     fake = types.ModuleType("agent.recipient_grounding")
     fake.current_key = lambda session_id="", env=None: "k1"
     fake.ledger_path = lambda key: tmp_path / f"{key}.json"
-    fake._load = lambda path: {"version": 2, "current": {"text": text, "origin": origin,
-                                                         "sender": sender or {"kind": "local"}}}
+    fake._load = lambda path: {"version": 2, "updated": time.time() - updated_ago,
+                               "current": {"text": text, "origin": origin, "sender": sender or {"kind": "local"}}}
     monkeypatch.setitem(sys.modules, "agent.recipient_grounding", fake)
     import agent
     monkeypatch.setattr(agent, "recipient_grounding", fake, raising=False)
@@ -122,6 +124,7 @@ class TestTheCodeThePersonSays:
         out = json.loads(raw)
         assert out["error_type"] == "code_not_said" and expr == ""
         assert "type the code into the page themselves" in out["error"]
+        assert "I've brought it up in front of you" in out["error"]
 
     def test_without_the_ledger_it_is_refused_and_the_person_types_it(self, monkeypatch, tmp_path):
         _ledger(monkeypatch, tmp_path, text="482913", module=False)
@@ -129,12 +132,29 @@ class TestTheCodeThePersonSays:
         out = json.loads(raw)
         assert out["error_type"] == "code_source" and expr == "" and "themselves" in out["error"]
 
-    def test_the_owner_s_own_chat_counts(self, monkeypatch, tmp_path):
+    def test_the_owner_s_own_chat_counts_while_it_is_the_turn_running(self, monkeypatch, tmp_path):
         (tmp_path / "owner.json").write_text(json.dumps({"telegram": ["5550001"]}))
         monkeypatch.setenv("HERMES_OWNER_FILE", str(tmp_path / "owner.json"))
         _ledger(monkeypatch, tmp_path, text="482913",
                 sender={"kind": "chat", "platform": "telegram", "user_id": "5550001"})
+        live = {"live": True, "why": "", "surface": "chat", "platform": "telegram"}
+        monkeypatch.setattr("tools.browser_chrome_extension.turn_presence", lambda: live)
         assert json.loads(_enter(TICKET_PAGE, code="482913", source="person")[0])["success"]
+
+    @pytest.mark.parametrize("now,age", [
+        ({"live": False, "why": "a scheduled job"}, 1),                              # a job reading the ledger
+        ({"live": True, "why": "", "surface": "chat", "platform": "whatsapp"}, 1),   # another chat's turn
+        ({"live": True, "why": "", "surface": "chat", "platform": "telegram"}, 3600),  # a stale record
+    ])
+    def test_the_owner_s_chat_words_must_be_this_live_turn_s(self, monkeypatch, tmp_path, now, age):
+        import time
+        (tmp_path / "owner.json").write_text(json.dumps({"telegram": ["5550001"]}))
+        monkeypatch.setenv("HERMES_OWNER_FILE", str(tmp_path / "owner.json"))
+        _ledger(monkeypatch, tmp_path, text="482913",
+                sender={"kind": "chat", "platform": "telegram", "user_id": "5550001"}, updated_ago=age)
+        monkeypatch.setattr("tools.browser_chrome_extension.turn_presence", lambda: now)
+        raw, expr, _ = _enter(TICKET_PAGE, code="482913", source="person")
+        assert json.loads(raw)["error_type"] == "code_source" and expr == ""
 
     def test_someone_else_s_chat_does_not(self, monkeypatch, tmp_path):
         (tmp_path / "owner.json").write_text(json.dumps({"telegram": ["5550001"]}))
@@ -214,3 +234,33 @@ class TestTheFieldByItsName:
     @pytest.mark.parametrize("name", ["promoCode", "zipCode", "countryCode", "couponCode", "giftCode", "username"])
     def test_other_codes_stay_other(self, name):
         assert classify_otp_controls([_ctl(name=name)]) == []
+
+
+class TestWholeTokens:
+    """A code is in the owner's words as a whole word, or as pieces said one by one -- never as letters
+    that happen to line up across words (review 2026-09-25: "into" and "thebank" were accepted from
+    "sign in to the bank")."""
+
+    @pytest.mark.parametrize("code,words", [
+        ("482913", "the code is 482913"),
+        ("482913", "482 913"),
+        ("482913", "4-8-2-9-1-3"),
+        ("482913", "four eight two nine one three"),
+        ("482913", "four eight two, 913"),
+        ("AB12CD", "it's AB12CD"),
+        ("AB12CD", "A B 1 2 C D"),
+    ])
+    def test_said_as_a_code(self, code, words):
+        from tools.browser_vault_tool import code_in_words
+        assert code_in_words(code, words)
+
+    @pytest.mark.parametrize("code,words", [
+        ("into", "sign in to the bank"),
+        ("thebank", "sign in to the bank"),
+        ("4829", "the code is 482913"),        # part of a longer code is not the code
+        ("48291", "call 4829 1st"),
+        ("sign", "sig n"),
+    ])
+    def test_not_said_as_a_code(self, code, words):
+        from tools.browser_vault_tool import code_in_words
+        assert not code_in_words(code, words)

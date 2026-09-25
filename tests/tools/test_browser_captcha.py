@@ -617,12 +617,16 @@ def test_hook_passed_clears_blocked_by_and_says_carry_on(cli, canned):
     assert "carry on" in c["next"] and "Never try to solve" in c["next"]
 
 
-def test_hook_needs_person_points_at_browser_handoff_or_the_person(cli, canned, monkeypatch):
+def test_hook_needs_person_points_at_browser_handoff_or_the_person(cli, canned, monkeypatch, tmp_path):
     cli["stdout"] = PH_WALL
     canned["challenge"] = bc.classify(rc(image=True))
     canned["outcome"] = bl.Outcome(kind=bc.RECAPTCHA_V2, host="forms.example", outcome=bl.NEEDS_PERSON,
                                    reason="the recaptcha_v2 check is an image puzzle", tier="C")
-    monkeypatch.setattr("tools.browser_chrome_extension.turn_presence", lambda: {"live": True, "why": ""})
+    stamp = tmp_path / "presence.json"
+    stamp.write_text(json.dumps({"active": True, "at": time.time(), "idle": 1}))
+    monkeypatch.setenv("HERMES_PRESENCE_FILE", str(stamp))    # the person is at the Mac
+    monkeypatch.setattr("tools.browser_chrome_extension.turn_presence",
+                        lambda: {"live": True, "why": "", "surface": "local"})
     monkeypatch.setattr(bl, "handoff_available", lambda: True)
     out = _exec()
     assert out["blocked_by"] == "cloudflare" and out["captcha"]["outcome"] == "needs_person"
@@ -633,6 +637,12 @@ def test_hook_needs_person_points_at_browser_handoff_or_the_person(cli, canned, 
     monkeypatch.setattr("tools.browser_chrome_extension.turn_presence", lambda: {"live": False, "why": "a cron job"})
     out = _exec()
     assert "a cron job" in out["captcha"]["next"] and "waiting" in out["captcha"]["next"]
+    # The owner texting from their phone: live, but no window goes up on an empty Mac.
+    monkeypatch.setattr(bl, "handoff_available", lambda: True)
+    monkeypatch.setattr("tools.browser_chrome_extension.turn_presence",
+                        lambda: {"live": True, "why": "the person's message on telegram", "surface": "chat"})
+    out = _exec()
+    assert "browser_handoff" not in out["captcha"]["next"] and "in your reply" in out["captcha"]["next"]
 
 
 def test_hook_hard_stop_replaces_the_try_it_in_chrome_hint(cli, canned, monkeypatch, tmp_path):

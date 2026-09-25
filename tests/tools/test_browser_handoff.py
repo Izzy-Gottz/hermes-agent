@@ -10,6 +10,7 @@ vault tool's no_code_field hint ("tell the user to complete it on their device")
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -112,9 +113,6 @@ class TestDetection:
     def test_pages_that_only_mention_it_are_nothing(self, text, inputs):
         assert ps.classify_page(text, fillable_inputs=inputs) is None
 
-    def test_a_webauthn_request_in_flight_is_a_passkey_step_whatever_the_words(self):
-        assert ps.classify_page("Continue", fillable_inputs=3, webauthn_pending=True)["kind"] == "passkey"
-
     def test_output_only_decides_whether_to_look(self):
         assert ps.suggests_person_step(GOOGLE_PASSKEY_STDOUT)
         assert ps.suggests_person_step("https://accounts.google.com/v3/signin/challenge/pk")
@@ -124,13 +122,14 @@ class TestDetection:
         step = ps.classify_page(GOOGLE_PASSKEY_STDOUT)
         assert step["kind"] != "device_prompt" and "phone" not in step["page_says"].lower()
 
-    def test_the_fidelity_keeper_installs_the_webauthn_hook_before_any_page_script(self):
+    def test_nothing_is_injected_into_pages(self):
+        """The WebAuthn hook was dropped (a Proxy is not native to toString; see browser_person_step):
+        the fidelity keeper must not bring a page script back."""
         from tools.browser_tool_fidelity import commands_for_attached_target
-        cmds = commands_for_attached_target({"targetInfo": {"type": "page"}}, "UA", {})
-        methods = [m for m, _ in cmds]
-        i = methods.index("Page.addScriptToEvaluateOnNewDocument")
-        assert i < methods.index("Runtime.runIfWaitingForDebugger")
-        assert cmds[i][1]["source"] == ps.WEBAUTHN_HOOK_JS and cmds[i][1]["runImmediately"] is True
+        for kind in ("page", "iframe", "webview"):
+            methods = [m for m, _ in commands_for_attached_target({"targetInfo": {"type": kind}}, "UA", {})]
+            assert "Page.addScriptToEvaluateOnNewDocument" not in methods
+        assert not hasattr(ps, "WEBAUTHN_HOOK_JS") and "Symbol.for" not in ps.probe_js()
 
 
 def _find_node():
@@ -147,15 +146,10 @@ def _find_node():
 NODE = _find_node()
 
 
-def _run_js(tmp_path, body, *, frames=(), inputs=(), calls=()):
-    """PROBE_JS (after WEBAUTHN_HOOK_JS and the page's own navigator.credentials calls) in node,
-    against a minimal page. The shared patterns compile and match in a real JS engine."""
+def _run_js(tmp_path, body, *, frames=(), inputs=()):
+    """PROBE_JS in node, against a minimal page: the shared patterns compile and match in a real JS engine."""
     script = tmp_path / "probe.js"
     script.write_text(
-        "globalThis.window = globalThis;\n"
-        "class CredentialsContainer { get(o) { return new Promise(() => {}); } create(o) { return new Promise(() => {}); } }\n"
-        "globalThis.CredentialsContainer = CredentialsContainer;\n"
-        "const creds = new CredentialsContainer();\n"
         "const rect = (w, h) => () => ({width: w, height: h});\n"
         "const frames = %s.map(([src, w, h]) => ({src, getBoundingClientRect: rect(w, h)}));\n"
         "const inputs = %s.map((t) => ({type: t, getBoundingClientRect: rect(200, 30)}));\n"
@@ -163,11 +157,8 @@ def _run_js(tmp_path, body, *, frames=(), inputs=(), calls=()):
         "globalThis.document = {title: 't', body: {innerText: %s},\n"
         "  querySelectorAll: (sel) => sel === 'iframe' ? frames : (sel.startsWith('input') ? inputs : [])};\n"
         "globalThis.getComputedStyle = () => ({visibility: 'visible', display: 'block'});\n"
-        "%s\n"
-        "for (const c of %s) creds[c[0]](c[1]);\n"
         "console.log(JSON.stringify(%s));\n"
-        % (json.dumps(list(frames)), json.dumps(list(inputs)), json.dumps(body), ps.WEBAUTHN_HOOK_JS,
-           json.dumps(list(calls)), ps.probe_js()))
+        % (json.dumps(list(frames)), json.dumps(list(inputs)), json.dumps(body), ps.probe_js()))
     out = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     return ps.parse_probe(json.loads(out.stdout))
@@ -180,16 +171,11 @@ class TestTheProbeInJavaScript:
         assert got["kind"] == "passkey" and got["why"] == "imperative"
 
     def test_github_login_offering_a_passkey_is_not(self, tmp_path):
-        assert _run_js(tmp_path, GITHUB_LOGIN_TEXT, inputs=["text", "password"],
-                       calls=[["get", {"publicKey": {}, "mediation": "conditional"}]]) is None
+        assert _run_js(tmp_path, GITHUB_LOGIN_TEXT, inputs=["text", "password"]) is None
 
     @pytest.mark.parametrize("text", [GOOGLE_HELP_TEXT, WIKIPEDIA_TEXT])
     def test_articles_are_not(self, tmp_path, text):
         assert _run_js(tmp_path, text, inputs=["search"]) is None
-
-    def test_a_webauthn_get_in_flight_is_a_passkey_step(self, tmp_path):
-        got = _run_js(tmp_path, "Continue", inputs=["text"], calls=[["get", {"publicKey": {"challenge": 1}}]])
-        assert got["kind"] == "passkey" and got["why"] == "webauthn"
 
     @pytest.mark.parametrize("frames,expect", [
         ([("https://www.google.com/recaptcha/api2/anchor?k=x&size=invisible", 256, 60)], None),
@@ -303,6 +289,18 @@ class TestBrowserExec:
         assert out["needs_person"]["code"] == "person_needed" and "in your reply" in out["hint"]
         assert "browser_handoff(" not in out["hint"]
 
+    def test_a_captcha_the_ladder_already_handled_is_not_said_twice(self, cli, monkeypatch):
+        seen = _probe_returns(monkeypatch, cli, {"kind": "captcha", "page_says": "", "why": "challenge_frame",
+                                                 "url": "https://shop.example/", "title": "x"})
+
+        def ladder(result, *a, **k):
+            result["captcha"] = {"outcome": "needs_person", "next": "Call browser_handoff(...)"}
+            return "needs_person"
+        monkeypatch.setattr(bu, "_captcha_ladder", ladder)
+        cli["stdout"] = "Verify you are human"
+        out = json.loads(bu.browser_exec('print(js("document.body.innerText"))', task_id="t"))
+        assert out["captcha"]["outcome"] == "needs_person" and "needs_person" not in out and seen == []
+
     def test_the_schema_teaches_the_handoff_and_the_rule(self):
         desc = bu._HELPERS_DIGEST
         assert "browser_handoff" in desc and "unless the page itself says so" in desc
@@ -339,6 +337,15 @@ class TestHandoff:
         assert "lost" in out["form_state"]                      # the reload is said, not hidden
         assert "END YOUR TURN" in out["next"] and "unless page_says" in out["next"]
         assert state["opened"] == [] and state["chrome"] == []
+
+    def test_a_window_macos_did_not_bring_forward_is_said_honestly(self, handoff):
+        bh, state = handoff
+        state["shown"] = {"ok": True, "url": "https://accounts.google.com/pk", "title": "", "relaunched": False,
+                          "front": False, "form_state_lost": False, "reopened": 0}
+        out = json.loads(bh.browser_handoff(reason="confirm", task_id="t"))
+        assert out["front"] is False
+        assert "click Moe's browser in the Dock" in out["next"] and "Never say it is in front" in out["next"]
+        assert "in front of them (macOS confirmed" not in out["next"]
 
     def test_then_the_extension_lane(self, handoff):
         bh, state = handoff
@@ -498,7 +505,38 @@ class TestShowToPerson:
         assert not out["ok"] and out["busy"] and "other conversation" in out["why"]
         assert calls["terminated"] == 0 and calls["launched_headless"] == []
 
-    def test_other_work_is_read_from_this_process_s_lanes(self, monkeypatch):
+    def test_other_processes_claims_are_their_own_files(self, tmp_path, monkeypatch):
+        from tools import browser_tool_real_profile as rp
+        d = tmp_path / "claims"
+        monkeypatch.setattr(rp, "_claims_dir", lambda: str(d))
+        window = rp._origin().BROWSER_SESSION_INACTIVITY_TIMEOUT
+        rp.claim_driven_browser()
+        assert rp.other_live_claims(window) == []                     # our own claim is never "other work"
+        other = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            (d / str(other.pid)).write_text("")
+            rp.claim_driven_browser()                                  # our re-claim touches only our file
+            assert rp.other_live_claims(window) == [other.pid]
+            assert any("other part" in r for r in rp._other_work("t"))
+            old = time.time() - window - 5                             # outside the window: not live work
+            os.utime(d / str(other.pid), (old, old))
+            assert rp.other_live_claims(window) == []
+            now = time.time()
+            os.utime(d / str(other.pid), (now - window + 5, now - window + 5))
+            assert rp.other_live_claims(window) == [other.pid]         # just inside it: live work
+        finally:
+            other.kill()
+            other.wait()
+        assert rp.other_live_claims(window) == [] and not (d / str(other.pid)).exists()   # dead: pruned
+
+    def test_every_acquire_claims(self, tmp_path, monkeypatch):
+        from tools import browser_tool_real_profile as rp
+        src = open(rp.__file__).read()
+        acquire = src[src.index("def _real_profile_cdp() -> tuple:"):]
+        assert acquire.index("claim_driven_browser()") < acquire.index('cached = _bt._real_profile_cdp_cache.get("cdp")')
+
+    def test_other_work_is_read_from_this_process_s_lanes(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.browser_tool_real_profile._claims_dir", lambda: str(tmp_path / "none"))
         from tools import browser_tool_real_profile as rp
         lane.record_lane("mine", "", lane.LANE_OWN)
         assert rp._other_work("mine") == []
@@ -555,11 +593,14 @@ class TestShowToPerson:
         assert rp.release_if_idle(now=time.time() + 5) is False
         assert rp.release_if_idle(now=time.time() + _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT + 60) is True
 
-    def test_a_window_nobody_hands_back_is_released_after_the_ceiling(self, rp, monkeypatch):
+    def test_a_window_nobody_hands_back_is_released_after_the_two_hour_ceiling(self, rp, monkeypatch):
         rp, _ = rp
+        assert rp.SHOWN_MAX_SECONDS == 2 * 3600
         monkeypatch.setattr(rp, "_real_profile_in_use", lambda: False)
         rp.show_to_person()
-        assert rp.release_if_idle(now=time.time() + rp.SHOWN_MAX_SECONDS + 60) is True
+        since = rp._shown_to_person["since"]
+        assert rp.release_if_idle(now=since + rp.SHOWN_MAX_SECONDS - 5) is False
+        assert rp.release_if_idle(now=since + rp.SHOWN_MAX_SECONDS + 5) is True
 
     @pytest.mark.parametrize("cmdlines,headless", [
         (["/x/Chrome for Testing --user-data-dir=/tmp/copy --headless=new", "/x/Helper --type=renderer"], True),
@@ -598,10 +639,18 @@ class TestRaiseByPid:
         ran = []
         monkeypatch.setattr(rp.sys, "platform", "darwin")
         monkeypatch.setattr(rp.subprocess, "run", lambda argv, **k: ran.append(argv) or
-                            subprocess.CompletedProcess(argv, 0, "true\n", ""))
+                            subprocess.CompletedProcess(argv, 0, "front\n", ""))
         assert rp._activate_pid(4242) is True
         assert ran[0][:3] == ["/usr/bin/osascript", "-l", "JavaScript"] and "(4242)" in ran[0][-1]
+        assert "frontmostApplication" in ran[0][-1] and "== 4242" in ran[0][-1] and "delay(0.3)" in ran[0][-1]
         assert not any("/usr/bin/open" in a for argv in ran for a in argv)
+
+    @pytest.mark.parametrize("said", ["not_front", "no_app", "true", ""])
+    def test_only_a_confirmed_front_is_front(self, monkeypatch, said):
+        from tools import browser_tool_real_profile as rp
+        monkeypatch.setattr(rp.sys, "platform", "darwin")
+        monkeypatch.setattr(rp.subprocess, "run", lambda argv, **k: subprocess.CompletedProcess(argv, 0, said + "\n", ""))
+        assert rp._activate_pid(4242) is False
 
     def test_no_pid_raises_nothing(self, monkeypatch):
         from tools import browser_tool_real_profile as rp

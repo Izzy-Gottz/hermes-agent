@@ -243,9 +243,13 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
                                  "saved is gone. Say so if it matters, and re-enter it after they are done.")
         if shown.get("tabs_lost"):
             out["other_tabs"] = f"{shown['tabs_lost']} other tab(s) of Moe's browser did not reopen."
-        where = "in Moe's browser window, now in front" if out["front"] else \
-            "in Moe's browser window (it may be behind other windows)"
-        out["next"] = f"The page is open {where}. " + _WAIT.format(reason=reason) + " " + _GROUNDED
+        if out["front"]:
+            where = "The page is open in Moe's browser window, in front of them (macOS confirmed it)."
+        else:
+            where = ("The page is open in Moe's browser window, but macOS did not bring it forward: tell them \"It's "
+                     "open, but macOS didn't bring it forward -- click Moe's browser in the Dock.\" Never say it is "
+                     "in front of them.")
+        out["next"] = f"{where} " + _WAIT.format(reason=reason) + " " + _GROUNDED
         return tool_result(out)
     target = current or str(shown.get("url") or "")
     if not target:

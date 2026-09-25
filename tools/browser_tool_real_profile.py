@@ -637,6 +637,7 @@ def _real_profile_cdp() -> tuple:
 
     with _bt._real_profile_cdp_lock:
         _bt._real_profile_last_used = time.time()
+        claim_driven_browser()  # one file per process: a hand-over elsewhere sees this work (_other_work)
         cached = _bt._real_profile_cdp_cache.get("cdp")
         if cached and _cdp_http_ready(cached):
             # The keeper is checked on EVERY acquire: one that died or stalled is restarted here.
@@ -772,26 +773,32 @@ def _main_browser_pid(copy_dir: str) -> Optional[int]:
 
 
 #: Raises one running application by pid, through AppKit (NSRunningApplication), from JavaScript
-#: for Automation -- no Apple event, so no Automation prompt. Options 3 = all windows | ignoring
-#: other apps. Prints true/false.
+#: for Automation -- no Apple event, so no Automation prompt (options 3 = all windows | ignoring other
+#: apps) -- then, ~300 ms later, asks macOS which app is actually frontmost. macOS 14+ may quietly
+#: decline an activation a background process asks for, so the request succeeding proves nothing.
+#: Prints "front", "not_front" or "no_app".
 _ACTIVATE_PID_JXA = ("ObjC.import('AppKit');"
                      "var a=$.NSRunningApplication.runningApplicationWithProcessIdentifier(%d);"
-                     "(a && !a.isNil()) ? a.activateWithOptions(3) : false")
+                     "var r='no_app';"
+                     "if (a && !a.isNil()) { a.activateWithOptions(3); delay(0.3);"
+                     "var f=$.NSWorkspace.sharedWorkspace.frontmostApplication;"
+                     "r=(f && !f.isNil() && f.processIdentifier == %d) ? 'front' : 'not_front'; }"
+                     "r")
 
 
 def _activate_pid(pid: int) -> bool:
-    """Bring the process ``pid`` (and only it) to the front on macOS. By pid, never by bundle path:
-    ``open -a`` on the newest installed Chrome for Testing could start a second copy, or raise a
-    different one than the browser this page is in."""
+    """Bring the process ``pid`` (and only it) to the front on macOS, and report whether it IS in front
+    afterwards. By pid, never by bundle path: ``open -a`` on the newest installed Chrome for Testing
+    could start a second copy, or raise a different one than the browser this page is in."""
     if sys.platform != "darwin" or not pid:
         return False
     try:
-        out = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", _ACTIVATE_PID_JXA % int(pid)],
+        out = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", _ACTIVATE_PID_JXA % (int(pid), int(pid))],
                              capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
     except (subprocess.SubprocessError, OSError) as e:
         _origin().logger.debug("handoff: activating pid %s failed: %s", pid, e)
         return False
-    return out.returncode == 0 and out.stdout.strip() == "true"
+    return out.returncode == 0 and out.stdout.strip() == "front"
 
 
 def _bring_to_front(port: int, target_id: str, pid: Optional[int]) -> bool:
@@ -826,6 +833,73 @@ def _pick_page(pages: List[Dict[str, str]], url_hint: str) -> Optional[Dict[str,
     return pages[0] if pages else None
 
 
+#: Every Hermes process that uses the driven browser keeps ONE file here, named by its pid, touched on
+#: every acquire. A single shared owner file was overwritten by our own re-claim, so another process's
+#: live work was invisible to a hand-over; one file per process cannot be.
+_CLAIMS_DIRNAME = "driven-browser-claims"
+
+
+def _claims_dir() -> str:
+    from hermes_cli.browser_connect import get_hermes_home
+    return os.path.join(str(get_hermes_home()), "browser-profile", _CLAIMS_DIRNAME)
+
+
+def claim_driven_browser(now: Optional[float] = None) -> None:
+    """This process is using the driven browser (called on every acquire). Never raises."""
+    try:
+        d = _claims_dir()
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        path = os.path.join(d, str(os.getpid()))
+        with open(path, "a", encoding="utf-8"):
+            pass
+        now = time.time() if now is None else now
+        os.utime(path, (now, now))
+    except OSError as e:
+        _origin().logger.debug("real-profile: claim not written: %s", e)
+
+
+def other_live_claims(within_s: float, now: Optional[float] = None) -> List[int]:
+    """Pids of OTHER live processes that used the driven browser within ``within_s`` seconds. A claim
+    whose process is gone is removed."""
+    now = time.time() if now is None else now
+    out: List[int] = []
+    try:
+        d = _claims_dir()
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid, path = int(name), os.path.join(d, name)
+        if pid == os.getpid():
+            continue
+        if not _pid_alive(pid):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        try:
+            if 0 <= now - os.path.getmtime(path) <= within_s:
+                out.append(pid)
+        except OSError:
+            continue
+    return sorted(out)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _other_work(task_id: str) -> List[str]:
     """Who else is using the driven browser now, in words: another conversation in this process
     (a browser_exec lane used within the inactivity window), or another Hermes process (its claim on
@@ -839,16 +913,9 @@ def _other_work(task_id: str) -> List[str]:
             reasons.append(f"{len(others)} other conversation(s) used it in the last few minutes")
     except Exception:
         pass
-    try:
-        from tools import browser_tool_lifecycle as _lc
-        socket_dir = os.path.join(_bt._socket_safe_tmpdir(), f"agent-browser-{_bt._REAL_PROFILE_SESSION}")
-        path = os.path.join(socket_dir, f"{_bt._REAL_PROFILE_SESSION}.owner_pid")
-        pid, alive = _lc._owner_pid_alive(socket_dir, _bt._REAL_PROFILE_SESSION)
-        if pid and alive and pid != os.getpid() and \
-                time.time() - os.path.getmtime(path) <= _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT:
-            reasons.append("another part of Moe (a different conversation's tools) used it in the last few minutes")
-    except Exception:
-        pass
+    others = other_live_claims(_bt.BROWSER_SESSION_INACTIVITY_TIMEOUT)
+    if others:
+        reasons.append(f"{len(others)} other part(s) of Moe (a different conversation's tools) used it in the last few minutes")
     return reasons
 
 

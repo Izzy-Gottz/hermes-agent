@@ -344,15 +344,43 @@ _APPROVAL_WORDS = _re.compile(r"\b(?:approv\w*|confirm\w*|tap\w*|wait\w*|accept\
                               r"authori[sz]\w*|respond\w*)\b", _re.I)
 _SENTENCE_SPLIT = _re.compile(r"(?<=[.!?])\s+|\n+")
 _QUOTED = _re.compile(r"\"[^\"]{3,}\"|“[^”]{3,}”|'[^']{6,}'")
-DEVICE_CLAIM_MARK = ("[unverified: true only when the page itself says so -- otherwise the page needs the person, "
-                     "which is browser_handoff]")
+#: No colon (YAML reads "key: value" in a flow context), nothing a Markdown renderer interprets.
+DEVICE_CLAIM_MARK = "[unverified]"
+
+_FRONTMATTER = _re.compile(r"\A---[ \t]*\n.*?\n---[ \t]*(?:\n|\Z)", _re.S)
+_FENCE = _re.compile(r"^(```|~~~)[^\n]*\n.*?^\1[ \t]*$", _re.S | _re.M)
+
+
+def _segments(text: str) -> list:
+    """``[(is_prose, chunk)]`` covering ``text``: YAML frontmatter and fenced code blocks are not prose,
+    and are never read for claims or marked."""
+    spans = []
+    fm = _FRONTMATTER.match(text or "")
+    if fm:
+        spans.append((fm.start(), fm.end()))
+    for m in _FENCE.finditer(text or ""):
+        if not fm or m.start() >= fm.end():
+            spans.append((m.start(), m.end()))
+    out, pos = [], 0
+    for a, b in sorted(spans):
+        if a > pos:
+            out.append((True, text[pos:a]))
+        out.append((False, text[a:b]))
+        pos = b
+    if pos < len(text or ""):
+        out.append((True, text[pos:]))
+    return out
+
+
+def _prose(text: str) -> str:
+    return "\n".join(chunk for is_prose, chunk in _segments(text) if is_prose)
 
 
 def device_approval_claims(text: str) -> list:
-    """The sentences of ``text`` that say a step waits on the person's phone or device, except ones
-    that quote a page's own words about it."""
+    """The sentences of ``text``'s prose that say a step waits on the person's phone or device, except
+    ones that quote a page's own words about it. Frontmatter and fenced code are not read."""
     out = []
-    for sentence in _SENTENCE_SPLIT.split(text or ""):
+    for sentence in _SENTENCE_SPLIT.split(_prose(text or "")):
         s = " ".join(sentence.split())
         if not s or DEVICE_CLAIM_MARK in s or not (_DEVICE_WORDS.search(s) and _APPROVAL_WORDS.search(s)):
             continue
@@ -368,11 +396,14 @@ def annotate_device_claims(old: Optional[str], new: str) -> tuple:
     that ``old`` did not already hold. Sentences already in the skill are left exactly as they are."""
     before = set(device_approval_claims(old or ""))
     added = [s for s in device_approval_claims(new) if s not in before]
-    content = new
+    segments = _segments(new)
     for sentence in added:
         pattern = _re.compile(r"\s+".join(_re.escape(w) for w in sentence.split()))
-        content = pattern.sub(lambda m: m.group(0) + " " + DEVICE_CLAIM_MARK, content, count=1)
-    return content, added
+        for i, (is_prose, chunk) in enumerate(segments):
+            if is_prose and pattern.search(chunk):
+                segments[i] = (True, pattern.sub(lambda m: m.group(0) + " " + DEVICE_CLAIM_MARK, chunk, count=1))
+                break
+    return "".join(chunk for _, chunk in segments), added
 
 
 _claim_warnings = _threading.local()
@@ -388,7 +419,7 @@ def review_device_claims(old: Optional[str], new: str, label: str) -> str:
         quote = added[0] if len(added[0]) <= 220 else added[0][:217] + "..."
         _claim_warnings.value = (
             f"{label}: this adds a claim that a step waits on the person's phone or device (\"{quote}\"); it was "
-            "kept, and marked unverified. Whether a site sent anything to a device is only known from that page, at "
+            "kept, and marked [unverified] (true only when the page itself says so). Whether a site sent anything to a device is only known from that page, at "
             "that moment. Consider rewording it as the general rule: when a page needs the person, call "
             "browser_handoff, and say only what the page itself says.")
     return content

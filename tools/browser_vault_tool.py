@@ -350,15 +350,43 @@ _PERSON_CODE_CHARS = re.compile(r"^[A-Za-z0-9]{4,10}$")
 #: Digits said as words ("four eight two nine one three"), the way a code read aloud is transcribed.
 _DIGIT_WORDS = {"zero": "0", "oh": "0", "o": "0", "one": "1", "two": "2", "three": "3", "four": "4",
                 "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"}
-_TYPE_IN_WINDOW = ("type the code into the page themselves: it is open in front of them (browser_handoff "
-                   "puts it there if it is not)")
+_TYPE_IN_WINDOW = ("type the code into the page themselves: call browser_handoff first if the page is not in front of "
+                   "them, then say \"Type it into the page yourself — I've brought it up in front of you.\"")
 
 
-def _normalised_words(text: str) -> str:
-    """``text`` as one run of lowercase letters and digits, spoken digits made digits: "4 8 2-913",
-    "four eight two nine one three" and "482913" all read ``482913``."""
-    tokens = re.findall(r"[a-z0-9]+", str(text or "").lower())
-    return "".join(_DIGIT_WORDS.get(t, t) for t in tokens)
+#: How recent the ledger's record of the turn must be for a chat turn's words to count.
+_TURN_FRESH_SECONDS = 30 * 60
+
+
+def _code_ish(token: str) -> bool:
+    """A piece a code is said in: a run of digits, a digit word (already mapped), or one letter."""
+    return token.isdigit() or (len(token) == 1 and token.isalpha())
+
+
+def code_in_words(code: str, text: str) -> bool:
+    """Whether ``code`` is in ``text`` the way a person says a code: as one whole word ("482913",
+    "AB12CD"), or as consecutive pieces each a digit run, a digit word or a single letter ("482 913",
+    "4-8-2-9-1-3", "four eight two nine one three", "A B 1 2"). Never a substring of words run together:
+    "into" is not in "sign in to the bank", and "thebank" is not either."""
+    want = "".join(re.findall(r"[a-z0-9]+", str(code or "").lower()))
+    if not want:
+        return False
+    tokens = [_DIGIT_WORDS.get(t, t) for t in re.findall(r"[a-z0-9]+", str(text or "").lower())]
+    if want in tokens:
+        return True
+    for i, tok in enumerate(tokens):
+        if not _code_ish(tok):
+            continue
+        run = ""
+        for nxt in tokens[i:]:
+            if not _code_ish(nxt):
+                break
+            run += nxt
+            if run == want:
+                return True
+            if len(run) >= len(want) or not want.startswith(run):
+                break
+    return False
 
 
 def _owner_record() -> dict:
@@ -407,6 +435,8 @@ def _this_turns_owner_words() -> tuple:
     try:
         from agent import recipient_grounding as rg
     except Exception:
+        # Until the recipient-grounding ledger lands (branch recipient-ground, being redesigned), this is
+        # every call: source='person' refuses, and the person types the code into the page themselves.
         return None, "this Hermes keeps no record of what the person said in this turn"
     try:
         from gateway.session_context import get_session_env
@@ -434,6 +464,17 @@ def _this_turns_owner_words() -> tuple:
     elif kind == "chat":
         if not _chat_sender_is_owner(sender):
             return None, "the message this turn answers is not from the owner's own chat"
+        # Liveness: the turn running NOW is that chat message -- not a job or a helper reading a ledger
+        # an earlier chat turn left behind, and not a stale entry.
+        from tools.browser_chrome_extension import SURFACE_CHAT, turn_presence
+        now = turn_presence()
+        if not (now.get("live") and now.get("surface") == SURFACE_CHAT
+                and str(now.get("platform") or "") == str(sender.get("platform") or "").lower()):
+            return None, "the owner's chat message is not the turn running now"
+        import time as _time
+        updated = data.get("updated") if isinstance(data, dict) else None
+        if not isinstance(updated, (int, float)) or not (0 <= _time.time() - float(updated) <= _TURN_FRESH_SECONDS):
+            return None, "the record of the owner's message is too old to be this turn's"
     else:
         return None, "this turn was not started by the owner"
     return str(current["text"]), None
@@ -458,7 +499,7 @@ def _code_from_person(code: str, source: str) -> tuple:
         return None, json.dumps({"success": False, "error_type": "code_source",
                                  "error": f"Nothing was typed: {why}, so a code cannot be taken as theirs. Ask them to "
                                           + _TYPE_IN_WINDOW + "."})
-    if _normalised_words(clean) not in _normalised_words(words):
+    if not code_in_words(clean, words):
         return None, json.dumps({"success": False, "error_type": "code_not_said",
                                  "error": ("Nothing was typed: that code is not in what the person said in this turn. "
                                            "Only a code they read out or typed to you now can be entered this way -- "
@@ -833,7 +874,9 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
         "the fresh message from this site (waiting up to a minute for it to land) and enters the code; only if none "
         "arrives is the person asked in their UI. You never need to read the code yourself, and never ask for it in "
         "chat. If the PERSON tells you the code in this turn (they read it out or type it), pass it as code with "
-        "source='person' and it is typed into the code field -- never type a code with the browser's input tool. "
+        "source='person': it is typed only when Hermes can confirm the code is in their own words this turn; "
+        "otherwise the result says so -- ask them to type it into the page themselves (browser_handoff brings the "
+        "page up in front of them). Never type a code with the browser's input tool. "
         "no_code_field: follow its error -- the page may need the person (a passkey, a security key, a CAPTCHA), "
         "which is browser_handoff. Only tell the person a code was sent, or that something waits on their phone "
         "or another device, when a tool result shows the site said so."

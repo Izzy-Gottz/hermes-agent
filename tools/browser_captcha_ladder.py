@@ -623,12 +623,27 @@ def next_step(out: Outcome, presence: Optional[dict]) -> str:
     if out.outcome == REPORT_ONLY:
         return "Nothing to do for this check; carry on."
     live = bool((presence or {}).get("live"))
+    away = ""
+    if live:
+        # A window goes up only for a person AT this Mac (browser_chrome_extension.at_this_mac): the owner
+        # texting from their phone is live, and a window on an empty Mac helps nobody.
+        try:
+            from tools.browser_chrome_extension import at_this_mac
+            here, why = at_this_mac(presence)
+            if not here:
+                away = why or "they are away from the Mac"
+        except Exception:
+            pass
     stop = (" This is a hard stop: do not retry it, do not try it in another browser, and never try to solve it "
             "yourself." if out.outcome == HARD_STOP else " Do not try to solve it yourself.")
     if not live:
         return (f"The page needs the person ({out.reason}), and this is "
                 f"{(presence or {}).get('why') or 'a turn nobody started live'}: report that this step is waiting "
                 "for them, and stop there." + stop)
+    if away:
+        return (f"The page needs the person ({out.reason}), and {away}: tell them in your reply that the "
+                f"{out.kind.replace('_', ' ')} check on {out.host} is waiting in Moe's browser on their Mac, and stop "
+                "there." + stop)
     if handoff_available():
         return (f"The page needs the person ({out.reason}). Call browser_handoff(reason=\"complete the "
                 f"{out.kind.replace('_', ' ')} check on {out.host}\") to put it in front of them, then wait." + stop)

@@ -13,11 +13,10 @@ So the engine looks at the page itself, for every site, and says two things:
 * ``page_says`` -- the page's own line, verbatim. A reply may repeat it; it may not add to it. Only
   ``device_prompt`` makes "check your phone" a true thing to say.
 
-Detection is by what the page is DOING, never a site list and never the bare word (see the block
-above IMPERATIVE): a WebAuthn request in flight (the hook the fidelity keeper installs in every page),
-a visible challenge frame, or imperative challenge phrasing on a short page with no form to fill.
-The phrasing is English; a non-English page is caught only by the hook or a challenge frame (an
-honest gap, not a guess).
+Detection is by what the page SAYS AND OFFERS, never a site list and never the bare word (see the
+block above IMPERATIVE): imperative challenge phrasing on a short page with no form to fill, or a
+visible challenge frame. No script is injected into pages (the note above PROBE_JS says why). The
+phrasing is English; a non-English passkey page is not recognised (an honest gap, not a guess).
 
 :func:`suggests_person_step` decides from a tool's output whether the page is worth a look;
 :func:`probe_active_page` runs :data:`PROBE_JS` in the active tab, within a tight budget;
@@ -44,9 +43,9 @@ KINDS = (DEVICE_PROMPT, PASSKEY, CAPTCHA, IDENTITY_CHECK)
 #
 # Measured by review, 2026-09-25: the bare word is not a challenge. github.com/login says "Sign in with
 # a passkey" as ONE option beside a password form; a Google help article and Wikipedia's "Passkey" page
-# are full of the word. A step only the person can take is a page that (1) has asked the browser for a
-# passkey right now -- a WebAuthn call in flight, seen by the hook below -- or (2) tells them, in the
-# imperative, to do one thing, and offers no other way forward: no form to fill, a short page.
+# are full of the word. A step only the person can take is a page that tells them, in the imperative,
+# to do one thing, and offers no other way forward: no form to fill, a short page. (Why there is no
+# WebAuthn hook: see the note above PROBE_JS.)
 
 #: ``(kind, pattern)``, most specific first: imperative challenge phrasing only. Written in the regex
 #: subset Python and JavaScript share (no lookbehind, no inline flags): PROBE_JS runs the same strings.
@@ -99,13 +98,10 @@ def _line_around(text: str, start: int) -> str:
     return line[:_SAYS_LIMIT]
 
 
-def classify_page(text: str, *, fillable_inputs: int = 0, webauthn_pending: bool = False) -> Optional[Dict[str, str]]:
+def classify_page(text: str, *, fillable_inputs: int = 0) -> Optional[Dict[str, str]]:
     """The verdict for one page from what it shows: ``{"kind", "page_says"}`` or None. Python twin of
     PROBE_JS's decision (tests hold them to the same fixtures)."""
     text = text or ""
-    if webauthn_pending:
-        found = next(((k, m) for k, p in _COMPILED if (m := p.search(text))), None)
-        return {"kind": PASSKEY, "page_says": _line_around(text, found[1].start()) if found else ""}
     if len(text) > SHORT_PAGE_CHARS or fillable_inputs > 0:
         return None
     for kind, pattern in _COMPILED:
@@ -115,34 +111,13 @@ def classify_page(text: str, *, fillable_inputs: int = 0, webauthn_pending: bool
     return None
 
 
-#: Installed in every page of the driven browser before its scripts run (the fidelity keeper,
-#: tools/browser_tool_fidelity.py): it notes a WebAuthn request in flight. ``mediation:
-#: "conditional"`` is passkey AUTOFILL (github.com/login offers it quietly beside the password form)
-#: and is not a request. A Proxy keeps ``toString`` native, so the page sees nothing new.
-WEBAUTHN_HOOK_JS = """(() => {
-  const K = Symbol.for("hermes.webauthn");
-  if (window[K]) return;
-  const st = {pending: 0, last: null};
-  try { Object.defineProperty(window, K, {value: st, enumerable: false}); } catch (e) { return; }
-  const C = window.CredentialsContainer && window.CredentialsContainer.prototype;
-  if (!C) return;
-  for (const op of ["get", "create"]) {
-    const orig = C[op];
-    if (typeof orig !== "function") continue;
-    const wrapped = new Proxy(orig, {apply(target, self, args) {
-      const o = (args && args[0]) || {};
-      const p = Reflect.apply(target, self, args);
-      if (!o.publicKey || o.mediation === "conditional") return p;
-      st.pending++; st.last = {op, at: Date.now()};
-      const done = () => { st.pending = Math.max(0, st.pending - 1); };
-      try { Promise.resolve(p).then(done, done); } catch (e) { done(); }
-      return p;
-    }});
-    try { Object.defineProperty(C, op, {value: wrapped, writable: true, configurable: true, enumerable: true}); }
-    catch (e) { /* leave the page alone */ }
-  }
-})();"""
-
+# No page script. A WebAuthn hook (wrapping navigator.credentials.get/create) was built and dropped,
+# 2026-09-25: V8 prints a Proxy as "function () { [native code] }", not "function get() { [native
+# code] }", so any page can tell; a throwing ``publicKey`` getter would show the wrapper's frame in its
+# stack; and an init script on every document is one more thing a site can fingerprint. The CDP
+# WebAuthn domain is no substitute: enabling it routes every request to virtual authenticators, which
+# would break the person's real passkey. So the verdict comes from what the page SAYS AND OFFERS: the
+# imperative wording on a short page with nothing to fill, or a visible challenge frame.
 
 PROBE_JS = """(() => {
   const P = __PATTERNS__;
@@ -156,9 +131,7 @@ PROBE_JS = """(() => {
     return text.slice(b, e).replace(/\\s+/g, " ").trim().slice(0, __LIMIT__);
   };
   const out = (kind, says, why) => JSON.stringify({kind, page_says: says, why, url: location.href, title: document.title});
-  const hook = window[Symbol.for("hermes.webauthn")];
   const find = () => { for (const [kind, src] of P) { const m = new RegExp(src, "im").exec(text); if (m) return [kind, m]; } return null; };
-  if (hook && hook.pending > 0) { const f = find(); return out("passkey", f ? line(f[1].index) : "", "webauthn"); }
   const frame = Array.from(document.querySelectorAll("iframe")).find(
     (f) => visible(f) && new RegExp(__FRAME__, "i").test(f.src || ""));
   const widget = Array.from(document.querySelectorAll(__SELECTOR__)).find(visible);

@@ -78,7 +78,30 @@ def _read(path):
 
 
 def test_a_quoted_page_line_is_not_a_claim():
-    assert device_approval_claims('When the page says "Check your phone to approve the sign-in", wait for them.') == []
+    """Without the exemption this sentence IS matched ("on your phone" + "Tap"/"approve")."""
+    quoted = 'When the page says "Tap Yes on your phone to approve", tell them exactly that.'
+    unquoted = "When the page asks, Tap Yes on your phone to approve, and tell them exactly that."
+    assert device_approval_claims(unquoted)                   # the words alone are a claim
+    assert device_approval_claims(quoted) == []               # quoting the page is a grounded report
+    content, added = annotate_device_claims(None, SKILL + quoted + "\n")
+    assert added == [] and DEVICE_CLAIM_MARK not in content
+
+
+def test_the_mark_has_no_colon_and_the_skill_still_parses():
+    import yaml
+    assert DEVICE_CLAIM_MARK == "[unverified]" and ":" not in DEVICE_CLAIM_MARK
+    fm_claim = SKILL.replace("description: Submitting a product to launch directories.",
+                             "description: Wait for the user to approve it on their phone first.")
+    fence = "\n```yaml\nnote: wait for the user to approve it on their device\n```\n"
+    content, added = annotate_device_claims(None, fm_claim + fence + "\n" + POISON + "\n")
+    assert added == [POISON]                                  # the prose line only
+    assert "approve it on their phone first.\n" in content    # frontmatter untouched
+    assert "approve it on their device\n```" in content        # the fence untouched
+    front = content.split("---")[1]
+    assert yaml.safe_load(front)["description"].endswith("phone first.")
+    block = content.split("```yaml\n")[1].split("```")[0]
+    assert yaml.safe_load(block) == {"note": "wait for the user to approve it on their device"}
+    assert POISON + " " + DEVICE_CLAIM_MARK in content
 
 
 def test_the_background_review_adding_the_claim_keeps_it_marked_and_warns(tmp_path):
