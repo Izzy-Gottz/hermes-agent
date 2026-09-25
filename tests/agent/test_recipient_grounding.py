@@ -274,3 +274,52 @@ def test_a_claude_code_turn_records_the_words_under_the_sessions_key(home, tmp_p
         for key in list(rt._REGISTRY):
             rt.evict_session(key)
         rt.drop_spare()
+
+
+def test_a_cron_agent_is_built_with_the_jobs_grounding_words():
+    """cron/scheduler._construct_cron_agent is where a job becomes an agent: the job's
+    creating-turn words become the only person words, its prompt the model's."""
+    from unittest.mock import MagicMock
+
+    from cron.scheduler import _construct_cron_agent
+
+    setup = SimpleNamespace(model="m", runtime={"api_key": "k", "provider": "openrouter"},
+                            prefill_messages=None, max_iterations=5, reasoning_config=None,
+                            fallback_model=None, credential_pool=None)
+    asked = [{"text": "send me a message when done", "origin": "person", "sender": {"kind": "local"}}]
+    job = {"id": "j", "name": "t", "prompt": "message Yisrael the list", "grounding_words": asked}
+    agent = _construct_cron_agent(MagicMock(), job, {}, setup, workdir=None, session_id="s", session_db=None)
+    assert agent._grounding_override == {"person": asked, "model": ["message Yisrael the list"]}
+    legacy = _construct_cron_agent(MagicMock(), {"id": "old", "name": "t", "prompt": "text Dan"}, {},
+                                   setup, workdir=None, session_id="s", session_db=None)
+    assert legacy._grounding_override == {"person": [], "model": ["text Dan"]}
+
+
+def test_a_real_delegated_child_carries_the_parents_person_words(tmp_path, monkeypatch):
+    """Through tools.delegate_tool._build_child_agent with a real AIAgent: the goal the
+    parent model wrote is the child's model words; the person's words come from the parent."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("model:\n  default: anthropic/claude-sonnet-4.6\n", encoding="utf-8")
+    from run_agent import AIAgent
+    from tools import delegate_tool as dt
+    import tools.delegate_tool_config as dtc
+    monkeypatch.setattr(dt, "_load_config", lambda: {})
+    monkeypatch.setattr(dtc, "_load_config", lambda: {})
+    kw = dict(api_key="k", base_url="https://openrouter.ai/api/v1", provider="openrouter",
+              api_mode="chat_completions", model="anthropic/claude-sonnet-4.6", platform="cli", quiet_mode=True,
+              skip_context_files=True, skip_memory=True, save_trajectories=False, enabled_toolsets=["file"])
+    parent = AIAgent(session_id="p", **kw)
+    parent._grounding_person_words = [{"text": "find my brother's flight", "origin": "person",
+                                       "sender": {"kind": "local"}}]
+    child = dt._build_child_agent(task_index=0, goal="Message Moshe Finkelman the flight", context=None,
+                                  toolsets=["file"], model=None, max_iterations=4, task_count=1,
+                                  parent_agent=parent)
+    try:
+        assert child._grounding_override["person"] == parent._grounding_person_words
+        assert "Message Moshe Finkelman the flight" in child._grounding_override["model"]
+    finally:
+        for a in (child, parent):
+            try:
+                a.close()
+            except Exception:
+                pass

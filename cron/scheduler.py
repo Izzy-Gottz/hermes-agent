@@ -2172,7 +2172,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
     # A `light_context` job does one small thing on a clock and must not spend its budget on
     # the person's whole memory or a repo's instructions (cron/jobs.py create_job).
     _light_context = bool(job.get("light_context"))
-    return AIAgent(
+    agent = AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -2204,6 +2204,14 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         session_id=session_id,
         session_db=session_db,
     )
+    # Recipient grounding (agent/recipient_grounding.py): the job's prompt —
+    # written by a model, carrying skills and context_from — can refuse a
+    # recipient but never name one. Only the words of the person who asked
+    # for the job, recorded when it was created, can. run_job swaps in the
+    # full built prompt once it has it.
+    agent._grounding_override = {"person": list(job.get("grounding_words") or []),
+                                 "model": [str(job.get("prompt") or "")]}
+    return agent
 
 
 class _FireAudit:
@@ -2286,12 +2294,12 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
-        # Recipient grounding (agent/recipient_grounding.py): the job's prompt —
-        # written by a model, carrying skills and context_from — can refuse a
-        # recipient but never name one. Only the words of the person who asked
-        # for the job, recorded when it was created, can.
-        agent._grounding_override = {"person": list(job.get("grounding_words") or []),
-                                     "model": [prompt]}
+        # The prompt as it will run (skills, context_from and all): model words.
+        try:
+            agent._grounding_override["model"] = [prompt]
+        except Exception:
+            agent._grounding_override = {"person": list(job.get("grounding_words") or []),
+                                         "model": [prompt]}
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(
