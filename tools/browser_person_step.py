@@ -13,10 +13,12 @@ So the engine looks at the page itself, for every site, and says two things:
 * ``page_says`` -- the page's own line, verbatim. A reply may repeat it; it may not add to it. Only
   ``device_prompt`` makes "check your phone" a true thing to say.
 
-Detection is by what the page SAYS AND OFFERS, never a site list and never the bare word (see the
-block above IMPERATIVE): imperative challenge phrasing on a short page with no form to fill, or a
-visible challenge frame. No script is injected into pages (the note above PROBE_JS says why). The
-phrasing is English; a non-English passkey page is not recognised (an honest gap, not a guess).
+Detection is a HINT by what the page SAYS AND OFFERS, never a site list and never the bare word (see
+the block above IMPERATIVE): imperative challenge wording, in a challenge context, with no field on
+screen to fill and no article around it -- or a visible challenge frame. English first, a few French,
+German, Spanish and Hebrew lines; other languages are not recognised. No script is injected into pages
+(the note above PROBE_JS says why). The rule the model follows is the real path: a check only the
+person can complete is browser_handoff, whether or not this note fired.
 
 :func:`suggests_person_step` decides from a tool's output whether the page is worth a look;
 :func:`probe_active_page` runs :data:`PROBE_JS` in the active tab, within a tight budget;
@@ -41,11 +43,23 @@ KINDS = (DEVICE_PROMPT, PASSKEY, CAPTCHA, IDENTITY_CHECK)
 
 # ── The verdict: what the page is DOING ────────────────────────────────────────
 #
+# Detection is a HINT, not the rule. The rule the model is held to -- in the soul and in every tool
+# description -- is "a check only the person can complete means browser_handoff"; this only puts a
+# `needs_person` note on a result so the model does not miss one. It is tuned for precision: a note
+# on an ordinary page costs the person an interruption, a missed one only leaves the rule to act.
+#
 # Measured by review, 2026-09-25: the bare word is not a challenge. github.com/login says "Sign in with
 # a passkey" as ONE option beside a password form; a Google help article and Wikipedia's "Passkey" page
-# are full of the word. A step only the person can take is a page that tells them, in the imperative,
-# to do one thing, and offers no other way forward: no form to fill, a short page. (Why there is no
-# WebAuthn hook: see the note above PROBE_JS.)
+# are full of the word; a cart page can say "verify your identity". A page counts only when ALL hold:
+#   1. imperative challenge wording (IMPERATIVE; English first, a few French, German, Spanish and
+#      Hebrew lines -- other languages are not recognised, an honest gap);
+#   2. challenge context: the title or a heading reads like a sign-in / verification step, or a
+#      button offers the way out challenge pages offer ("Try another way", "Use another method",
+#      "Continue"); an identity check needs the title or heading;
+#   3. no other way forward: no field a person could fill that is really on screen (see the
+#      visibility rules in PROBE_JS: hidden, off-screen, transparent, clipped, aria-hidden, disabled,
+#      read-only fields, search boxes and <select> language pickers do not count);
+#   4. not an article: short visible text, no <article>, not paragraph after paragraph.
 
 #: ``(kind, pattern)``, most specific first: imperative challenge phrasing only. Written in the regex
 #: subset Python and JavaScript share (no lookbehind, no inline flags): PROBE_JS runs the same strings.
@@ -53,19 +67,44 @@ IMPERATIVE = (
     # The site says a device is involved -- the only kind where "check your phone" is grounded.
     (DEVICE_PROMPT, r"check your (?:phone|device|iphone|android)\b|tap (?:yes|approve|allow) on your (?:phone|device)"
                     r"|approve (?:the |this )?(?:sign[- ]?in|request|login)[^.\n]{0,40} on your (?:phone|device|other device)"
-                    r"|we sent a (?:notification|prompt|push)[^.\n]{0,40} to your"),
+                    r"|we sent a (?:notification|prompt|push)[^.\n]{0,40} to your"
+                    r"|(?:verification )?code (?:has been |was )?sent to your (?:trusted )?(?:apple )?devices"
+                    r"|allow (?:this )?sign[- ]?in on your (?:iphone|ipad|mac)"
+                    r"|consultez votre (?:téléphone|appareil)|prüfen sie ihr (?:telefon|smartphone|gerät)"
+                    r"|revisa tu (?:teléfono|dispositivo)|בדק(?:ו|י)? את הטלפון"),
     (PASSKEY, r"use your (?:passkey|security key|fingerprint|face|screen lock|device) to (?:confirm|verify|sign in|continue|log in)"
-              r"|insert your security key|touch your security key|confirm it['’]?s (?:really )?you with your passkey"),
+              r"|use your face, fingerprint, pin,? or security key|use touch id or your passkey|use your passkey\b"
+              r"|authenticate with (?:a|your) passkey|sign in with your passkey|insert your security key"
+              r"|touch your security key|confirm it['’]?s (?:really )?you with your passkey"
+              r"|utilisez votre (?:clé d['’]accès|clé de sécurité)|verwenden sie ihren (?:passkey|sicherheitsschlüssel)"
+              r"|usa (?:tu|su) (?:llave de acceso|clave de acceso|llave de seguridad)|השתמש(?:ו|י)? במפתח (?:הגישה|אבטחה)"),
     (CAPTCHA, r"verify (?:that )?you(?: are|['’]re) (?:a )?human|are you a (?:person or a )?robot|press (?:&|and) hold"
               r"|complete the security check|solve (?:the|this) (?:puzzle|challenge)"),
-    (IDENTITY_CHECK, r"^(?:verify|confirm) it['’]?s (?:really )?you|^(?:verify|confirm) your identity"),
+    (IDENTITY_CHECK, r"^(?:verify|confirm) it['’]?s (?:really )?you|^(?:verify|confirm) your identity"
+                     r"|^(?:confirmez|vérifiez) (?:qu['’]il s['’]agit bien de vous|votre identité)"
+                     r"|^(?:bestätigen sie, dass sie es sind|identität bestätigen|bestätigen sie ihre identität)"
+                     r"|^(?:confirma que eres tú|verifica tu identidad)|^(?:אמת(?:ו|י)? שזה את(?:ה|ם|ן)|אימות זהות)"),
 )
 #: The old name: tests and callers that want the verdict patterns.
 PATTERNS = IMPERATIVE
 _COMPILED = tuple((kind, re.compile(p, re.I | re.M)) for kind, p in IMPERATIVE)
 
+#: Title / heading wording of a sign-in or verification step.
+CONTEXT_TITLE = (r"sign[- ]?in|log[- ]?in|verif|confirm|security|2-step|two[- ]step|two[- ]factor|authenticat|passkey"
+                 r"|it['’]?s you|identity|apple account|apple id|microsoft account|connexion|vérif|anmeld|bestätig"
+                 r"|sicherheit|iniciar sesión|verific|התחבר|אימות|כניסה")
+#: The way out a challenge page offers, as a whole button label.
+CONTEXT_BUTTON = (r"^(?:continue|next|try another way|use another (?:method|way|option)|use a different (?:method|option)"
+                  r"|more ways to (?:verify|sign in)|sign in another way|other ways to sign in|cancel|continuer"
+                  r"|essayer une autre méthode|weiter|andere methode|continuar|probar otra manera|המשך|נסה דרך אחרת)$")
+_CONTEXT_TITLE = re.compile(CONTEXT_TITLE, re.I)
+_CONTEXT_BUTTON = re.compile(CONTEXT_BUTTON, re.I)
+
 #: A challenge page is short; an article or a dashboard is not. Visible text above this is not one.
 SHORT_PAGE_CHARS = 1500
+#: Paragraphs longer than this, this many times over, are an article.
+ARTICLE_PARAGRAPH_CHARS = 80
+ARTICLE_PARAGRAPHS = 3
 
 #: Visible challenge frames and widgets. The invisible reCAPTCHA badge (``size=invisible``) is on
 #: countless ordinary login pages and is NOT a challenge; the checkbox (``size=normal|compact``), the
@@ -98,16 +137,22 @@ def _line_around(text: str, start: int) -> str:
     return line[:_SAYS_LIMIT]
 
 
-def classify_page(text: str, *, fillable_inputs: int = 0) -> Optional[Dict[str, str]]:
-    """The verdict for one page from what it shows: ``{"kind", "page_says"}`` or None. Python twin of
-    PROBE_JS's decision (tests hold them to the same fixtures)."""
+def classify_page(text: str, *, fillable_inputs: int = 0, title: str = "", headings=(), buttons=(),
+                  article: bool = False) -> Optional[Dict[str, str]]:
+    """The verdict for one page: ``{"kind", "page_says"}`` or None. Python twin of PROBE_JS's decision
+    (tests hold them to the same fixtures). ``fillable_inputs`` counts only fields really on screen."""
     text = text or ""
-    if len(text) > SHORT_PAGE_CHARS or fillable_inputs > 0:
+    if article or len(text) > SHORT_PAGE_CHARS or fillable_inputs > 0:
         return None
+    titled = any(_CONTEXT_TITLE.search(t or "") for t in [title, *headings])
+    buttoned = any(_CONTEXT_BUTTON.search(" ".join(str(b or "").split())) for b in buttons)
     for kind, pattern in _COMPILED:
         m = pattern.search(text)
-        if m:
+        if not m:
+            continue
+        if titled or (buttoned and kind != IDENTITY_CHECK):
             return {"kind": kind, "page_says": _line_around(text, m.start())}
+        return None
     return None
 
 
@@ -131,27 +176,60 @@ PROBE_JS = """(() => {
     return text.slice(b, e).replace(/\\s+/g, " ").trim().slice(0, __LIMIT__);
   };
   const out = (kind, says, why) => JSON.stringify({kind, page_says: says, why, url: location.href, title: document.title});
-  const find = () => { for (const [kind, src] of P) { const m = new RegExp(src, "im").exec(text); if (m) return [kind, m]; } return null; };
   const frame = Array.from(document.querySelectorAll("iframe")).find(
     (f) => visible(f) && new RegExp(__FRAME__, "i").test(f.src || ""));
   const widget = Array.from(document.querySelectorAll(__SELECTOR__)).find(visible);
   if (frame || widget) return out("captcha", "", "challenge_frame");
-  // Another way forward: any visible field to fill (a password form beside "sign in with a passkey").
-  const fillable = Array.from(document.querySelectorAll("input, textarea, select")).filter((el) => {
+  // A field a person could fill, really on screen. Hidden-by-design fields (Google keeps its email
+  // field on the passkey step, off screen) are not another way forward.
+  const skipTypes = ["hidden", "submit", "button", "reset", "image", "checkbox", "radio", "search", "file", "range", "color"];
+  const onScreen = (el) => {
+    if (el.disabled || el.readOnly) return false;
+    if (el.tagName === "SELECT") return false;                          // language pickers
     const t = (el.type || "").toLowerCase();
-    if (["hidden", "submit", "button", "reset", "image", "checkbox", "radio", "search"].includes(t)) return false;
-    return visible(el) || (el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0);
-  }).length;
-  if (text.length > __SHORT__ || fillable > 0) return null;
-  const f = find();
-  return f ? out(f[0], line(f[1].index), "imperative") : null;
+    if (skipTypes.includes(t)) return false;
+    const attr = (n) => (el.getAttribute && el.getAttribute(n)) || "";
+    if (attr("role") === "searchbox" || /search|query/i.test([el.name, el.id, attr("aria-label"), el.placeholder].join(" ")))
+      return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;                        // sr-only, 1x1 clipped
+    if (r.right + (window.scrollX || 0) <= 0 || r.bottom + (window.scrollY || 0) <= 0) return false;  // off screen
+    for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+      const s = getComputedStyle(n);
+      if (s.display === "none" || s.visibility === "hidden" || s.visibility === "collapse") return false;
+      if (parseFloat(s.opacity) === 0) return false;
+      if (n.getAttribute && n.getAttribute("aria-hidden") === "true") return false;
+      if (s.clip && /rect\\(\\s*0(?:px)?[ ,]+0(?:px)?[ ,]+0(?:px)?[ ,]+0/.test(s.clip)) return false;
+      if (s.clipPath && /inset\\(\\s*(?:50|100)%|circle\\(\\s*0/.test(s.clipPath)) return false;
+    }
+    return true;
+  };
+  const fillable = Array.from(document.querySelectorAll("input, textarea, select")).filter(onScreen).length;
+  const long = Array.from(document.querySelectorAll("p")).filter((p) => (p.textContent || "").trim().length > __PARA__).length;
+  const article = document.querySelectorAll("article").length > 0 || long >= __PARAS__;
+  if (article || text.length > __SHORT__ || fillable > 0) return null;
+  const heads = [document.title || ""].concat(Array.from(document.querySelectorAll("h1, h2, [role=heading]"),
+    (h) => h.textContent || ""));
+  const titled = heads.some((h) => new RegExp(__CTITLE__, "i").test(h));
+  const buttoned = Array.from(document.querySelectorAll("button, [role=button], input[type=submit], input[type=button]"),
+    (b) => ((b.innerText || b.textContent || b.value || "") + "").replace(/\\s+/g, " ").trim())
+    .some((b) => new RegExp(__CBUTTON__, "i").test(b));
+  for (const [kind, src] of P) {
+    const m = new RegExp(src, "im").exec(text);
+    if (!m) continue;
+    if (titled || (buttoned && kind !== "identity_check")) return out(kind, line(m.index), "imperative");
+    return null;
+  }
+  return null;
 })()"""
 
 
 def probe_js() -> str:
     return (PROBE_JS.replace("__PATTERNS__", json.dumps([list(p) for p in IMPERATIVE]))
             .replace("__FRAME__", json.dumps(CHALLENGE_FRAME)).replace("__SELECTOR__", json.dumps(CHALLENGE_SELECTOR))
-            .replace("__LIMIT__", str(_SAYS_LIMIT)).replace("__SHORT__", str(SHORT_PAGE_CHARS)))
+            .replace("__LIMIT__", str(_SAYS_LIMIT)).replace("__SHORT__", str(SHORT_PAGE_CHARS))
+            .replace("__PARA__", str(ARTICLE_PARAGRAPH_CHARS)).replace("__PARAS__", str(ARTICLE_PARAGRAPHS))
+            .replace("__CTITLE__", json.dumps(CONTEXT_TITLE)).replace("__CBUTTON__", json.dumps(CONTEXT_BUTTON)))
 
 
 def parse_probe(raw) -> Optional[Dict[str, str]]:

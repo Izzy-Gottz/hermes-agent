@@ -597,10 +597,13 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
 
 
 def _person_step(stdout: str, env: dict) -> Optional[dict]:
-    """A person-only step on the active tab -- looked for only when the code's own output suggests
-    a stall (a passkey, a challenge URL, "verify"...), and then decided by the page itself (a WebAuthn
-    request in flight, a visible challenge, imperative wording with no other way forward), within
-    a sub-second budget. None when there is none, nothing could be read, or the browser is not local."""
+    """A person-only step on the active tab -- a HINT, looked for only when the code's own output
+    suggests a stall (a passkey, a challenge URL, "verify"...), and then decided by what the page says
+    and offers (tools/browser_person_step.py): imperative challenge wording, English first, in a
+    challenge context, with no field on screen to fill and no article -- or a visible challenge frame.
+    No script is injected into pages. Within a sub-second budget. None when there is none, nothing could
+    be read, or the browser is not local. The model's rule ("a check only the person can complete is
+    browser_handoff") holds whether or not this fires."""
     from tools import browser_person_step as ps
     if not ps.suggests_person_step(stdout or ""):
         return None
@@ -756,9 +759,11 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                                       "— it runs in Moe's own tab group in the owner's real Chrome.")
                 else:
                     result["hint"] = "This site blocks Moe's own browser. " + chrome_lane.not_connected_message()
-    if lane == chrome_lane.LANE_OWN and not result.get("captcha") \
+    ladder_said = (result.get("captcha") or {}).get("outcome") not in (None, "passed")
+    if lane == chrome_lane.LANE_OWN and not ladder_said \
             and not (result.get("blocked_by") and bridge is not None and presence.get("live")):
-        # A CAPTCHA is the ladder's (tools/browser_captcha_ladder.py): it already said what to do.
+        # A CAPTCHA the ladder could not pass is the ladder's (tools/browser_captcha_ladder.py): it already
+        # said what to do. After one it DID pass, the page may still need the person (a passkey next).
         # Moe's own browser is out of sight: a passkey, a CAPTCHA or an identity check there can only be
         # done by the person, and only once they can see it (tools/browser_handoff_tool.py). A bot wall
         # with the Chrome lane available keeps the where="chrome" hint above instead.
@@ -834,8 +839,9 @@ _HELPERS_DIGEST = (
     "in Python before printing; it is thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) "
     "gives click coordinates. ensure_real_tab() recovers from a stale/internal tab. Login walls: never guess "
     "credentials; see the vault note below if present, otherwise stop and ask the user. This browser is out of "
-    "the person's sight: a passkey, security key, CAPTCHA or identity check (a result's needs_person), or the "
-    "person asking to see the page, is browser_handoff -- never tell them to check their phone or another "
+    "the person's sight: any check only the person can complete -- a passkey, security key, CAPTCHA the engine "
+    "could not pass, or identity check, whether or not a result flags needs_person -- or the person asking to "
+    "see the page, is browser_handoff -- never tell them to check their phone or another "
     "device unless the page itself says so."
 )
 

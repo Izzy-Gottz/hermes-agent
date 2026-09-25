@@ -1392,6 +1392,7 @@ def _turn_begins(agent) -> str:
         ledger.stamped = 0.0
     agent._turn_id = token
     agent._turn_live = True
+    agent._turn_started_at = time.time()  # at_this_mac's grace for a person waiting at the Mac (browser hand-over)
     # The ledger this turn began on, so it is the one ended even if the session is retired (and
     # agent._claude_code_session cleared) before the turn's finally runs.
     agent._hermes_turn_ledger_in_use = ledger
@@ -1482,7 +1483,11 @@ def make_tool_bridge_dispatch(agent):
                 # a background subagent of the claude child, say — is not the person's live turn.
                 return _json.dumps({"live": False, "why": "a turn that has already ended"})
             from tools.browser_chrome_extension import local_turn_presence
-            return _json.dumps(local_turn_presence())
+            answer = local_turn_presence()
+            started = getattr(agent, "_turn_started_at", None)
+            if isinstance(started, (int, float)):
+                answer["turn_started_at"] = float(started)
+            return _json.dumps(answer)
         from gateway.session_context import session_history_delivery_supported
         from tools.delegate_tool import forced_synchronous_delegation
 

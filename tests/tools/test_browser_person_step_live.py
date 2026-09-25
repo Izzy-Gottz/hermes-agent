@@ -43,7 +43,14 @@ PAGES = {
     "login.html": ("<h1>Sign in to GitHub</h1><label>Username or email address<input name=login></label>"
                    "<label>Password<input type=password name=password></label><button>Sign in</button>"
                    "<p>or</p><button>Sign in with a passkey</button>"),
-    "article.html": "<h1>Passkey</h1>" + "<p>Use your passkey to sign in to your account on any device.</p>" * 60,
+    "article.html": ("<title>Sign in with a passkey - Help</title><h1>Sign in with a passkey</h1>"
+                     + "<p>Use your passkey to sign in to your account on any device, instead of typing a password "
+                       "every time you visit.</p>" * 6),
+    "hidden.html": ("<title>Sign in - Accounts</title><h1>Sign in</h1>"
+                    "<div style='position:absolute;left:-9999px'><input type=email name=identifier></div>"
+                    "<input type=text style='opacity:0' name=a><div style='display:none'><input name=b></div>"
+                    "<select name=hl><option>English</option></select>"
+                    "<p>Use your passkey to confirm it’s really you</p><button>Try another way</button>"),
 }
 
 
@@ -108,6 +115,11 @@ def test_the_probe_reads_each_page_it_is_navigated_to(browser):
     _eval_in_active(cdp, f"location.href = {site!r} + '/article.html'")
     time.sleep(1.5)
     assert ps.probe_active_page(cdp, budget=3) is None                 # an article about passkeys
+
+    _eval_in_active(cdp, f"location.href = {site!r} + '/hidden.html'")
+    time.sleep(1.5)
+    got = ps.probe_active_page(cdp, budget=3)                          # fields not really on screen
+    assert got and got["kind"] == "passkey"
 
 
 @LIVE

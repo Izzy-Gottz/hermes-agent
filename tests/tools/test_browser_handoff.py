@@ -86,32 +86,54 @@ WIKIPEDIA_TEXT = ("Passkey\nFrom Wikipedia, the free encyclopedia\nA passkey is 
 
 # ---- what the page is ------------------------------------------------------------------------
 
+GOOGLE_CTX = {"title": "Sign in - Google Accounts", "buttons": ["Try another way"]}
+
+
 class TestDetection:
     def test_the_measured_google_passkey_page_is_a_passkey_step(self):
-        step = ps.classify_page(GOOGLE_PASSKEY_STDOUT)
+        step = ps.classify_page(GOOGLE_PASSKEY_STDOUT, **GOOGLE_CTX)
         assert step == {"kind": "passkey", "page_says": "Use your passkey to confirm it’s really you"}
 
-    @pytest.mark.parametrize("text,kind", [
-        ("Check your phone\nGoogle sent a notification to your Pixel", "device_prompt"),
-        ("Tap Yes on your phone to sign in", "device_prompt"),
-        ("Insert your security key and touch it", "passkey"),
-        ("Please verify you are human", "captcha"),
-        ("Verify it's you\nTo help keep your account safe", "identity_check"),
-        ("Confirm your identity to continue", "identity_check"),
+    @pytest.mark.parametrize("text,kind,ctx", [
+        ("Check your phone\nGoogle sent a notification to your Pixel", "device_prompt", {"title": "2-Step Verification"}),
+        ("Tap Yes on your phone to sign in", "device_prompt", {"buttons": ["Try another way"]}),
+        ("Insert your security key and touch it", "passkey", {"title": "Security key"}),
+        ("Please verify you are human", "captcha", {"buttons": ["Continue"]}),
+        ("Verify it's you\nTo help keep your account safe", "identity_check", {"headings": ["Verify it's you"]}),
+        ("Confirm your identity to continue", "identity_check", {"title": "Account security"}),
+        # Common phrasings (review round 3)
+        ("Use your face, fingerprint, PIN or security key", "passkey", {"title": "Sign in to your account"}),
+        ("Use Touch ID or your passkey", "passkey", {"buttons": ["Use another method"]}),
+        ("Authenticate with a passkey", "passkey", {"headings": ["Two-factor authentication"]}),
+        ("A verification code has been sent to your Apple devices", "device_prompt", {"title": "Apple Account"}),
+        ("Allow this sign in on your iPhone", "device_prompt", {"headings": ["Sign in with Apple"]}),
+        ("Utilisez votre clé d'accès pour vous connecter", "passkey", {"title": "Connexion"}),
+        ("Confirmez qu'il s'agit bien de vous", "identity_check", {"headings": ["Vérification"]}),
+        ("Verwenden Sie Ihren Passkey", "passkey", {"buttons": ["Andere Methode"]}),
+        ("Bestätigen Sie, dass Sie es sind", "identity_check", {"title": "Anmelden"}),
+        ("Usa tu llave de acceso", "passkey", {"title": "Iniciar sesión"}),
+        ("Verifica tu identidad", "identity_check", {"headings": ["Verificación"]}),
+        ("השתמש במפתח הגישה שלך", "passkey", {"title": "התחברות"}),
+        ("אימות זהות", "identity_check", {"headings": ["אימות"]}),
     ])
-    def test_imperative_kinds_on_a_short_page_with_nothing_to_fill(self, text, kind):
-        assert ps.classify_page(text)["kind"] == kind
+    def test_imperative_kinds_in_a_challenge_context(self, text, kind, ctx):
+        assert (ps.classify_page(text, **ctx) or {}).get("kind") == kind
 
-    @pytest.mark.parametrize("text,inputs", [
-        (GITHUB_LOGIN_TEXT, 2),           # a passkey is one option beside a password form
-        (GOOGLE_HELP_TEXT, 0),            # an article: long, and not asking for anything
-        (WIKIPEDIA_TEXT, 1),              # the search box aside, long
-        ("Welcome back! Your dashboard is ready.", 0),
-        ("cookies can be stored or read on your device to recognise it each time it connects", 0),
-        ("", 0),
+    @pytest.mark.parametrize("text,kw", [
+        (GITHUB_LOGIN_TEXT, {"fillable_inputs": 2, "title": "Sign in to GitHub"}),  # one option beside a form
+        (GOOGLE_HELP_TEXT, {"title": "Sign in with a passkey - Google Account Help"}),  # an article: long
+        (WIKIPEDIA_TEXT, {"fillable_inputs": 0, "title": "Passkey - Wikipedia"}),
+        # A short help snippet: the words and a sign-in title, but article structure
+        ("Use your passkey to sign in to your Google Account.", {"title": "Sign in with a passkey", "article": True}),
+        # The words with no challenge context at all
+        ("Use your passkey to confirm it's you", {}),
+        # "Verify your identity" on a cart page: a Continue button is not an identity-check context
+        ("Verify your identity\nYour cart (2 items)", {"title": "Your cart - Shop", "buttons": ["Continue"]}),
+        ("Welcome back! Your dashboard is ready.", {"title": "Sign in"}),
+        ("", {}),
     ])
-    def test_pages_that_only_mention_it_are_nothing(self, text, inputs):
-        assert ps.classify_page(text, fillable_inputs=inputs) is None
+    def test_pages_that_only_mention_it_are_nothing(self, text, kw):
+        assert ps.classify_page(text, **kw) is None
 
     def test_output_only_decides_whether_to_look(self):
         assert ps.suggests_person_step(GOOGLE_PASSKEY_STDOUT)
@@ -119,8 +141,15 @@ class TestDetection:
         assert not ps.suggests_person_step("{'url': 'https://example.com/', 'title': 'Example'}\nok")
 
     def test_only_a_device_prompt_names_a_device(self):
-        step = ps.classify_page(GOOGLE_PASSKEY_STDOUT)
+        step = ps.classify_page(GOOGLE_PASSKEY_STDOUT, **GOOGLE_CTX)
         assert step["kind"] != "device_prompt" and "phone" not in step["page_says"].lower()
+
+    def test_detection_is_documented_as_a_hint_and_the_rule_is_handoff(self):
+        from tools import browser_handoff_tool as bh
+        assert "HINT" in ps.__doc__ and "English first" in ps.__doc__
+        d = bh.BROWSER_HANDOFF_SCHEMA["description"]
+        assert "a check only the person can complete" in d and "only a hint" in d
+        assert "whether or not a result flags needs_person" in bu._HELPERS_DIGEST
 
     def test_nothing_is_injected_into_pages(self):
         """The WebAuthn hook was dropped (a Proxy is not native to toString; see browser_person_step):
@@ -145,37 +174,109 @@ def _find_node():
 
 NODE = _find_node()
 
+_DOM = """
+const S = %s;
+const withStyle = (o, style) => Object.assign(o, {nodeType: 1, style: style || {}});
+const rectOf = ([x, y, w, h]) => () => ({left: x, top: y, width: w, height: h, right: x + w, bottom: y + h});
+const mkInput = (i) => {
+  const parent = withStyle({parentElement: null, getAttribute: (n) => (n === "aria-hidden" && i.parentAriaHidden) ? "true" : null},
+                           i.parentStyle);
+  return withStyle({parentElement: parent, tagName: (i.tag || "INPUT").toUpperCase(), type: i.type || "text",
+    name: i.name || "", id: i.id || "", placeholder: i.placeholder || "", disabled: !!i.disabled, readOnly: !!i.readOnly,
+    getAttribute: (n) => n === "aria-hidden" ? (i.ariaHidden ? "true" : null) : (n === "role" ? (i.role || null) : null),
+    getBoundingClientRect: rectOf(i.rect || [10, 10, 200, 30])}, i.style);
+};
+const frames = (S.frames || []).map(([src, w, h]) => withStyle({src, getBoundingClientRect: rectOf([0, 0, w, h])}, {}));
+const inputs = (S.inputs || []).map(mkInput);
+const paras = (S.paragraphs || []).map((t) => ({textContent: t}));
+const heads = (S.headings || []).map((t) => ({textContent: t}));
+const buttons = (S.buttons || []).map((t) => ({innerText: t, textContent: t}));
+const articles = S.article ? [{}] : [];
+globalThis.window = globalThis; globalThis.scrollX = 0; globalThis.scrollY = 0;
+globalThis.location = {href: "https://accounts.example/x"};
+globalThis.document = {title: S.title || "", body: {innerText: S.body},
+  querySelectorAll: (sel) => sel === "iframe" ? frames : sel.startsWith("input") ? inputs : sel === "p" ? paras
+    : sel === "article" ? articles : sel.startsWith("h1") ? heads : sel.startsWith("button") ? buttons : []};
+globalThis.getComputedStyle = (n) => Object.assign({visibility: "visible", display: "block", opacity: "1",
+  clip: "auto", clipPath: "none"}, n.style || {});
+console.log(JSON.stringify(%s));
+"""
 
-def _run_js(tmp_path, body, *, frames=(), inputs=()):
-    """PROBE_JS in node, against a minimal page: the shared patterns compile and match in a real JS engine."""
+
+def _run_js(tmp_path, body, **page):
+    """PROBE_JS in node against a small page model (real enough for its rules: rects, computed styles,
+    parents, attributes): the shared patterns and the visibility rules run in a real JS engine."""
     script = tmp_path / "probe.js"
-    script.write_text(
-        "const rect = (w, h) => () => ({width: w, height: h});\n"
-        "const frames = %s.map(([src, w, h]) => ({src, getBoundingClientRect: rect(w, h)}));\n"
-        "const inputs = %s.map((t) => ({type: t, getBoundingClientRect: rect(200, 30)}));\n"
-        "globalThis.location = {href: 'https://accounts.example/x'};\n"
-        "globalThis.document = {title: 't', body: {innerText: %s},\n"
-        "  querySelectorAll: (sel) => sel === 'iframe' ? frames : (sel.startsWith('input') ? inputs : [])};\n"
-        "globalThis.getComputedStyle = () => ({visibility: 'visible', display: 'block'});\n"
-        "console.log(JSON.stringify(%s));\n"
-        % (json.dumps(list(frames)), json.dumps(list(inputs)), json.dumps(body), ps.probe_js()))
+    script.write_text(_DOM % (json.dumps({"body": body, **page}), ps.probe_js()))
     out = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     return ps.parse_probe(json.loads(out.stdout))
 
 
+GOOGLE_PK_BODY = "Sign in\nUse your passkey to confirm it’s really you\nTry another way"
+
+
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 class TestTheProbeInJavaScript:
     def test_the_google_passkey_page(self, tmp_path):
-        got = _run_js(tmp_path, "Sign in\nUse your passkey to confirm it’s really you\nTry another way")
+        got = _run_js(tmp_path, GOOGLE_PK_BODY, **GOOGLE_CTX)
         assert got["kind"] == "passkey" and got["why"] == "imperative"
 
+    @pytest.mark.parametrize("hidden", [
+        {"type": "email", "rect": [-5000, 10, 300, 40]},                         # off screen (Google's email field)
+        {"type": "email", "style": {"opacity": "0"}},                              # transparent
+        {"type": "text", "style": {"clip": "rect(0px, 0px, 0px, 0px)"}},           # clipped away
+        {"type": "text", "rect": [10, 10, 1, 1]},                                  # sr-only 1x1
+        {"type": "text", "parentStyle": {"display": "none"}},                      # hidden parent
+        {"type": "text", "parentStyle": {"visibility": "hidden"}},                 # hidden parent
+        {"type": "text", "parentAriaHidden": True},                                # aria-hidden parent
+        {"type": "text", "ariaHidden": True},
+        {"type": "hidden"},
+        {"type": "text", "disabled": True},
+        {"type": "text", "readOnly": True},
+        {"tag": "select", "type": "select-one", "name": "hl"},                     # the language picker
+        {"type": "text", "name": "q", "placeholder": "Search"},                    # a search box
+        {"type": "text", "role": "searchbox"},
+    ])
+    def test_fields_not_really_on_screen_do_not_stop_it(self, tmp_path, hidden):
+        """Review round 3, measured: each of these left the old "rect > 0" rule counting a field. Revert
+        to `visible(el) || rect > 0` and the transparent, clipped and hidden-parent cases go red."""
+        got = _run_js(tmp_path, GOOGLE_PK_BODY, inputs=[hidden], **GOOGLE_CTX)
+        assert got and got["kind"] == "passkey", hidden
+
+    def test_a_real_field_on_screen_is_another_way_forward(self, tmp_path):
+        assert _run_js(tmp_path, GOOGLE_PK_BODY, inputs=[{"type": "password"}], **GOOGLE_CTX) is None
+
     def test_github_login_offering_a_passkey_is_not(self, tmp_path):
-        assert _run_js(tmp_path, GITHUB_LOGIN_TEXT, inputs=["text", "password"]) is None
+        assert _run_js(tmp_path, GITHUB_LOGIN_TEXT, inputs=[{"type": "text", "name": "login"}, {"type": "password"}],
+                       title="Sign in to GitHub", buttons=["Sign in", "Sign in with a passkey"]) is None
 
     @pytest.mark.parametrize("text", [GOOGLE_HELP_TEXT, WIKIPEDIA_TEXT])
     def test_articles_are_not(self, tmp_path, text):
-        assert _run_js(tmp_path, text, inputs=["search"]) is None
+        assert _run_js(tmp_path, text, inputs=[{"type": "search"}], title="Sign in with a passkey") is None
+
+    def test_a_short_help_page_with_article_structure_is_not(self, tmp_path):
+        para = "With a passkey you can sign in with your fingerprint, face or screen lock instead of a password. " * 2
+        assert _run_js(tmp_path, "Use your passkey to sign in", title="Sign in with a passkey - Help",
+                       buttons=["Continue"], paragraphs=[para, para, para]) is None
+        assert _run_js(tmp_path, "Use your passkey to sign in", title="Sign in with a passkey - Help",
+                       article=True) is None
+
+    def test_the_words_alone_without_a_challenge_context_are_not(self, tmp_path):
+        assert _run_js(tmp_path, "Use your passkey to confirm it's you", title="My notes") is None
+
+    def test_verify_your_identity_on_a_cart_page_is_not(self, tmp_path):
+        assert _run_js(tmp_path, "Verify your identity\nYour cart", title="Your cart", buttons=["Continue"]) is None
+
+    @pytest.mark.parametrize("body,ctx,kind", [
+        ("Use your face, fingerprint, PIN or security key", {"title": "Sign in to your account"}, "passkey"),
+        ("Authenticate with a passkey", {"headings": ["Two-factor authentication"]}, "passkey"),
+        ("Utilisez votre clé d'accès", {"title": "Connexion"}, "passkey"),
+        ("השתמש במפתח הגישה שלך", {"title": "התחברות"}, "passkey"),
+        ("Verifica tu identidad", {"headings": ["Verificación"]}, "identity_check"),
+    ])
+    def test_common_and_other_language_phrasings(self, tmp_path, body, ctx, kind):
+        assert (_run_js(tmp_path, body, **ctx) or {}).get("kind") == kind
 
     @pytest.mark.parametrize("frames,expect", [
         ([("https://www.google.com/recaptcha/api2/anchor?k=x&size=invisible", 256, 60)], None),
@@ -183,7 +284,8 @@ class TestTheProbeInJavaScript:
         ([("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/x", 300, 65)], "captcha"),
     ])
     def test_only_a_visible_challenge_is_a_captcha(self, tmp_path, frames, expect):
-        assert (_run_js(tmp_path, "Log in", frames=frames, inputs=["text", "password"]) or {}).get("kind") == expect
+        got = _run_js(tmp_path, "Log in", frames=frames, inputs=[{"type": "text"}, {"type": "password"}])
+        assert (got or {}).get("kind") == expect
 
 
 # ---- at the Mac, or not ----------------------------------------------------------------------------
@@ -200,6 +302,28 @@ class TestAtThisMac:
     def test_no_stamp_on_a_host_that_writes_one_is_not(self, _live_turn_at_the_mac):
         _live_turn_at_the_mac.unlink()
         assert lane.at_this_mac()[0] is False
+
+    @pytest.mark.parametrize("stamp,started_ago,here", [
+        ({"active": False, "locked": False, "asleep": False, "idle": 400}, 60, True),       # waiting, hands off
+        ({"active": False, "locked": False, "asleep": False, "idle": 400}, None, True),     # in progress, no start
+        ({"active": False, "locked": False, "asleep": False, "idle": 2000}, 20 * 60, False),  # grace is over
+        ({"active": False, "locked": True, "asleep": False, "idle": 5}, 60, False),        # locked: never
+        ({"active": False, "locked": False, "asleep": True, "idle": 5}, 60, False),        # asleep: never
+        ({"active": False, "idle": 400}, 60, False),        # an older app that does not say: absent is the safe answer
+    ])
+    def test_a_person_waiting_at_the_mac_stays_at_the_mac_for_their_turn(self, _live_turn_at_the_mac,
+                                                                          stamp, started_ago, here):
+        _live_turn_at_the_mac.write_text(json.dumps({**stamp, "at": time.time() - 5}))
+        presence = {"live": True, "why": "", "surface": "local"}
+        if started_ago is not None:
+            presence["turn_started_at"] = time.time() - started_ago
+        assert lane.at_this_mac(presence)[0] is here
+        assert lane.LOCAL_TURN_GRACE_SECONDS == 15 * 60
+
+    def test_the_grace_needs_a_fresh_stamp(self, _live_turn_at_the_mac):
+        _live_turn_at_the_mac.write_text(json.dumps({"active": False, "locked": False, "asleep": False,
+                                                     "at": time.time() - 600}))
+        assert lane.at_this_mac({"live": True, "surface": "local", "turn_started_at": time.time()})[0] is False
 
     def test_the_owner_texting_from_their_phone_is_live_but_not_here(self):
         bound = _bind(platform="telegram", origin="")
@@ -300,6 +424,17 @@ class TestBrowserExec:
         cli["stdout"] = "Verify you are human"
         out = json.loads(bu.browser_exec('print(js("document.body.innerText"))', task_id="t"))
         assert out["captcha"]["outcome"] == "needs_person" and "needs_person" not in out and seen == []
+
+    def test_after_a_captcha_the_ladder_passed_a_passkey_still_gets_our_note(self, cli, monkeypatch):
+        _probe_returns(monkeypatch, cli, PASSKEY_PROBE)
+
+        def ladder(result, *a, **k):
+            result["captcha"] = {"outcome": "passed", "next": "carry on"}
+            return "passed"
+        monkeypatch.setattr(bu, "_captcha_ladder", ladder)
+        cli["stdout"] = GOOGLE_PASSKEY_STDOUT
+        out = json.loads(bu.browser_exec('print(js("document.body.innerText"))', task_id="t"))
+        assert out["captcha"]["outcome"] == "passed" and out["needs_person"]["kind"] == "passkey"
 
     def test_the_schema_teaches_the_handoff_and_the_rule(self):
         desc = bu._HELPERS_DIGEST
@@ -675,3 +810,26 @@ class TestGroundedWords:
         """The note on the input tool used to forbid accepting a code "even if the user shows it"."""
         import model_tools
         assert "source='person'" in model_tools._VAULT_NO_PASSWORD_NOTE
+
+
+def test_the_bridge_says_when_the_live_turn_began(monkeypatch):
+    """at_this_mac's grace needs the turn's start: the agent answers it with the presence."""
+    import contextvars
+    import types
+    from agent import claude_code_runtime as rt
+    from agent.transports.hermes_tool_bridge import TURN_PRESENCE_QUERY
+    agent = types.SimpleNamespace()
+    agent._turn_context = contextvars.copy_context()
+    dispatch = rt.make_tool_bridge_dispatch(agent)
+    seen = {}
+
+    def body(agent, **_kw):
+        _kw["_on_locked"]()
+        seen["during"] = json.loads(dispatch(TURN_PRESENCE_QUERY, {}))
+        return {}
+
+    monkeypatch.setattr(rt, "_run_claude_code_turn_body", body)
+    before = time.time()
+    rt.run_claude_code_turn(agent, user_message="hi", original_user_message="hi", messages=[], effective_task_id="t")
+    assert seen["during"]["live"] is True and before <= seen["during"]["turn_started_at"] <= time.time()
+    assert seen["during"]["surface"] == "local"
