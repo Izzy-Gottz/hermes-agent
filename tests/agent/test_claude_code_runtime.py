@@ -1294,3 +1294,47 @@ def test_the_delegate_heartbeat_sees_a_working_cli_child():
         on_event({"kind": "tool_completed", "call_id": f"c{i}", "name": "browser_exec", "args": {}, "result": ""})
     assert any("running browser_exec" in d for d in touched), touched[-3:]
     assert not any("initializing" in d for d in touched)
+
+
+class TestTurnLedgerSurvivesARebuild:
+    """A respawn that fails rebuilds the session mid-turn. The turn is still the same turn: its
+    ledger (token, live flag, tool_use ids) must be the rebuilt session's, or a card this turn put up
+    pings an empty ledger and is answered "unknown" — never stamped, never withdrawn with the turn."""
+
+    def test_a_failed_respawn_moves_the_live_turn_onto_the_new_session(self, monkeypatch):
+        first = _agent("s-ledger", ephemeral="ONE")
+        _turn(first)
+        old = first._claude_code_session
+        monkeypatch.setattr(type(old), "restart", lambda self, **kw: (_ for _ in ()).throw(RuntimeError("respawn failed")))
+        seen = {}
+        turn_agent = [None]
+        real_build = rt._build_session
+
+        def build(agent, **kw):
+            session = real_build(agent, **kw)
+            real_started = session.ensure_started
+
+            def ensure_started():
+                if "live" in seen or agent is not turn_agent[0]:   # a spare, not the turn's rebuild
+                    return real_started()
+                ledger = getattr(session, "_hermes_turn_ledger", None)
+                seen["live"] = bool(ledger and ledger.live)
+                seen["token"] = ledger.token if ledger else None
+                seen["same"] = ledger is getattr(agent, "_hermes_turn_ledger_in_use", None)
+                rt._note_turn_tool_call(agent, "toolu_DURING")
+                seen["ping"] = rt._human_wait_state(agent, "toolu_DURING", "on the card")
+                return real_started()
+
+            session.ensure_started = ensure_started
+            return session
+
+        monkeypatch.setattr(rt, "_build_session", build)
+        second = _agent("s-ledger", ephemeral="TWO")
+        second._touch_activity = lambda label: None
+        turn_agent[0] = second
+        result = _turn(second)
+        assert result["completed"] is True
+        assert second._claude_code_session is not old            # it really was rebuilt
+        assert seen == {"live": True, "token": second._turn_id, "same": True, "ping": "ok"}
+        # And after the turn, the rebuilt session's ledger says so.
+        assert rt._human_wait_state(second, "toolu_DURING", "x") == "ended"

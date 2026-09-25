@@ -1337,6 +1337,18 @@ def _turn_ledger(agent) -> _TurnLedger:
     return ledger
 
 
+def _carry_turn_ledger(old_session, new_session) -> None:
+    """A session rebuilt mid-turn takes over the turn's ledger — the same object, so the token, the
+    live flag and every tool_use id seen so far stay one record, and anything still holding the old
+    one (the turn's own ``_hermes_turn_ledger_in_use``) agrees with it."""
+    ledger = getattr(old_session, "_hermes_turn_ledger", None)
+    if isinstance(ledger, _TurnLedger) and new_session is not None:
+        try:
+            setattr(new_session, "_hermes_turn_ledger", ledger)
+        except Exception:
+            logger.debug("could not carry the turn ledger to the rebuilt session", exc_info=True)
+
+
 def _note_turn_tool_call(agent, call_id: str) -> None:
     """Record ``call_id`` as belonging to the turn that is live now."""
     ledger = _turn_ledger(agent)
@@ -1732,9 +1744,13 @@ def _run_claude_code_turn_body(
                     session.close()
                 except Exception:
                     pass
+                old_session = session
                 session = _build_session(agent)
                 entry.session = session
                 agent._claude_code_session = session
+                # The turn is still this one: its ledger (token, live flag, its tool calls) moves
+                # with it, or its cards would ping a new, empty ledger and never be answered.
+                _carry_turn_ledger(old_session, session)
 
         # NOTE: the user message is ALREADY in ``messages`` (appended by
         # run_conversation before dispatch). Do not append it again.
