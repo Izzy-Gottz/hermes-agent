@@ -1505,9 +1505,12 @@ def _run_conversation_turn(
     # The person's words for this conversation, for the send gate's recipient grounding
     # (agent/recipient_grounding.py): keyed by session id, which is what the gate sees for
     # tools this process runs. The claude_code runtime records them again under its own key.
+    # Only this turn's own message is read, with who sent it; earlier turns were
+    # recorded as they happened, and summaries and injected blocks never are.
     try:
-        from agent.recipient_grounding import record_words
-        record_words(str(getattr(agent, "session_id", "") or ""), s.messages, s.user_message)
+        from agent.recipient_grounding import record_turn
+        _said = s.original_user_message if isinstance(s.original_user_message, (str, list)) else s.user_message
+        record_turn(agent, [str(getattr(agent, "session_id", "") or "")], _said)
     except Exception:
         pass
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex

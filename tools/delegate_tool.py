@@ -296,6 +296,17 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Recipient grounding: the goal is the parent MODEL's words, so it can refuse
+    # a recipient but never name one; the person's words from the parent's turn
+    # travel with the helper (agent/recipient_grounding.py).
+    try:
+        from agent.recipient_grounding import person_words_now
+        _person = getattr(parent_agent, "_grounding_person_words", None)
+        child._grounding_override = {
+            "person": list(_person) if isinstance(_person, list) else person_words_now(),
+            "model": [goal, context or ""]}
+    except Exception:
+        pass
     _apply_child_cache_ttl(child)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent

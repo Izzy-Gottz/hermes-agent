@@ -1766,8 +1766,11 @@ def _run_claude_code_turn_body(
             # they carry no session id of their own. See
             # agent/recipient_grounding.py.
             try:
-                from agent.recipient_grounding import record_words
-                record_words(getattr(session, "grounding_key", "") or "", messages, user_message)
+                from agent.recipient_grounding import record_turn
+                _said = (original_user_message if isinstance(original_user_message, (str, list))
+                         else user_message)
+                record_turn(agent, [getattr(session, "grounding_key", "") or "",
+                                    str(getattr(agent, "session_id", "") or "")], _said)
             except Exception:
                 logger.debug("claude-code: recording the turn's words failed", exc_info=True)
             # A turn's first words never carry the break a previous turn

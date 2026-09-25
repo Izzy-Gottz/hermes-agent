@@ -12,6 +12,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -145,6 +147,30 @@ class _ServerRequestRouting:
     auto_approve_apply_patch: bool = False
 
 
+def grounding_client_kwargs(key: str, codex_home: Optional[str] = None) -> dict:
+    """Client kwargs that hand the grounding key to Hermes' MCP server in codex.
+
+    Codex starts MCP servers from its own config, not this process's environment,
+    so the key has to ride in that server's ``env`` table — and only when the
+    server is configured: a ``-c mcp_servers.<name>.env…`` override for a server
+    that does not exist would create a half-defined server table. The key is also
+    put in codex's own environment, for tools codex runs itself."""
+    if not key:
+        return {}
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    try:
+        with open(os.path.join(home, "config.toml"), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        text = ""
+    from agent.recipient_grounding import GROUNDING_KEY_ENV
+    extra = []
+    for name in ("hermes-tools", "hermes-mcp"):
+        if re.search(r"^\s*\[mcp_servers\.(\"%s\"|%s)\]" % (re.escape(name), re.escape(name)), text, re.M):
+            extra += ["-c", "mcp_servers.%s.env.%s=%s" % (name, GROUNDING_KEY_ENV, json.dumps(key))]
+    return {"extra_args": extra, "env": {GROUNDING_KEY_ENV: key}}
+
+
 class CodexAppServerSession:
     """One Codex thread per Hermes session, lifetime owned by AIAgent. Not thread-safe: one caller at a time."""
 
@@ -155,8 +181,13 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        grounding_key: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
+        # Recipient grounding (agent/recipient_grounding.py): the key the send
+        # gate files this conversation's lookups under, handed to Hermes' MCP
+        # server inside codex — whose calls carry no session id of their own.
+        self._grounding_key = (grounding_key or "").strip()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
         self._permission_profile = permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
@@ -182,7 +213,9 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            self._client = self._client_factory(codex_bin=self._codex_bin, codex_home=self._codex_home)
+            grounding = grounding_client_kwargs(self._grounding_key, self._codex_home)
+            self._client = self._client_factory(codex_bin=self._codex_bin, codex_home=self._codex_home,
+                                                **grounding)
         self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version())
         # Permissions are NOT sent on thread/start: codex gates ``thread/start.permissions``
         # behind experimentalApi + a matching ``[permissions]`` table in ~/.codex/config.toml.

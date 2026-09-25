@@ -1765,10 +1765,18 @@ def create_job(
         provider=f["provider"], model=f["model"], base_url=f["base_url"], no_agent=f["no_agent"])
     next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, name, schedule, "")
 
+    try:
+        from agent.recipient_grounding import words_for_new_task
+        grounding_words = words_for_new_task(prompt_text)
+    except Exception:
+        grounding_words = []
     job = {
         "id": job_id,
         "name": name,
         "prompt": prompt_text,
+        # Who asked for this job, in their own words — the only words that may
+        # name a recipient when it runs (agent/recipient_grounding.py).
+        "grounding_words": grounding_words,
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,
         "model": f["model"],
@@ -1983,6 +1991,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if "light_context" in updates:
             updates["light_context"] = bool(updates["light_context"])
         previous_inference_axes = _normalized_inference_axes(job)
+        # Who asked is never an editable field; a new prompt is grounded by the
+        # words of whoever changed it (agent/recipient_grounding.py).
+        updates.pop("grounding_words", None)
+        if "prompt" in updates:
+            try:
+                from agent.recipient_grounding import words_for_new_task
+                updates["grounding_words"] = words_for_new_task(updates.get("prompt"))
+            except Exception:
+                updates["grounding_words"] = []
         updated = _apply_skill_fields({**job, **updates})
         if "light_context" in updated and not updated["light_context"]:
             updated.pop("light_context", None)

@@ -2286,6 +2286,12 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
+        # Recipient grounding (agent/recipient_grounding.py): the job's prompt —
+        # written by a model, carrying skills and context_from — can refuse a
+        # recipient but never name one. Only the words of the person who asked
+        # for the job, recorded when it was created, can.
+        agent._grounding_override = {"person": list(job.get("grounding_words") or []),
+                                     "model": [prompt]}
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(
