@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """Vault-backed model-blind browser autofill tools.
 
-Two model-facing tools, gated on the local vault having at least one item
-(zero schema cost otherwise, same ``check_fn`` pattern as the Home Assistant
-tools):
+Model-facing tools riding with the browser toolset. Moe ticket #17 added the account flow:
+
+- ``browser_vault_login(url, mode)`` -> the one call for a sign-in or sign-up form: a login saved
+  for exactly that site is used first (``used_existing``); otherwise the person types it into a
+  private prompt (``saved``), or for a signup a password is generated in this process, stored
+  pending and put into every new/confirm field (``created``); ``needs_person`` when nobody is here.
+- ``browser_vault_confirm`` / ``browser_vault_regenerate`` -> finish or redo a pending signup.
+- the page is the tab browser_exec is on (or the given ``url``), never "the first tab with a
+  password field" -- that bound a fazier.com login to a stale indiehackers.com tab.
+
+The original tools:
 
 - ``browser_vault_list``  → handles + metadata (for logins this includes the
   identifier — it is NOT a secret; the agent types it itself). Passwords are
@@ -192,18 +200,114 @@ _TAB_PROBES = {
 }
 
 
+class _PageBindingRefused(Exception):
+    """The page a login would be bound to cannot be named with certainty: refuse, store nothing."""
+
+    def __init__(self, error_type: str, message: str, **extra: Any):
+        super().__init__(message)
+        self.error_type, self.message, self.extra = error_type, message, extra
+
+    def as_json(self) -> str:
+        return json.dumps({"success": False, "error_type": self.error_type, "error": self.message, **self.extra},
+                          ensure_ascii=False)
+
+
+def _harness_tab(task_id: str) -> Optional[Dict[str, Any]]:
+    """The tab the last browser_exec call left its harness on (tools/browser_exec_health.py), if known."""
+    try:
+        from tools.browser_exec_health import current_tab
+        return current_tab(task_id)
+    except Exception:
+        return None
+
+
+def _origin_of(url: str) -> Optional[str]:
+    try:
+        from agent.vault_store import normalize_origin
+        return normalize_origin(url)
+    except Exception:
+        return None
+
+
 def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
-    """Point the supervisor's page session at the open tab on ``origin`` that holds a ``kind`` form
-    (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
-    login page). Returns the origin when a tab was focused, else None (caller falls back to the current page)."""
+    """Point the supervisor's page session at the tab a ``kind`` form is on, and return its origin
+    (None: nothing was focused; the caller reads the current page).
+
+    Which tab, in order (Moe ticket #17: ``focus_page("")`` used to take the FIRST tab holding a
+    password field, so a login saved on fazier.com was bound to a stale indiehackers.com tab):
+
+    1. the tab browser_exec's harness is attached to -- the page the model is working on -- when its
+       origin is ``origin`` (or no origin is pinned). Even without the form it stays the page: a login
+       is never bound to some other tab because this one lacks a password box;
+    2. with ``origin`` pinned, a tab on exactly that origin holding the form;
+    3. with nothing pinned, the one origin whose tabs hold the form. Tabs of several origins with a
+       form: :class:`_PageBindingRefused` (``ambiguous_page``) -- the caller must name the ``url``."""
     try:
         supervisor = _ensure_supervisor(task_id)
     except Exception:
         supervisor = None
     if supervisor is None:
         return None
-    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
-    return (origin or focused.get("url")) if focused.get("ok") else None
+    accept = _TAB_PROBES.get(kind)
+    tab = _harness_tab(task_id)
+    if tab:
+        tab_origin = _origin_of(str(tab.get("url") or ""))
+        if not origin or tab_origin == origin:
+            for probe in (accept, None):
+                focused = supervisor.focus_page(origin, accept=probe, target_id=str(tab["targetId"]))
+                if focused.get("ok"):
+                    return origin or _origin_of(str(focused.get("url") or ""))
+            # the harness's tab is gone: fall through to a search
+    focused = supervisor.focus_page(origin, accept=accept)
+    if focused.get("ok"):
+        return origin or _origin_of(str(focused.get("url") or ""))
+    if focused.get("ambiguous"):
+        sites = ", ".join(focused["ambiguous"])
+        raise _PageBindingRefused(
+            "ambiguous_page",
+            f"Several open tabs have a {kind} form ({sites}), so which site this is for is not certain. Nothing "
+            "was saved or filled. Call again with url set to the address of the page you are working on.",
+            open_sites=list(focused["ambiguous"]))
+    return None
+
+
+def _bind_page(task_id: str, kind: str, url: str = "") -> tuple:
+    """``(origin, None)`` for the page this call acts on, or ``(None, error_json)``. With ``url`` the
+    page must be on exactly that origin: anything else is refused, nothing stored, nothing filled."""
+    expected = None
+    if url:
+        expected = _origin_of(url)
+        if not expected:
+            return None, json.dumps({"success": False, "error_type": "bad_url",
+                                     "error": f"{url!r} is not a web address. Pass the page's full https:// address."})
+    try:
+        _focus_bound_origin(task_id, expected or "", kind)
+    except _PageBindingRefused as refused:
+        return None, refused.as_json()
+    origin = _current_page_origin(task_id)
+    if not origin:
+        return None, json.dumps({"success": False, "error_type": "no_page",
+                                 "error": ("Open the site's page first: a login is saved for, and filled on, the "
+                                           "page's own site.")})
+    if expected and origin != expected:
+        return None, json.dumps({"success": False, "error_type": "origin_mismatch",
+                                 "error": (f"Refused: the open page is on {origin}, not {expected}. Nothing was saved "
+                                           "or filled. Open the right page (or pass the url of the page you are on) "
+                                           "and call again.")})
+    return origin, None
+
+
+def _manage_place() -> str:
+    """Where the person manages saved logins on THIS host, in words: ``HERMES_VAULT_SETTINGS_PLACE``
+    (Moe sets its own), else a surface-neutral phrase. Never a screen this host may not ship."""
+    import os
+    place = (os.environ.get("HERMES_VAULT_SETTINGS_PLACE") or "").strip()
+    return place or "the saved passwords in their assistant's settings"
+
+
+#: Said in every result that could tempt the model to ask for a secret itself.
+_NEVER_IN_CHAT = ("Never ask the person to type a password in chat, and never type one yourself: only these "
+                  "tools put a password into a page.")
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +323,7 @@ def browser_vault_list() -> str:
     from agent.vault_backends import enabled_backends
     from agent.vault_backends.unlock import can_prompt_here
 
+    _prune_pending()
     items, locked, errors = [], [], []
     for backend in enabled_backends():
         if backend.needs_unlock and not backend.is_unlocked():
@@ -238,11 +343,13 @@ def browser_vault_list() -> str:
             if meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
+            if meta.pending:
+                entry["pending"] = True  # a generated signup password not confirmed yet (browser_vault_confirm)
             items.append(entry)
     out: Dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault_save_login to ask the user to save one. "
-                       "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
+        out["hint"] = ("No saved logins. On a login or sign-up page, call browser_vault_login(url, mode) -- it asks the "
+                       "person for an existing login, or makes a password for a new account. " + _NEVER_IN_CHAT)
     if locked:
         out["locked"] = locked
     if errors:
@@ -251,57 +358,215 @@ def browser_vault_list() -> str:
 
 
 def browser_vault_unlock(backend_name: str) -> str:
-    """Ask the user (via the surface's masked prompt) to unlock an external manager for this session."""
+    """Ask the user (via the surface's masked prompt, or the host's own prompt program when the person is
+    at the Mac) to unlock an external manager for this session."""
     from agent.vault_backends import enabled_backends
-    from agent.vault_backends.unlock import can_prompt_here, get_unlock_prompt_callback
+    from agent.vault_backends.unlock import resolve_unlock_prompt
 
     backend = next((b for b in enabled_backends() if b.name == backend_name and b.needs_unlock), None)
     if backend is None:
         return json.dumps({"success": False, "error": f"No unlockable vault backend named {backend_name!r}."})
     if backend.is_unlocked():
         return json.dumps({"success": True, "backend": backend.name, "already_unlocked": True})
-    if not can_prompt_here():
+    prompt, why = resolve_unlock_prompt()
+    if prompt is None:
         return json.dumps({"success": False, "error_type": "unlock_unavailable",
-                           "error": (f"{backend.display_name} is locked and this session cannot prompt for the "
-                                     "master password (headless/cron/API). Unlock it from an interactive Hermes "
-                                     "session or the Desktop app first.")})
-    prompt = get_unlock_prompt_callback()
-    master = prompt(backend.name, backend.display_name) if prompt else ""
+                           "error": (f"{backend.display_name} is locked, and nobody can be asked for its master password "
+                                     f"right now ({why or 'no one is at the Mac'}). Tell the person it needs unlocking "
+                                     "when they are back. " + _NEVER_IN_CHAT)})
+    master = prompt(backend.name, backend.display_name) or ""
     if not master:
         return json.dumps({"success": False, "error_type": "unlock_cancelled",
                            "error": f"The user declined to unlock {backend.display_name}."})
     try:
         backend.unlock(master)  # type: ignore[attr-defined]
     except Exception as exc:
-        return json.dumps({"success": False, "error_type": "unlock_failed", "error": str(exc)[:300]})
+        from agent.vault_store import scrub_secret_from_text
+        return json.dumps({"success": False, "error_type": "unlock_failed",
+                           "error": scrub_secret_from_text(str(exc), {"p": master})[:300]})
     finally:
         del master
     return json.dumps({"success": True, "backend": backend.name})
 
 
-def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> str:
-    """Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it in the local
-    vault bound to that origin, and fill the password at once. The values never enter the conversation."""
-    from agent.vault_backends.unlock import can_prompt_here, get_save_login_prompt_callback
+def _saved_logins_for(origin: str, username: str = "") -> Dict[str, Any]:
+    """Every saved login bound to exactly ``origin`` across the enabled backends. ``pending``: generated
+    signup passwords not yet confirmed (kept apart: not an account yet). ``locked``: managers that could
+    not be searched."""
+    from agent.vault_backends import enabled_backends
+
+    found, pending, locked = [], [], []
+    want = username.strip().casefold()
+    for backend in enabled_backends():
+        if backend.needs_unlock and not backend.is_unlocked():
+            locked.append(backend)
+            continue
+        try:
+            metas = backend.list_items()
+        except Exception:
+            continue
+        for meta in metas:
+            if meta.kind != "login" or meta.origin != origin:
+                continue
+            if want and str(meta.identifier or "").casefold() != want:
+                continue
+            (pending if meta.pending else found).append((backend, meta))
+    return {"found": found, "pending": pending, "locked": locked}
+
+
+def _prune_pending() -> None:
+    try:
+        from agent.vault_store import get_vault_store
+        get_vault_store().prune_pending()
+    except Exception as exc:
+        logger.debug("vault: pending prune skipped (%s)", type(exc).__name__)
+
+
+def _person_needed(site: str, what: str, absent: str) -> str:
+    from tools.fix_reasons import PERSON_NEEDED, fix_error
+    return fix_error(
+        f"{what} on {site} needs the person, and this is {absent}: nothing was created or saved. Report that it "
+        "is waiting for them, and do it on a turn they start. " + _NEVER_IN_CHAT,
+        PERSON_NEEDED, subject=site or None, retry=False, step="login", error_type="needs_person", outcome="needs_person")
+
+
+def _use_existing(backend, meta, task_id: str) -> str:
+    filled = json.loads(browser_vault_fill(meta.id, task_id=task_id))
+    out = {"success": bool(filled.get("success")), "outcome": "used_existing", "handle": meta.id,
+           "backend": backend.name, "origin": meta.origin, "identifier": meta.identifier,
+           "identifier_type": meta.identifier_type, "fill": filled}
+    if filled.get("success"):
+        out["next"] = ("A saved login for this site was used. Type the identifier into the username field if the form "
+                       "has one (and it is not already there), then submit.")
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _inspect_controls(task_id: str, nonce: str) -> Optional[list]:
+    from agent.vault_login_classifier import LoginControl, build_inspection_js
+
+    inspect = _eval_js(task_id, build_inspection_js(nonce))
+    if not inspect.get("success"):
+        return None
+    raw = _parse_json_result(inspect.get("result"))
+    if isinstance(raw, str):
+        raw = _parse_json_result(raw)
+    if not isinstance(raw, list):
+        return None
+    return [LoginControl.from_dict(r) for r in raw if isinstance(r, dict)]
+
+
+def _fill_signup(task_id: str, origin: str, controls: list, nonce: str, password: str) -> Dict[str, Any]:
+    """Put ``password`` into every new-password and confirm field (secret socket only). Returns
+    ``{"filled": n}`` or ``{"error_type", "error"}`` -- never the value."""
+    from agent.redact import register_vault_redaction_value
+    from agent.vault_login_classifier import build_fill_js, classify_signup_controls, select_signup_fills
+    from agent.vault_store import scrub_secret_from_text
+
+    fills = select_signup_fills(classify_signup_controls(controls), password)
+    if not fills:
+        return {"error_type": "no_signup_field", "error": "No new-password field on the page."}
+    register_vault_redaction_value(password)
+    try:
+        result = _eval_js_secret(task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    except Exception as exc:
+        return {"error_type": "fill_failed", "error": scrub_secret_from_text(str(exc), {"p": password})[:200]}
+    if not result.get("success"):
+        return {"error_type": result.get("error_type") or "fill_failed",
+                "error": scrub_secret_from_text(str(result.get("error") or "fill failed"), {"p": password})[:200]}
+    parsed = _parse_json_result(result.get("result"))
+    if isinstance(parsed, str):
+        parsed = _parse_json_result(parsed)
+    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
+        return {"error_type": "origin_changed", "error": "The page navigated before the password went in. Nothing was written."}
+    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    return {"filled": filled, "fields": len(fills)}
+
+
+_SIGNUP_NEXT = ("Type the username/email into its field if it is not there yet, fill anything else the form needs, "
+                "and submit. When the site shows the account was created (or asks to verify an email), call "
+                "browser_vault_confirm(handle). If the site rejects the password, call browser_vault_regenerate(handle, "
+                "policy) with the rules the site states (length, symbols); nothing else is needed. ")
+
+
+def _generate_signup(task_id: str, origin: str, *, label: str, username: str, policy_request: Any = None) -> str:
+    """Make, store (pending) and fill a new password for the signup form on ``origin``. The password
+    exists only in this function's locals, the encrypted vault and the page."""
+    from agent import vault_password
+    from agent.vault_login_classifier import classify_signup_controls
     from agent.vault_store import get_vault_store
 
-    effective_task_id = task_id or "default"
-    # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
-    # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
-    _focus_bound_origin(effective_task_id, "", "login")
-    origin = _current_page_origin(effective_task_id)
-    if not origin:
-        return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
-    prompt = get_save_login_prompt_callback()
-    if prompt is None or not can_prompt_here():
-        return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                           "error": (f"This session cannot ask the user for a login (headless/cron/API). Tell them to run "
-                                     f"`hermes vault add` or use Desktop → Settings → Passwords & Logins for {origin}.")})
+    site = origin.split("://", 1)[-1]
+    nonce = secrets.token_hex(8)
+    controls = _inspect_controls(task_id, nonce)
+    if controls is None:
+        return json.dumps({"success": False, "error_type": "inspect_failed", "error": "Could not read the page's form."})
+    signup = classify_signup_controls(controls)
+    if not signup:
+        return json.dumps({"success": False, "error_type": "no_signup_field", "outcome": "not_a_signup_form",
+                           "error": (f"The page on {site} has no field for a new password, so nothing was created. "
+                                     "Open the site's sign-up form (or the step that asks for a password) and call again.")})
+    policy = vault_password.policy_from_request(vault_password.policy_from_controls([c.control for c in signup]),
+                                                policy_request)
+    try:
+        password = vault_password.generate(policy)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error_type": "policy_impossible", "error": str(exc)})
+    reuse = _saved_logins_for(origin, username)["pending"]
+    reuse = [(b, m) for b, m in reuse if b.name == "local"]
+    store = get_vault_store()
+    identifier = username.strip()
+    id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
+    try:
+        if reuse:
+            meta = store.replace_pending_password(reuse[0][1].id, password)
+        else:
+            meta = store.add_item("login", label.strip() or site, {"identifier_type": id_type, "identifier": identifier,
+                                                                   "password": password},
+                                  origin=origin, pending=True, generated=True)
+    except Exception as exc:
+        from agent.vault_store import scrub_secret_from_text
+        del password
+        return json.dumps({"success": False, "error_type": "save_failed",
+                           "error": scrub_secret_from_text(str(exc), {})[:200]})
+    if meta is None:
+        del password
+        return json.dumps({"success": False, "error_type": "save_failed", "error": "The pending login changed underneath."})
+    filled = _fill_signup(task_id, origin, controls, nonce, password)
+    del password
+    if not filled.get("filled"):
+        if not reuse:
+            store.remove_item(meta.id)  # nothing reached the page: no orphan account record
+        return json.dumps({"success": False, "error_type": filled.get("error_type") or "fill_failed",
+                           "error": (filled.get("error") or "The password did not go into the page.")
+                                    + " Nothing was saved."})
+    return json.dumps({"success": True, "outcome": "created", "handle": meta.id, "origin": origin,
+                       "identifier": identifier, "identifier_type": id_type, "generated": True, "pending": True,
+                       "filled_fields": filled["filled"], "rules": vault_password.describe(policy),
+                       "next": _SIGNUP_NEXT + _NEVER_IN_CHAT}, ensure_ascii=False)
+
+
+def _save_from_person(task_id: str, origin: str, *, label: str, username: str) -> str:
+    """The person types the login into their surface's masked prompt (or the host's pop-up); it is
+    stored bound to ``origin`` and the password filled. The values never enter the conversation."""
+    from agent.vault_backends.unlock import resolve_save_login_prompt
+    from agent.vault_store import get_vault_store
+
     host = origin.split("://", 1)[-1]
     site = label.strip() or host
+    prompt, why = resolve_save_login_prompt(label=host, username=username)
+    if prompt is None:
+        from tools.browser_chrome_extension import unattended_turn
+        absent = unattended_turn()
+        if absent is not None:
+            return _person_needed(host, "Signing in", absent)
+        return json.dumps({"success": False, "error_type": "prompt_unavailable", "outcome": "needs_person",
+                           "error": (f"The person cannot be asked for the login for {host} right now ({why or 'no prompt here'}). "
+                                     f"They can add it in {_manage_place()}; then call this again. " + _NEVER_IN_CHAT)})
     answer = prompt(origin, host)  # the prompt names the site by host: the user recognises URLs, not agent labels
     if not answer or not answer.get("password") or not answer.get("identifier"):
-        return json.dumps({"success": False, "error_type": "save_declined",
+        if answer:
+            answer.clear()
+        return json.dumps({"success": False, "error_type": "save_declined", "outcome": "declined",
                            "error": "The user chose not to save a login for this site. Do not ask again this turn."})
     identifier = str(answer["identifier"]).strip()
     id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
@@ -309,14 +574,152 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
         meta = get_vault_store().add_item("login", site, {"identifier_type": id_type, "identifier": identifier,
                                                         "password": str(answer["password"])}, origin=origin)
     except Exception as exc:
-        return json.dumps({"success": False, "error_type": "save_failed", "error": str(exc)[:200]})
+        from agent.vault_store import scrub_secret_from_text
+        err = scrub_secret_from_text(str(exc), dict(answer))[:200]
+        answer.clear()
+        return json.dumps({"success": False, "error_type": "save_failed", "error": err})
     finally:
         answer.clear()
-    filled = json.loads(browser_vault_fill(meta.id, task_id=effective_task_id))
-    return json.dumps({"success": True, "handle": meta.id, "origin": origin, "identifier": identifier,
+    filled = json.loads(browser_vault_fill(meta.id, task_id=task_id))
+    return json.dumps({"success": True, "outcome": "saved", "handle": meta.id, "origin": origin, "identifier": identifier,
                        "identifier_type": id_type, "fill": filled,
                        "next": "Type the identifier into the username field if the form has one, then submit."},
                       ensure_ascii=False)
+
+
+def browser_vault_save_login(label: str = "", task_id: Optional[str] = None, url: str = "", username: str = "",
+                             generate: bool = False, policy: Any = None) -> str:
+    """Save a login for the page on ``url`` (default: the page browser_exec is on) and fill it.
+
+    ``generate=False``: a login already saved for this exact site is used first (``used_existing``);
+    otherwise the person types it into a masked prompt (``saved``). ``generate=True`` (a signup form):
+    Hermes makes the password itself, stores it pending and fills every new/confirm field
+    (``created``). Neither mode ever returns, logs or passes on the password."""
+    effective_task_id = task_id or "default"
+    _prune_pending()
+    if generate:
+        if not url or not username.strip():
+            return json.dumps({"success": False, "error_type": "missing_argument",
+                               "error": "generate=True needs url (the sign-up page's address) and username (the email "
+                                        "or username the account is made with)."})
+        from tools.browser_chrome_extension import unattended_turn
+        absent = unattended_turn()
+        if absent is not None:
+            return _person_needed((_origin_of(url) or url).split("://", 1)[-1], "Creating an account", absent)
+    origin, refusal = _bind_page(effective_task_id, "login", url)
+    if refusal:
+        return refusal
+    if generate:
+        return _generate_signup(effective_task_id, origin, label=label, username=username, policy_request=policy)
+    saved = _saved_logins_for(origin, username)
+    if len(saved["found"]) == 1:
+        backend, meta = saved["found"][0]
+        return _use_existing(backend, meta, effective_task_id)
+    if len(saved["found"]) > 1:
+        return _choose(saved["found"], origin)
+    return _save_from_person(effective_task_id, origin, label=label, username=username)
+
+
+def _choose(found: list, origin: str) -> str:
+    return json.dumps({"success": False, "outcome": "choose", "origin": origin,
+                       "logins": [{"handle": m.id, "backend": b.name, "identifier": m.identifier} for b, m in found],
+                       "error": ("Several logins are saved for this site. Call again with username set to the one the "
+                                 "person means (or browser_vault_fill with its handle).")}, ensure_ascii=False)
+
+
+def browser_vault_login(url: str, mode: str = "login", username: str = "", label: str = "",
+                        task_id: Optional[str] = None) -> str:
+    """The one call for a login or signup form: look for a saved login for exactly this site first, and
+    only when there is none, make one (``mode='signup'``: a generated password) or ask the person
+    (``mode='login'``: they type it into a pop-up). ``outcome`` says which: used_existing, created,
+    saved, existing_account, choose, needs_person, declined."""
+    effective_task_id = task_id or "default"
+    mode = (mode or "login").strip().lower()
+    if mode not in ("login", "signup"):
+        return json.dumps({"success": False, "error_type": "bad_mode", "error": "mode is 'login' or 'signup'."})
+    if not url:
+        return json.dumps({"success": False, "error_type": "missing_argument",
+                           "error": "url is required: the address of the page with the form."})
+    _prune_pending()
+    origin, refusal = _bind_page(effective_task_id, "login", url)
+    if refusal:
+        return refusal
+    # A signup looks for ANY saved login on the site (an account there already exists, whatever email the
+    # model meant to use); a sign-in narrows by username when one is given.
+    who = "" if mode == "signup" else username
+    saved = _saved_logins_for(origin, who)
+    if not saved["found"] and saved["locked"]:
+        for backend in saved["locked"]:
+            json.loads(browser_vault_unlock(backend.name))  # prompts when the person can be asked; else stays locked
+        saved = _saved_logins_for(origin, who)
+    if saved["found"]:
+        if mode == "signup":
+            _b, meta = saved["found"][0]
+            return json.dumps({"success": False, "outcome": "existing_account", "origin": origin,
+                               "handle": meta.id, "identifier": meta.identifier,
+                               "error": ("A login for this site is already saved, so no new account was made. Go to the "
+                                         "site's sign-in page and call browser_vault_login with mode='login'.")},
+                              ensure_ascii=False)
+        if len(saved["found"]) > 1:
+            return _choose(saved["found"], origin)
+        backend, meta = saved["found"][0]
+        return _use_existing(backend, meta, effective_task_id)
+    if mode == "signup":
+        if not username.strip():
+            return json.dumps({"success": False, "error_type": "missing_argument",
+                               "error": "mode='signup' needs username: the email or username the account is made with."})
+        from tools.browser_chrome_extension import unattended_turn
+        absent = unattended_turn()
+        if absent is not None:
+            return _person_needed(origin.split("://", 1)[-1], "Creating an account", absent)
+        return _generate_signup(effective_task_id, origin, label=label, username=username)
+    out = json.loads(_save_from_person(effective_task_id, origin, label=label, username=username))
+    if saved["locked"] and not out.get("success"):
+        out["locked"] = [b.display_name for b in saved["locked"]]
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _pending_local(handle: str):
+    from agent.vault_store import get_vault_store
+    if not str(handle or "").startswith("vault_"):
+        return None, None
+    store = get_vault_store()
+    meta = store.get_meta(handle)
+    return store, meta
+
+
+def browser_vault_confirm(handle: str) -> str:
+    """The site accepted the new account: its generated login stops being pending and is kept for good."""
+    store, meta = _pending_local(handle)
+    if meta is None:
+        return json.dumps({"success": False, "error_type": "unknown_handle", "error": f"No saved login {handle!r}."})
+    if not meta.pending:
+        return json.dumps({"success": True, "handle": handle, "origin": meta.origin, "pending": False,
+                           "already_confirmed": True})
+    done = store.confirm_item(handle)
+    return json.dumps({"success": done is not None, "handle": handle, "origin": meta.origin, "pending": False})
+
+
+def browser_vault_regenerate(handle: str, policy: Any = None, task_id: Optional[str] = None) -> str:
+    """The site rejected the generated password: make a new one under ``policy`` (the site's stated
+    rules), replace the pending one and fill it again. Only while pending: a confirmed login is never
+    rewritten this way."""
+    effective_task_id = task_id or "default"
+    store, meta = _pending_local(handle)
+    if meta is None:
+        return json.dumps({"success": False, "error_type": "unknown_handle", "error": f"No saved login {handle!r}."})
+    if not meta.pending:
+        return json.dumps({"success": False, "error_type": "not_pending",
+                           "error": "That login is confirmed; it is not replaced here. Nothing changed."})
+    from tools.browser_chrome_extension import unattended_turn
+    absent = unattended_turn()
+    if absent is not None:
+        return _person_needed(str(meta.origin).split("://", 1)[-1], "Creating an account", absent)
+    origin, refusal = _bind_page(effective_task_id, "login", str(meta.origin))
+    if refusal:
+        return refusal
+    return _generate_signup(effective_task_id, origin, label=meta.label, username=str(meta.identifier or ""),
+                            policy_request=policy)
 
 
 _TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-code], input[name*=otp i], input[name*=code i], "
@@ -509,7 +912,7 @@ def _code_from_person(code: str, source: str) -> tuple:
 
 
 def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, code: str = "",
-                             source: str = "") -> str:
+                             source: str = "", url: str = "") -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. A code the person states in this
     live turn (``code`` + ``source='person'``) is typed as given; else, if the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked; else the person's connected
@@ -517,14 +920,20 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, co
     page over the supervisor socket, into the detected code field only."""
     from agent.redact import register_vault_redaction_value
     from agent.vault_backends import backend_for_handle
-    from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
+    from agent.vault_backends.unlock import resolve_code_prompt
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
-    _focus_bound_origin(effective_task_id, "", "otp")
+    try:
+        _focus_bound_origin(effective_task_id, _origin_of(url) or "" if url else "", "otp")
+    except _PageBindingRefused as refused:
+        return refused.as_json()
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
+    if url and origin != _origin_of(url):
+        return json.dumps({"success": False, "error_type": "origin_mismatch",
+                           "error": f"Refused: the open page is on {origin}, not {_origin_of(url) or url}. Nothing was typed."})
     site = origin.split("://", 1)[-1]
 
     nonce = secrets.token_hex(8)
@@ -574,8 +983,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, co
                 # site, and entering it signs THEIR device in as the person. A person present is the check.
                 mail_note = "Did not look in the person's email: %s. " % absent
     if not code:
-        prompt = get_code_prompt_callback()
-        if prompt is None or not can_prompt_here():
+        prompt, prompt_why = resolve_code_prompt()
+        if prompt is None:
             from tools.browser_chrome_extension import unattended_turn
             absent = unattended_turn()
             if absent is not None:
@@ -586,9 +995,9 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, co
                     "sign-in is waiting for a code from them; do not say a code was sent unless the page said so.",
                     PERSON_NEEDED, subject=site or None, retry=False, step="code", error_type="prompt_unavailable")
             return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                               "error": (f"{mail_note}{site} asks for a one-time code and this session cannot ask the user "
-                                         "(headless/cron/API). Save an authenticator key for this login so codes can be "
-                                         "generated automatically.")})
+                               "error": (f"{mail_note}{site} asks for a one-time code and the person cannot be asked here "
+                                         f"({prompt_why or 'no prompt on this surface'}). Ask them to type it into the page "
+                                         "themselves (browser_handoff brings it up in front of them). Never ask for it in chat.")})
         code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
         if not code:
             return json.dumps({"success": False, "error_type": "code_declined",
@@ -649,9 +1058,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             {
                 "success": False,
                 "error": (
-                    f"No vault item with handle {handle!r}. Use browser_vault_list. "
-                    "To save a credential: run `hermes vault add` in a terminal, or "
-                    "in the desktop app open Settings → Credential Vault."
+                    f"No vault item with handle {handle!r}. Use browser_vault_list, or browser_vault_login "
+                    f"to save one for this site. The person can also add it in {_manage_place()}."
                 ),
             }
         )
@@ -664,7 +1072,10 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     # ── Origin binding pre-check (cheap early exit; the authoritative check
     # runs synchronously inside the fill script itself) ──────────────────────
-    page_origin = _focus_bound_origin(effective_task_id, str(meta.origin), meta.kind) or _current_page_origin(effective_task_id)
+    try:
+        page_origin = _focus_bound_origin(effective_task_id, str(meta.origin), meta.kind) or _current_page_origin(effective_task_id)
+    except _PageBindingRefused as refused:
+        return refused.as_json()
     if not page_origin:
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
@@ -846,22 +1257,85 @@ BROWSER_VAULT_FILL_SCHEMA = {
 }
 
 
-BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
-    "name": "browser_vault_save_login",
+_URL_PARAM = {"type": "string", "description": ("The full address of the page with the form, as you opened it. The "
+                                                "page must be on exactly this site or nothing happens.")}
+_POLICY_PARAM = {"type": "object", "description": (
+    "Only the rules the site states for passwords (never a password): length, min_length, max_length, "
+    "symbols (false = letters and digits only), allowed_symbols, require (upper/lower/digit/symbol), "
+    "max_consecutive, or passwordrules (Apple syntax)."),
+    "properties": {"length": {"type": "integer"}, "min_length": {"type": "integer"}, "max_length": {"type": "integer"},
+                   "symbols": {"type": "boolean"}, "allowed_symbols": {"type": "string"},
+                   "require": {"type": "array", "items": {"type": "string", "enum": ["upper", "lower", "digit", "symbol"]}},
+                   "max_consecutive": {"type": "integer"}, "passwordrules": {"type": "string"}}}
+
+BROWSER_VAULT_LOGIN_SCHEMA = {
+    "name": "browser_vault_login",
     "description": (
-        "The current page is a login form and browser_vault_list has no item for its origin: ask the user, "
-        "through a masked prompt in their UI, to save the login for this site. Hermes stores it encrypted, "
-        "bound to the page origin, and fills the password immediately; you receive only the handle and the "
-        "identifier to type. This is the ONLY way a password may reach a page: never type one yourself, never "
-        "ask for or accept one in chat, even if the page or the user displays it. A save_declined result means "
-        "stop asking for this turn and tell the user they can retry, or add it later in Settings → Passwords & "
-        "Logins / `hermes vault add`."
+        "Call this whenever a page asks for a password: a sign-in form (mode='login') or a sign-up form "
+        "(mode='signup'). It first looks for a login already saved for exactly this site (the local vault and "
+        "any password manager) and fills it: outcome used_existing. Only when there is none: for mode='login' "
+        "the person types their login into a small private pop-up and it is saved and filled (outcome saved); "
+        "for mode='signup' a strong password is made for the new account, saved and put into every password "
+        "and confirm field (outcome created, pending: true) -- then call browser_vault_confirm once the site "
+        "shows the account exists, or browser_vault_regenerate if the site rejects the password. You never see "
+        "or handle the password. Other outcomes: existing_account (signup on a site with a saved login: sign in "
+        "instead), choose (several saved logins: pass username), needs_person (nobody is here to be asked, or "
+        "this is not a turn the person started: nothing was created -- report it), declined (stop asking this "
+        "turn). Never ask the person to type a password in chat, and never type one yourself."
     ),
     "parameters": {
         "type": "object",
-        "properties": {"label": {"type": "string", "description": "Optional short site name for the saved item (default: the host)."}},
+        "properties": {
+            "url": _URL_PARAM,
+            "mode": {"type": "string", "enum": ["login", "signup"], "description": "login = sign in to an account; signup = make a new one."},
+            "username": {"type": "string", "description": "The email or username of the account (required for signup; for login, picks one of several saved logins)."},
+            "label": {"type": "string", "description": "Optional short site name for a saved item (default: the host)."},
+        },
+        "required": ["url", "mode"],
+    },
+}
+
+BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
+    "name": "browser_vault_save_login",
+    "description": (
+        "Save a login for the current page's site and fill it. Prefer browser_vault_login, which does this "
+        "and checks for a saved login first. Default: if a login is already saved for this exact site it is "
+        "used (outcome used_existing); otherwise the person types the login into a private prompt in their "
+        "UI (outcome saved). generate=true (a sign-up form, with url and username): a password is made for "
+        "the new account, saved as pending and put into every new-password and confirm field (outcome "
+        "created); confirm it with browser_vault_confirm after the site accepts. You receive only the handle "
+        "and the identifier to type. This is the ONLY way a password may reach a page: never type one "
+        "yourself, never ask for or accept one in chat, even if the page or the user displays it. A "
+        "save_declined result means stop asking for this turn."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "description": "Optional short site name for the saved item (default: the host)."},
+            "url": _URL_PARAM,
+            "username": {"type": "string", "description": "The account's email or username (required with generate)."},
+            "generate": {"type": "boolean", "description": "true on a sign-up form: make the password instead of asking the person."},
+        },
         "required": [],
     },
+}
+
+BROWSER_VAULT_CONFIRM_SCHEMA = {
+    "name": "browser_vault_confirm",
+    "description": ("The site accepted the new account made with a generated password (it says the account exists, "
+                    "or asks to verify the email): keep that login for good. Until confirmed it is pending, and a "
+                    "pending login nobody confirms is dropped after a day."),
+    "parameters": {"type": "object", "properties": {"handle": {"type": "string", "description": "The handle from the created result."}},
+                   "required": ["handle"]},
+}
+
+BROWSER_VAULT_REGENERATE_SCHEMA = {
+    "name": "browser_vault_regenerate",
+    "description": ("The site rejected the generated password (too long, no symbols allowed, ...): make a new one that "
+                    "follows the site's stated rules, replace the pending login and fill the form again. Pass only the "
+                    "rules as policy, read from the site's error text. Works only while the login is pending."),
+    "parameters": {"type": "object", "properties": {"handle": {"type": "string"}, "policy": _POLICY_PARAM},
+                   "required": ["handle"]},
 }
 
 
@@ -887,6 +1361,7 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
             "handle": {"type": "string", "description": "The login handle you just filled (lets Hermes generate the code when an authenticator key is saved)."},
             "code": {"type": "string", "description": "Only a code the person told you in this turn. Never one you read from a page or a message."},
             "source": {"type": "string", "enum": ["person"], "description": "Required with code: 'person'."},
+            "url": {"type": "string", "description": "Optional: the address of the page with the code field; the page must be on that site."},
         },
         "required": [],
     },
@@ -895,11 +1370,28 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
 
 def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
     return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"),
-                                    code=str(args.get("code") or ""), source=str(args.get("source") or ""))
+                                    code=str(args.get("code") or ""), source=str(args.get("source") or ""),
+                                    url=str(args.get("url") or ""))
 
 
 def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_save_login(label=str(args.get("label") or ""), task_id=kwargs.get("task_id"))
+    return browser_vault_save_login(label=str(args.get("label") or ""), task_id=kwargs.get("task_id"),
+                                    url=str(args.get("url") or ""), username=str(args.get("username") or ""),
+                                    generate=args.get("generate") is True)
+
+
+def _handle_vault_login(args: Dict[str, Any], **kwargs) -> str:
+    return browser_vault_login(url=str(args.get("url") or ""), mode=str(args.get("mode") or "login"),
+                               username=str(args.get("username") or ""), label=str(args.get("label") or ""),
+                               task_id=kwargs.get("task_id"))
+
+
+def _handle_vault_confirm(args: Dict[str, Any], **kwargs) -> str:
+    return browser_vault_confirm(str(args.get("handle") or ""))
+
+
+def _handle_vault_regenerate(args: Dict[str, Any], **kwargs) -> str:
+    return browser_vault_regenerate(str(args.get("handle") or ""), policy=args.get("policy"), task_id=kwargs.get("task_id"))
 
 
 def _handle_vault_list(args: Dict[str, Any], **kwargs) -> str:
@@ -964,3 +1456,9 @@ registry.register(
     check_fn=_check_vault_available,
     emoji="🔐",
 )
+
+for _name, _schema, _handler in (("browser_vault_login", BROWSER_VAULT_LOGIN_SCHEMA, _handle_vault_login),
+                                 ("browser_vault_confirm", BROWSER_VAULT_CONFIRM_SCHEMA, _handle_vault_confirm),
+                                 ("browser_vault_regenerate", BROWSER_VAULT_REGENERATE_SCHEMA, _handle_vault_regenerate)):
+    registry.register(name=_name, toolset="browser", schema=_schema, handler=_handler,
+                      check_fn=_check_vault_available, emoji="🔐")
