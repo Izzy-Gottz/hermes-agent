@@ -17,6 +17,7 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.browser_tool_origin import origin as _bt
 from tools import browser_tool_cdp as _cdp
 from tools import browser_tool_cloud as _cloud
+from tools import browser_tool_fidelity as _fidelity
 from tools import browser_tool_install as _install
 from tools import browser_tool_lifecycle as _lifecycle
 from tools import browser_tool_lightpanda_fallback as _lp
@@ -525,6 +526,8 @@ def _spawn_and_collect(
                              command)
     else:
         _apply_chromium_sandbox_args(browser_env)
+        # After the sandbox bypass: it only sets AGENT_BROWSER_ARGS when nothing else has.
+        _fidelity.apply_launch_env(browser_env, session_info.get("fidelity_launch") or {})
 
     stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
     stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
@@ -549,6 +552,62 @@ def _spawn_and_collect(
         stderr = f.read()
     _unlink_command_output_files(stdout_path, stderr_path)
     return _interpret_browser_command_output(command, stdout, stderr, proc.returncode)
+
+
+def _is_signed_out_lane(session_info: Dict[str, Any], engine: str) -> bool:
+    """True for a session whose browser agent-browser launches itself (``--session``, no CDP url):
+    the signed-out lane on a Mac whose default browser is Safari, Firefox or Arc, the hybrid local
+    sidecar, and the cloud machine. Not Lightpanda, not Camofox, not a CDP/cloud/real-profile one."""
+    return (not session_info.get("cdp_url") and engine != "lightpanda" and not _bt._is_camofox_mode()
+            and bool((session_info.get("features") or {}).get("local"))
+            and not (session_info.get("features") or {}).get("lightpanda"))
+
+
+def _cdp_port(cdp_url: str) -> Optional[int]:
+    import re
+    m = re.match(r"^(?:ws|http)://(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)(?:/|$)", cdp_url or "")
+    return int(m.group(1)) if m else None
+
+
+def _ensure_signed_out_fidelity(task_id: str, session_info: Dict[str, Any], browser_cmd: str,
+                                backend_args: List[str], engine: str, timeout: int) -> None:
+    """Fidelity for a browser agent-browser launches (``tools.browser_tool_fidelity``): the launch
+    switches go into every command's env (:func:`_spawn_and_collect`), and a keeper puts the
+    engine's own ``userAgentMetadata`` on every target. The keeper needs the browser's port, so a
+    session's FIRST command launches the browser on its blank tab (``get cdp-url``) and starts the
+    keeper before that command runs: the first page the model opens is already covered. Later
+    commands only check the keeper (a status-file read), and re-resolve the port when the browser
+    it served is gone (agent-browser relaunched it). Never fails the command it precedes."""
+    launch = session_info.get("fidelity_launch")
+    if launch is None:
+        try:
+            launch = _fidelity.signed_out_launch(_bt._build_browser_env(), headless=not _cloud._is_headed_mode())
+        except Exception as e:
+            _bt.logger.warning("browser fidelity: launch settings unavailable (%s); launching without them", e)
+            launch = {}
+        session_info["fidelity_launch"] = launch
+    identity = launch.get("identity")
+    if not identity:
+        return
+    port = session_info.get("fidelity_port")
+    if port:
+        keeper = _fidelity.ensure_keeper(port, identity, lane=_fidelity.SIGNED_OUT_LANE)
+        if keeper is not None and keeper.state in ("serving", "starting"):
+            return  # "starting": still coming up on a loaded machine, not gone
+        _fidelity.stop_keeper(port)  # its browser is gone (or never answered): find the current one
+        session_info.pop("fidelity_port", None)
+    cmd = _agent_browser_argv(browser_cmd) + backend_args + ["--json", "get", "cdp-url"]
+    try:
+        res = _spawn_and_collect(task_id, session_info, cmd, "get", engine, timeout)
+    except Exception as e:
+        res = {"success": False, "error": str(e)}
+    port = _cdp_port(str(((res or {}).get("data") or {}).get("cdpUrl") or "")) if (res or {}).get("success") else None
+    if port is None:
+        _bt.logger.warning("browser fidelity: no debug port for session %s (%s); its brands are not applied",
+                           session_info.get("session_name"), (res or {}).get("error"))
+        return
+    session_info["fidelity_port"] = port
+    _fidelity.ensure_keeper(port, identity, lane=_fidelity.SIGNED_OUT_LANE)
 
 
 def _run_browser_command(
@@ -598,11 +657,23 @@ def _run_browser_command(
 
     cmd_parts = _agent_browser_argv(browser_cmd) + backend_args + ["--json", command] + args
 
+    signed_out = _is_signed_out_lane(session_info, engine)
+    if signed_out and command != "close":
+        try:
+            _ensure_signed_out_fidelity(task_id, session_info, browser_cmd, backend_args, engine, timeout)
+        except Exception as e:  # fidelity is never why a browser command fails
+            _bt.logger.warning("browser fidelity: not applied to session %s: %s", session_info.get("session_name"), e)
+
     try:
         result = _spawn_and_collect(task_id, session_info, cmd_parts, command, engine, timeout)
     except Exception as e:
         _bt.logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
+    if signed_out and command == "close" and session_info.get("fidelity_port"):
+        try:
+            _fidelity.stop_keeper(session_info.pop("fidelity_port"))
+        except Exception as e:
+            _bt.logger.debug("browser fidelity: keeper stop failed: %s", e)
 
     # Lightpanda automatic Chrome fallback — runs for ALL exit paths (timeout,
     # empty, non-JSON, nonzero rc, parsed).

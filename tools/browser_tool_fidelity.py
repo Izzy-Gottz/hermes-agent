@@ -30,9 +30,17 @@ own Mac, from their own home. This module makes the driven browser report exactl
   released by the client that set it), checked and restarted on every acquire, with a watchdog
   that drops a stalled keeper's connection so Chrome lets its targets run.
 
+The signed-out lane (and the cloud machine) gets the same, from :func:`signed_out_launch`: the
+browser agent-browser launches for itself when real-profile browsing is off or the default browser
+is not Chromium (Safari, Firefox, Arc). It claims the ENGINE's own identity, never a brand it is
+not: Chrome for Testing reports ``Chromium`` and GREASE only, and so does the claim. What changes is
+only what headless mode adds on top of the engine: the ``HeadlessChrome`` token, ``navigator.webdriver``,
+the 800x600 screen, and (once a UA switch is set) the blanked high-entropy hints the keeper restores.
+
 What it does NOT do, by design: no CAPTCHA solving, no proxy, no randomised or invented
 fingerprint, and no JavaScript patching of page globals. Every value is either the browser's own
-or the person's own browser's. ``browser.stealth_fidelity: false`` turns all of it off.
+or the person's own browser's (or, on a machine with no display, the display its operator
+declared in ``browser.virtual_display``). ``browser.stealth_fidelity: false`` turns all of it off.
 
 Why headless and not a hidden window (measured 2026-09-23, macOS 27, see the test notes in the
 commit): a headed Chrome for Testing takes focus from the person's app whenever a tab opens in
@@ -60,6 +68,8 @@ logger = logging.getLogger(__name__)
 
 # The macOS token every Chrome on a Mac sends since UA reduction (frozen, whatever the OS).
 _MAC_UA_PLATFORM = "Macintosh; Intel Mac OS X 10_15_7"
+# The Linux token every Chrome on Linux sends since UA reduction (frozen, whatever the CPU).
+_LINUX_UA_PLATFORM = "X11; Linux x86_64"
 
 # Brand each supported default browser declares in Sec-CH-UA (Chromium's embedder brand), and the
 # extra UA-string product token it adds after ``Safari/537.36`` (Edge only).
@@ -159,9 +169,16 @@ def brand_list(brand: Optional[str], major: int, version: str) -> List[Dict[str,
     return out
 
 
+def _on_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
 def _mac_platform_version() -> str:
-    parts = (platform.mac_ver()[0] or "").split(".")
-    parts = [p for p in parts if p.isdigit()] or ["0"]
+    """macOS ``27.0.0`` (measured: Chrome for Testing 154 reports ``27.0.0`` on this Mac). On Linux,
+    the kernel release's first three numbers, which is what Chromium's ``GetPlatformVersion`` returns
+    there (``base::SysInfo::OperatingSystemVersionNumbers``; from the source, not measured here)."""
+    raw = os.uname().release if _on_linux() else (platform.mac_ver()[0] or "")
+    parts = re.findall(r"\d+", raw)[:3] or ["0"]
     return ".".join((parts + ["0", "0"])[:3])
 
 
@@ -171,8 +188,8 @@ def _architecture() -> Tuple[str, str]:
 
 
 def user_agent(identity: Dict[str, Any]) -> str:
-    """The reduced UA string the person's browser sends on a Mac."""
-    ua = (f"Mozilla/5.0 ({_MAC_UA_PLATFORM}) AppleWebKit/537.36 (KHTML, like Gecko) "
+    """The reduced UA string the person's browser (or the engine) sends on a Mac, or on Linux."""
+    ua = (f"Mozilla/5.0 ({_LINUX_UA_PLATFORM if _on_linux() else _MAC_UA_PLATFORM}) AppleWebKit/537.36 (KHTML, like Gecko) "
           f"Chrome/{identity['major']}.0.0.0 Safari/537.36")
     if identity.get("ua_suffix"):
         ua += f" {identity['ua_suffix']}/{identity['major']}.0.0.0"
@@ -186,7 +203,7 @@ def user_agent_metadata(identity: Dict[str, Any]) -> Dict[str, Any]:
         "brands": brand_list(identity["brand"], identity["major"], str(identity["major"])),
         "fullVersionList": brand_list(identity["brand"], identity["major"], identity["full_version"]),
         "fullVersion": identity["full_version"],
-        "platform": "macOS",
+        "platform": "Linux" if _on_linux() else "macOS",
         "platformVersion": _mac_platform_version(),
         "architecture": arch,
         "bitness": bitness,
@@ -267,7 +284,8 @@ def launch_flags(identity: Optional[Dict[str, Any]], headless: bool,
         # Measured: {2940x1912 devicePixelRatio=2 workAreaTop=66 workAreaBottom=144 colorDepth=30}
         # reads back as screen 1470x956, availTop 33, availHeight 851, colorDepth 30.
         flags.append(f"--screen-info={{{px(display['width'])}x{px(display['height'])} devicePixelRatio={scale:g} "
-                     f"workAreaTop={px(display['top'])} workAreaBottom={px(display['bottom'])} colorDepth=30}}")
+                     f"workAreaTop={px(display['top'])} workAreaBottom={px(display['bottom'])} "
+                     f"colorDepth={int(display.get('depth', 30))}}}")
     return flags
 
 
@@ -276,6 +294,153 @@ def default_window_size(width: int, height: int) -> Tuple[int, int]:
     display, Chrome for Testing 153 opened 1440x853 (full width less a 15 px margin each side,
     height less the menu bar and Dock). The same margins apply on any display."""
     return max(800, width - 30), max(600, height - 103)
+
+
+# ---------------------------------------------------------------------------
+# The signed-out lane: the browser agent-browser launches for itself
+# ---------------------------------------------------------------------------
+
+_engine_versions: Dict[Tuple[str, float], Optional[str]] = {}
+
+
+def engine_version(binary: str) -> Optional[str]:
+    """Full version of the driven engine: its bundle's Info.plist on macOS (never by running it),
+    else ``<binary> --version`` (Linux builds carry no plist; cached per file and mtime)."""
+    version = installed_browser_version(binary)
+    if version or sys.platform == "darwin":
+        return version
+    try:
+        key = (binary, os.stat(binary).st_mtime)
+    except OSError:
+        return None
+    if key not in _engine_versions:
+        import subprocess
+        try:
+            out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=15,
+                                 stdin=subprocess.DEVNULL).stdout or ""
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.debug("fidelity: %s --version failed: %s", binary, e)
+            out = ""
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out)
+        _engine_versions[key] = m.group(1) if m else None
+    return _engine_versions[key]
+
+
+def engine_identity(binary: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The driven engine's own identity: no embedder brand (Chrome for Testing reports ``Chromium``
+    and GREASE only; measured on CfT 154: ``Not A(Brand;99, Chromium;154``), and its own version.
+    None when the version cannot be read. Nothing here is borrowed from another browser."""
+    version = engine_version(binary) if binary else None
+    if not version:
+        return None
+    return {"brand": None, "ua_suffix": None, "full_version": version, "major": int(version.split(".")[0])}
+
+
+def virtual_display() -> Optional[Dict[str, float]]:
+    """``browser.virtual_display`` (``"1920x1080"``, optionally ``"@2"`` for the scale): the display a
+    machine with no screen declares for its headless browser. One fixed value per machine, set by its
+    operator, never drawn at random. None when unset or malformed (Chrome's 800x600 stays)."""
+    def parse(v):
+        m = re.fullmatch(r"\s*(\d{3,5})\s*[xX]\s*(\d{3,5})\s*(?:@\s*([1-4](?:\.\d+)?))?\s*", str(v or ""))
+        if not m:
+            return None
+        return {"width": float(m.group(1)), "height": float(m.group(2)), "scale": float(m.group(3) or 1),
+                "top": 0.0, "bottom": 0.0, "depth": 24}
+    from tools.browser_tool_origin import origin_module
+    return origin_module()._browser_cfg("virtual_display", None, parse, "browser.virtual_display from config")
+
+
+def launch_display() -> Optional[Dict[str, float]]:
+    """The display a headless launch reports: a Mac's real main display, elsewhere the declared one."""
+    return main_display() if sys.platform == "darwin" else virtual_display()
+
+
+def launch_wrapper(binary: str, ua: str) -> Optional[str]:
+    """Path of a two-line ``sh`` script that runs ``binary`` with every argument agent-browser passes,
+    plus ``--user-agent=<ua>``. None off POSIX or when it cannot be written.
+
+    Why a script (measured 2026-09-25, agent-browser 0.37.1): agent-browser splits
+    ``AGENT_BROWSER_ARGS``, and its config file's ``args``, on commas, and every Chrome UA contains
+    one ("KHTML, like Gecko"). The UA arrived as two argv entries and Chrome exited with "Multiple
+    targets are not supported in headless mode". ``AGENT_BROWSER_USER_AGENT`` is no substitute: it
+    is a per-tab DevTools override WITHOUT ``userAgentMetadata``, and it blanked
+    ``navigator.userAgentData.brands`` (``""`` instead of ``Chromium;154``). The switch is also the
+    only thing that reaches shared and service workers (:func:`launch_flags`). ``exec`` keeps the
+    pid, so agent-browser still owns, watches and closes the browser exactly as before."""
+    if os.name != "posix" or not binary:
+        return None
+    import hashlib
+    import shlex
+    body = ("#!/bin/sh\n# Written by tools.browser_tool_fidelity: the driven browser, plus the UA switch "
+            "agent-browser cannot pass.\n"
+            f"exec {shlex.quote(binary)} \"$@\" {shlex.quote('--user-agent=' + ua)}\n")
+    import tempfile
+    from pathlib import Path
+    from hermes_constants import get_hermes_home
+    name = f"launch-{hashlib.sha256(body.encode()).hexdigest()[:16]}.sh"
+    # A home on a volume mounted noexec would make the browser fail to start at all, so such a
+    # folder is passed over: the next one, else no wrapper (the keeper still covers every page).
+    for folder in (get_hermes_home() / "browser-fidelity",
+                   Path(tempfile.gettempdir()) / f"hermes-browser-fidelity-{os.getuid()}"):
+        try:
+            folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if os.statvfs(folder).f_flag & getattr(os, "ST_NOEXEC", 0):
+                continue
+            path = folder / name
+            if not path.is_file() or path.read_text(encoding="utf-8") != body or not os.access(path, os.X_OK):
+                tmp = folder / f".{name}.{os.getpid()}.tmp"
+                tmp.write_text(body, encoding="utf-8")
+                os.chmod(tmp, 0o755)
+                os.replace(tmp, path)
+            return str(path)
+        except Exception as e:
+            logger.debug("fidelity: launch wrapper not written in %s: %s", folder, e)
+    return None
+
+
+def signed_out_launch(env: Dict[str, str], headless: bool) -> Dict[str, Any]:
+    """What an agent-browser launch on the signed-out lane needs, computed once per session:
+    ``{"args": [...], "executable": wrapper or None, "identity": dict or None}``; ``{}`` when
+    ``browser.stealth_fidelity`` is off.
+
+    * ``args``: ``AutomationControlled`` off, and headless, the display's ``--screen-info``. NOT
+      ``--window-size``: agent-browser drops its own 1280x720 window whenever the args carry one, and
+      the value cannot get through (a comma; ``1440x853`` is not parsed). Measured: either form read
+      back as a 756x556 window. So the window stays agent-browser's own.
+    * ``identity``: the ENGINE's (:func:`engine_identity`), for the UA switch and the keeper.
+      None when an operator set a UA of their own (``AGENT_BROWSER_USER_AGENT``, or ``--user-agent``
+      in the args): theirs is left alone, and the keeper would only fight it."""
+    if not fidelity_enabled():
+        return {}
+    display = launch_display() if headless else None
+    args = [f for f in launch_flags(None, headless, display) if not f.startswith("--window-size=")]
+    operator_args = f"{env.get('AGENT_BROWSER_ARGS', '')},{env.get('AGENT_BROWSER_CHROME_FLAGS', '')}"
+    if env.get("AGENT_BROWSER_USER_AGENT", "").strip() or "--user-agent" in operator_args:
+        return {"args": args, "executable": None, "identity": None}
+    binary = env.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()
+    if not os.path.isfile(binary):
+        from tools.browser_tool_real_profile import driven_browser_executable
+        binary = driven_browser_executable() or ""
+    identity = engine_identity(binary)
+    wrapper = launch_wrapper(binary, user_agent(identity)) if identity else None
+    return {"args": args, "executable": wrapper, "identity": identity}
+
+
+def apply_launch_env(env: Dict[str, str], launch: Dict[str, Any]) -> None:
+    """Merge :func:`signed_out_launch`'s result into one agent-browser command's environment. The
+    operator's own args (and the sandbox bypass) are kept and come first; a switch they already set
+    is not repeated. Every command gets it, because any command may be the one that (re)launches."""
+    if not launch:
+        return
+    key = "AGENT_BROWSER_CHROME_FLAGS" if ("AGENT_BROWSER_CHROME_FLAGS" in env and "AGENT_BROWSER_ARGS" not in env) \
+        else "AGENT_BROWSER_ARGS"
+    have = [a.strip() for a in env.get(key, "").split(",") if a.strip()]
+    names = {a.split("=", 1)[0] for a in have}
+    add = [a for a in launch.get("args") or [] if a.split("=", 1)[0] not in names]
+    if add:
+        env[key] = ",".join(have + add)
+    if launch.get("executable"):
+        env["AGENT_BROWSER_EXECUTABLE_PATH"] = launch["executable"]
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +925,13 @@ def _keeper_main(argv: List[str]) -> int:
     return 0
 
 
+# Which browser a keeper serves. The real-profile browser is one per home and is stopped with
+# :func:`stop_keepers`; a signed-out browser is one per agent-browser session, launched and closed
+# by agent-browser, so its keeper is stopped with the session (:func:`stop_keeper`) or, once its
+# browser is gone, forgotten by the monitor.
+REAL_PROFILE_LANE = "real_profile"
+SIGNED_OUT_LANE = "signed_out"
+
 KEEPER_LOG_NAME = "browser-fidelity-keeper.log"
 
 
@@ -786,10 +958,12 @@ class KeeperProcess:
     """The gateway's handle on one keeper process. The same surface the tests and callers use:
     ``port``, ``ua``, ``state``, ``applied``, ``error``, ``healthy()``, ``stop()``, ``join()``."""
 
-    def __init__(self, port: int, identity: Dict[str, Any]):
+    lane = REAL_PROFILE_LANE
+
+    def __init__(self, port: int, identity: Dict[str, Any], lane: str = REAL_PROFILE_LANE):
         import subprocess
         import tempfile
-        self.port, self.identity = port, identity
+        self.port, self.identity, self.lane = port, identity, lane
         self.ua = user_agent(identity)
         fd, self.status_path = tempfile.mkstemp(prefix=f"hermes-fidelity-{port}-", suffix=".json")
         os.close(fd)
@@ -884,7 +1058,8 @@ class KeeperProcess:
 
     def describe(self) -> Dict[str, Any]:
         snap = self._snap()
-        d = {"port": self.port, "state": self.state, "pid": self.proc.pid, "applied": snap.get("applied") or {},
+        d = {"port": self.port, "lane": self.lane, "state": self.state, "pid": self.proc.pid,
+             "applied": snap.get("applied") or {},
              "error": self.error, "claims": snap.get("claims") or f"{self.identity.get('brand') or 'Chromium'} {self.identity['full_version']}",
              # The keeper process's own heartbeat and counters, so a reader can tell live from frozen.
              "beat": snap.get("beat") or 0, "heartbeat_age": round(self.heartbeat_age(), 1),
@@ -900,8 +1075,8 @@ _keepers_lock = threading.Lock()
 _monitor: Optional[threading.Thread] = None
 
 
-def _start_keeper(port: int, identity: Dict[str, Any]) -> "KeeperProcess":
-    keeper = KeeperProcess(port, identity)
+def _start_keeper(port: int, identity: Dict[str, Any], lane: str = REAL_PROFILE_LANE) -> "KeeperProcess":
+    keeper = KeeperProcess(port, identity, lane=lane)
     _keepers[port] = keeper
     _ensure_monitor()
     return keeper
@@ -914,6 +1089,14 @@ def _monitor_once() -> None:
     with _keepers_lock:
         items = list(_keepers.items())
     for port, keeper in items:
+        if getattr(keeper, "lane", REAL_PROFILE_LANE) != REAL_PROFILE_LANE and not keeper.is_alive():
+            # A signed-out browser is closed by agent-browser (session close, idle timeout), and its
+            # keeper ends with it. That is the normal end of the session, not a failure to report.
+            with _keepers_lock:
+                if _keepers.get(port) is keeper:
+                    del _keepers[port]
+            keeper.join(1)
+            continue
         if keeper.is_alive() and keeper.state == "serving" and keeper.heartbeat_age() > STALL_SECONDS:
             logger.warning("fidelity: keeper for port %s silent for %.0fs; replacing it now",
                            port, keeper.heartbeat_age())
@@ -921,7 +1104,7 @@ def _monitor_once() -> None:
             keeper.join(3)
             with _keepers_lock:
                 if _keepers.get(port) is keeper:
-                    _start_keeper(port, keeper.identity)
+                    _start_keeper(port, keeper.identity, getattr(keeper, "lane", REAL_PROFILE_LANE))
     # Every tick, not only on start/replace/stop: a healthy keeper's file must stay live, with
     # its heartbeat and counters, or it cannot be told apart from a frozen one.
     write_status()
@@ -945,11 +1128,12 @@ def _ensure_monitor() -> None:
     _monitor.start()
 
 
-def ensure_keeper(port: int, identity, wait: float = 15.0) -> Optional["KeeperProcess"]:
+def ensure_keeper(port: int, identity, wait: float = 15.0, lane: str = REAL_PROFILE_LANE) -> Optional["KeeperProcess"]:
     """Make sure a keeper serves the browser on ``port``: start one, or restart one that died,
     failed, or was a follower last time. Called on EVERY acquire of the real-profile browser, the
     cache-hit path included. ``identity`` is a dict or a zero-argument callable returning one
-    (resolved only when a keeper must start). None when fidelity is off or the identity is unknown."""
+    (resolved only when a keeper must start). None when fidelity is off or the identity is unknown.
+    ``lane`` says which browser it serves (see :data:`REAL_PROFILE_LANE`)."""
     if not fidelity_enabled():
         return None
     with _keepers_lock:
@@ -974,7 +1158,7 @@ def ensure_keeper(port: int, identity, wait: float = 15.0) -> Optional["KeeperPr
                 keeper.join(3)
             else:
                 sweep_lock_files()  # first keeper for this port in this process: tidy up old ones
-            keeper = _start_keeper(port, identity)
+            keeper = _start_keeper(port, identity, lane)
     keeper.wait_ready(wait)
     if keeper.state == "failed":
         logger.warning("fidelity: brands not applied (%s)", keeper.error)
@@ -982,16 +1166,29 @@ def ensure_keeper(port: int, identity, wait: float = 15.0) -> Optional["KeeperPr
     return keeper
 
 
-def stop_keepers() -> None:
-    """Stop every keeper (the browser they serve is being terminated)."""
+def stop_keepers(lane: Optional[str] = REAL_PROFILE_LANE) -> None:
+    """Stop the keepers of ``lane`` (the browser they serve is being terminated); ``None`` stops
+    every keeper. The default is the real-profile lane, whose terminate calls this: closing that
+    browser must not strip the brands from a signed-out session's browser that is still open."""
     with _keepers_lock:
-        keepers = list(_keepers.values())
-        _keepers.clear()
+        keepers = [k for k in _keepers.values() if lane is None or getattr(k, "lane", REAL_PROFILE_LANE) == lane]
+        for port in [p for p, k in _keepers.items() if k in keepers]:
+            del _keepers[port]
     for keeper in keepers:
         keeper.stop()
     for keeper in keepers:
         keeper.join(3)
     write_status()
+
+
+def stop_keeper(port: int) -> None:
+    """Stop the keeper serving the browser on ``port``, if any (its session is closing)."""
+    with _keepers_lock:
+        keeper = _keepers.pop(port, None)
+    if keeper is not None:
+        keeper.stop()
+        keeper.join(3)
+        write_status()
 
 
 # ---------------------------------------------------------------------------

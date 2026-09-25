@@ -264,7 +264,7 @@ docker run -d \
 
 - Python 3 及所有 Hermes 依赖（`uv pip install -e ".[all]"`）
 - Node.js + npm（用于浏览器自动化和 WhatsApp 桥接）
-- Playwright 与 Chromium（`npx playwright install --with-deps chromium --only-shell`）
+- Playwright 与 Chromium（`npx playwright install --with-deps chromium --no-shell`）
 - ripgrep、ffmpeg、git 和 `xz-utils` 作为系统工具
 - **`docker-cli`** — 使容器内运行的 agent 可以驱动宿主机的 Docker 守护进程（绑定挂载 `/var/run/docker.sock` 以启用），用于 `docker build`、`docker run`、容器检查等操作
 - **`openssh-client`** — 从容器内启用 [SSH 终端后端](/user-guide/configuration#ssh-backend)。SSH 后端调用系统 `ssh` 二进制文件；若缺少此组件，在容器化安装中会静默失败

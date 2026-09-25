@@ -196,9 +196,19 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
+# Chrome for Testing, not chrome-headless-shell (`--no-shell`, where this said
+# `--only-shell`). The shell is Chrome's OLD headless implementation, a
+# separate stripped build. tools/browser_tool_fidelity.py was measured on the
+# full build's new headless mode, the engine the Mac drives too, and the shell
+# keeps no persistent cookie store (browser_tool_real_profile.py skips it for
+# that). agent-browser launches the full build with --headless=new, so
+# nothing ever opens a window. Cost,
+# measured 2026-09-25 for Playwright 1.62.1's build (CfT 151.0.7922.34,
+# linux64): 395 MB unpacked vs 267 MB for the shell (+128 MB), a 193 MB vs
+# 120 MB download. docker/stage2-hook.sh finds it by name (`chrome`).
 RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
     for i in 1 2 3; do \
-        npx playwright install --with-deps chromium --only-shell && break || \
+        npx playwright install --with-deps chromium --no-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
     done && \
     npm cache clean --force
