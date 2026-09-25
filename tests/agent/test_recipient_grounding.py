@@ -297,7 +297,8 @@ def test_a_cron_agent_is_built_with_the_jobs_grounding_words():
                                          "legacy_job": False}
     legacy = _construct_cron_agent(MagicMock(), {"id": "old", "name": "t", "prompt": "text Dan"}, {},
                                    setup, workdir=None, session_id="s", session_db=None)
-    assert legacy._grounding_override == {"person": [], "model": ["text Dan"], "legacy_job": True}
+    assert legacy._grounding_override == {"person": [], "model": ["text Dan"],
+                                          "legacy_job": {"prompt": "text Dan"}}
 
 
 def test_a_real_delegated_child_carries_the_parents_person_words(tmp_path, monkeypatch):
@@ -367,12 +368,19 @@ def test_set_job_grounding_is_the_only_way_in(home, monkeypatch):
 
 
 def test_a_legacy_job_is_marked_in_the_ledger_so_moe_can_be_soft(home):
-    agent = _agent(_grounding_override={"person": [], "model": ["text Dan"], "legacy_job": True})
+    agent = _agent(_grounding_override={"person": [], "model": ["text Dan"],
+                                        "legacy_job": {"prompt": "text Dan"}})
     _fresh(rg.record_turn, agent, ["cron-old"], "text Dan")
-    assert _ledger("cron-old")["legacy_job"] is True
+    # The job's own stored prompt travels with the marker: the send gate is
+    # soft only about the people it asks for (the Jobs card's "keep?").
+    assert _ledger("cron-old")["legacy_job"] == {"prompt": "text Dan"}
     agent = _agent(_grounding_override={"person": [], "model": ["text Dan"], "legacy_job": False})
     _fresh(rg.record_turn, agent, ["cron-new"], "text Dan")
     assert "legacy_job" not in _ledger("cron-new")
+    # An old bare True names nobody, so it marks nothing.
+    agent = _agent(_grounding_override={"person": [], "model": ["text Dan"], "legacy_job": True})
+    _fresh(rg.record_turn, agent, ["cron-true"], "text Dan")
+    assert "legacy_job" not in _ledger("cron-true")
 
 
 def test_a_cron_agent_knows_whether_its_job_predates_grounding():
@@ -386,7 +394,7 @@ def test_a_cron_agent_knows_whether_its_job_predates_grounding():
                                 workdir=None, session_id="s", session_db=None)
     new = _construct_cron_agent(MagicMock(), {"id": "n", "name": "t", "prompt": "p", "grounding_words": []},
                                 {}, setup, workdir=None, session_id="s", session_db=None)
-    assert old._grounding_override["legacy_job"] is True
+    assert old._grounding_override["legacy_job"] == {"prompt": "p"}
     assert new._grounding_override["legacy_job"] is False
 
 

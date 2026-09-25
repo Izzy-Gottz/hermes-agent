@@ -1980,8 +1980,10 @@ def set_job_grounding(job_id: str, words: List[Dict[str, Any]]) -> Optional[Dict
     """Record who asked for a job: the person's own answer on Moe's Jobs card
     ("this job messages X — keep?"), or the answers they typed into Moe's
     Reminders form. Called only by Moe's hermes/reminders.py on a request the
-    Memoe app started (it checks that its parent is the signed app); Moe's send
-    gate refuses a model's tool call that names this function. Residual risk,
+    Memoe app started (it checks that its parent is the signed app) — and, with
+    ``[]`` only, by its ``list`` for an old job whose prompt messages nobody,
+    which only ever makes a job stricter. Moe's send gate refuses a model's
+    tool call that names this function. Residual risk,
     stated: anything running as this user can import this module and call it —
     the guard is against a confused or injected model taking a cheap path, not
     against a determined process of the same uid. Not reachable through

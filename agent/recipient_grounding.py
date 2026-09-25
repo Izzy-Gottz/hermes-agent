@@ -343,7 +343,11 @@ def record_turn(agent: Any, keys: Iterable[str], current: Any) -> None:
             pass
         current_entry = new[-1] if new else None
         override = getattr(agent, "_grounding_override", None)
-        legacy = bool(isinstance(override, dict) and override.get("legacy_job"))
+        legacy = override.get("legacy_job") if isinstance(override, dict) else None
+        # {"prompt": …}: the job's own stored prompt, which says whom it may
+        # be soft about. Anything else (an old True) is soft about nobody.
+        legacy = ({"prompt": str(legacy.get("prompt") or "")[:4000]}
+                  if isinstance(legacy, dict) else None)
 
         def _set(data: dict) -> None:
             data["words"] = words
@@ -352,7 +356,7 @@ def record_turn(agent: Any, keys: Iterable[str], current: Any) -> None:
             # sends in amber ("made before Moe checked recipients") rather than
             # refusing them, until the person answers on the Jobs card.
             if legacy:
-                data["legacy_job"] = True
+                data["legacy_job"] = legacy
             else:
                 data.pop("legacy_job", None)
 

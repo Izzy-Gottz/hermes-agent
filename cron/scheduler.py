@@ -2211,9 +2211,19 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
     # full built prompt once it has it.
     agent._grounding_override = {"person": list(job.get("grounding_words") or []),
                                  "model": [str(job.get("prompt") or "")],
-                                 # No key at all: made before jobs carried it.
-                                 "legacy_job": "grounding_words" not in job}
+                                 "legacy_job": _legacy_marker(job)}
     return agent
+
+
+def _legacy_marker(job):
+    """A job with no ``grounding_words`` key at all was made before jobs carried
+    them. The send gate shows its sends in amber rather than refusing them —
+    but only to the people its OWN prompt, as stored, asks it to message (the
+    Jobs card's "This job messages Dan — keep?"), so the prompt travels with
+    the marker. False for every job that has the key."""
+    if "grounding_words" in job:
+        return False
+    return {"prompt": str(job.get("prompt") or "")[:4000]}
 
 
 class _FireAudit:
@@ -2302,7 +2312,7 @@ def run_job(
         except Exception:
             agent._grounding_override = {"person": list(job.get("grounding_words") or []),
                                          "model": [prompt],
-                                         "legacy_job": "grounding_words" not in job}
+                                         "legacy_job": _legacy_marker(job)}
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(
