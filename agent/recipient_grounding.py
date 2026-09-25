@@ -219,15 +219,55 @@ def in_turn() -> bool:
     return _TURN_PERSON_WORDS.get() is not None
 
 
+#: Environment that marks a process a model started or is driving: any of these
+#: set means whatever created a job here was not a person at a terminal.
+AGENT_ENV_MARKERS = (
+    GROUNDING_KEY_ENV, "HERMES_SESSION_ID", "HERMES_TOOL_BRIDGE_SOCKET", "HERMES_MCP_TOOL_PROFILE",
+    "HERMES_CRON_SESSION", "HERMES_KANBAN_TASK", "HERMES_SINGLE_QUERY_SESSION",
+    "HERMES_DELEGATED_CHILD_CONTEXT", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX",
+)
+
+
+def _interactive_person(env: Optional[dict] = None) -> bool:
+    """A human at a terminal: stdin is a tty and nothing an agent sets is set."""
+    env = os.environ if env is None else env
+    if any(str(env.get(k) or "").strip() for k in AGENT_ENV_MARKERS):
+        return False
+    try:
+        import sys
+        return bool(sys.stdin and sys.stdin.isatty())
+    except Exception:
+        return False
+
+
+def ledger_person_words(key: str) -> List[Dict[str, Any]]:
+    """The person words already filed for a conversation (a process that runs
+    the conversation's tools but not its turns — codex's MCP server)."""
+    data = _load(ledger_path(key)) if key else {}
+    if data.get("version") != VERSION:
+        return []
+    return [dict(w) for w in data.get("words") or []
+            if isinstance(w, dict) and w.get("origin") == "person" and w.get("text")]
+
+
 def words_for_new_task(prompt: Any = None) -> List[Dict[str, Any]]:
     """``grounding_words`` for a job or goal being created now.
 
-    Inside a turn: that turn's person words — the model writes the job, the
-    person's words are what may ground it. Outside any turn (the CLI, the
-    dashboard, an app writing a job for the person) a person at this machine
-    typed the prompt, and it is recorded as theirs."""
+    Inside a turn: that turn's person words — the model writes the job; the
+    person's words are what may ground it. In a process that serves a
+    conversation's tools but not its turns (the MCP server codex starts, which
+    carries the conversation's key): the person words the turn filed for it.
+    Otherwise the prompt is the person's only when a person typed it: an
+    interactive terminal with nothing an agent sets. Anything else — a model's
+    shell running `hermes cron create`, a script — records no person words,
+    so the job can name nobody."""
     if in_turn():
         return person_words_now()
+    key = str(os.environ.get(GROUNDING_KEY_ENV) or "").strip()
+    if key:
+        return ledger_person_words(key)
+    if not _interactive_person():
+        return []
     text = clean(prompt)
     return [{"text": text, "origin": "person", "sender": {"kind": "local"}}] if text else []
 

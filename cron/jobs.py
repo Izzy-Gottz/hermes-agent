@@ -1976,6 +1976,22 @@ def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
     updated["next_run_at"] = next_run
 
 
+def set_job_grounding(job_id: str, words: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Record who asked for a job, from outside any model: the person's own
+    answer to "this job messages X — keep?" (Moe's tools/job-grounding.py).
+    Not reachable through update_job, which drops the field."""
+    clean = [dict(w) for w in words or [] if isinstance(w, dict) and w.get("text")
+             and w.get("origin") == "person"]
+
+    def apply(jobs, i, job):
+        updated = {**job, "grounding_words": clean}
+        jobs[i] = updated
+        save_jobs(jobs)
+        return _normalize_job_record(updated)
+
+    return _with_job(job_id, apply)
+
+
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # ``id`` is a path component under OUTPUT_DIR — changing it would leak path-escape values.
