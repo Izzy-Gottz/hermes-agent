@@ -109,6 +109,33 @@ def _real_profile_consented() -> bool:
     return _lazy_call("tools.browser_tool_cloud", "_use_real_profile", False, "real-profile consent lookup failed")
 
 
+def _cloud_backend_configured() -> bool:
+    """True when browser_exec's default browser is a cloud one (a provider, a failed provider lookup, or a
+    legacy Browser Use cloud config) -- the same test the real-profile route uses. Only then does
+    ``local`` choose anything: without one, every call already runs in the person's signed-in copy."""
+    try:
+        from tools.browser_tool_cloud import _get_cloud_provider
+    except Exception:  # pragma: no cover — stubbed browser_tool in tests
+        return False
+    return (_quiet(_get_cloud_provider, object()) is not None
+            or is_legacy_browser_use_cloud_config(_read_browser_cfg()))
+
+
+# A Google sign-in wall: the accounts pages that ask for a password / passkey / account choice, and
+# the signed-out landing page of the Google Account.
+_GOOGLE_WALL_RE = re.compile(
+    r"https?://accounts\.google\.com/[^\s'\"]*?(?:signin|ServiceLogin|AccountChooser|challenge|passkey)"
+    r"|https?://myaccount\.google\.com/intro", re.IGNORECASE)
+
+
+def _google_sign_in_wall(stdout: str, step: Optional[dict]) -> bool:
+    """True when this call ended on a Google account sign-in / passkey wall (see ``GOOGLE_SESSION_NOTE``)."""
+    url = str((step or {}).get("url") or "")
+    if re.match(r"https?://accounts\.google\.com(?:[/:?#]|$)", url, re.IGNORECASE):
+        return True
+    return bool(_GOOGLE_WALL_RE.search(stdout or ""))
+
+
 def _set_cdp_env(env: dict, cdp: str) -> None:
     """Export a CDP endpoint under the BU_CDP_* contract (http(s) → URL, else WS)."""
     env["BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"] = cdp
@@ -774,6 +801,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         step = _person_step(proc.stdout, env)
         if step:
             _note_person_step(result, step, presence if chrome_lane.lane_enabled(browser_cfg) else None)
+    if lane == chrome_lane.LANE_OWN and _google_sign_in_wall(proc.stdout, result.get("needs_person")):
+        # Ticket #18: Google keeps its account sessions to the person's own Chrome; no refresh helps.
+        from tools.browser_tool_real_profile import GOOGLE_SESSION_NOTE
+        result["google_sign_in"] = GOOGLE_SESSION_NOTE
     if workspace:
         result["workspace"] = workspace
     if session:
@@ -859,19 +890,35 @@ def _description_header() -> str:
     return _HEADER_BASE + (_HEADER_VISION if vision else _HEADER_TEXT_ONLY)
 
 
+def _real_profile_description(cloud: bool) -> str:
+    """What the model must know about sign-ins when real-profile browsing is on (ticket #18): where the
+    default runs, and that Google account sign-ins stay with the person's own Chrome."""
+    from tools.browser_tool_real_profile import GOOGLE_SESSION_NOTE
+    where = ("By default the code runs in the configured cloud browser, which is signed in as nobody; pass "
+             "local=true to use Moe's own browser on this Mac, which carries the person's sign-ins."
+             if cloud else
+             "Moe's browser already carries the person's sign-ins, copied from their own browser and brought "
+             "up to date as they sign in there -- every call runs there; there is no switch to turn it on.")
+    return "\n\nSIGN-INS: " + where + " " + GOOGLE_SESSION_NOTE
+
+
 def _dynamic_schema_overrides() -> dict:
-    overrides: dict = {"description": _description_header() + _HELPERS_DIGEST}
-    # ``local`` exists ONLY when the user consented to real-profile browsing — everyone
-    # else's schema carries zero extra surface. The caller memoizes on config.yaml mtime,
-    # so toggling consent applies next session, not mid-chat.
-    if _real_profile_consented():
+    consented = _real_profile_consented()
+    cloud = consented and _cloud_backend_configured()
+    overrides: dict = {"description": _description_header()
+                       + (_real_profile_description(cloud) if consented else "") + _HELPERS_DIGEST}
+    # ``local`` exists ONLY when the user consented to real-profile browsing AND a cloud browser is the
+    # default -- without one it chose nothing (every call already ran in the signed-in copy) and read as
+    # if the default were a cloud browser (ticket #18). The caller memoizes on config.yaml mtime, so
+    # toggling consent or the provider applies next session, not mid-chat.
+    if cloud:
         props = dict(BROWSER_EXEC_SCHEMA["parameters"]["properties"])
         props["local"] = {
             "type": "boolean", "default": False,
-            "description": ("Drive the user's own local browser (a Hermes-managed copy of their real "
-                            "default-Chromium profile, logins/cookies included) instead of the configured "
-                            "cloud browser backend. Use when the user asks to act as themselves — their "
-                            "accounts, their sessions. No-op when the backend is already local. Default false."),
+            "description": ("Run in Moe's own browser on this Mac -- a copy of the person's own browser "
+                            "profile, their sign-ins included -- instead of the configured cloud browser (signed "
+                            "in as nobody). Use when the person asks to act as themselves: their accounts, "
+                            "their sessions. Default false: the cloud browser."),
         }
         overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
     # ``where`` exists ONLY when the Chrome-extension lane is enabled (same rule as ``local``).

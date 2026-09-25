@@ -26,8 +26,10 @@ is read through ``_bt`` (resolved per call — never import ``tools.browser_tool
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from tools.browser_tool_origin import origin_module as _origin
@@ -121,8 +123,11 @@ _restart_notes: List[str] = []
 
 
 def take_restart_note() -> Optional[str]:
-    """The restart note, once (None when the browser was not restarted since the last call)."""
-    return _restart_notes.pop() if _restart_notes else None
+    """What the model must know about the browser since the last call, once: the restart note, and
+    the note that a sign-in refresh was skipped. None when there is nothing to tell."""
+    notes = list(dict.fromkeys(_restart_notes))
+    _restart_notes.clear()
+    return "; ".join(notes) or None
 
 
 def _await_holders_gone(data_dir: str, wait: float = 10.0) -> None:
@@ -282,12 +287,25 @@ def driven_browser_executable() -> Optional[str]:
     return None
 
 
+def _terminate_one(proc, what: str) -> None:
+    """Terminate ``proc`` alone and forget it -- never the other browsers this process runs (a sign-in
+    refresh starts the person's browser while the driven one is live, and must not take it down)."""
+    from tools.browser_lightpanda import _terminate
+    try:
+        _origin()._real_profile_chrome_procs.remove(proc)
+    except ValueError:
+        pass
+    _terminate(proc, what=what)
+
+
 def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str], what: str,
-                           headless: bool) -> Tuple[Optional[subprocess.Popen], Optional[int], Optional[str]]:
-    """Launch ``binary`` on the profile COPY and wait for its debug port: ``(proc, port, error)``.
+                           headless: bool, startup_wait: float = 30.0,
+                           ) -> Tuple[Optional[subprocess.Popen], Optional[int], Optional[str]]:
+    """Launch ``binary`` on the profile COPY and wait up to ``startup_wait`` s for its debug port:
+    ``(proc, port, error)``.
 
     The process is recorded in ``_real_profile_chrome_procs`` so exit/idle/atexit cleanup can reach
-    it. On failure it is terminated here and ``(None, None, error)`` is returned.
+    it. On failure it (and only it) is terminated here and ``(None, None, error)`` is returned.
     """
     _bt = _origin()
     try:
@@ -304,16 +322,16 @@ def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str
         return None, None, f"{_RP}the {what} launch failed: {e}"
     _bt._real_profile_chrome_procs.append(proc)
 
-    deadline = time.monotonic() + 30.0
+    deadline = time.monotonic() + startup_wait
     while time.monotonic() < deadline:
         line = _read_devtools_port(copy_dir) or ""
         if line.isdigit():
             return proc, int(line), None
         if proc.poll() is not None:
-            _terminate_real_profile_chrome()
+            _terminate_one(proc, what)
             return None, None, _RP + f"the {what} exited during startup (another instance may hold the profile copy)."
         time.sleep(0.25)
-    _terminate_real_profile_chrome()
+    _terminate_one(proc, what)
     return None, None, _RP + f"the {what} did not expose a debug port in time. Retry, or turn the toggle off."
 
 
@@ -403,24 +421,30 @@ def _cookie_param(cookie: Dict[str, Any]) -> Dict[str, Any]:
     return param
 
 
-def _export_cookies_from_persons_browser(real_binary: str, copy_dir: str) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+def _export_cookies_from_persons_browser(real_binary: str, copy_dir: str, budget: Optional[float] = None,
+                                         ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
     """Start the person's browser binary headless on the copy, read every cookie its keychain
-    entry decrypts, and terminate it. ``(cookies, None)`` or ``(None, error)``.
+    entry decrypts, and terminate it. ``(cookies, None)`` or ``(None, error)``. ``budget`` bounds the
+    whole read (startup + read) in seconds; None keeps the launch defaults.
 
     This is the only moment the person's browser application runs for Hermes. It is headless,
     opens no window, and lives for the read (sub-second, measured) — but while it lives Launch
-    Services counts it as that application, so it is never left running past this function.
+    Services counts it as that application, so it is never left running past this function. Only
+    THIS process is terminated: a refresh runs while the driven browser is live.
     """
     _bt = _origin()
-    proc, port, err = _spawn_browser_on_copy(real_binary, copy_dir, (), "hand-over browser", headless=True)
+    deadline = None if budget is None else time.monotonic() + budget
+    proc, port, err = _spawn_browser_on_copy(real_binary, copy_dir, (), "hand-over browser", headless=True,
+                                             startup_wait=30.0 if budget is None else budget)
     if proc is None or port is None:
         return None, err
     try:
-        cookies = list(_cdp_call(port, "Storage.getCookies").get("cookies") or [])
+        timeout = 20.0 if deadline is None else max(0.5, deadline - time.monotonic())
+        cookies = list(_cdp_call(port, "Storage.getCookies", timeout=timeout).get("cookies") or [])
     except Exception as e:
         return None, f"{_RP}the sign-in hand-over failed to read the cookie jar: {e}"
     finally:
-        _terminate_real_profile_chrome()
+        _terminate_one(proc, "hand-over browser")
     _bt.logger.info("real-profile: hand-over read %d cookie(s) from %s", len(cookies), os.path.basename(real_binary))
     return cookies, None
 
@@ -435,15 +459,174 @@ def _forget_keychain_bound_auth_files(copy_dir: str) -> None:
                 pass
 
 
-def _import_cookies_into_driven_browser(port: int, cookies: List[Dict[str, Any]]) -> Optional[str]:
-    """``Storage.setCookies`` in chunks; None on success, else an error message."""
+def _import_cookies_into_driven_browser(port: int, cookies: List[Dict[str, Any]],
+                                        budget: Optional[float] = None) -> Optional[str]:
+    """``Storage.setCookies`` in chunks; None on success, else an error message. ``setCookies``
+    overwrites a cookie of the same name/domain/path, so loading into a live browser is safe."""
     params = [_cookie_param(c) for c in cookies]
+    deadline = None if budget is None else time.monotonic() + budget
     try:
         for i in range(0, len(params), _COOKIE_IMPORT_CHUNK):
-            _cdp_call(port, "Storage.setCookies", {"cookies": params[i:i + _COOKIE_IMPORT_CHUNK]})
+            if deadline is None:
+                _cdp_call(port, "Storage.setCookies", {"cookies": params[i:i + _COOKIE_IMPORT_CHUNK]})
+                continue
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"out of time after {i} of {len(params)} cookie(s)")
+            _cdp_call(port, "Storage.setCookies", {"cookies": params[i:i + _COOKIE_IMPORT_CHUNK]}, timeout=left)
     except Exception as e:
         return f"{_RP}the sign-in hand-over failed to load the cookie jar: {e}"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Keeping the jar current: a cookie-only hand-over into the RUNNING driven browser
+# ---------------------------------------------------------------------------
+# Ticket #18: the hand-over ran only when the driven browser was launched, so a sign-in the person
+# made in their own browser afterwards never reached it -- one hand-over at 21:25, a sign-in at
+# ~21:31, and calls at 21:33 reused the 21:25 jar. A reused browser now re-takes the jar when the
+# person's cookie file has changed since the last hand-over, or that hand-over is older than
+# _COOKIE_REFRESH_MAX_AGE_S (Chrome writes its cookie file lazily, so the file's time can lag a
+# sign-in). Google account sessions are the exception no refresh fixes: see GOOGLE_SESSION_NOTE.
+
+_COOKIE_REFRESH_MAX_AGE_S = 60.0
+#: Never more often than this, however many calls arrive: a burst of browser_exec calls must not start
+#: the person's browser for every one.
+_COOKIE_REFRESH_MIN_INTERVAL_S = 15.0
+#: The whole refresh (copy the jar, the person's browser reads it, load it) gets this long; past it the
+#: call goes ahead with the jar the driven browser already has, and the model is told.
+_COOKIE_REFRESH_BUDGET_S = 8.0
+_COOKIE_DB_RELS = ("Cookies", os.path.join("Network", "Cookies"))
+
+#: The browser the last hand-over went into (its CDP root), the person's browser it came from, when it
+#: was taken (wall clock, compared with the cookie file's mtime) and when a refresh was last tried.
+_handover: Dict[str, Any] = {"cdp": "", "browser": "", "at": 0.0, "attempt": 0.0}
+
+REFRESH_SKIPPED_NOTE = ("sign-ins the person made in their own browser in the last minute or so may not have "
+                        "reached Moe's browser yet (bringing them over did not finish this time); if a site "
+                        "shows them signed out, try again in a moment")
+
+#: Said to the model (tool description, and a result that lands on a Google sign-in wall) in words it can
+#: pass on. Measured on ticket #18: every Google session cookie was handed over and sent, and Google still
+#: served the signed-out page and asked for the passkey -- it binds the session to the person's own
+#: browser. Copying cookies cannot fix that, and nothing here tries to get around it.
+GOOGLE_SESSION_NOTE = ("Google account sign-ins do not carry over into Moe's browser: Google ties them to the "
+                       "person's own Chrome, so signing in to Google there asks for their passkey even when they "
+                       "are signed in on their own Chrome. Tell them that plainly. To go on, hand the page to them "
+                       "with browser_handoff so they can sign in themselves, or work in their own Chrome through "
+                       "the Memoe extension (where=\"chrome\") if it is set up.")
+
+
+def _record_handover_target(cdp: str, browser: str, at: float = 0.0) -> None:
+    """Remember which browser the jar is kept current in. ``at`` is when a hand-over into it was taken;
+    a browser this process did not hand over to (re-attached, another process's) starts at 0 -- its
+    jar's age is unknown, so the next acquire refreshes it."""
+    if at or _handover.get("cdp") != cdp or _handover.get("browser") != browser:
+        _handover.update(cdp=cdp, browser=browser, at=at, attempt=at)
+
+
+def _persons_jar(browser: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(user-data dir, profile dir name)`` of the person's browser -- the pinned profile when
+    ``browser.real_profile_pin`` is set, as the snapshot uses -- or ``(None, None)``."""
+    from hermes_cli.browser_connect import _resolve_source_profile, real_profile_data_dir
+    src = real_profile_data_dir(browser)
+    if not src or not os.path.isdir(src):
+        return None, None
+    profile, err = _resolve_source_profile(src)
+    return (src, profile) if profile and not err else (None, None)
+
+
+def _jar_mtime(src: str, profile: str) -> float:
+    """Newest mtime of the person's cookie DBs (and their sqlite sidecars), 0 when none is readable."""
+    newest = 0.0
+    for rel in _COOKIE_DB_RELS:
+        for suffix in ("", "-journal", "-wal"):
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(src, profile, rel + suffix)))
+            except OSError:
+                pass
+    return newest
+
+
+def _snapshot_jar(src: str, profile: str, dst: str) -> Optional[str]:
+    """Copy ONLY what the export needs -- ``Local State`` and the cookie DBs -- into ``dst``, a fresh
+    temp dir (never the live copy dir a running browser holds). The DBs go through the same sqlite
+    online backup the snapshot uses, which folds in what the person's browser committed (its
+    ``Cookies-journal``); a raw journal is never copied (a stale one corrupts the copy)."""
+    from hermes_cli.browser_connect import _copy_auth_file, _sync_local_state
+    _sync_local_state(src, dst, profile)
+    copied = 0
+    for rel in _COOKIE_DB_RELS:
+        s = os.path.join(src, profile, rel)
+        if os.path.isfile(s):
+            copied += bool(_copy_auth_file(s, os.path.join(dst, "Default", rel)))
+    return None if copied else "the person's cookie jar could not be copied (their browser was writing it)"
+
+
+def _refresh_jar_now(port: int, browser: str, now: float) -> Optional[str]:
+    """The cookie-only hand-over into the live browser on ``port``; None when done, else why not."""
+    from hermes_cli.browser_connect import chromium_executable, detect_default_chromium, get_hermes_home
+    current = detect_default_chromium()
+    if current != browser:
+        # Never a hand-over from another browser into this one -- and a switch to a pre-release channel
+        # (Beta / Dev / Canary) is refused here exactly as at launch.
+        return (_real_profile_unsupported_reason(current)
+                or f"the default browser changed ({browser} -> {current}); the next launch hands over from it")
+    src, profile = _persons_jar(browser)
+    real_binary = chromium_executable(browser)
+    if not src or not profile or not real_binary:
+        return "the person's browser profile or application could not be found"
+    deadline = time.monotonic() + _COOKIE_REFRESH_BUDGET_S
+    root = os.path.join(str(get_hermes_home()), "browser-profile")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=".cookie-refresh-", dir=root)  # 0700; the orphan reaper covers it
+    try:
+        err = _snapshot_jar(src, profile, tmp)
+        if err:
+            return err
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return f"copying the jar used the whole {_COOKIE_REFRESH_BUDGET_S:.0f}s budget"
+        cookies, err = _export_cookies_from_persons_browser(real_binary, tmp, budget=left)
+        if cookies is None:
+            return err
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return f"reading the jar used the whole {_COOKIE_REFRESH_BUDGET_S:.0f}s budget"
+        err = _import_cookies_into_driven_browser(port, cookies, budget=left)
+        if err:
+            return err
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _handover["at"] = now
+    _origin().logger.info("real-profile: sign-ins refreshed into the running browser (%d cookie(s))", len(cookies))
+    return None
+
+
+def _refresh_jar_if_due(cdp: str) -> None:
+    """Re-take the person's cookies into the reused driven browser at ``cdp`` when they may have changed
+    (see the section comment). Rate-limited and bounded; a skip never fails the call -- it is logged and
+    the model is told (``take_restart_note``). Never raises."""
+    if not cdp or _handover.get("cdp") != cdp or not _handover.get("browser"):
+        return  # not a browser whose jar this process keeps current
+    now = time.time()
+    if now - float(_handover.get("attempt") or 0) < _COOKIE_REFRESH_MIN_INTERVAL_S:
+        return
+    browser = str(_handover["browser"])
+    try:
+        if now - float(_handover.get("at") or 0) <= _COOKIE_REFRESH_MAX_AGE_S:
+            src, profile = _persons_jar(browser)
+            if not src or not profile or _jar_mtime(src, profile) <= float(_handover["at"]):
+                return  # nothing new since the last hand-over
+        _handover["attempt"] = now
+        why = _refresh_jar_now(int(cdp.rsplit(":", 1)[1]), browser, now)
+    except Exception as e:
+        _handover["attempt"] = now
+        why = f"unexpected error: {e}"
+    if why:
+        _origin().logger.warning("real-profile: sign-in refresh skipped; the browser keeps the sign-ins it has: %s", why)
+        if REFRESH_SKIPPED_NOTE not in _restart_notes:
+            _restart_notes.append(REFRESH_SKIPPED_NOTE)
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +828,7 @@ def _real_profile_cdp() -> tuple:
             # Re-claim the shared daemon's socket dir so the orphan reaper's idle clock sees
             # this process still using it (a cache hit never runs a daemon command).
             _session._prepare_session_socket_dir(_bt._REAL_PROFILE_SESSION)
+            _refresh_jar_if_due(cached)  # a sign-in made since the last hand-over (ticket #18)
             return cached, None
         _bt._real_profile_cdp_cache.pop("cdp", None)
 
@@ -661,6 +845,8 @@ def _real_profile_cdp() -> tuple:
         if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
             _fidelity.ensure_keeper(int(existing.rsplit(":", 1)[1]), lambda: _persons_identity(browser))
             _bt._real_profile_cdp_cache["cdp"] = existing
+            _record_handover_target(existing, browser)
+            _refresh_jar_if_due(existing)
             return existing, None
         if existing:  # stale/wrong-dir session: close it so nothing holds the dir open
             _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
@@ -701,8 +887,11 @@ def _real_profile_cdp() -> tuple:
                 return None, err
             _bt._real_profile_cdp_cache["cdp"] = cdp
             _bt.logger.info("real-profile: re-attached to a live owner's browser at %s (%s)", cdp, copy_dir)
+            _record_handover_target(cdp, browser)
+            _refresh_jar_if_due(cdp)
             return cdp, None
 
+        handover_at = time.time()  # before the copy: a cookie written during it counts as newer
         copy_dir, err = snapshot_real_profile(browser)
         if err or not copy_dir:
             return None, _real_profile_snapshot_error(err)
@@ -732,6 +921,7 @@ def _real_profile_cdp() -> tuple:
             _terminate_real_profile_chrome()
             return None, err
         _bt._real_profile_cdp_cache["cdp"] = cdp
+        _record_handover_target(cdp, browser, at=handover_at)
         _bt.logger.info("real-profile browser ready for %s at %s (%s, %d cookie(s) handed over)",
                         browser, cdp, copy_dir, len(cookies))
         return cdp, None
@@ -993,6 +1183,8 @@ def show_to_person(url_hint: str = "", task_id: str = "") -> Dict[str, Any]:
             return {"ok": False, "why": attach_err or "the browser did not start again", "url": page["url"],
                     "browser_gone": True}
         _bt._real_profile_cdp_cache["cdp"] = cdp
+        if _handover.get("cdp") == cached:
+            _handover["cdp"] = cdp  # the same jar, carried across; its age is unchanged
         try:
             before = {t.get("targetId") for t in (_cdp_call(new_port, "Target.getTargets").get("targetInfos") or [])
                       if t.get("type") == "page"}

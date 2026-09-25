@@ -10,6 +10,7 @@ import json
 import os
 import time
 import ntpath
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
@@ -36,6 +37,21 @@ def _never_launch_a_real_browser(monkeypatch):
             raise AssertionError(f"test tried to launch a real browser ({exe}); stub the launcher")
         return real_popen(argv, *a, **k)
     monkeypatch.setattr(bt_real_profile.subprocess, "Popen", _guarded)
+
+
+_REAL_REFRESH_NOW = bt_real_profile._refresh_jar_now
+
+
+@pytest.fixture(autouse=True)
+def _no_sign_in_refresh_unless_asked(monkeypatch):
+    """A reused browser re-takes the person's cookies (ticket #18) from their REAL browser profile on this
+    Mac; outside TestSignInRefresh that step is a recorder, and the hand-over record starts empty."""
+    bt_real_profile._handover.update(cdp="", browser="", at=0.0, attempt=0.0)
+    bt_real_profile._restart_notes.clear()
+    monkeypatch.setattr(bt_real_profile, "_refresh_jar_now", lambda port, browser, now: None)
+    yield
+    bt_real_profile._handover.update(cdp="", browser="", at=0.0, attempt=0.0)
+    bt_real_profile._restart_notes.clear()
 
 
 def _auth_db(path, value=None):
@@ -752,17 +768,57 @@ class TestBrowserExecSchemaGating:
         assert "parameters" not in overrides
         assert "local" not in bu.BROWSER_EXEC_SCHEMA["parameters"]["properties"]
 
-    def test_local_arg_present_with_consent(self):
+    def test_local_arg_present_with_consent_and_a_cloud_provider(self):
         import tools.browser_use_cli as bu
-        with patch.object(bu, "_real_profile_consented", return_value=True):
+        with patch.object(bu, "_real_profile_consented", return_value=True), \
+             patch("tools.browser_tool_cloud._get_cloud_provider", return_value=object()):
             overrides = bu._dynamic_schema_overrides()
         props = overrides["parameters"]["properties"]
+        assert "cloud browser" in props["local"]["description"]
+        assert "local=true" in overrides["description"]
         assert "local" in props
         assert props["local"]["type"] == "boolean"
         # Static schema must stay untouched (override is a copy).
         assert "local" not in bu.BROWSER_EXEC_SCHEMA["parameters"]["properties"]
         # 'local' must not be required — pure opt-in.
         assert "local" not in overrides["parameters"].get("required", [])
+
+
+    def test_no_local_arg_without_a_cloud_provider(self):
+        """Ticket #18: with no cloud provider every call already runs in the signed-in copy, so ``local``
+        chose nothing -- and its text ("instead of the configured cloud browser") made the model think the
+        default was a cloud browser. It is not offered; the description says what the default is."""
+        import tools.browser_use_cli as bu
+        with patch.object(bu, "_real_profile_consented", return_value=True), \
+             patch("tools.browser_tool_cloud._get_cloud_provider", return_value=None), \
+             patch.object(bu, "_read_browser_cfg", return_value={}):
+            overrides = bu._dynamic_schema_overrides()
+        props = (overrides.get("parameters") or bu.BROWSER_EXEC_SCHEMA["parameters"])["properties"]
+        assert "local" not in props
+        assert "already carries the person's sign-ins" in overrides["description"]
+        assert "no switch" in overrides["description"]
+        assert overrides["description"].endswith(bu._HELPERS_DIGEST)
+
+    def test_a_legacy_browser_use_cloud_config_counts_as_cloud(self):
+        import tools.browser_use_cli as bu
+        with patch.object(bu, "_real_profile_consented", return_value=True), \
+             patch("tools.browser_tool_cloud._get_cloud_provider", return_value=None), \
+             patch.object(bu, "is_legacy_browser_use_cloud_config", return_value=True):
+            overrides = bu._dynamic_schema_overrides()
+        assert "local" in overrides["parameters"]["properties"]
+
+    def test_the_description_says_google_sign_ins_stay_in_the_persons_chrome(self):
+        import tools.browser_use_cli as bu
+        for provider in (None, object()):
+            with patch.object(bu, "_real_profile_consented", return_value=True), \
+                 patch("tools.browser_tool_cloud._get_cloud_provider", return_value=provider), \
+                 patch.object(bu, "_read_browser_cfg", return_value={}):
+                desc = bu._dynamic_schema_overrides()["description"]
+            assert bt_real_profile.GOOGLE_SESSION_NOTE in desc
+        with patch.object(bu, "_real_profile_consented", return_value=False):
+            assert bt_real_profile.GOOGLE_SESSION_NOTE not in bu._dynamic_schema_overrides()["description"]
+        note = bt_real_profile.GOOGLE_SESSION_NOTE
+        assert "passkey" in note and "browser_handoff" in note and "Memoe extension" in note
 
 
 class TestNavigationRouting:
@@ -1405,3 +1461,164 @@ class TestWindowsLockedProfileCopy:
         # A FIRST snapshot still fails closed — but never tells the person to close their
         # browser: it is open because they are using it (ticket #13).
         assert err and "login data" in err.lower() and "close" not in err.lower()
+
+
+class TestSignInRefresh:
+    """Ticket #18: a sign-in the person makes in their own browser AFTER the driven browser started reaches
+    it on the next call -- not only on the next launch. Everything outside this module is faked; the jar
+    copy and the temp dir are real file I/O."""
+
+    PERSON = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    CDP = "http://127.0.0.1:41000"
+    NEW = {"name": "fazier_session", "value": "signed-in", "domain": ".fazier.com", "path": "/", "secure": True,
+           "httpOnly": True, "sameSite": "Lax", "expires": 4102444800.0, "session": False, "size": 9}
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch):
+        import tools.browser_tool as bt
+        import hermes_cli.browser_connect as bc
+        monkeypatch.setattr(bt_real_profile, "_refresh_jar_now", _REAL_REFRESH_NOW)
+        self.home = tmp_path / "hh"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: self.home)
+        # The person's browser profile, with a real sqlite cookie jar.
+        self.person = tmp_path / "person"
+        (self.person / "Default" / "Network").mkdir(parents=True)
+        (self.person / "Local State").write_text(json.dumps({"profile": {"last_used": "Default"}}))
+        self.jar = self.person / "Default" / "Network" / "Cookies"
+        _auth_db(self.jar, "jar-v1")
+        # The live copy dir the driven browser holds: nothing may be written into it.
+        self.live = self.home / "browser-profile" / "chrome"
+        (self.live / "Default").mkdir(parents=True)
+        (self.live / "Default" / "Preferences").write_text("{}")
+        (self.live / "DevToolsActivePort").write_text("41000\n/devtools/browser/live\n")
+        self.driven = _FakeChrome()
+        bt._real_profile_chrome_procs[:] = [self.driven]
+        bt._real_profile_cdp_cache["cdp"] = self.CDP
+        self.launches, self.calls, self.seen_dirs = [], [], []
+        self.write_port = True
+
+        def fake_popen(argv, **kw):
+            self.launches.append(argv)
+            data_dir = next(a.split("=", 1)[1] for a in argv if a.startswith("--user-data-dir="))
+            self.seen_dirs.append((data_dir, sorted(str(p.relative_to(data_dir)) for p in Path(data_dir).rglob("*"))))
+            if self.write_port:
+                with open(os.path.join(data_dir, "DevToolsActivePort"), "w") as fh:
+                    fh.write("42000\n/devtools/browser/handover\n")
+            return _FakeChrome()
+
+        def fake_cdp(port, method, params=None, timeout=20.0):
+            self.calls.append((port, method, params))
+            return {"cookies": [dict(self.NEW)]} if method == "Storage.getCookies" else {}
+
+        monkeypatch.setattr(bt_cloud, "_use_real_profile", lambda: True)
+        monkeypatch.setattr(bt_lightpanda_fallback, "_using_lightpanda_engine", lambda: False)
+        monkeypatch.setattr(bt_real_profile, "_cdp_http_ready", lambda cdp: True)
+        monkeypatch.setattr(bt_session, "_prepare_session_socket_dir", lambda name: "/tmp/x")
+        monkeypatch.setattr(bt_real_profile._fidelity, "ensure_keeper", lambda *a, **k: None)
+        monkeypatch.setattr(bt_real_profile, "_cdp_call", fake_cdp)
+        monkeypatch.setattr(bt_real_profile.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(bc, "detect_default_chromium", lambda system=None: "chrome")
+        monkeypatch.setattr(bc, "real_profile_data_dir", lambda browser, system=None: str(self.person))
+        monkeypatch.setattr(bc, "chromium_executable", lambda browser, system=None: self.PERSON)
+        yield
+        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_chrome_procs.clear()
+
+    def _handed_over(self, ago, attempt_ago=None):
+        now = time.time()
+        bt_real_profile._record_handover_target(self.CDP, "chrome", at=now - ago)
+        bt_real_profile._handover["attempt"] = now - (ago if attempt_ago is None else attempt_ago)
+        return now
+
+    def _touch_jar(self, when):
+        os.utime(self.jar, (when, when))
+
+    def _live_state(self):
+        return sorted((str(p.relative_to(self.live)), p.stat().st_mtime_ns) for p in self.live.rglob("*"))
+
+    def _set_cookie_calls(self):
+        return [(port, params) for port, method, params in self.calls if method == "Storage.setCookies"]
+
+    def test_a_cache_hit_loads_a_sign_in_made_since_the_hand_over(self):
+        now = self._handed_over(ago=30)
+        self._touch_jar(now - 5)                    # the person signed in after the hand-over
+        live_before = self._live_state()
+        assert bt_real_profile._real_profile_cdp() == (self.CDP, None)
+        # The side effect: the new cookie went into the LIVE driven browser.
+        sets = self._set_cookie_calls()
+        assert len(sets) == 1 and sets[0][0] == 41000
+        assert sets[0][1]["cookies"][0]["name"] == "fazier_session"
+        assert sets[0][1]["cookies"][0]["value"] == "signed-in"
+        # Read by the person's own browser, headless, keychain intact, on a SEPARATE temp copy.
+        (argv,) = self.launches
+        assert argv[0] == self.PERSON and "--headless=new" in argv and "--use-mock-keychain" not in argv
+        data_dir, files = self.seen_dirs[0]
+        assert os.path.dirname(data_dir) == str(self.home / "browser-profile")
+        assert os.path.basename(data_dir).startswith(".cookie-refresh-") and data_dir != str(self.live)
+        assert "Local State" in files and os.path.join("Default", "Network", "Cookies") in files
+        assert not os.path.exists(data_dir)          # cleaned up
+        # Nothing was written into the live copy dir under the running browser.
+        assert self._live_state() == live_before
+        # Only the hand-over browser was stopped; the driven browser is still running.
+        assert self.driven.poll() is None
+        import tools.browser_tool as bt
+        assert bt._real_profile_chrome_procs == [self.driven]
+        assert bt_real_profile._handover["at"] >= now
+        assert bt_real_profile.take_restart_note() is None
+
+    def test_nothing_new_and_recent_means_no_hand_over(self):
+        now = self._handed_over(ago=30)
+        self._touch_jar(now - 40)                    # last written before the hand-over
+        assert bt_real_profile._real_profile_cdp() == (self.CDP, None)
+        assert self.launches == [] and self.calls == []
+
+    def test_an_old_hand_over_is_refreshed_even_if_the_file_looks_old(self):
+        """Chrome writes its cookie file lazily: past a minute the jar is re-taken regardless."""
+        now = self._handed_over(ago=bt_real_profile._COOKIE_REFRESH_MAX_AGE_S + 5)
+        self._touch_jar(now - 3600)
+        bt_real_profile._real_profile_cdp()
+        assert len(self.launches) == 1 and len(self._set_cookie_calls()) == 1
+
+    def test_a_burst_of_calls_starts_the_persons_browser_once(self):
+        now = self._handed_over(ago=30)
+        self._touch_jar(now - 5)
+        for i in range(5):
+            self._touch_jar(time.time() + i)         # the person keeps browsing: the file keeps changing
+            assert bt_real_profile._real_profile_cdp() == (self.CDP, None)
+        assert len(self.launches) == 1 and len(self._set_cookie_calls()) == 1
+
+    def test_a_refresh_that_takes_too_long_is_skipped_and_the_model_is_told(self, monkeypatch):
+        monkeypatch.setattr(bt_real_profile, "_COOKIE_REFRESH_BUDGET_S", 0.6)
+        self.write_port = False                      # the person's browser never answers
+        now = self._handed_over(ago=30)
+        self._touch_jar(now - 5)
+        started = time.monotonic()
+        assert bt_real_profile._real_profile_cdp() == (self.CDP, None)   # the call still goes ahead
+        assert time.monotonic() - started < 5
+        assert self._set_cookie_calls() == []
+        assert bt_real_profile.take_restart_note() == bt_real_profile.REFRESH_SKIPPED_NOTE
+        assert self.driven.poll() is None            # the driven browser was not touched
+        data_dir, _ = self.seen_dirs[0]
+        assert not os.path.exists(data_dir)
+        # And the next call inside the rate limit does not try again.
+        bt_real_profile._real_profile_cdp()
+        assert len(self.launches) == 1
+
+    def test_a_pre_release_default_is_refused_on_refresh_too(self, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        monkeypatch.setattr(bc, "detect_default_chromium", lambda system=None: bc.UNSUPPORTED_CHANNEL)
+        now = self._handed_over(ago=30)
+        self._touch_jar(now - 5)
+        assert bt_real_profile._real_profile_cdp() == (self.CDP, None)
+        assert self.launches == [] and self._set_cookie_calls() == []
+        assert bt_real_profile.take_restart_note() == bt_real_profile.REFRESH_SKIPPED_NOTE
+
+    def test_reusing_another_process_browser_refreshes_its_jar(self, monkeypatch):
+        """The reuse path (a live engine session on our copy dir): its jar's age is unknown, so re-take it."""
+        import tools.browser_tool as bt
+        bt._real_profile_cdp_cache.clear()
+        monkeypatch.setattr(bt_real_profile, "_agent_browser_get_cdp", lambda name: self.CDP)
+        monkeypatch.setattr(bt_real_profile, "_cdp_on_data_dir", lambda cdp, d: True)
+        self._touch_jar(time.time() - 3600)
+        assert bt_real_profile._real_profile_cdp() == (self.CDP, None)
+        assert len(self._set_cookie_calls()) == 1 and self._set_cookie_calls()[0][0] == 41000
