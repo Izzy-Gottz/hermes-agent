@@ -173,8 +173,11 @@ def _attached(session, kind, url="https://example.com/", opener=None):
 
 @pytest.fixture(autouse=True)
 def _no_keepers_left():
+    """Every lane's keepers, before and after: a test elsewhere that really launches a signed-out
+    browser leaves its keeper to the session's close, which that test never sends."""
+    fid.stop_keepers(lane=None)
     yield
-    fid.stop_keepers()
+    fid.stop_keepers(lane=None)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -252,8 +255,8 @@ class _FakeProc:
     """Stands in for a KeeperProcess: the surface ensure_keeper and the monitor use."""
     made = []
 
-    def __init__(self, port, identity, state="serving", age=0.0):
-        self.port, self.identity, self._state, self.age = port, identity, state, age
+    def __init__(self, port, identity, state="serving", age=0.0, lane=fid.REAL_PROFILE_LANE):
+        self.port, self.identity, self._state, self.age, self.lane = port, identity, state, age, lane
         self.alive, self.killed, self.stopped = True, False, False
         self.ua = fid.user_agent(identity)
         _FakeProc.made.append(self)
@@ -439,7 +442,7 @@ os.write(fd, str(os.getpid()).encode()); print("held", flush=True); time.sleep(6
 
     def test_a_follower_adds_no_pause_and_is_retried(self):
         _FakeProc.made = []
-        with patch.object(fid, "KeeperProcess", lambda port, ident: _FakeProc(port, ident, state="follower")), \
+        with patch.object(fid, "KeeperProcess", lambda port, ident, **kw: _FakeProc(port, ident, state="follower", **kw)), \
              patch.object(fid, "_ensure_monitor"), patch.object(fid, "fidelity_enabled", return_value=True):
             first = fid.ensure_keeper(4400, CHROME_153)
             assert first.state == "follower"
