@@ -60,18 +60,8 @@ DEFAULT_BLOCKING_HOSTS: Tuple[str, ...] = (
     "producthunt.com", "theresanaiforthat.com",
 )
 
-#: Page-text hints of a bot wall, most specific first: (label, pattern). These only label a result
-#: and add the where="chrome" hint; they never teach the router (see :func:`wall_host`).
-_BLOCK_SIGNATURES = (
-    # Measured 2026-09-23, Skyscanner search in Chrome for Testing: url .../sttc/px/captcha-v2/...,
-    # text "Are you a person or a robot?".
-    ("perimeterx", re.compile(r"px-captcha|/px/captcha|captcha-v2|press\s*(?:&|and)\s*hold|perimeterx|_pxhd", re.I)),
-    ("datadome", re.compile(r"datadome|captcha-delivery\.com", re.I)),
-    ("cloudflare", re.compile(r"just a moment\.\.\.|cf-chl|challenges\.cloudflare\.com|attention required! \| cloudflare"
-                              r"|verify you are human|error 1020", re.I)),
-    ("akamai", re.compile(r"access denied.{0,80}reference #|akamai", re.I | re.S)),
-    ("captcha", re.compile(r"are you a (?:person or a )?robot|not a robot|unusual traffic|google\.com/sorry|recaptcha|hcaptcha", re.I)),
-)
+#: Page-text hints of a bot wall: one table, owned by the CAPTCHA detector (tools/browser_captcha.py).
+from tools.browser_captcha import BLOCK_SIGNATURES as _BLOCK_SIGNATURES  # noqa: E402
 
 _URL_RE = re.compile(r"""https?://[^\s'"\\)<>]+""", re.I)
 

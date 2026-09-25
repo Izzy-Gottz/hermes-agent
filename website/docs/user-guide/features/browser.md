@@ -739,7 +739,7 @@ List all images on the current page with their URLs and alt text. Useful for fin
 
 ### `browser_vision`
 
-Take a screenshot and analyze it with vision AI. Use this when text snapshots don't capture important visual information — especially useful for CAPTCHAs, complex layouts, or visual verification challenges.
+Take a screenshot and analyze it with vision AI. Use this when text snapshots don't capture important visual information, such as complex layouts. It is not for solving CAPTCHAs: those go to the person.
 
 The screenshot is saved persistently and the file path is returned alongside the AI analysis. On messaging platforms (Telegram, Discord, Slack, WhatsApp), you can ask the agent to share the screenshot — it will be sent as a native photo attachment via the `MEDIA:` mechanism.
 

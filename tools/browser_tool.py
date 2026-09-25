@@ -532,7 +532,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_vision",
-        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - especially for CAPTCHAs, visual verification challenges, complex layouts, or cases where the text snapshot misses important visual information. When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; otherwise Hermes falls back to an auxiliary vision model and returns a text analysis. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
+        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - complex layouts, or cases where the text snapshot misses important visual information. Not for CAPTCHAs: never try to solve one yourself; a CAPTCHA or 'are you human' check goes to the person (browser_handoff when it is available, otherwise tell them what the page shows). When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; otherwise Hermes falls back to an auxiliary vision model and returns a text analysis. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -761,11 +761,12 @@ def _add_navigate_warnings(response: Dict[str, Any], title: str, first_nav_sessi
     """Bot-detection hint from the page title; on first navigation, the session's stealth features."""
     title_lower = title.lower()
     if any(pattern in title_lower for pattern in _BOT_DETECTION_TITLE_PATTERNS):
+        # Never "enable Browserbase stealth" and never "solve it": Moe's engine handles the CAPTCHAs it can in
+        # browser_exec (tools/browser_captcha_ladder.py) and the rest go to the person.
         response["bot_detection_warning"] = (
-            f"Page title '{title}' suggests bot detection. The site may have blocked this request. "
-            "Options: 1) Try adding delays between actions, 2) Access different pages first, "
-            "3) Enable advanced stealth (BROWSERBASE_ADVANCED_STEALTH=true, requires Scale plan), "
-            "4) Some sites have very aggressive bot detection that may be unavoidable."
+            f"Page title '{title}' suggests a bot check or CAPTCHA. Do not try to solve it yourself. If the person "
+            "can pass it, hand the page to them (browser_handoff, when it is available) or tell them what the page "
+            "shows; otherwise report the block."
         )
     if first_nav_session is not None and "features" in first_nav_session:
         features = first_nav_session["features"]

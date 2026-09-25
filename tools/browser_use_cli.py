@@ -541,6 +541,14 @@ def _clamp_timeout(timeout_s: Any) -> int:
         return _DEFAULT_TIMEOUT_S
 
 
+def _captcha_ladder(result: dict, stdout: str, env: dict, browser_cfg: dict, task_id: Optional[str],
+                    presence: Optional[dict]) -> Optional[str]:
+    """The CAPTCHA ladder's outcome for this call ("passed" / "needs_person" / "hard_stop" / "report_only"),
+    or None when it did not run. Never raises: a broken ladder must not break browser_exec."""
+    return _quiet(lambda: importlib.import_module("tools.browser_captcha_ladder").run_for_exec(
+        result, stdout, env, browser_cfg, task_id, presence), None, "captcha ladder failed")
+
+
 # After a whole-group SIGKILL, every pipe holder is dead, so the drain below is normally
 # instant; the deadline only guards against a process outside the group still holding a pipe.
 _POST_KILL_DRAIN_S = 10.0
@@ -682,10 +690,13 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         if lane == chrome_lane.LANE_CHROME and not where:
             result["lane_reason"] = lane_reason
     if lane == chrome_lane.LANE_OWN:
-        blocked_by = chrome_lane.detect_block(proc.stdout)
+        # Engine CAPTCHA ladder (tools/browser_captcha_ladder.py): try the engine's own rungs before reporting a wall.
+        captcha = _captcha_ladder(result, proc.stdout, env, browser_cfg, task_id,
+                                  presence if chrome_lane.lane_enabled(browser_cfg) else None)
+        blocked_by = None if captcha == "passed" else chrome_lane.detect_block(proc.stdout)
         if blocked_by:
             result["blocked_by"] = blocked_by
-            if chrome_lane.lane_enabled(browser_cfg):
+            if chrome_lane.lane_enabled(browser_cfg) and captcha != "hard_stop":
                 wall = chrome_lane.wall_host(proc.stdout)  # the host that served the wall, signature-grade only
                 if wall:
                     chrome_lane.remember_blocking_host(wall[1])
