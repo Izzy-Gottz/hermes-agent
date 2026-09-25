@@ -312,18 +312,29 @@ def _org_mirror_write_guard(name: str, skill_path: Path, action: str) -> Optiona
     return None
 
 
-# ── Claims a skill must not keep ─────────────────────────────────────────────
+# ── Claims a skill should not keep unmarked ────────────────────────────────────
 #
 # A skill is read on every later turn, for every site. On 2026-09-24 the background review wrote into
 # a launch skill that a passkey challenge "on the user's own device" is expected, "so ... wait for the
 # user to approve it on their device" -- and Moe then told its owner to approve things on his phone
 # that no site had sent to any phone. Whether a step waits on a device is a fact about ONE page at ONE
-# moment, known only from what that page said (tools/browser_person_step.py: page_says); a skill that
-# states it as procedure is a standing false claim. So a write that ADDS such a sentence is refused,
-# whoever makes it; a sentence already there is left for the person to remove (their skills are
-# theirs), and edits that keep it pass.
+# moment, known only from what that page said (tools/browser_person_step.py: page_says).
+#
+# What this does, and what it does not:
+# * Only writes the BACKGROUND REVIEW / curator makes are looked at. A skill the person dictates is
+#   theirs, word for word.
+# * It never refuses. A sentence the write ADDS that says a step waits on the person's phone or
+#   device gets a visible marker after it, and the tool result carries a warning, so the reviewer can
+#   reword it -- the rest of the lesson (often true and useful) is kept.
+# * A sentence that QUOTES a page ("the page says \"check your phone\"") is left alone: that is a
+#   grounded report, not a claim.
+# * It is a word-level check. A reworded claim ("the owner's handset", "their iPad") passes, and a
+#   true general line that happens to pair a device word with an approval word gets a marker. It is a
+#   nudge at the one place such lines are written, not a proof; the grounding rule in the tool
+#   descriptions and the soul is what the model is held to.
 
 import re as _re
+import threading as _threading
 
 _DEVICE_WORDS = _re.compile(
     r"\b(?:on|from|with|via|using)\s+(?:the\s+|their\s+|your\s+|his\s+|her\s+)?"
@@ -332,29 +343,58 @@ _DEVICE_WORDS = _re.compile(
 _APPROVAL_WORDS = _re.compile(r"\b(?:approv\w*|confirm\w*|tap\w*|wait\w*|accept\w*|allow\w*|complet\w*|finish\w*|"
                               r"authori[sz]\w*|respond\w*)\b", _re.I)
 _SENTENCE_SPLIT = _re.compile(r"(?<=[.!?])\s+|\n+")
+_QUOTED = _re.compile(r"\"[^\"]{3,}\"|“[^”]{3,}”|'[^']{6,}'")
+DEVICE_CLAIM_MARK = ("[unverified: true only when the page itself says so -- otherwise the page needs the person, "
+                     "which is browser_handoff]")
 
 
 def device_approval_claims(text: str) -> list:
-    """The sentences of ``text`` that say a step waits on the person's phone or device."""
+    """The sentences of ``text`` that say a step waits on the person's phone or device, except ones
+    that quote a page's own words about it."""
     out = []
     for sentence in _SENTENCE_SPLIT.split(text or ""):
         s = " ".join(sentence.split())
-        if s and _DEVICE_WORDS.search(s) and _APPROVAL_WORDS.search(s):
-            out.append(s)
+        if not s or DEVICE_CLAIM_MARK in s or not (_DEVICE_WORDS.search(s) and _APPROVAL_WORDS.search(s)):
+            continue
+        if any(_DEVICE_WORDS.search(q.group(0)) or _re.search(r"phone|device", q.group(0), _re.I)
+               for q in _QUOTED.finditer(s)):
+            continue  # quotes what a page said: grounded
+        out.append(s)
     return out
 
 
-def _device_claim_write_guard(old: Optional[str], new: str, label: str) -> Optional[Dict[str, Any]]:
-    """Refuse a write that adds a device-approval claim ``old`` did not already hold."""
+def annotate_device_claims(old: Optional[str], new: str) -> tuple:
+    """``(content, added)``: ``new`` with :data:`DEVICE_CLAIM_MARK` after each device-approval sentence
+    that ``old`` did not already hold. Sentences already in the skill are left exactly as they are."""
     before = set(device_approval_claims(old or ""))
     added = [s for s in device_approval_claims(new) if s not in before]
-    if not added:
-        return None
-    quote = added[0] if len(added[0]) <= 220 else added[0][:217] + "..."
-    return _refusal(
-        f"Refused: this write to {label} adds a claim that a step waits on the person's phone or device "
-        f"(\"{quote}\"). A skill is read for every later site and turn, but whether a site sent anything to a "
-        "device is only known from that page, at that moment. Write the general rule instead: when a page needs "
-        "the person (a passkey, a security key, a CAPTCHA, an approval), call browser_handoff so they can see it, "
-        "and tell them only what the page itself says.",
-        error_type="ungrounded_device_claim")
+    content = new
+    for sentence in added:
+        pattern = _re.compile(r"\s+".join(_re.escape(w) for w in sentence.split()))
+        content = pattern.sub(lambda m: m.group(0) + " " + DEVICE_CLAIM_MARK, content, count=1)
+    return content, added
+
+
+_claim_warnings = _threading.local()
+
+
+def review_device_claims(old: Optional[str], new: str, label: str) -> str:
+    """For a background-review write: the content to write, with any new device claim marked, and a
+    warning parked for :func:`take_device_claim_warning`. Any other write passes through unchanged."""
+    if not _is_background_review():
+        return new
+    content, added = annotate_device_claims(old, new)
+    if added:
+        quote = added[0] if len(added[0]) <= 220 else added[0][:217] + "..."
+        _claim_warnings.value = (
+            f"{label}: this adds a claim that a step waits on the person's phone or device (\"{quote}\"); it was "
+            "kept, and marked unverified. Whether a site sent anything to a device is only known from that page, at "
+            "that moment. Consider rewording it as the general rule: when a page needs the person, call "
+            "browser_handoff, and say only what the page itself says.")
+    return content
+
+
+def take_device_claim_warning() -> Optional[str]:
+    warning = getattr(_claim_warnings, "value", None)
+    _claim_warnings.value = None
+    return warning

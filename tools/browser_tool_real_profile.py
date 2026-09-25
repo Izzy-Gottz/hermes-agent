@@ -320,7 +320,7 @@ def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str
 #: True while the driven browser is shown to the person (browser_handoff): a relaunch in that window
 #: (a wedge restart, say) must not hide the page they are working in. Cleared on hand-back and when
 #: the browser is released, so the next launch is headless again.
-_shown_to_person = {"on": False}
+_shown_to_person: Dict[str, Any] = {"on": False, "since": 0.0}
 #: Whether the browser THIS process launched is headless (None: not launched here, e.g. re-attached).
 _launched_headless: Dict[str, Optional[bool]] = {"headless": None}
 
@@ -554,6 +554,10 @@ def release_if_idle(now: Optional[float] = None) -> bool:
         return False
     if now - _bt._real_profile_last_used <= _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT or _real_profile_in_use():
         return False
+    if _shown_to_person["on"] and now - float(_shown_to_person.get("since") or 0) < SHOWN_MAX_SECONDS:
+        # The person is working in this window (browser_handoff) and has not said "done": closing it
+        # would take the page out from under them.
+        return False
     with _bt._real_profile_cdp_lock:
         _bt._real_profile_cdp_cache.pop("cdp", None)
         _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
@@ -752,34 +756,58 @@ def _is_headless_now(copy_dir: str) -> bool:
     return not mains or any("--headless" in c for c in mains)
 
 
-def _app_bundle(binary: str) -> Optional[str]:
-    """``/…/Name.app`` for a macOS app binary, else None."""
-    i = binary.find(".app/")
-    return binary[:i + 4] if i > 0 else None
+def _main_browser_pid(copy_dir: str) -> Optional[int]:
+    """The pid of the browser process (not a helper) running on ``copy_dir``: ours first, else the
+    process holding the copy dir whose command line carries no ``--type=``."""
+    for proc in reversed(_origin()._real_profile_chrome_procs):
+        if proc.poll() is None:
+            return proc.pid
+    try:
+        for p in _browsers_on_data_dir(copy_dir):
+            if "--type=" not in " ".join(p.cmdline()):
+                return int(p.pid)
+    except Exception:
+        return None
+    return None
 
 
-def _bring_to_front(port: int, target_id: str) -> bool:
-    """Select the tab and raise the driven browser's window over the person's apps. ``Target.activateTarget``
-    selects the tab; on macOS ``open -a <its own .app>`` activates the RUNNING instance (Launch Services
-    routes to the process that checked in under Chrome for Testing's identifier; never the person's
-    Chrome). Best effort: True when both steps ran."""
+#: Raises one running application by pid, through AppKit (NSRunningApplication), from JavaScript
+#: for Automation -- no Apple event, so no Automation prompt. Options 3 = all windows | ignoring
+#: other apps. Prints true/false.
+_ACTIVATE_PID_JXA = ("ObjC.import('AppKit');"
+                     "var a=$.NSRunningApplication.runningApplicationWithProcessIdentifier(%d);"
+                     "(a && !a.isNil()) ? a.activateWithOptions(3) : false")
+
+
+def _activate_pid(pid: int) -> bool:
+    """Bring the process ``pid`` (and only it) to the front on macOS. By pid, never by bundle path:
+    ``open -a`` on the newest installed Chrome for Testing could start a second copy, or raise a
+    different one than the browser this page is in."""
+    if sys.platform != "darwin" or not pid:
+        return False
+    try:
+        out = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", _ACTIVATE_PID_JXA % int(pid)],
+                             capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (subprocess.SubprocessError, OSError) as e:
+        _origin().logger.debug("handoff: activating pid %s failed: %s", pid, e)
+        return False
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
+def _bring_to_front(port: int, target_id: str, pid: Optional[int]) -> bool:
+    """Select the tab, un-minimise its window and raise that browser process. True only when every
+    step reported success (the window really is in front is not something CDP can confirm)."""
     ok = True
     try:
         _cdp_call(port, "Target.activateTarget", {"targetId": target_id}, timeout=5)
+        window = _cdp_call(port, "Browser.getWindowForTarget", {"targetId": target_id}, timeout=5).get("windowId")
+        if window is not None:
+            _cdp_call(port, "Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": "normal"}},
+                      timeout=5)
     except Exception as e:
-        _origin().logger.debug("handoff: activateTarget failed: %s", e)
+        _origin().logger.debug("handoff: selecting the tab failed: %s", e)
         ok = False
-    if sys.platform == "darwin":
-        binary = driven_browser_executable() or ""
-        bundle = _app_bundle(binary)
-        if not bundle:
-            return False
-        try:
-            subprocess.run(["/usr/bin/open", "-a", bundle], capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
-        except (subprocess.SubprocessError, OSError) as e:
-            _origin().logger.debug("handoff: activating %s failed: %s", bundle, e)
-            ok = False
-    return ok
+    return _activate_pid(pid or 0) and ok
 
 
 def driven_pages() -> List[Dict[str, str]]:
@@ -798,17 +826,50 @@ def _pick_page(pages: List[Dict[str, str]], url_hint: str) -> Optional[Dict[str,
     return pages[0] if pages else None
 
 
-def show_to_person(url_hint: str = "") -> Dict[str, Any]:
-    """Put the driven browser's current tab in front of the person, headed, with the same sign-ins.
+def _other_work(task_id: str) -> List[str]:
+    """Who else is using the driven browser now, in words: another conversation in this process
+    (a browser_exec lane used within the inactivity window), or another Hermes process (its claim on
+    the shared engine session is newer than ours). Restarting the browser would cut both off."""
+    _bt = _origin()
+    reasons: List[str] = []
+    try:
+        from tools.browser_chrome_extension import recent_tasks
+        others = [t for t in recent_tasks(_bt.BROWSER_SESSION_INACTIVITY_TIMEOUT) if t != str(task_id or "")]
+        if others:
+            reasons.append(f"{len(others)} other conversation(s) used it in the last few minutes")
+    except Exception:
+        pass
+    try:
+        from tools import browser_tool_lifecycle as _lc
+        socket_dir = os.path.join(_bt._socket_safe_tmpdir(), f"agent-browser-{_bt._REAL_PROFILE_SESSION}")
+        path = os.path.join(socket_dir, f"{_bt._REAL_PROFILE_SESSION}.owner_pid")
+        pid, alive = _lc._owner_pid_alive(socket_dir, _bt._REAL_PROFILE_SESSION)
+        if pid and alive and pid != os.getpid() and \
+                time.time() - os.path.getmtime(path) <= _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT:
+            reasons.append("another part of Moe (a different conversation's tools) used it in the last few minutes")
+    except Exception:
+        pass
+    return reasons
 
-    A running headed browser: select the tab and raise the window. A headless one (the default)
-    cannot grow a window, so it is relaunched headed on the SAME profile copy: every cookie is read
-    out first and loaded back, and the tab is reopened at its URL. What a reload loses -- text typed
-    into a form the site did not save, a sessionStorage-only step -- is lost, and the result says so
-    (``form_state_lost``); the caller must not tell the person otherwise.
 
-    ``{"ok": True, "url", "title", "relaunched", "front", "form_state_lost", "closed_tabs"}`` or
-    ``{"ok": False, "why", "url"?, "browser_gone"?}``."""
+#: How long a shown window is protected from the idle reaper without a hand-back: long enough for
+#: a person to find their phone, dig out a security key or step away and come back; not forever.
+SHOWN_MAX_SECONDS = 2 * 3600
+
+
+def show_to_person(url_hint: str = "", task_id: str = "") -> Dict[str, Any]:
+    """Put the driven browser's page in front of the person, with the same sign-ins.
+
+    * Already headed: select the tab, un-minimise, raise that process by pid.
+    * Headless, launched by THIS process and nobody else using it: relaunched headed on the same
+      profile copy. Every cookie is read out first and loaded back; EVERY open tab is reopened at its
+      URL, the chosen one in front. A reload loses text typed into a form the site did not save and
+      sessionStorage-only steps (``form_state_lost``); the caller must say so.
+    * Headless and launched by another Hermes process, or in use by another conversation: NOT
+      restarted (``busy``) -- that would cut their work off. The caller routes elsewhere.
+
+    ``{"ok": True, "url", "title", "relaunched", "front", "form_state_lost", "reopened"}`` or
+    ``{"ok": False, "why", "url"?, "busy"?, "browser_gone"?}``."""
     _bt = _origin()
     with _bt._real_profile_cdp_lock:
         cached = _bt._real_profile_cdp_cache.get("cdp")
@@ -825,9 +886,18 @@ def show_to_person(url_hint: str = "") -> Dict[str, Any]:
         browser = detect_default_chromium()
         copy_dir = real_profile_copy_dir(browser)
         if not _is_headless_now(copy_dir):
-            _shown_to_person["on"] = True
+            _shown_to_person.update(on=True, since=time.time())
             return {"ok": True, "url": page["url"], "title": page["title"], "relaunched": False,
-                    "front": _bring_to_front(port, page["id"]), "form_state_lost": False, "closed_tabs": 0}
+                    "front": _bring_to_front(port, page["id"], _main_browser_pid(copy_dir)),
+                    "form_state_lost": False, "reopened": 0}
+        if _launched_headless["headless"] is None:
+            return {"ok": False, "busy": True, "url": page["url"],
+                    "why": ("Moe's browser was started by another part of Moe (another conversation's tools) and "
+                            "runs out of sight; it cannot get a window from here without closing it under that work")}
+        others = _other_work(task_id)
+        if others:
+            return {"ok": False, "busy": True, "url": page["url"],
+                    "why": "Moe's browser was not restarted with a window: " + "; ".join(others)}
 
         binary = driven_browser_executable()
         if not binary or not _cdp_on_data_dir(cached, copy_dir):
@@ -843,7 +913,7 @@ def show_to_person(url_hint: str = "") -> Dict[str, Any]:
         _terminate_real_profile_chrome()
         _bt._real_profile_cdp_cache.pop("cdp", None)
         _await_holders_gone(copy_dir)
-        _shown_to_person["on"] = True
+        _shown_to_person.update(on=True, since=time.time())
         new_port, err = _launch_driven_browser(binary, copy_dir, _persons_identity(browser))
         if new_port is None:
             _shown_to_person["on"] = False
@@ -857,31 +927,43 @@ def show_to_person(url_hint: str = "") -> Dict[str, Any]:
                     "browser_gone": True}
         _bt._real_profile_cdp_cache["cdp"] = cdp
         try:
-            target_id = str(_cdp_call(new_port, "Target.createTarget", {"url": page["url"]}).get("targetId") or "")
-        except Exception as e:
-            return {"ok": False, "why": f"the browser is up, but the page did not open again: {e}", "url": page["url"]}
-        # The blank tab the engine's attach opened would otherwise be the first page a later call lands on.
-        try:
-            others = [t for t in (_cdp_call(new_port, "Target.getTargets").get("targetInfos") or [])
-                      if t.get("type") == "page" and t.get("targetId") != target_id]
+            before = {t.get("targetId") for t in (_cdp_call(new_port, "Target.getTargets").get("targetInfos") or [])
+                      if t.get("type") == "page"}
         except Exception:
-            others = []
-        for other in others:
+            before = set()
+        # Every tab comes back, the chosen one last so it is the one in front.
+        order = [p for p in pages if p is not page] + [page]
+        target_id, reopened = "", 0
+        for p in order:
             try:
-                _cdp_call(new_port, "Target.closeTarget", {"targetId": other["targetId"]}, timeout=5)
+                tid = str(_cdp_call(new_port, "Target.createTarget", {"url": p["url"]}).get("targetId") or "")
+            except Exception as e:
+                if p is page:
+                    return {"ok": False, "why": f"the browser is up, but the page did not open again: {e}",
+                            "url": page["url"]}
+                continue
+            reopened += 1
+            if p is page:
+                target_id = tid
+        # The blank tab the engine's attach opened would otherwise be the first page a later call lands on.
+        for blank in before:
+            try:
+                _cdp_call(new_port, "Target.closeTarget", {"targetId": blank}, timeout=5)
             except Exception:
                 pass
-        _bt.logger.info("handoff: driven browser shown to the person at %s (relaunched headed, %d cookie(s))",
-                        page["url"][:120], len(cookies))
+        _bt.logger.info("handoff: driven browser shown to the person at %s (relaunched headed, %d tab(s), %d cookie(s))",
+                        page["url"][:120], reopened, len(cookies))
         return {"ok": True, "url": page["url"], "title": page["title"], "relaunched": True,
-                "front": _bring_to_front(new_port, target_id), "form_state_lost": True,
-                "closed_tabs": max(0, len(pages) - 1)}
+                "front": _bring_to_front(new_port, target_id, _main_browser_pid(copy_dir)), "form_state_lost": True,
+                "reopened": reopened, "tabs_lost": len(pages) - reopened}
 
 
 def hand_back() -> Dict[str, Any]:
     """The person is done: where the page is now, and the next launch goes back out of sight. The window
-    is left as it is -- relaunching it hidden again would reload the page they just finished on."""
+    is left as it is -- relaunching it hidden again would reload the page they just finished on. The
+    idle clock restarts now, so the reaper does not close the window the moment they finish."""
     _shown_to_person["on"] = False
+    _origin()._real_profile_last_used = time.time()
     pages = driven_pages()
     page = pages[0] if pages else None
     return {"url": page["url"], "title": page["title"]} if page else {}

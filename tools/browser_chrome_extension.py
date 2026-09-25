@@ -211,15 +211,16 @@ def local_turn_presence() -> dict:
     if platform == "api_server":
         origin = get_turn_origin()
         if origin == TURN_ORIGIN_PERSON:
-            verdict = {"live": True, "why": "the person's own turn"}
+            verdict = {"live": True, "why": "the person's own turn", "surface": SURFACE_LOCAL}
             return _as_helper(verdict) if helper else verdict
         if origin == TURN_ORIGIN_BACKGROUND:
             return {"live": False, "why": "a background note from the app"}
         return {"live": False, "why": "an API turn whose client did not say a person started it"}
     if platform in _LOCAL_SURFACES or (not platform and source in _LOCAL_SURFACES):
-        verdict = {"live": True, "why": "the person's own turn"}
+        verdict = {"live": True, "why": "the person's own turn", "surface": SURFACE_LOCAL}
     elif platform in _LIVE_CHAT_PLATFORMS:
-        verdict = {"live": True, "why": "the person's message"}
+        verdict = {"live": True, "why": f"the person's message on {platform.replace('_', ' ')}",
+                   "surface": SURFACE_CHAT, "platform": platform}
     elif platform:
         return {"live": False, "why": f"a {platform.replace('_', ' ')} turn"}
     else:
@@ -255,10 +256,72 @@ def turn_presence() -> dict:
             out = {"live": answer["live"], "why": str(answer.get("why") or "")}
             if answer.get("auto") is False:
                 out["auto"] = False
+            for key in ("surface", "platform"):
+                if isinstance(answer.get(key), str):
+                    out[key] = answer[key]
             return out
     except Exception as exc:
         logger.debug("turn presence query failed: %s", exc)
     return {"live": False, "why": "a turn whose origin could not be established (the agent did not answer)"}
+
+
+#: Where a live turn's person is: at this machine's own surfaces, or writing from a chat app.
+SURFACE_LOCAL = "local"
+SURFACE_CHAT = "chat"
+#: The host's "is the person at this machine" stamp (Memoe: ``Conductor.writePresence`` every
+#: minute and on lock/unlock/sleep/wake: ``{"active": bool, "at": epoch, "idle": s}``; ``active`` is
+#: already false when locked, asleep or idle). The same file and rule as Memoe's moe-screen
+#: ``deliver.at_mac``: older than this, absent or unreadable is NOT here.
+PRESENCE_FILENAME = "presence.json"
+PRESENCE_FRESH_SECONDS = 3 * 60
+
+
+def _presence_file() -> Optional[Path]:
+    """The host's presence stamp: ``HERMES_PRESENCE_FILE``, else ``$MOE_HOME/presence.json``, else
+    ``~/.moe/presence.json`` when that home exists. None: this host writes no stamp (plain Hermes)."""
+    explicit = (os.environ.get("HERMES_PRESENCE_FILE") or "").strip()
+    if explicit:
+        return Path(explicit)
+    home = (os.environ.get("MOE_HOME") or "").strip()
+    if home:
+        return Path(home) / PRESENCE_FILENAME
+    legacy = Path.home() / ".moe"
+    return legacy / PRESENCE_FILENAME if legacy.exists() else None
+
+
+def presence_stamp_says_here(now: Optional[float] = None) -> Tuple[Optional[bool], str]:
+    """``(True|False, why)`` from the host's stamp; ``(None, why)`` when the host writes none."""
+    path = _presence_file()
+    if path is None:
+        return None, "this host keeps no presence stamp"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, "the app has not said the person is at the Mac (no presence stamp)"
+    if not isinstance(data, dict):
+        return False, "the presence stamp is unreadable"
+    at = data.get("at")
+    now = time.time() if now is None else now
+    if not isinstance(at, (int, float)) or not (0 <= now - float(at) <= PRESENCE_FRESH_SECONDS):
+        return False, "the Mac has not been in use for a few minutes (the app is closed, or it is asleep)"
+    if data.get("active") is not True:
+        return False, "the Mac is locked, asleep or idle"
+    return True, "the person is at the Mac"
+
+
+def at_this_mac(presence: Optional[dict] = None, *, now: Optional[float] = None) -> Tuple[bool, str]:
+    """Whether a window may be put in front of the person: a live turn from this machine's own
+    surfaces (not a chat app -- the owner texting from their phone is live but not here) AND, when
+    the host keeps a presence stamp, a fresh one saying unlocked, awake and in use."""
+    presence = turn_presence() if presence is None else presence
+    if not presence.get("live"):
+        return False, presence.get("why") or "a turn nobody started live"
+    if presence.get("surface") != SURFACE_LOCAL:
+        return False, presence.get("why") or "a turn from away from the Mac"
+    here, why = presence_stamp_says_here(now)
+    if here is False:
+        return False, why
+    return True, "the person's own turn, at the Mac"
 
 
 def unattended_turn() -> Optional[str]:
@@ -367,11 +430,23 @@ def choose_lane(where: str, code: str, *, task_id: Optional[str], session: str, 
     return LANE_OWN, "default"
 
 
+_lane_used_at: Dict[Tuple[str, str], float] = {}
+
+
 def record_lane(task_id: Optional[str], session: str, lane: str) -> None:
     with _sticky_lock:
         key = (str(task_id or ""), str(session or ""))
         _sticky.pop(key, None)  # re-insert: the dict's order is then most-recent-last
         _sticky[key] = lane
+        _lane_used_at[key] = time.time()
+
+
+def recent_tasks(within_s: float, *, lane: str = LANE_OWN, now: Optional[float] = None) -> list:
+    """Task ids whose browser_exec ran in ``lane`` within the last ``within_s`` seconds (this process)."""
+    now = time.time() if now is None else now
+    with _sticky_lock:
+        return sorted({t for (t, s), at in _lane_used_at.items()
+                       if now - at <= within_s and _sticky.get((t, s)) == lane})
 
 
 def last_lane(task_id: Optional[str]) -> Optional[str]:
@@ -387,6 +462,7 @@ def last_lane(task_id: Optional[str]) -> Optional[str]:
 def reset_sticky_lanes() -> None:
     with _sticky_lock:
         _sticky.clear()
+        _lane_used_at.clear()
 
 
 def wall_host(text: str) -> Optional[Tuple[str, str]]:

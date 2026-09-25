@@ -1,7 +1,7 @@
-"""A skill may not add a claim that a step waits on the person's phone or device (slice D).
+"""A background-review write that adds "it waits on their phone/device" is marked and warned (slice D).
 
 On 2026-09-24 the background review wrote into ~/.hermes/skills/product-launch-social-media/SKILL.md
-(line 118, read-only here) the sentence quoted below, and Moe then told its owner to approve things
+(then line 118, now 128; read-only here) the sentence quoted below, and Moe then told its owner to approve things
 on his phone that no site had sent to any phone.
 """
 
@@ -10,8 +10,10 @@ from unittest.mock import patch
 
 import pytest
 
-from tools.skill_manager_guards import device_approval_claims
-from tools.skill_manager_tool import _create_skill, _edit_skill, _patch_skill, _write_file
+import json
+
+from tools.skill_manager_guards import DEVICE_CLAIM_MARK, annotate_device_claims, device_approval_claims
+from tools.skill_manager_tool import _create_skill, _edit_skill, _patch_skill, _write_file, skill_manage
 
 #: Verbatim from the live skill (measured 2026-09-25).
 POISON = ("That is expected, not a new failure — there is nothing to click through it (`browser_vault_enter_code` "
@@ -59,42 +61,73 @@ def test_ordinary_sentences_are_not(text):
     assert device_approval_claims(text) == []
 
 
-def test_creating_a_skill_with_the_claim_is_refused(tmp_path):
+@contextmanager
+def _review(on=True):
+    """The background review, writing skills it manages (the ownership guards are not under test)."""
+    with patch("tools.skill_manager_guards._is_background_review", return_value=on), \
+         patch("tools.skill_manager_tool._background_review_write_guard", return_value=None), \
+         patch("tools.skill_manager_tool._background_review_read_before_write_guard", return_value=None):
+        yield
+
+
+def _read(path):
+    """The review has read the file it changes (the read-before-write guard requires it)."""
+    from tools.skill_manager_guards import _reset_background_review_read_marks, mark_background_review_skill_read
+    _reset_background_review_read_marks()
+    mark_background_review_skill_read(path)
+
+
+def test_a_quoted_page_line_is_not_a_claim():
+    assert device_approval_claims('When the page says "Check your phone to approve the sign-in", wait for them.') == []
+
+
+def test_the_background_review_adding_the_claim_keeps_it_marked_and_warns(tmp_path):
+    with _skills(tmp_path), _review():
+        out = json.loads(skill_manage(action="create", name="launch-kit", content=SKILL + "\n" + POISON + "\n"))
+    assert out["success"] is True and "unverified" in out["warning"] and "browser_handoff" in out["warning"]
+    text = (tmp_path / "launch-kit" / "SKILL.md").read_text()
+    assert POISON + " " + DEVICE_CLAIM_MARK in text
+
+
+def test_a_review_patch_that_adds_it_is_marked_not_refused(tmp_path):
     with _skills(tmp_path):
+        assert _create_skill("launch-kit", SKILL)["success"]
+        with _review():
+            _read(tmp_path / "launch-kit" / "SKILL.md")
+            out = _patch_skill("launch-kit", "Read the post-login page before re-filling anything.",
+                               "Read the post-login page before re-filling anything. " + POISON)
+        assert out["success"] is True
+        assert DEVICE_CLAIM_MARK in (tmp_path / "launch-kit" / "SKILL.md").read_text()
+
+
+def test_a_review_supporting_file_is_held_to_the_same_rule(tmp_path):
+    with _skills(tmp_path):
+        assert _create_skill("launch-kit", SKILL)["success"]
+        with _review():
+            out = _write_file("launch-kit", "references/google.md", "Google sign-in\n\n" + POISON + "\n")
+        assert out["success"] is True
+        assert DEVICE_CLAIM_MARK in (tmp_path / "launch-kit" / "references" / "google.md").read_text()
+
+
+def test_what_the_owner_dictates_is_written_word_for_word(tmp_path):
+    with _skills(tmp_path), _review(on=False):
         out = _create_skill("launch-kit", SKILL + "\n" + POISON + "\n")
-    assert out["success"] is False and out["error_type"] == "ungrounded_device_claim"
-    assert "browser_handoff" in out["error"]
-    assert not (tmp_path / "launch-kit").exists()
+    assert out["success"] is True
+    assert DEVICE_CLAIM_MARK not in (tmp_path / "launch-kit" / "SKILL.md").read_text()
 
 
-def test_a_patch_that_adds_it_is_refused_and_the_file_is_unchanged(tmp_path):
-    with _skills(tmp_path):
-        assert _create_skill("launch-kit", SKILL)["success"]
-        out = _patch_skill("launch-kit", "Read the post-login page before re-filling anything.",
-                           "Read the post-login page before re-filling anything. " + POISON)
-        assert out["success"] is False and out["error_type"] == "ungrounded_device_claim"
-        assert (tmp_path / "launch-kit" / "SKILL.md").read_text() == SKILL
-
-
-def test_a_supporting_file_is_held_to_the_same_rule(tmp_path):
-    with _skills(tmp_path):
-        assert _create_skill("launch-kit", SKILL)["success"]
-        out = _write_file("launch-kit", "references/google.md", "Google sign-in\n\n" + POISON + "\n")
-    assert out["success"] is False and out["error_type"] == "ungrounded_device_claim"
-
-
-def test_an_edit_that_keeps_an_existing_sentence_passes(tmp_path):
-    """The claim already in someone's skill is theirs to remove; unrelated edits are not blocked by it."""
-    with _skills(tmp_path):
+def test_an_edit_that_keeps_an_existing_sentence_leaves_it_alone(tmp_path):
+    """The claim already in someone's skill is theirs to remove; unrelated edits do not touch it."""
+    with _skills(tmp_path), _review():
         (tmp_path / "launch-kit").mkdir()
         (tmp_path / "launch-kit" / "SKILL.md").write_text(SKILL + "\n" + POISON + "\n")
+        _read(tmp_path / "launch-kit" / "SKILL.md")
         out = _edit_skill("launch-kit", SKILL.replace("Launch kit", "Launch kit (v2)") + "\n" + POISON + "\n")
     assert out["success"] is True
+    assert DEVICE_CLAIM_MARK not in (tmp_path / "launch-kit" / "SKILL.md").read_text()
 
 
-def test_an_edit_that_removes_it_passes(tmp_path):
-    with _skills(tmp_path):
-        (tmp_path / "launch-kit").mkdir()
-        (tmp_path / "launch-kit" / "SKILL.md").write_text(SKILL + "\n" + POISON + "\n")
-        out = _edit_skill("launch-kit", SKILL + "\nWhen a page needs the person, call browser_handoff.\n")
-    assert out["success"] is True
+def test_marking_is_idempotent(tmp_path):
+    content, added = annotate_device_claims(None, SKILL + POISON)
+    again, added2 = annotate_device_claims(content, content)
+    assert added and added2 == [] and again == content

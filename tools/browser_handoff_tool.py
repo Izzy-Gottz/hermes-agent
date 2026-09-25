@@ -16,9 +16,11 @@ Routes, first that works:
 3. ``default_browser`` -- the URL opens in the person's default browser, with the explicit note that
    Moe's session does not carry over.
 
-A turn nobody is at (cron, a background helper, other people's words -- ``turn_presence``) never pops
-a window: it gets the ``person_needed`` fixable result (tools/fix_reasons.py) so the job reports the
-step instead of inventing a device prompt.
+A window is put up only for a person AT THIS MAC (``at_this_mac``: a live turn from the machine's own
+surfaces and a fresh "in use" presence stamp). The owner texting from their phone is live but not here,
+and a turn nobody is at (cron, a helper, other people's words) is neither: both get the ``person_needed``
+fixable result (tools/fix_reasons.py) with ``tell_owner``, the words to pass on, instead of a window on
+an empty Mac or an invented device prompt.
 
 After the call the turn ENDS: the model tells the person what to do in one line and waits. When they
 say they are done, ``browser_handoff(done=true)`` reads where the page is now; the next launch of
@@ -78,15 +80,47 @@ def _presence() -> dict:
     return turn_presence()
 
 
-def _needs_person(reason: str, url: str, why: str, step: Optional[dict] = None) -> str:
+def owner_message(reason: str, url: str, step: Optional[dict] = None) -> str:
+    """Plain words for the owner about a step that waits for them: what, where, and what happens
+    next. Only what the page showed -- never that anything was sent to a device."""
+    from tools.browser_person_step import host_of
+    host = host_of(url) or "A site"
+    says = (step or {}).get("page_says") or ""
+    line = f"{host} needs you for one step: {reason}"
+    if says:
+        line += f' (the page says: "{says}")'
+    line += ". It's waiting in Moe's browser on your Mac"
+    if url:
+        line += f" ({url})"
+    return line + ". Tell me when you're at the Mac and I'll bring it up in front of you."
+
+
+def _needs_person(reason: str, url: str, presence: dict, why: str, step: Optional[dict] = None) -> str:
+    """The step waits for a person who is not at this Mac: nothing is opened on its screen.
+
+    * A live turn from a chat app (the owner texting from their phone): the reply IS the message --
+      the model says ``tell_owner`` there.
+    * A turn nobody is at (a scheduled job, a helper): ``tell_owner`` goes to the owner through
+      ``reach_owner(text)`` when the runtime offers it (Memoe; slice A), and is the job's reported
+      outcome either way.
+    """
     from tools.browser_person_step import describe, host_of
     from tools.fix_reasons import PERSON_NEEDED, fix_error
     host = host_of(url)
     what = describe(step) if step else reason
-    msg = (f"{host or 'This page'} needs the person for this step: {what}. This is {why}, not their own live turn, "
-           "so nothing was opened on their screen. Report exactly that as the outcome -- the step is waiting for them. "
-           + _GROUNDED)
-    extra = {"url": url} if url else {}
+    tell = owner_message(reason, url, step)
+    if presence.get("live"):
+        where = presence.get("platform") or "a chat"
+        next_step = (f"They are writing from {where.replace('_', ' ')}, away from the Mac: tell them tell_owner in your "
+                     "reply, then stop -- do not keep working the page.")
+    else:
+        next_step = ("Nobody is at the Mac: pass tell_owner to reach_owner(text) if you have that tool, and report it "
+                     "as this job's outcome -- the step is waiting for them.")
+    msg = (f"{host or 'This page'} needs the person for this step: {what}. This is {why}, so nothing was opened on "
+           f"the Mac's screen. {next_step} " + _GROUNDED)
+    extra: Dict[str, Any] = {"tell_owner": tell, "reason": reason}
+    if url:
+        extra["url"] = url
     if step:
         extra["step"] = step.get("kind", "")
     return fix_error(msg, PERSON_NEEDED, subject=host or None, retry=False, **extra)
@@ -173,15 +207,16 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
         current = pages[0]["url"] if pages else ""
 
     presence = _presence()
-    if not presence.get("live"):
+    here, why = chrome_lane.at_this_mac(presence)
+    if not here:
         step = None
         try:
-            from tools.browser_person_step import probe_pages
+            from tools.browser_person_step import probe_active_page
             cached = rp._origin()._real_profile_cdp_cache.get("cdp")
-            step = probe_pages(cached) if cached else None
+            step = probe_active_page(cached) if cached else None
         except Exception:
             step = None
-        return _needs_person(reason, current, presence.get("why") or "a turn with no person present", step)
+        return _needs_person(reason, current, presence, why or "a turn with no person present", step)
 
     base: Dict[str, Any] = {"success": True, "reason": reason}
     if resume_hint:
@@ -197,7 +232,7 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
                                      + " " + _GROUNDED)})
 
     # 1. Moe's own browser, shown. The URL the model names only picks the tab; it is never a new site.
-    shown = rp.show_to_person(url)
+    shown = rp.show_to_person(url, task)
     if shown.get("ok"):
         _record(task, ROUTE_DRIVEN, shown.get("url", ""))
         out = {**base, "route": ROUTE_DRIVEN, "url": shown.get("url"), "title": shown.get("title"),
@@ -206,8 +241,8 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
             out["form_state"] = ("lost: Moe's browser had to restart in a window, so the page was reloaded at its "
                                  "address. Sign-ins came across; anything typed on the page that the site had not "
                                  "saved is gone. Say so if it matters, and re-enter it after they are done.")
-        if shown.get("closed_tabs"):
-            out["other_tabs"] = f"{shown['closed_tabs']} other tab(s) of Moe's browser were not reopened."
+        if shown.get("tabs_lost"):
+            out["other_tabs"] = f"{shown['tabs_lost']} other tab(s) of Moe's browser did not reopen."
         where = "in Moe's browser window, now in front" if out["front"] else \
             "in Moe's browser window (it may be behind other windows)"
         out["next"] = f"The page is open {where}. " + _WAIT.format(reason=reason) + " " + _GROUNDED
@@ -263,8 +298,10 @@ BROWSER_HANDOFF_SCHEMA = {
         "Moe's tab group, else in their default browser -- the result's route and session say which, and what "
         "carried over). Then tell them in one line what to do and END YOUR TURN: they say when they are done, and "
         "you call browser_handoff(done=true) and carry on in the same browser_exec session. Use it when a result "
-        "has needs_person, or browser_vault_enter_code finds no code field. On a turn nobody is at (a scheduled "
-        "job) it opens nothing and returns code person_needed: report that the step is waiting for the person. "
+        "has needs_person, or browser_vault_enter_code finds no code field. A window is only ever put up for a "
+        "person at this Mac: when they are writing from their phone, or nobody is there (a scheduled job), it opens "
+        "nothing and returns code person_needed with tell_owner -- say it in your reply, or pass it to "
+        "reach_owner(text) on a job, and stop. "
         "Only tell the person that something was sent, or is waiting on their phone or another device, when a "
         "tool result shows the site said so (page_says)."
     ),

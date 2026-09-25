@@ -13,12 +13,15 @@ So the engine looks at the page itself, for every site, and says two things:
 * ``page_says`` -- the page's own line, verbatim. A reply may repeat it; it may not add to it. Only
   ``device_prompt`` makes "check your phone" a true thing to say.
 
-Detection is by what the page shows (its text and its visible challenge frames), never a site list.
-The text patterns are English; a non-English page still trips the challenge-frame check for CAPTCHAs,
-and a passkey page in another language is not recognised (an honest gap, not a guess).
+Detection is by what the page is DOING, never a site list and never the bare word (see the block
+above IMPERATIVE): a WebAuthn request in flight (the hook the fidelity keeper installs in every page),
+a visible challenge frame, or imperative challenge phrasing on a short page with no form to fill.
+The phrasing is English; a non-English page is caught only by the hook or a challenge frame (an
+honest gap, not a guess).
 
-:func:`classify_text` reads whatever a tool printed; :data:`PROBE_JS` runs in the page itself (one
-source of patterns for both); :func:`probe_pages` runs it over a local CDP endpoint's open tabs.
+:func:`suggests_person_step` decides from a tool's output whether the page is worth a look;
+:func:`probe_active_page` runs :data:`PROBE_JS` in the active tab, within a tight budget;
+:func:`classify_page` is the same decision in Python.
 """
 
 from __future__ import annotations
@@ -37,19 +40,33 @@ IDENTITY_CHECK = "identity_check"
 DEVICE_PROMPT = "device_prompt"
 KINDS = (DEVICE_PROMPT, PASSKEY, CAPTCHA, IDENTITY_CHECK)
 
-#: ``(kind, pattern)``, most specific first. Written in the subset of regex syntax Python and
-#: JavaScript share (no lookbehind, no inline flags): the same strings run in the page (PROBE_JS).
-PATTERNS = (
+# ── The verdict: what the page is DOING ────────────────────────────────────────
+#
+# Measured by review, 2026-09-25: the bare word is not a challenge. github.com/login says "Sign in with
+# a passkey" as ONE option beside a password form; a Google help article and Wikipedia's "Passkey" page
+# are full of the word. A step only the person can take is a page that (1) has asked the browser for a
+# passkey right now -- a WebAuthn call in flight, seen by the hook below -- or (2) tells them, in the
+# imperative, to do one thing, and offers no other way forward: no form to fill, a short page.
+
+#: ``(kind, pattern)``, most specific first: imperative challenge phrasing only. Written in the regex
+#: subset Python and JavaScript share (no lookbehind, no inline flags): PROBE_JS runs the same strings.
+IMPERATIVE = (
     # The site says a device is involved -- the only kind where "check your phone" is grounded.
-    (DEVICE_PROMPT, r"check your (?:phone|device|iphone|android)|tap (?:yes|approve|allow) on your (?:phone|device)"
+    (DEVICE_PROMPT, r"check your (?:phone|device|iphone|android)\b|tap (?:yes|approve|allow) on your (?:phone|device)"
                     r"|approve (?:the |this )?(?:sign[- ]?in|request|login)[^.\n]{0,40} on your (?:phone|device|other device)"
-                    r"|we sent a (?:notification|prompt|push)[^.\n]{0,40} to your|open the [a-z0-9 ]{1,30} app on your (?:phone|device)"),
-    (PASSKEY, r"\bpasskey|security key|touch id|face id|windows hello|use your (?:fingerprint|face|screen lock)"),
-    (CAPTCHA, r"verify (?:that )?you(?: are|['’]re) (?:a )?human|are you a (?:person or a )?robot|i['’]?m not a robot"
-              r"|press (?:&|and) hold|complete the security check|solve (?:the|this) (?:puzzle|challenge)"),
-    (IDENTITY_CHECK, r"(?:verify|confirm) it['’]?s (?:really )?you|(?:verify|confirm) your identity|identity verification"),
+                    r"|we sent a (?:notification|prompt|push)[^.\n]{0,40} to your"),
+    (PASSKEY, r"use your (?:passkey|security key|fingerprint|face|screen lock|device) to (?:confirm|verify|sign in|continue|log in)"
+              r"|insert your security key|touch your security key|confirm it['’]?s (?:really )?you with your passkey"),
+    (CAPTCHA, r"verify (?:that )?you(?: are|['’]re) (?:a )?human|are you a (?:person or a )?robot|press (?:&|and) hold"
+              r"|complete the security check|solve (?:the|this) (?:puzzle|challenge)"),
+    (IDENTITY_CHECK, r"^(?:verify|confirm) it['’]?s (?:really )?you|^(?:verify|confirm) your identity"),
 )
-_COMPILED = tuple((kind, re.compile(p, re.I)) for kind, p in PATTERNS)
+#: The old name: tests and callers that want the verdict patterns.
+PATTERNS = IMPERATIVE
+_COMPILED = tuple((kind, re.compile(p, re.I | re.M)) for kind, p in IMPERATIVE)
+
+#: A challenge page is short; an article or a dashboard is not. Visible text above this is not one.
+SHORT_PAGE_CHARS = 1500
 
 #: Visible challenge frames and widgets. The invisible reCAPTCHA badge (``size=invisible``) is on
 #: countless ordinary login pages and is NOT a challenge; the checkbox (``size=normal|compact``), the
@@ -58,7 +75,20 @@ CHALLENGE_FRAME = (r"recaptcha/(?:api2|enterprise)/(?:anchor[^\"']*size=(?:norma
                    r"|challenges\.cloudflare\.com|captcha-delivery\.com|arkoselabs\.com|funcaptcha\.com")
 CHALLENGE_SELECTOR = "#px-captcha, .cf-turnstile, .h-captcha, [data-sitekey][class*=captcha i]"
 
+# ── The trigger: output that suggests a stall, so the page is worth a look ────────
+#
+# Cheap and loose on purpose: it only decides whether to spend one probe of the active tab. It is
+# never a verdict, and never reaches the person.
+_STALL_HINT = re.compile(
+    r"passkey|security key|webauthn|captcha|robot|human|verify it|confirm it|verify your|identity|"
+    r"check your (?:phone|device)|two[- ]step|2-step|/challenge|/signin/|press (?:&|and) hold|just a moment", re.I)
+
 _SAYS_LIMIT = 200
+
+
+def suggests_person_step(text: str) -> bool:
+    """Whether a tool's output hints that the page may be waiting on the person (worth a probe)."""
+    return bool(text) and bool(_STALL_HINT.search(text))
 
 
 def _line_around(text: str, start: int) -> str:
@@ -69,15 +99,49 @@ def _line_around(text: str, start: int) -> str:
     return line[:_SAYS_LIMIT]
 
 
-def classify_text(text: str) -> Optional[Dict[str, str]]:
-    """``{"kind", "page_says"}`` for the first person-only step the text shows, else None."""
-    if not text:
+def classify_page(text: str, *, fillable_inputs: int = 0, webauthn_pending: bool = False) -> Optional[Dict[str, str]]:
+    """The verdict for one page from what it shows: ``{"kind", "page_says"}`` or None. Python twin of
+    PROBE_JS's decision (tests hold them to the same fixtures)."""
+    text = text or ""
+    if webauthn_pending:
+        found = next(((k, m) for k, p in _COMPILED if (m := p.search(text))), None)
+        return {"kind": PASSKEY, "page_says": _line_around(text, found[1].start()) if found else ""}
+    if len(text) > SHORT_PAGE_CHARS or fillable_inputs > 0:
         return None
     for kind, pattern in _COMPILED:
         m = pattern.search(text)
         if m:
             return {"kind": kind, "page_says": _line_around(text, m.start())}
     return None
+
+
+#: Installed in every page of the driven browser before its scripts run (the fidelity keeper,
+#: tools/browser_tool_fidelity.py): it notes a WebAuthn request in flight. ``mediation:
+#: "conditional"`` is passkey AUTOFILL (github.com/login offers it quietly beside the password form)
+#: and is not a request. A Proxy keeps ``toString`` native, so the page sees nothing new.
+WEBAUTHN_HOOK_JS = """(() => {
+  const K = Symbol.for("hermes.webauthn");
+  if (window[K]) return;
+  const st = {pending: 0, last: null};
+  try { Object.defineProperty(window, K, {value: st, enumerable: false}); } catch (e) { return; }
+  const C = window.CredentialsContainer && window.CredentialsContainer.prototype;
+  if (!C) return;
+  for (const op of ["get", "create"]) {
+    const orig = C[op];
+    if (typeof orig !== "function") continue;
+    const wrapped = new Proxy(orig, {apply(target, self, args) {
+      const o = (args && args[0]) || {};
+      const p = Reflect.apply(target, self, args);
+      if (!o.publicKey || o.mediation === "conditional") return p;
+      st.pending++; st.last = {op, at: Date.now()};
+      const done = () => { st.pending = Math.max(0, st.pending - 1); };
+      try { Promise.resolve(p).then(done, done); } catch (e) { done(); }
+      return p;
+    }});
+    try { Object.defineProperty(C, op, {value: wrapped, writable: true, configurable: true, enumerable: true}); }
+    catch (e) { /* leave the page alone */ }
+  }
+})();"""
 
 
 PROBE_JS = """(() => {
@@ -91,23 +155,30 @@ PROBE_JS = """(() => {
     const b = text.lastIndexOf("\\n", i) + 1; let e = text.indexOf("\\n", i); if (e < 0) e = text.length;
     return text.slice(b, e).replace(/\\s+/g, " ").trim().slice(0, __LIMIT__);
   };
-  const out = (kind, says) => JSON.stringify({kind, page_says: says, url: location.href, title: document.title});
-  for (const [kind, src] of P) {
-    const m = new RegExp(src, "i").exec(text);
-    if (m) return out(kind, line(m.index));
-  }
+  const out = (kind, says, why) => JSON.stringify({kind, page_says: says, why, url: location.href, title: document.title});
+  const hook = window[Symbol.for("hermes.webauthn")];
+  const find = () => { for (const [kind, src] of P) { const m = new RegExp(src, "im").exec(text); if (m) return [kind, m]; } return null; };
+  if (hook && hook.pending > 0) { const f = find(); return out("passkey", f ? line(f[1].index) : "", "webauthn"); }
   const frame = Array.from(document.querySelectorAll("iframe")).find(
     (f) => visible(f) && new RegExp(__FRAME__, "i").test(f.src || ""));
   const widget = Array.from(document.querySelectorAll(__SELECTOR__)).find(visible);
-  if (frame || widget) return out("captcha", "");
-  return null;
+  if (frame || widget) return out("captcha", "", "challenge_frame");
+  // Another way forward: any visible field to fill (a password form beside "sign in with a passkey").
+  const fillable = Array.from(document.querySelectorAll("input, textarea, select")).filter((el) => {
+    const t = (el.type || "").toLowerCase();
+    if (["hidden", "submit", "button", "reset", "image", "checkbox", "radio", "search"].includes(t)) return false;
+    return visible(el) || (el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0);
+  }).length;
+  if (text.length > __SHORT__ || fillable > 0) return null;
+  const f = find();
+  return f ? out(f[0], line(f[1].index), "imperative") : null;
 })()"""
 
 
 def probe_js() -> str:
-    return (PROBE_JS.replace("__PATTERNS__", json.dumps([list(p) for p in PATTERNS]))
+    return (PROBE_JS.replace("__PATTERNS__", json.dumps([list(p) for p in IMPERATIVE]))
             .replace("__FRAME__", json.dumps(CHALLENGE_FRAME)).replace("__SELECTOR__", json.dumps(CHALLENGE_SELECTOR))
-            .replace("__LIMIT__", str(_SAYS_LIMIT)))
+            .replace("__LIMIT__", str(_SAYS_LIMIT)).replace("__SHORT__", str(SHORT_PAGE_CHARS)))
 
 
 def parse_probe(raw) -> Optional[Dict[str, str]]:
@@ -119,7 +190,7 @@ def parse_probe(raw) -> Optional[Dict[str, str]]:
             except ValueError:
                 return None
     if isinstance(raw, dict) and raw.get("kind") in KINDS:
-        return {k: str(raw.get(k) or "") for k in ("kind", "page_says", "url", "title")}
+        return {k: str(raw.get(k) or "") for k in ("kind", "page_says", "why", "url", "title")}
     return None
 
 
@@ -162,21 +233,28 @@ def _evaluate(ws_url: str, expression: str, timeout: float) -> object:
                 return ((msg.get("result") or {}).get("result") or {}).get("value")
 
 
-def probe_pages(cdp: str, *, limit: int = 3, timeout: float = 1.5) -> Optional[Dict[str, str]]:
-    """Run :data:`PROBE_JS` in up to ``limit`` open tabs of a local browser; the first step found, or None.
-    Best effort by design: a page that does not answer in ``timeout`` is skipped, never waited on."""
-    expression = probe_js()
-    for target in page_targets(cdp)[:limit]:
-        if not target["ws"]:
-            continue
-        try:
-            found = parse_probe(_evaluate(target["ws"], expression, timeout))
-        except Exception as exc:
-            logger.debug("person-step: probe of %s failed: %s", target["url"][:80], exc)
-            continue
-        if found:
-            return found
-    return None
+def probe_active_page(cdp: str, *, budget: float = 0.8) -> Optional[Dict[str, str]]:
+    """Run :data:`PROBE_JS` in the ACTIVE tab of a local browser (``/json/list``'s first page: Chrome
+    lists the most recently activated tab first, measured 2026-09-25), within ``budget`` seconds all
+    told. Best effort by design: a page that does not answer in time is not waited on."""
+    import time as _time
+    deadline = _time.monotonic() + budget
+    pages = page_targets(cdp, timeout=max(0.1, budget / 2))
+    if not pages or not pages[0]["ws"]:
+        return None
+    left = deadline - _time.monotonic()
+    if left <= 0.05:
+        return None
+    try:
+        return parse_probe(_evaluate(pages[0]["ws"], probe_js(), left))
+    except Exception as exc:
+        logger.debug("person-step: probe of %s failed: %s", pages[0]["url"][:80], exc)
+        return None
+
+
+#: Kept for callers written against the first version; now the active tab only.
+def probe_pages(cdp: str, *, limit: int = 1, timeout: float = 0.8) -> Optional[Dict[str, str]]:
+    return probe_active_page(cdp, budget=timeout)
 
 
 def host_of(url: str) -> str:

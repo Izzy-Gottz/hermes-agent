@@ -597,33 +597,42 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
 
 
 def _person_step(stdout: str, env: dict) -> Optional[dict]:
-    """A person-only step the page shows: in what the code printed, else in the page itself (a local
-    browser's open tabs, probed briefly). None when there is none, or nothing could be read."""
+    """A person-only step on the active tab -- looked for only when the code's own output suggests
+    a stall (a passkey, a challenge URL, "verify"...), and then decided by the page itself (a WebAuthn
+    request in flight, a visible challenge, imperative wording with no other way forward), within
+    a sub-second budget. None when there is none, nothing could be read, or the browser is not local."""
     from tools import browser_person_step as ps
-    found = ps.classify_text(stdout or "")
-    if found:
-        return found
+    if not ps.suggests_person_step(stdout or ""):
+        return None
     cdp = env.get("BU_CDP_URL") or ""
-    return _quiet(lambda: ps.probe_pages(cdp), None, "person-step probe failed") if cdp else None
+    return _quiet(lambda: ps.probe_active_page(cdp), None, "person-step probe failed") if cdp else None
 
 
 def _note_person_step(result: dict, step: dict, presence: Optional[dict]) -> None:
-    """Put ``needs_person`` on a browser_exec result, and the next move: browser_handoff on a person's live
-    turn, a report on a turn nobody is at. ``presence`` None = ask now."""
+    """Put ``needs_person`` on a browser_exec result, and the next move: browser_handoff when the person
+    is at this Mac; the words to tell them when they are writing from away; a report (and reach_owner)
+    on a turn nobody is at. ``presence`` None = ask now."""
     from tools import browser_person_step as ps
+    from tools.browser_chrome_extension import at_this_mac, turn_presence
     if presence is None:
-        from tools.browser_chrome_extension import turn_presence
         presence = _quiet(turn_presence, {"live": False, "why": ""}, "turn presence lookup failed")
     result["needs_person"] = {k: v for k, v in step.items() if v}
     what = ps.describe(step)
-    if presence.get("live"):
+    here, why = _quiet(lambda: at_this_mac(presence), (False, ""), "at-Mac lookup failed")
+    if here:
         hint = (f"The page needs the person: {what}. Moe's browser is out of sight, so they cannot do it yet: call "
                 "browser_handoff(reason=...) to put the page in front of them, then wait for them. " + ps.GROUNDING_RULE)
     else:
+        from tools.browser_handoff_tool import owner_message
         result["needs_person"]["code"] = "person_needed"
-        hint = (f"The page needs the person: {what}. This is {presence.get('why') or 'a turn nobody started live'}, "
-                "so nobody can do it now: report that this step is waiting for them, and stop there. "
-                + ps.GROUNDING_RULE)
+        result["needs_person"]["tell_owner"] = owner_message(what, step.get("url") or "", step)
+        if presence.get("live"):
+            hint = (f"The page needs the person: {what}. {why or 'They are away from the Mac'}, so nothing can be shown "
+                    "to them: say needs_person.tell_owner in your reply and stop there. " + ps.GROUNDING_RULE)
+        else:
+            hint = (f"The page needs the person: {what}. This is {why or 'a turn nobody started live'}, so nobody can "
+                    "do it now: pass needs_person.tell_owner to reach_owner(text) if you have that tool, report that "
+                    "this step is waiting for them, and stop there. " + ps.GROUNDING_RULE)
     result["hint"] = (result["hint"] + " " + hint) if result.get("hint") else hint
 
 

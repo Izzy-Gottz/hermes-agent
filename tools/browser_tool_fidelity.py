@@ -477,6 +477,10 @@ def commands_for_attached_target(params: Dict[str, Any], ua: str, metadata: Dict
     cmds: List[Tuple[str, Dict[str, Any]]] = []
     if kind in _PAGE_LIKE:
         cmds.append(("Emulation.setUserAgentOverride", override))
+        # Notes a WebAuthn request in flight, so a passkey challenge is known by what the page DOES,
+        # not by the word on it (tools/browser_person_step.py). Installed before any page script runs.
+        from tools.browser_person_step import WEBAUTHN_HOOK_JS
+        cmds.append(("Page.addScriptToEvaluateOnNewDocument", {"source": WEBAUTHN_HOOK_JS, "runImmediately": True}))
         cmds.append(("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True}))
     elif kind in _WORKER_LIKE:
         cmds.append(("Network.setUserAgentOverride", override))
