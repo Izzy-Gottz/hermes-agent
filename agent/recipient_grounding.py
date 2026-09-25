@@ -219,27 +219,6 @@ def in_turn() -> bool:
     return _TURN_PERSON_WORDS.get() is not None
 
 
-#: Environment that marks a process a model started or is driving: any of these
-#: set means whatever created a job here was not a person at a terminal.
-AGENT_ENV_MARKERS = (
-    GROUNDING_KEY_ENV, "HERMES_SESSION_ID", "HERMES_TOOL_BRIDGE_SOCKET", "HERMES_MCP_TOOL_PROFILE",
-    "HERMES_CRON_SESSION", "HERMES_KANBAN_TASK", "HERMES_SINGLE_QUERY_SESSION",
-    "HERMES_DELEGATED_CHILD_CONTEXT", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX",
-)
-
-
-def _interactive_person(env: Optional[dict] = None) -> bool:
-    """A human at a terminal: stdin is a tty and nothing an agent sets is set."""
-    env = os.environ if env is None else env
-    if any(str(env.get(k) or "").strip() for k in AGENT_ENV_MARKERS):
-        return False
-    try:
-        import sys
-        return bool(sys.stdin and sys.stdin.isatty())
-    except Exception:
-        return False
-
-
 def ledger_person_words(key: str) -> List[Dict[str, Any]]:
     """The person words already filed for a conversation (a process that runs
     the conversation's tools but not its turns — codex's MCP server)."""
@@ -257,19 +236,17 @@ def words_for_new_task(prompt: Any = None) -> List[Dict[str, Any]]:
     person's words are what may ground it. In a process that serves a
     conversation's tools but not its turns (the MCP server codex starts, which
     carries the conversation's key): the person words the turn filed for it.
-    Otherwise the prompt is the person's only when a person typed it: an
-    interactive terminal with nothing an agent sets. Anything else — a model's
-    shell running `hermes cron create`, a script — records no person words,
-    so the job can name nobody."""
+    Anywhere else — the CLI, a script, a model's own shell running
+    `hermes cron create`, the dashboard — NO person words, ever: nothing about
+    a process says a person typed the prompt (a tty is one `script -q` away).
+    A job made that way names nobody until the person says so on the Jobs
+    card in the app (Moe's reminders.py `keep`). ``prompt`` is unused."""
     if in_turn():
         return person_words_now()
     key = str(os.environ.get(GROUNDING_KEY_ENV) or "").strip()
     if key:
         return ledger_person_words(key)
-    if not _interactive_person():
-        return []
-    text = clean(prompt)
-    return [{"text": text, "origin": "person", "sender": {"kind": "local"}}] if text else []
+    return []
 
 
 # ── the ledger ───────────────────────────────────────────────────────────────
@@ -365,10 +342,19 @@ def record_turn(agent: Any, keys: Iterable[str], current: Any) -> None:
         except Exception:
             pass
         current_entry = new[-1] if new else None
+        override = getattr(agent, "_grounding_override", None)
+        legacy = bool(isinstance(override, dict) and override.get("legacy_job"))
 
         def _set(data: dict) -> None:
             data["words"] = words
             data["current"] = current_entry
+            # A job made before jobs recorded who asked for them: Moe shows its
+            # sends in amber ("made before Moe checked recipients") rather than
+            # refusing them, until the person answers on the Jobs card.
+            if legacy:
+                data["legacy_job"] = True
+            else:
+                data.pop("legacy_job", None)
 
         for key in keys:
             _update(key, _set)

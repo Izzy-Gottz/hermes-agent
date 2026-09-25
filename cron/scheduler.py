@@ -2210,7 +2210,9 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
     # for the job, recorded when it was created, can. run_job swaps in the
     # full built prompt once it has it.
     agent._grounding_override = {"person": list(job.get("grounding_words") or []),
-                                 "model": [str(job.get("prompt") or "")]}
+                                 "model": [str(job.get("prompt") or "")],
+                                 # No key at all: made before jobs carried it.
+                                 "legacy_job": "grounding_words" not in job}
     return agent
 
 
@@ -2299,7 +2301,8 @@ def run_job(
             agent._grounding_override["model"] = [prompt]
         except Exception:
             agent._grounding_override = {"person": list(job.get("grounding_words") or []),
-                                         "model": [prompt]}
+                                         "model": [prompt],
+                                         "legacy_job": "grounding_words" not in job}
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(

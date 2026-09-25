@@ -1977,14 +1977,24 @@ def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
 
 
 def set_job_grounding(job_id: str, words: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Record who asked for a job, from outside any model: the person's own
-    answer to "this job messages X — keep?" (Moe's tools/job-grounding.py).
-    Not reachable through update_job, which drops the field."""
-    clean = [dict(w) for w in words or [] if isinstance(w, dict) and w.get("text")
-             and w.get("origin") == "person"]
+    """Record who asked for a job: the person's own answer on Moe's Jobs card
+    ("this job messages X — keep?"), or the answers they typed into Moe's
+    Reminders form. Called only by Moe's hermes/reminders.py on a request the
+    Memoe app started (it checks that its parent is the signed app); Moe's send
+    gate refuses a model's tool call that names this function. Residual risk,
+    stated: anything running as this user can import this module and call it —
+    the guard is against a confused or injected model taking a cheap path, not
+    against a determined process of the same uid. Not reachable through
+    update_job, which drops the field."""
+    clean = None if words is None else [dict(w) for w in words if isinstance(w, dict) and w.get("text")
+                                        and w.get("origin") == "person"]
 
     def apply(jobs, i, job):
         updated = {**job, "grounding_words": clean}
+        if clean is None:
+            # None: a job made before jobs carried who asked (a travelled copy
+            # of one) — the key is absent, as it was there.
+            updated.pop("grounding_words", None)
         jobs[i] = updated
         save_jobs(jobs)
         return _normalize_job_record(updated)
@@ -2010,7 +2020,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         # Who asked is never an editable field; a new prompt is grounded by the
         # words of whoever changed it (agent/recipient_grounding.py).
         updates.pop("grounding_words", None)
-        if "prompt" in updates:
+        # Re-grounded only when the words of the prompt actually change: a job
+        # spec that travels to the away machine and back with the same prompt
+        # keeps the words of the person who asked for it.
+        if "prompt" in updates and str(updates.get("prompt") or "").strip() != \
+                str(job.get("prompt") or "").strip():
             try:
                 from agent.recipient_grounding import words_for_new_task
                 updates["grounding_words"] = words_for_new_task(updates.get("prompt"))

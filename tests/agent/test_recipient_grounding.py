@@ -126,19 +126,14 @@ def test_a_job_created_in_a_turn_carries_that_turns_words_not_its_prompt(home):
     assert [w["text"] for w in words] == ["every morning, text my brother good morning"]
 
 
-def test_a_job_created_at_a_persons_terminal_was_typed_by_them(home, monkeypatch):
+def test_outside_a_turn_a_job_names_nobody_even_at_a_terminal(home, monkeypatch):
+    """A tty proves nothing (`script -q /dev/null` gives the model one)."""
     class Tty:
         def isatty(self):
             return True
-    for marker in rg.AGENT_ENV_MARKERS:
-        monkeypatch.delenv(marker, raising=False)
     monkeypatch.setattr("sys.stdin", Tty())
-    words = _fresh(rg.words_for_new_task, "text Dan at 9")
-    assert words == [{"text": "text Dan at 9", "origin": "person", "sender": {"kind": "local"}}]
-    # …and not when nothing is at a terminal (a script, a pipe, the model's shell).
-    monkeypatch.setattr("sys.stdin", None)
+    monkeypatch.delenv(rg.GROUNDING_KEY_ENV, raising=False)
     assert _fresh(rg.words_for_new_task, "text Dan at 9") == []
-
 
 def test_create_job_stores_the_creating_turns_words(home, monkeypatch):
     from cron import jobs
@@ -298,10 +293,11 @@ def test_a_cron_agent_is_built_with_the_jobs_grounding_words():
     asked = [{"text": "send me a message when done", "origin": "person", "sender": {"kind": "local"}}]
     job = {"id": "j", "name": "t", "prompt": "message Yisrael the list", "grounding_words": asked}
     agent = _construct_cron_agent(MagicMock(), job, {}, setup, workdir=None, session_id="s", session_db=None)
-    assert agent._grounding_override == {"person": asked, "model": ["message Yisrael the list"]}
+    assert agent._grounding_override == {"person": asked, "model": ["message Yisrael the list"],
+                                         "legacy_job": False}
     legacy = _construct_cron_agent(MagicMock(), {"id": "old", "name": "t", "prompt": "text Dan"}, {},
                                    setup, workdir=None, session_id="s", session_db=None)
-    assert legacy._grounding_override == {"person": [], "model": ["text Dan"]}
+    assert legacy._grounding_override == {"person": [], "model": ["text Dan"], "legacy_job": True}
 
 
 def test_a_real_delegated_child_carries_the_parents_person_words(tmp_path, monkeypatch):
@@ -348,21 +344,6 @@ def test_update_job_never_takes_grounding_words_from_the_caller(home, monkeypatc
     assert store[0]["grounding_words"] != forged
 
 
-def test_a_job_created_by_an_agent_process_outside_a_turn_names_nobody(home, monkeypatch):
-    """`hermes cron create` from the model's own shell: no turn, but an agent's
-    environment — never the person's words."""
-    class Tty:
-        def isatty(self):
-            return True
-    monkeypatch.setattr("sys.stdin", Tty())          # even at a terminal
-    for marker in rg.AGENT_ENV_MARKERS:
-        monkeypatch.delenv(marker, raising=False)
-    for marker in ("HERMES_SESSION_ID", "HERMES_TOOL_BRIDGE_SOCKET", "CLAUDECODE"):
-        monkeypatch.setenv(marker, "x")
-        assert _fresh(rg.words_for_new_task, "text Moshe Finkelman") == [], marker
-        monkeypatch.delenv(marker)
-
-
 def test_codex_mcp_server_reads_the_turns_person_words_from_the_ledger(home, monkeypatch):
     """codex has no bridge: cronjob_manage runs in its MCP server, which carries
     the conversation's key — the words come from what the turn filed."""
@@ -383,3 +364,48 @@ def test_set_job_grounding_is_the_only_way_in(home, monkeypatch):
             {"text": "model words", "origin": "model"}]
     jobs.set_job_grounding(job["id"], said)
     assert store[0]["grounding_words"] == said[:1]
+
+
+def test_a_legacy_job_is_marked_in_the_ledger_so_moe_can_be_soft(home):
+    agent = _agent(_grounding_override={"person": [], "model": ["text Dan"], "legacy_job": True})
+    _fresh(rg.record_turn, agent, ["cron-old"], "text Dan")
+    assert _ledger("cron-old")["legacy_job"] is True
+    agent = _agent(_grounding_override={"person": [], "model": ["text Dan"], "legacy_job": False})
+    _fresh(rg.record_turn, agent, ["cron-new"], "text Dan")
+    assert "legacy_job" not in _ledger("cron-new")
+
+
+def test_a_cron_agent_knows_whether_its_job_predates_grounding():
+    from unittest.mock import MagicMock
+    from cron.scheduler import _construct_cron_agent
+
+    setup = SimpleNamespace(model="m", runtime={"api_key": "k", "provider": "openrouter"},
+                            prefill_messages=None, max_iterations=5, reasoning_config=None,
+                            fallback_model=None, credential_pool=None)
+    old = _construct_cron_agent(MagicMock(), {"id": "o", "name": "t", "prompt": "p"}, {}, setup,
+                                workdir=None, session_id="s", session_db=None)
+    new = _construct_cron_agent(MagicMock(), {"id": "n", "name": "t", "prompt": "p", "grounding_words": []},
+                                {}, setup, workdir=None, session_id="s", session_db=None)
+    assert old._grounding_override["legacy_job"] is True
+    assert new._grounding_override["legacy_job"] is False
+
+
+def test_an_unchanged_prompt_keeps_the_words_of_who_asked(home, monkeypatch):
+    """A job spec that travels to the away machine and back must not lose them."""
+    from cron import jobs
+
+    store = []
+    monkeypatch.setattr(jobs, "save_jobs", lambda j, *_a, **_k: store.__setitem__(slice(None), j))
+    monkeypatch.setattr(jobs, "load_jobs", lambda *_a, **_k: list(store))
+
+    def turn():
+        rg.record_turn(_agent(), ["s-keep"], "every day text Dan hi")
+        return jobs.create_job(prompt="Text Dan hi", schedule="every 1h")
+
+    job = _fresh(turn)
+    said = store[0]["grounding_words"]
+    assert said
+    _fresh(jobs.update_job, job["id"], {"prompt": "Text Dan hi  ", "name": "x"})
+    assert store[0]["grounding_words"] == said
+    _fresh(jobs.update_job, job["id"], {"prompt": "Text Moshe Finkelman hi"})
+    assert store[0]["grounding_words"] == []
