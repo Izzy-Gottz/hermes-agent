@@ -36,6 +36,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import os
 import random
 import re
 import threading
@@ -75,15 +76,26 @@ BUDGETS: Dict[str, Budget] = {
     bc.PERIMETERX: Budget(attempts=3, poll_s=4.0, hold_max_s=15.0),
 }
 
-#: Where the clickable box sits inside each widget's iframe (CSS px from the frame's top-left: x, y, w, h).
-#: Widget layouts measured from the vendors' own rendered widgets: Turnstile 300x65 with the box at left
-#: 16-44 px, vertically centred; reCAPTCHA's anchor 304x78 with the box at (12..40, 25..53); hCaptcha's
-#: checkbox frame 303x78 with the box at (14..42, vertically centred).
+#: Where the clickable box sits inside each widget's iframe (CSS px from the frame's top-left: x, y, w, h),
+#: used only when the frame's own DOM cannot be read (:meth:`CdpSurface._box_in_frame` reads it first).
+#: MEASURED 2026-09-25 on Chrome for Testing 154 with each vendor's official test sitekey, read from the
+#: widget frame's DOM (pierced) with DOM.getBoxModel:
+#:   Turnstile (3x00000000000000000000FF): frame 300x65; input[type=checkbox] in a closed shadow root at
+#:     (9, 20.5) 168.1x24 -- the input spans the label, so the target is its left 26 px (the box itself).
+#:   reCAPTCHA v2 (6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI): frame 304x78; #recaptcha-anchor (13, 23) 28x28.
+#:   hCaptcha (10000000-ffff-ffff-ffff-000000000001): frame 302x76; #checkbox (16, 23) 30x30.
 CHECKBOX_IN_FRAME = {
-    bc.TURNSTILE: lambda fw, fh: (16.0, fh / 2 - 12, 26.0, 24.0),
-    bc.CF_MANAGED: lambda fw, fh: (16.0, fh / 2 - 12, 26.0, 24.0),
-    bc.RECAPTCHA_V2: lambda fw, fh: (13.0, 26.0, 26.0, 26.0),
-    bc.HCAPTCHA: lambda fw, fh: (15.0, fh / 2 - 13, 26.0, 26.0),
+    bc.TURNSTILE: lambda fw, fh: (9.0, 20.5, 26.0, 24.0),
+    bc.CF_MANAGED: lambda fw, fh: (9.0, 20.5, 26.0, 24.0),
+    bc.RECAPTCHA_V2: lambda fw, fh: (13.0, 23.0, 28.0, 28.0),
+    bc.HCAPTCHA: lambda fw, fh: (16.0, 23.0, 30.0, 30.0),
+}
+#: How to find the checkbox in each widget frame's (pierced) DOM, and the widest a target may be.
+_CHECKBOX_NODE = {
+    bc.TURNSTILE: (lambda name, a: name == "INPUT" and a.get("type") == "checkbox", 26.0),
+    bc.CF_MANAGED: (lambda name, a: name == "INPUT" and a.get("type") == "checkbox", 26.0),
+    bc.RECAPTCHA_V2: (lambda name, a: a.get("id") == "recaptcha-anchor", 40.0),
+    bc.HCAPTCHA: (lambda name, a: a.get("id") == "checkbox", 40.0),
 }
 
 
@@ -409,6 +421,7 @@ class CdpSurface(Surface):
     def __init__(self, conn: CdpConn, page: PageSession, browser_cfg: Optional[dict] = None,
                  sleep: Callable[[float], None] = time.sleep):
         self.conn, self.page, self.cfg, self.sleep = conn, page, browser_cfg or {}, sleep
+        self.last_geometry = ""
         self._delivery: Optional[Tuple[Delivery, str]] = None
 
     def _oopif_urls(self) -> List[str]:
@@ -454,8 +467,48 @@ class CdpSurface(Surface):
             fb = self._box(int(f.backend_node_id))  # type: ignore[arg-type]
             if fb is None:
                 continue
-            dx, dy, w, h = CHECKBOX_IN_FRAME[ch.kind](fb.width, fb.height)
+            inner = self._box_in_frame(ch.kind, f.url)
+            dx, dy, w, h = inner if inner else CHECKBOX_IN_FRAME[ch.kind](fb.width, fb.height)
+            self.last_geometry = "frame_dom" if inner else "fixed"
             return Box(fb.x + dx, fb.y + dy, w, h)
+        return None
+
+    def _box_in_frame(self, kind: str, src: str) -> Optional[Tuple[float, float, float, float]]:
+        """The checkbox's box inside the widget frame, read from that frame's own DOM (an out-of-process
+        frame: its own target), or None."""
+        match = _CHECKBOX_NODE.get(kind)
+        if match is None or not src:
+            return None
+        is_box, max_w = match
+        try:
+            infos = self.conn.call("Target.getTargets").get("targetInfos") or []
+        except Exception:
+            return None
+        key = src.split("#")[0][:80]
+        cands = [t for t in infos if t.get("type") == "iframe" and str(t.get("url") or "").split("#")[0][:80] == key]
+        for t in cands:
+            sid = None
+            try:
+                sid = self.conn.call("Target.attachToTarget", {"targetId": t["targetId"], "flatten": True})["sessionId"]
+                doc = self.conn.call("DOM.getDocument", {"depth": -1, "pierce": True}, session_id=sid)
+                node = _find_node(doc.get("root") or {}, is_box)
+                if node is None:
+                    continue
+                quad = (self.conn.call("DOM.getBoxModel", {"backendNodeId": node}, session_id=sid)
+                        .get("model") or {}).get("border")
+                if quad and len(quad) >= 8:
+                    xs, ys = quad[0::2], quad[1::2]
+                    w, h = max(xs) - min(xs), max(ys) - min(ys)
+                    if w > 4 and h > 4:
+                        return (min(xs), min(ys), min(w, max_w), h)
+            except Exception:
+                continue
+            finally:
+                if sid:
+                    try:
+                        self.conn.call("Target.detachFromTarget", {"sessionId": sid})
+                    except Exception:
+                        pass
         return None
 
     def delivery(self) -> Tuple[Delivery, str]:
@@ -464,6 +517,22 @@ class CdpSurface(Surface):
             self._delivery = pick_delivery(self.page, os_clicks=os_clicks, backend_factory=_cua_backend_for_page,
                                            sleep=self.sleep)
         return self._delivery
+
+
+def _find_node(node: dict, is_box: Callable[[str, Dict[str, str]], bool], depth: int = 0) -> Optional[int]:
+    if depth > 400:
+        return None
+    raw = node.get("attributes") or []
+    if is_box(str(node.get("nodeName") or "").upper(), {raw[i]: raw[i + 1] for i in range(0, len(raw) - 1, 2)}):
+        return node.get("backendNodeId")
+    for key in ("children", "shadowRoots"):
+        for child in node.get(key) or ():
+            hit = _find_node(child, is_box, depth + 1)
+            if hit:
+                return hit
+    if node.get("contentDocument"):
+        return _find_node(node["contentDocument"], is_box, depth + 1)
+    return None
 
 
 def _cua_backend_for_page() -> Any:
@@ -480,13 +549,15 @@ def _cua_backend_for_page() -> Any:
 
 
 def find_challenge(conn: CdpConn, prefer_hosts: Sequence[str] = (), limit: int = 4,
-                   hard_stop_hosts: Sequence[str] = bc.DEFAULT_HARD_STOP_HOSTS
+                   hard_stop_hosts: Sequence[str] = bc.DEFAULT_HARD_STOP_HOSTS, prefer_target: str = ""
                    ) -> Optional[Tuple[PageSession, bc.Challenge]]:
-    """The first open http(s) tab showing a challenge -- tabs on ``prefer_hosts`` first."""
+    """The first open http(s) tab showing a challenge -- the harness's attached tab (``prefer_target``)
+    first, then tabs on ``prefer_hosts``."""
     infos = conn.call("Target.getTargets").get("targetInfos") or []
     pages = [t for t in infos if t.get("type") == "page" and str(t.get("url") or "").startswith(("http://", "https://"))]
     prefer = {h.lower() for h in prefer_hosts if h}
-    pages.sort(key=lambda t: 0 if bc.host_of(str(t.get("url"))) in prefer else 1)
+    pages.sort(key=lambda t: (0 if prefer_target and t.get("targetId") == prefer_target else 1,
+                              0 if bc.host_of(str(t.get("url"))) in prefer else 1))
     for t in pages[:limit]:
         try:
             sid = conn.call("Target.attachToTarget", {"targetId": t["targetId"], "flatten": True})["sessionId"]
@@ -538,23 +609,165 @@ def next_step(out: Outcome, presence: Optional[dict]) -> str:
             "carry on when they have done it." + stop)
 
 
+#: What a browser_exec that never reached the page prints: the ticket #16 harness errors, a dead daemon, a
+#: refused socket. Then there is no page to read, and probing it would only add a stall.
+_UNREACHED = re.compile(r"did not answer|PageDidNotAnswer|waiting for the daemon|timed out|Connection ?refused"
+                        r"|ECONNREFUSED|daemon (?:is )?not running|no browser|BrokenPipe|ConnectionResetError", re.I)
+
+PROBE_BUDGET_S = 2.0
+ENV_TAB_NOTE = "HERMES_BU_CAPTCHA_TAB"
+
+#: Runs in the harness process after the model's code (atexit): writes the tab the daemon is attached to,
+#: so the every-call probe reads THAT page. Best effort, bounded to 1 s, silent.
+TAB_NOTE_PREAMBLE = r"""
+def _hermes_note_tab():
+    import atexit, json, os
+    _p = os.environ.get("HERMES_BU_CAPTCHA_TAB")
+    if not _p:
+        return
+    def _w():
+        try:
+            from browser_harness import helpers as _h
+            _t = _h._send({"meta": "current_tab"}, response_timeout=1.0) or {}
+            with open(_p, "w") as _f:
+                json.dump({"targetId": _t.get("targetId") or "", "url": _t.get("url") or ""}, _f)
+        except Exception:
+            pass
+    atexit.register(_w)
+_hermes_note_tab()
+del _hermes_note_tab
+"""
+
+#: One Runtime.evaluate: could this page hold a challenge? Cheap and deliberately generous -- it only
+#: decides whether the full detector (pierced DOM, cookies) runs.
+QUICK_PROBE_JS = r"""(() => {
+  const t = document.title || '';
+  if (/^(\W+\s*)?(just a moment|attention required! \| cloudflare)/i.test(t)) return 1;
+  if (typeof window._cf_chl_opt !== 'undefined' || typeof window.gokuProps !== 'undefined') return 1;
+  if (document.querySelector('#px-captcha, .cf-turnstile, [name="cf-turnstile-response"], .g-recaptcha, .h-captcha,'
+      + ' [name="h-captcha-response"], #captcha-container, [class^="geetest_"], img[src*="captcha" i], img[alt*="captcha" i]')) return 1;
+  const re = /challenges\.cloudflare\.com|recaptcha\/(api2|enterprise)\/(anchor|bframe)|hcaptcha\.com|captcha-delivery\.com|arkoselabs|funcaptcha|geetest|awswaf/i;
+  for (const f of document.querySelectorAll('iframe')) if (re.test(f.src || '')) return 1;
+  for (const sc of document.scripts) if (re.test(sc.src || '') || /recaptcha\/(api|enterprise)\.js/i.test(sc.src || '')) return 1;
+  return 0;
+})()"""
+
+
+def tab_note_path(task_id: Optional[str], session: str = "") -> str:
+    import tempfile
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", f"{task_id or 'default'}-{session or 'default'}")[:80]
+    return os.path.join(tempfile.gettempdir(), f"hermes-captcha-tab-{os.getuid()}-{safe}.json")
+
+
+def prepare_exec(code: str, env: Dict[str, str], browser_cfg: Optional[dict], task_id: Optional[str],
+                 session: str = "") -> str:
+    """Own lane, before the CLI runs: arm the attached-tab note. Returns the code to run."""
+    if not bc.ladder_enabled(browser_cfg):
+        return code
+    path = tab_note_path(task_id, session)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    env[ENV_TAB_NOTE] = path
+    return f"exec(compile({TAB_NOTE_PREAMBLE!r}, '<hermes-captcha-tab>', 'exec'))\n" + code  # one line
+
+
+def _attached_tab(env: Dict[str, str]) -> str:
+    path = env.get(ENV_TAB_NOTE) or ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return str(json.load(f).get("targetId") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def _http_root(env: Dict[str, str]) -> Optional[str]:
+    raw = str(env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or "").strip()
+    u = urlparse(raw)
+    if (u.hostname or "") not in _LOOPBACK or not u.port:
+        return None
+    return f"http://127.0.0.1:{u.port}" if u.hostname != "::1" else f"http://[::1]:{u.port}"
+
+
+def quick_probe(env: Dict[str, str], target_id: str = "", budget_s: float = PROBE_BUDGET_S,
+                prefer_hosts: Sequence[str] = ()) -> Optional[str]:
+    """The target id of the attached (else most recent) tab if it might hold a challenge, else None.
+    Local browsers only, and never longer than ``budget_s`` in total."""
+    root = _http_root(env)
+    if not root:
+        return None
+    deadline = time.monotonic() + budget_s
+    left = lambda: max(0.05, deadline - time.monotonic())  # noqa: E731
+    host = urlparse(root).netloc
+    if not target_id:
+        import urllib.request
+        try:
+            with urllib.request.urlopen(root + "/json/list", timeout=min(0.8, left())) as r:  # noqa: S310 -- loopback
+                pages = [t for t in json.loads(r.read().decode("utf-8")) if t.get("type") == "page"
+                         and str(t.get("url") or "").startswith(("http://", "https://"))]
+        except Exception:
+            return None
+        prefer = {h.lower() for h in prefer_hosts if h}
+        pages.sort(key=lambda t: 0 if bc.host_of(str(t.get("url"))) in prefer else 1)
+        if not pages:
+            return None
+        target_id = str(pages[0].get("id") or "")
+    if not target_id or time.monotonic() >= deadline:
+        return None
+    from websockets.sync.client import connect
+    try:
+        with connect(f"ws://{host}/devtools/page/{target_id}", max_size=None, open_timeout=left(),
+                     close_timeout=0.2) as ws:
+            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                "params": {"expression": QUICK_PROBE_JS, "returnByValue": True, "timeout": 1000}}))
+            while True:
+                msg = json.loads(ws.recv(timeout=left()))
+                if msg.get("id") == 1:
+                    hit = ((msg.get("result") or {}).get("result") or {}).get("value")
+                    return target_id if hit == 1 else None
+    except Exception as exc:
+        logger.debug("captcha quick probe failed: %s", exc)
+        return None
+
+
+def reached_browser(result: Dict[str, Any], stdout: str, stderr: str = "") -> bool:
+    """False when the call failed without reaching the page (nothing to read, and a probe would only stall)."""
+    if result.get("success") is not False:
+        return True
+    return not _UNREACHED.search(f"{stdout or ''}\n{stderr or ''}")
+
+
 def run_for_exec(result: Dict[str, Any], stdout: str, env: Dict[str, str], browser_cfg: Optional[dict],
                  task_id: Optional[str], presence: Optional[dict] = None,
-                 ladder_factory: Callable[[Optional[dict]], Ladder] = lambda cfg: Ladder(cfg)) -> Optional[str]:
-    """browser_exec's hook (own lane). Runs the ladder when the printed output suggests a challenge and the
-    browser is on this Mac; puts ``result["captcha"]`` and returns the outcome string, else None."""
-    if not bc.ladder_enabled(browser_cfg) or not bc.worth_a_look(stdout or ""):
+                 ladder_factory: Callable[[Optional[dict]], Ladder] = lambda cfg: Ladder(cfg),
+                 stderr: str = "") -> Optional[str]:
+    """browser_exec's hook (own lane), after EVERY call. A cheap bounded probe of the attached tab (or the
+    printed output looking like a wall) decides whether the full detector runs; the ladder runs only when
+    a challenge is really there and not already passed. Puts ``result["captcha"]`` and returns the
+    outcome string, else None. Skipped entirely when the call never reached the browser."""
+    if not bc.ladder_enabled(browser_cfg) or not reached_browser(result, stdout, stderr):
+        return None
+    if not _http_root(env):
+        return None  # not a browser on this Mac
+    hosts = [bc.host_of(u) for u in _urls(stdout)]
+    said_wall = bc.worth_a_look(stdout or "")
+    attached = _attached_tab(env)
+    probed = quick_probe(env, attached, prefer_hosts=hosts)
+    if not probed and not said_wall:
         return None
     ws = local_browser_ws(env)
     if not ws:
         return None
-    hosts = [bc.host_of(u) for u in _urls(stdout)]
     try:
         with CdpConn(ws) as conn:
-            found = find_challenge(conn, hosts, hard_stop_hosts=bc.hard_stop_hosts(browser_cfg))
+            found = find_challenge(conn, hosts, hard_stop_hosts=bc.hard_stop_hosts(browser_cfg),
+                                   prefer_target=probed or attached, limit=4 if said_wall else 1)
             if not found:
                 return None
             page, ch = found
+            if not said_wall and (ch.solved or ch.kind == bc.RECAPTCHA_V3):
+                return None  # a widget already passed, or a score-only badge: nothing to report
             ladder = ladder_factory(browser_cfg)
             out = ladder.run(CdpSurface(conn, page, browser_cfg, sleep=ladder.sleep), ch, task_id)
     except Exception as exc:

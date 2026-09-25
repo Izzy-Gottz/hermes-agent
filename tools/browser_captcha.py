@@ -211,9 +211,9 @@ class Challenge:
 _RE_TURNSTILE_FRAME = re.compile(r"challenges\.cloudflare\.com(?::\d+)?/.*(?:turnstile|/cdn-cgi/challenge-platform/)", re.I)
 _RE_CF_CHALLENGE_PATH = re.compile(r"__cf_chl_|/cdn-cgi/challenge-platform/", re.I)
 _RE_CF_TITLE = re.compile(r"^(?:\W+\s*)?(?:just a moment\.*|attention required! \| cloudflare|un instant\.*|einen moment\.*)$", re.I)
-_RE_RECAPTCHA_ANCHOR = re.compile(r"(?:google\.com|recaptcha\.net)/recaptcha/(?:api2|enterprise)/anchor", re.I)
-_RE_RECAPTCHA_BFRAME = re.compile(r"(?:google\.com|recaptcha\.net)/recaptcha/(?:api2|enterprise)/bframe", re.I)
-_RE_HCAPTCHA = re.compile(r"^https?://(?:[a-z0-9-]+\.)*hcaptcha\.com/", re.I)
+_RE_RECAPTCHA_ANCHOR = re.compile(r"(?:google\.com|recaptcha\.net)(?::\d+)?/recaptcha/(?:api2|enterprise)/anchor", re.I)
+_RE_RECAPTCHA_BFRAME = re.compile(r"(?:google\.com|recaptcha\.net)(?::\d+)?/recaptcha/(?:api2|enterprise)/bframe", re.I)
+_RE_HCAPTCHA = re.compile(r"^https?://(?:[a-z0-9-]+\.)*hcaptcha\.com(?::\d+)?/", re.I)
 _RE_DATADOME = re.compile(r"(?:geo\.)?captcha-delivery\.com/(?:captcha|interstitial)", re.I)
 _RE_ARKOSE = re.compile(r"arkoselabs\.com|funcaptcha\.com|arkoselabs\.cn", re.I)
 _RE_GEETEST = re.compile(r"static\.geetest\.com|gcaptcha4\.js|api\.geetest\.com|gcaptcha4\.geetest\.com", re.I)
@@ -398,7 +398,10 @@ PAGE_PROBE_JS = """(() => {
     globals: {_cf_chl_opt: typeof window._cf_chl_opt !== 'undefined', gokuProps: typeof window.gokuProps !== 'undefined'},
     visible_frames: Array.from(document.querySelectorAll('iframe')).filter(f => {
       const b = f.getBoundingClientRect(), s = getComputedStyle(f);
-      return b.width > 30 && b.height > 30 && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+      // on the page, not parked off it: reCAPTCHA's bframe and hCaptcha's challenge frame wait at top -9999
+      // (measured with both vendors' test sitekeys, 2026-09-25) until an image challenge is shown.
+      return b.width > 30 && b.height > 30 && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0'
+        && b.bottom + scrollY > 0 && b.right + scrollX > 0;
     }).map(f => f.src || '')});
 })()""" % json.dumps(list(_TOKEN_NAMES))
 

@@ -542,11 +542,17 @@ def _clamp_timeout(timeout_s: Any) -> int:
 
 
 def _captcha_ladder(result: dict, stdout: str, env: dict, browser_cfg: dict, task_id: Optional[str],
-                    presence: Optional[dict]) -> Optional[str]:
+                    presence: Optional[dict], stderr: str = "") -> Optional[str]:
     """The CAPTCHA ladder's outcome for this call ("passed" / "needs_person" / "hard_stop" / "report_only"),
     or None when it did not run. Never raises: a broken ladder must not break browser_exec."""
     return _quiet(lambda: importlib.import_module("tools.browser_captcha_ladder").run_for_exec(
-        result, stdout, env, browser_cfg, task_id, presence), None, "captcha ladder failed")
+        result, stdout, env, browser_cfg, task_id, presence, stderr=stderr), None, "captcha ladder failed")
+
+
+def _captcha_prepare(code: str, env: dict, browser_cfg: dict, task_id: Optional[str], session: str) -> str:
+    """Own lane: have the harness note which tab it is attached to, for the ladder's every-call probe."""
+    return _quiet(lambda: importlib.import_module("tools.browser_captcha_ladder").prepare_exec(
+        code, env, browser_cfg, task_id, session), code, "captcha tab note failed")
 
 
 # After a whole-group SIGKILL, every pipe holder is dead, so the drain below is normally
@@ -655,6 +661,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
     if session and not private_browser and lane != chrome_lane.LANE_CHROME:
         code = _OWN_TAB_PREAMBLE + code
+    if lane == chrome_lane.LANE_OWN:  # the CAPTCHA ladder's every-call probe reads the tab the harness is on
+        code = _captcha_prepare(code, env, browser_cfg, task_id, session)
     # Every lane: a page that does not answer gets 30 s (not 5) and an honest error (ticket #16).
     code = exec_health.harness_patch_preamble() + code
 
@@ -692,7 +700,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if lane == chrome_lane.LANE_OWN:
         # Engine CAPTCHA ladder (tools/browser_captcha_ladder.py): try the engine's own rungs before reporting a wall.
         captcha = _captcha_ladder(result, proc.stdout, env, browser_cfg, task_id,
-                                  presence if chrome_lane.lane_enabled(browser_cfg) else None)
+                                  presence if chrome_lane.lane_enabled(browser_cfg) else None, proc.stderr or "")
         blocked_by = None if captcha == "passed" else chrome_lane.detect_block(proc.stdout)
         if blocked_by:
             result["blocked_by"] = blocked_by

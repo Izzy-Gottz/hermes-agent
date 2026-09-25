@@ -588,6 +588,12 @@ def canned(monkeypatch):
     monkeypatch.setattr(bl, "find_challenge", lambda conn, hosts, **kw: (object(), state["challenge"]))
     monkeypatch.setattr(bl, "CdpSurface", lambda *a, **kw: None)
     monkeypatch.setattr(bl, "Ladder", lambda cfg: L())
+
+    def fake_probe(env, target_id="", budget_s=2.0, prefer_hosts=()):
+        state["probes"] = state.get("probes", 0) + 1
+        return state.get("probe")
+
+    monkeypatch.setattr(bl, "quick_probe", fake_probe)
     return state
 
 
@@ -661,6 +667,89 @@ def test_hook_does_not_run_off_this_mac_when_disabled_or_on_a_normal_page(cli, c
     assert canned["ran"] == 0 and "captcha" not in out and "blocked_by" not in out
 
 
+def test_every_call_a_silent_turnstile_is_caught_when_the_code_printed_nothing(cli, canned):
+    """The page holds a Turnstile, the model's code printed nothing about it: the every-call probe finds it."""
+    cli["stdout"] = ""
+    canned["probe"] = "TARGET1"
+    canned["challenge"] = bc.classify(ts())
+    canned["outcome"] = bl.Outcome(kind=bc.TURNSTILE, host="shop.example", outcome=bl.PASSED, attempts=1, tier="A")
+    out = _exec('new_tab("https://shop.example/login")')
+    assert canned["probes"] == 1 and canned["ran"] == 1
+    assert out["captcha"]["outcome"] == "passed" and "blocked_by" not in out
+
+
+def test_every_call_probe_finds_nothing_so_nothing_runs(cli, canned):
+    cli["stdout"] = ""
+    canned["probe"] = None
+    canned["challenge"] = bc.classify(ts())
+    canned["outcome"] = bl.Outcome(kind=bc.TURNSTILE, host="shop.example", outcome=bl.PASSED)
+    out = _exec('new_tab("https://shop.example/")')
+    assert canned["probes"] == 1 and canned["ran"] == 0 and "captcha" not in out
+
+
+@pytest.mark.parametrize("challenge", [bc.classify(ts(solved=True)),
+                                       bc.classify(PageFacts(url="https://login.example/", frames=[Frame(RC_ANCHOR_INV)]))])
+def test_every_call_ignores_a_passed_widget_and_a_score_only_badge(cli, canned, challenge):
+    cli["stdout"] = ""
+    canned["probe"] = "T"
+    canned["challenge"] = challenge
+    canned["outcome"] = bl.Outcome(kind=challenge.kind, host=challenge.host, outcome=bl.PASSED)
+    out = _exec('new_tab("https://login.example/")')
+    assert canned["ran"] == 0 and "captcha" not in out
+
+
+@pytest.mark.parametrize("stderr", ["RuntimeError: The page https://slow.example/ did not answer Runtime.evaluate in 30s.",
+                                    "Runtime.evaluate timed out after 5s waiting for the daemon",
+                                    "ConnectionRefusedError: [Errno 61] Connection refused"])
+def test_a_call_that_never_reached_the_browser_is_not_probed(cli, canned, monkeypatch, stderr):
+    from tools import browser_use_cli as bu
+    monkeypatch.setattr(bu, "_run_cli_killing_process_group",
+                        lambda cmd, code, env, timeout: subprocess.CompletedProcess(cmd, 1, "", stderr))
+    canned["probe"] = "T"
+    canned["challenge"] = bc.classify(ts())
+    canned["outcome"] = bl.Outcome(kind=bc.TURNSTILE, host="shop.example", outcome=bl.PASSED)
+    out = _exec()
+    assert canned.get("probes", 0) == 0 and canned["ran"] == 0 and "captcha" not in out
+
+
+def test_own_lane_arms_the_attached_tab_note(cli, monkeypatch):
+    from tools import browser_use_cli as bu
+    seen = {}
+    monkeypatch.setattr(bu, "_run_cli_killing_process_group",
+                        lambda cmd, code, env, timeout: seen.update(code=code, env=dict(env)) or
+                        subprocess.CompletedProcess(cmd, 0, "", ""))
+    monkeypatch.setattr(bl, "quick_probe", lambda *a, **kw: None)
+    _exec('print(1)')
+    assert seen["env"][bl.ENV_TAB_NOTE] == bl.tab_note_path("t", "")
+    assert "_hermes_note_tab" in seen["code"] and seen["code"].rstrip().endswith("print(1)")
+    cli["cfg"] = {"captcha": {"enabled": False}}
+    _exec('print(1)')
+    assert bl.ENV_TAB_NOTE not in seen["env"] and "_hermes_note_tab" not in seen["code"]
+
+
+def test_quick_probe_is_bounded_by_two_seconds_on_a_browser_that_never_answers():
+    import socket
+    ls = socket.socket()
+    ls.bind(("127.0.0.1", 0))
+    ls.listen(8)
+    held = []
+    def accept_and_say_nothing():
+        try:
+            while True:
+                held.append(ls.accept())
+        except OSError:
+            pass
+
+    threading.Thread(target=accept_and_say_nothing, daemon=True).start()
+    port = ls.getsockname()[1]
+    for target in ("", "ABC"):                     # /json/list hangs; the page WebSocket hangs
+        t0 = time.monotonic()
+        assert bl.quick_probe({"BU_CDP_URL": f"http://127.0.0.1:{port}"}, target) is None
+        assert time.monotonic() - t0 <= bl.PROBE_BUDGET_S + 0.5
+    assert bl.quick_probe({"BU_CDP_URL": "https://cdp.cloud.example:9222"}) is None   # never off this Mac
+    ls.close()
+
+
 def test_a_broken_ladder_never_breaks_browser_exec(cli, monkeypatch):
     cli["stdout"] = PH_WALL
     monkeypatch.setattr(bl, "run_for_exec", lambda *a, **kw: 1 / 0)
@@ -717,7 +806,7 @@ function rec(where, e){ const r = {where, type: e.type, screenX: e.screenX, scre
 # A fake Turnstile at Turnstile's own geometry (300x65, the box at left 16, vertically centred). It
 # passes only on a trusted click that lands inside the box, like the real thing's first gate.
 _FAKE_TS_FRAME = _REC + """<body style="margin:0;width:300px;height:65px;background:#fafafa">
-<div id="box" style="position:absolute;left:16px;top:20px;width:26px;height:24px;border:2px solid #666"></div>
+<input type="checkbox" id="box" style="position:absolute;left:9px;top:20.5px;width:168px;height:24px;margin:0">
 <script>
 document.addEventListener('mousedown', e => rec('frame', e));
 document.addEventListener('click', e => { rec('frame', e);
@@ -788,9 +877,17 @@ def chrome(tmp_path_factory):
 <script>window.addEventListener('message', m => {{ if (m.data && m.data.ev) window.__ev.push(m.data.ev);
   if (m.data && m.data.turnstile) document.querySelector('[name=cf-turnstile-response]').value = m.data.turnstile; }});</script>
 </body></html>"""
-    top_srv = _serve({"/login": top, "/px": _FAKE_PX})
+    hc = f"https://newassets.hcaptcha.com:{fport}/captcha/v1/abc/static/hcaptcha.html"
+    # hCaptcha / reCAPTCHA park their image-challenge frame at top -9999 until it is needed (measured on both
+    # vendors' test widgets 2026-09-25); this one is parked but NOT visibility:hidden, the harder case.
+    parked = f"""<html><head><title>Sign up</title></head><body style="margin:0"><div class="h-captcha" data-sitekey="x">
+<iframe src="{hc}#frame=checkbox&id=0a" style="position:absolute;left:20px;top:20px;width:302px;height:76px;border:0"></iframe>
+<iframe src="{hc}#frame=challenge&id=0a" style="position:absolute;left:9px;top:-9999px;width:300px;height:150px;border:0"></iframe>
+</div></body></html>"""
+    top_srv = _serve({"/login": top, "/px": _FAKE_PX, "/parked": parked})
     ud = tempfile.mkdtemp(prefix="captcha-live-")
-    rules = (f"MAP challenges.cloudflare.com 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost")
+    rules = ("MAP challenges.cloudflare.com 127.0.0.1, MAP newassets.hcaptcha.com 127.0.0.1, MAP * ~NOTFOUND, "
+             "EXCLUDE 127.0.0.1, EXCLUDE localhost")
     proc = subprocess.Popen([CFT, "--headless=new", f"--user-data-dir={ud}", "--remote-debugging-port=0",
                              "--no-first-run", "--no-default-browser-check", f"--host-resolver-rules={rules}",
                              "--ignore-certificate-errors",
@@ -895,9 +992,11 @@ def test_live_ladder_passes_a_local_fake_turnstile(chrome, conn):
     page, ch = found
     assert ch.kind == bc.TURNSTILE and not ch.solved and ch.sitekey == "1x00000000000000000000AA"
     fast = {**bl.BUDGETS, bc.TURNSTILE: bl.Budget(wait_s=1.0, attempts=3, poll_s=4.0)}
-    out = bl.Ladder({}, rng=random.Random(11), budgets=fast).run(bl.CdpSurface(conn, page), ch, "live")
+    surface = bl.CdpSurface(conn, page)
+    out = bl.Ladder({}, rng=random.Random(11), budgets=fast).run(surface, ch, "live")
     assert out.outcome == bl.PASSED, out.to_dict()
     assert out.delivery == "cdp" and out.attempts == 1
+    assert surface.last_geometry == "frame_dom"            # read from the frame's own DOM, not the fallback
     clicks = [e for e in _events(page) if e["type"] == "click"]
     assert clicks and all(e["isTrusted"] for e in clicks)
 
@@ -912,3 +1011,152 @@ def test_live_ladder_press_and_hold_until_the_page_lets_go(chrome, conn):
     out = bl.Ladder({}, rng=random.Random(5)).run(bl.CdpSurface(conn, page), ch, "live-px")
     assert out.outcome == bl.PASSED, out.to_dict()
     assert out.attempts == 1 and time.monotonic() - t0 < 15
+
+
+_BU_CLI = Path.home() / ".local" / "share" / "uv" / "tools" / "browser-use" / "bin" / "browser-use"
+
+
+@live
+@pytest.mark.live_system_guard_bypass  # it stops the harness daemon it started (a detached process)
+@pytest.mark.skipif(not _BU_CLI.exists(), reason="the browser-use CLI (browser_harness) is not installed")
+def test_live_browser_exec_end_to_end_catches_a_silent_turnstile(chrome, conn, monkeypatch):
+    """The whole path, real harness and all: the model's code opens a page and prints NOTHING; the harness
+    notes its attached tab, the every-call probe finds the Turnstile there, the ladder passes it."""
+    from tools import browser_use_cli as bu
+    monkeypatch.setattr(bu, "_find_cli", lambda: [str(_BU_CLI)])
+
+    def route(env, session, task_id, local):
+        env["BU_CDP_WS"] = chrome["ws"]
+        return None
+
+    monkeypatch.setattr(bu, "_route_backend", route)
+    monkeypatch.setattr(bu, "_attach_vault_supervisor", lambda env, task_id: None)
+    monkeypatch.setattr(bu, "_workspace_dir", lambda task_id: None)
+    monkeypatch.setattr(bu, "_read_browser_cfg", lambda: {})
+    monkeypatch.setattr(bl, "BUDGETS", {**bl.BUDGETS, bc.TURNSTILE: bl.Budget(wait_s=1.0, attempts=3, poll_s=4.0)})
+    code = (f'new_tab("http://127.0.0.1:{chrome["top"]}/login")\nwait_for_load()\n'
+            'import time\nfor _ in range(60):\n'
+            '    if js("document.querySelector(\'iframe\') && document.readyState") == "complete": break\n'
+            '    time.sleep(0.5)\ntime.sleep(3)\n')
+    try:
+        out = json.loads(bu.browser_exec(code, session="captchae2e", task_id="e2e", timeout_s=120))
+    finally:  # the harness daemon outlives its browser: stop the one this test started
+        pid_file = Path.home() / ".config" / "browser-harness" / "runtime" / "bu-captchae2e.pid"
+        try:
+            os.kill(int(pid_file.read_text().strip()), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+    if not out.get("success"):
+        pytest.skip(f"the harness did not run cleanly under this load: {str(out)[:300]}")
+    assert out["output"].strip() == ""                        # the code said nothing about a challenge
+    assert json.load(open(bl.tab_note_path("e2e", "captchae2e")))["targetId"]   # the harness noted its tab
+    assert out["captcha"]["kind"] == "turnstile" and out["captcha"]["outcome"] == "passed", out.get("captcha")
+
+
+# ---- live: the REAL widgets, with each vendor's official test sitekey -------------------------------------------
+# Opt-in (HERMES_CAPTCHA_LIVE_WIDGETS=1): these load challenges.cloudflare.com, google.com/recaptcha and
+# hcaptcha.com. Read-only and low volume: one page load per widget, a checkbox click, no form submission.
+# Test keys: developers.cloudflare.com/turnstile/troubleshooting/testing/ (1x...AA always passes,
+# 3x...FF forces an interactive challenge), developers.google.com/recaptcha/docs/faq (v2 test site key),
+# docs.hcaptcha.com (test sitekey). Measured 2026-09-25: all three load THROUGH this Mac's filtering proxy
+# (127.0.0.1:9176) with Chrome's default proxy settings, so these tests do not bypass it.
+
+REAL_WIDGETS = {
+    "ts_pass": ('<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>'
+                '<form><div class="cf-turnstile" data-sitekey="1x00000000000000000000AA"></div></form>'),
+    "ts_challenge": ('<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>'
+                     '<form><div class="cf-turnstile" data-sitekey="3x00000000000000000000FF"></div></form>'),
+    "recaptcha": ('<script src="https://www.google.com/recaptcha/api.js" async defer></script>'
+                  '<form><div class="g-recaptcha" data-sitekey="6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"></div></form>'),
+    "hcaptcha": ('<script src="https://js.hcaptcha.com/1/api.js" async defer></script>'
+                 '<form><div class="h-captcha" data-sitekey="10000000-ffff-ffff-ffff-000000000001"></div></form>'),
+}
+real_widgets = pytest.mark.skipif(CFT is None or os.environ.get("HERMES_CAPTCHA_LIVE_WIDGETS") != "1",
+                                  reason="opt-in: HERMES_CAPTCHA_LIVE_WIDGETS=1 loads the vendors' real test widgets")
+
+
+@pytest.fixture(scope="module")
+def real_chrome():
+    srv = _serve({f"/{k}": f"<title>{k}</title>{v}" for k, v in REAL_WIDGETS.items()})
+    ud = tempfile.mkdtemp(prefix="captcha-live-real-")
+    proc = subprocess.Popen([CFT, "--headless=new", f"--user-data-dir={ud}", "--remote-debugging-port=0",
+                             "--no-first-run", "--no-default-browser-check", "--window-size=1000,800", "about:blank"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    port_file = Path(ud) / "DevToolsActivePort"
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline and not (port_file.exists() and port_file.read_text().strip()):
+        time.sleep(0.3)
+    if not (port_file.exists() and port_file.read_text().strip()):
+        os.killpg(proc.pid, signal.SIGKILL)
+        pytest.skip("Chrome for Testing did not start in 90 s (a loaded Mac is not a result)")
+    port, path = port_file.read_text().split("\n")[:2]
+    with bl.CdpConn(f"ws://127.0.0.1:{port}{path}", timeout=30) as c:
+        yield c, srv.server_address[1]
+    os.killpg(proc.pid, signal.SIGKILL)
+    import shutil
+    shutil.rmtree(ud, ignore_errors=True)
+    srv.shutdown()
+
+
+def _real(real_chrome, name, want_frames=1):
+    conn, port = real_chrome
+    tid = conn.call("Target.createTarget", {"url": f"http://localhost:{port}/{name}"})["targetId"]
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        if sum(t.get("type") == "iframe" for t in conn.call("Target.getTargets")["targetInfos"]) >= want_frames:
+            break
+        time.sleep(0.5)
+    else:
+        conn.call("Target.closeTarget", {"targetId": tid})
+        pytest.skip(f"{name}: the vendor's widget frame did not load in 40 s (network / load, not a result)")
+    time.sleep(3)
+    found = bl.find_challenge(conn, ["localhost"])
+    return conn, tid, found
+
+
+@real_widgets
+@pytest.mark.parametrize("name,kind,measured,key", [
+    ("ts_challenge", bc.TURNSTILE, (9.0, 20.5, 26.0, 24.0), "3x00000000000000000000FF"),
+    ("recaptcha", bc.RECAPTCHA_V2, (13.0, 23.0, 28.0, 28.0), "6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"),
+    ("hcaptcha", bc.HCAPTCHA, (16.0, 23.0, 30.0, 30.0), "10000000-ffff-ffff-ffff-000000000001"),
+])
+def test_real_widget_checkbox_geometry_and_pass(real_chrome, name, kind, measured, key):
+    conn, tid, found = _real(real_chrome, name, want_frames=2 if kind != bc.TURNSTILE else 1)
+    try:
+        assert found is not None, f"{name}: no challenge detected"
+        page, ch = found
+        assert ch.kind == kind and ch.stage == "checkbox" and not ch.solved, ch   # parked frames are not "image"
+        surface = bl.CdpSurface(conn, page)
+        inner = surface._box_in_frame(kind, ch.frame)
+        print(f"measured {name} checkbox in frame: {inner}")
+        assert inner is not None and all(abs(a - b) <= 1.5 for a, b in zip(inner, measured)), inner
+        assert tuple(bl.CHECKBOX_IN_FRAME[kind](0, 0)) == measured      # the fallback IS the measurement
+        out = bl.Ladder({}, rng=random.Random(3)).run(surface, ch, f"real-{name}")
+        print(f"{name}: {out.to_dict()}")
+        assert out.outcome == bl.PASSED, out.to_dict()
+        assert surface.last_geometry == "frame_dom"
+    finally:
+        conn.call("Target.closeTarget", {"targetId": tid})
+
+
+@real_widgets
+def test_real_turnstile_always_pass_key_passes_without_a_click(real_chrome):
+    conn, tid, found = _real(real_chrome, "ts_pass")
+    try:
+        if found is None:  # it may already have passed during the settle
+            return
+        page, ch = found
+        out = bl.Ladder({}, rng=random.Random(3)).run(bl.CdpSurface(conn, page), ch, "real-ts-pass")
+        print(f"ts_pass: {out.to_dict()}")
+        assert out.outcome == bl.PASSED and out.attempts == 0, out.to_dict()
+    finally:
+        conn.call("Target.closeTarget", {"targetId": tid})
+
+
+@live
+def test_live_a_parked_challenge_frame_is_not_an_image_challenge(chrome, conn):
+    _open(conn, f"http://127.0.0.1:{chrome['top']}/parked",
+          settle=lambda p: sum(t.get("type") == "iframe" for t in conn.call("Target.getTargets")["targetInfos"]) >= 2)
+    found = bl.find_challenge(conn, ["127.0.0.1"])
+    assert found is not None and found[1].kind == bc.HCAPTCHA
+    assert found[1].stage == "checkbox"          # the -9999 frame is parked, not shown
