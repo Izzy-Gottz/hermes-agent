@@ -16,6 +16,12 @@ Routes, first that works:
 3. ``default_browser`` -- the URL opens in the person's default browser, with the explicit note that
    Moe's session does not carry over.
 
+On a cloud computer (Linux, ``browser.kept_profile``) there is no screen anybody sees, and no window is
+ever the answer: the route is the person's own phone, through a one-time link that shows this same
+browser. Minting that link is Moe's ``browser_sign_in_link`` (moe-connectors signin.py), in one place
+with its expiry and one-opener rule; this tool only points at it (:func:`_sign_in_link_route`), with the
+same ``person_needed`` code, so the model never improvises the route.
+
 A window is put up only for a person AT THIS MAC (``at_this_mac``: a live turn from the machine's own
 surfaces and a fresh "in use" presence stamp). The owner texting from their phone is live but not here,
 and a turn nobody is at (cron, a helper, other people's words) is neither: both get the ``person_needed``
@@ -42,6 +48,9 @@ logger = logging.getLogger(__name__)
 ROUTE_DRIVEN = "driven_browser"
 ROUTE_CHROME = "chrome"
 ROUTE_DEFAULT = "default_browser"
+#: The cloud computer: the person signs in on their phone through browser_sign_in_link.
+ROUTE_LINK = "sign_in_link"
+SIGN_IN_LINK_TOOL = "browser_sign_in_link"
 
 _lock = threading.Lock()
 #: task_id -> the last hand-off: {"route", "url", "at"}.
@@ -129,6 +138,43 @@ def _needs_person(reason: str, url: str, presence: dict, why: str, step: Optiona
     return fix_error(msg, PERSON_NEEDED, subject=host or None, retry=False, **extra)
 
 
+def _on_cloud_computer() -> bool:
+    """A cloud computer with a kept browser profile: Linux, ``use_real_profile`` and ``kept_profile``
+    on. Never a Mac, whatever its config says -- a person at a Mac gets the Mac's window."""
+    if sys.platform == "darwin" or not sys.platform.startswith("linux"):
+        return False
+    try:
+        from tools import browser_tool_cloud as cloud
+        return bool(cloud._use_real_profile() and cloud._use_kept_profile())
+    except Exception:
+        return False
+
+
+def _sign_in_link_route(reason: str, url: str, task: str, step: Optional[dict] = None) -> str:
+    """``person_needed``, pointing at ``browser_sign_in_link``: the page is in the cloud computer's kept
+    browser, which the person can only reach through the link that tool mints."""
+    from tools.browser_person_step import describe, host_of
+    from tools.fix_reasons import PERSON_NEEDED, fix_error
+    host = host_of(url)
+    what = describe(step) if step else reason
+    _record(task, ROUTE_LINK, url)
+    msg = (f"{host or 'This page'} needs the person for this step: {what}. The page is in the browser on their "
+           f"cloud computer, which nobody can see, so nothing was opened anywhere. Next: call "
+           f"{SIGN_IN_LINK_TOOL}(site=\"{host or 'the site'}\"" + (f", url=\"{url}\"" if url else "") + ") -- it "
+           "returns a one-time link to this same browser. Give that link to the OWNER only: in your reply when "
+           "they are writing to you, or through reach_owner(text) when nobody is (a scheduled job). Never send it "
+           "to anyone else or with a send tool to a contact -- it opens their browser; the recipient check refuses "
+           "that anyway. Then END YOUR TURN; when they say they are done, call browser_handoff(done=true). "
+           + _GROUNDED)
+    extra: Dict[str, Any] = {"reason": reason, "next": SIGN_IN_LINK_TOOL, "route": ROUTE_LINK,
+                             "site": host or ""}
+    if url:
+        extra["url"] = url
+    if step:
+        extra["step"] = step.get("kind", "")
+    return fix_error(msg, PERSON_NEEDED, subject=host or None, retry=False, **extra)
+
+
 def _open_in_chrome_group(bridge: dict, url: str) -> Optional[str]:
     """Open ``url`` in Moe's tab group through the extension's relay; error string or None."""
     from websockets.sync.client import connect
@@ -185,7 +231,13 @@ def _hand_back(task_id: str) -> str:
         last = _handoffs.pop(task_id, None)
     route = (last or {}).get("route") or ROUTE_DRIVEN
     out: Dict[str, Any] = {"success": True, "route": route}
-    if route == ROUTE_DRIVEN:
+    if route == ROUTE_LINK:
+        from tools import browser_tool_real_profile as rp
+        out.update(rp.hand_back())
+        out["next"] = ("Carry on with browser_exec in the same session: the person signed in inside this same "
+                       "browser on the cloud computer, and the sign-in stays there. Read the page first "
+                       "(page_info()) -- they may have moved it on.")
+    elif route == ROUTE_DRIVEN:
         from tools import browser_tool_real_profile as rp
         out.update(rp.hand_back())
         out["next"] = ("Carry on with browser_exec in the same session: it drives this same window. Read the page "
@@ -230,17 +282,22 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
             pages = rp.driven_pages()
             current = pages[0]["url"] if pages else ""
 
-    presence = _presence()
-    here, why = chrome_lane.at_this_mac(presence)
-    if not here:
-        step = None
+    def _probe() -> Optional[dict]:
         try:
             from tools.browser_person_step import probe_active_page
             cached = rp._origin()._real_profile_cdp_cache.get("cdp")
-            step = probe_active_page(cached) if cached else None
+            return probe_active_page(cached) if cached else None
         except Exception:
-            step = None
-        return _needs_person(reason, current, presence, why or "a turn with no person present", step)
+            return None
+
+    if _on_cloud_computer():
+        # Decided here, not by the model: no window, no default browser -- the link.
+        return _sign_in_link_route(reason, current, task, _probe())
+
+    presence = _presence()
+    here, why = chrome_lane.at_this_mac(presence)
+    if not here:
+        return _needs_person(reason, current, presence, why or "a turn with no person present", _probe())
 
     base: Dict[str, Any] = {"success": True, "reason": reason}
     if resume_hint:
@@ -333,7 +390,8 @@ BROWSER_HANDOFF_SCHEMA = {
         "(that note is only a hint and can miss one), and when browser_vault_enter_code finds no code field. A window is only ever put up for a "
         "person at this Mac: when they are writing from their phone, or nobody is there (a scheduled job), it opens "
         "nothing and returns code person_needed with tell_owner -- say it in your reply, or pass it to "
-        "reach_owner(text) on a job, and stop. "
+        "reach_owner(text) on a job, and stop. On a cloud computer it returns person_needed with next="
+        "browser_sign_in_link: call that for a one-time link and give it to the owner only. "
         "Only tell the person that something was sent, or is waiting on their phone or another device, when a "
         "tool result shows the site said so (page_says)."
     ),

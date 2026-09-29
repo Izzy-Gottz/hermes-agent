@@ -684,6 +684,64 @@ class TestHandoff:
         out = json.loads(bh.browser_handoff(done=True, task_id="t"))
         assert out["route"] == "driven_browser" and out["url"] == "https://accounts.google.com/after"
 
+    # -- the cloud computer (Linux + browser.kept_profile): the route is the sign-in link, decided here --
+
+    @staticmethod
+    def _host(monkeypatch, platform, kept, real=True):
+        from tools import browser_handoff_tool as bh
+        from tools import browser_tool_cloud as cloud
+        monkeypatch.setattr(bh.sys, "platform", platform)
+        monkeypatch.setattr(cloud, "_use_real_profile", lambda: real)
+        monkeypatch.setattr(cloud, "_use_kept_profile", lambda: kept)
+
+    @pytest.mark.parametrize("platform", ["telegram", "api_server"])
+    def test_on_the_cloud_computer_it_points_at_the_sign_in_link(self, handoff, monkeypatch, platform):
+        bh, state = handoff
+        self._host(monkeypatch, "linux", kept=True)
+        state["shown"] = {"ok": True, "url": "https://x.com/login", "title": "", "front": True}
+        bound = _bind(platform=platform, origin="")
+        try:
+            out = json.loads(bh.browser_handoff(reason="sign in to x.com", url="https://x.com/login", task_id="t"))
+        finally:
+            _unbind(bound)
+        assert out["code"] == "person_needed" and out["retry"] is False
+        assert out["next"] == "browser_sign_in_link" and out["route"] == "sign_in_link"
+        assert out["url"] == "https://x.com/login" and out["site"] == "x.com" and out["reason"] == "sign in to x.com"
+        assert 'browser_sign_in_link(site="x.com", url="https://x.com/login")' in out["error"]
+        assert "OWNER only" in out["error"] and "reach_owner(text)" in out["error"]
+        assert "recipient check refuses" in out["error"] and "END YOUR TURN" in out["error"]
+        # No window, no Chrome tab, no default browser: nobody sees this machine's screen.
+        assert state.get("show_calls") is None and state["opened"] == [] and state["chrome"] == []
+
+    def test_done_after_the_link_carries_on_in_the_same_browser(self, handoff, monkeypatch):
+        bh, state = handoff
+        self._host(monkeypatch, "linux", kept=True)
+        bh.browser_handoff(reason="sign in", url="https://x.com/login", task_id="t")
+        out = json.loads(bh.browser_handoff(done=True, task_id="t"))
+        assert out["route"] == "sign_in_link" and out["url"] == "https://accounts.google.com/after"
+        assert "same browser on the cloud computer" in out["next"]
+
+    def test_a_mac_never_takes_the_cloud_route_even_with_kept_profile_set(self, handoff, monkeypatch):
+        bh, state = handoff
+        self._host(monkeypatch, "darwin", kept=True)
+        state["shown"] = {"ok": True, "url": "https://x.com/login", "title": "", "front": True}
+        out = json.loads(bh.browser_handoff(reason="sign in", url="https://x.com/login", task_id="t"))
+        assert out["route"] == "driven_browser" and "next" in out and "browser_sign_in_link" not in out["next"]
+
+    def test_linux_without_kept_profile_is_unchanged(self, handoff, monkeypatch):
+        bh, state = handoff
+        self._host(monkeypatch, "linux", kept=False)
+        state["shown"] = {"ok": True, "url": "https://x.com/login", "title": "", "front": True}
+        out = json.loads(bh.browser_handoff(reason="sign in", url="https://x.com/login", task_id="t"))
+        assert out["route"] == "driven_browser"
+        self._host(monkeypatch, "linux", kept=True, real=False)   # kept alone is inert
+        out = json.loads(bh.browser_handoff(reason="sign in", url="https://x.com/login", task_id="t"))
+        assert out["route"] == "driven_browser"
+
+    def test_the_schema_names_the_cloud_route(self):
+        from tools.browser_handoff_tool import BROWSER_HANDOFF_SCHEMA
+        assert "browser_sign_in_link" in BROWSER_HANDOFF_SCHEMA["description"]
+
     def test_a_non_web_url_is_refused(self, handoff):
         bh, state = handoff
         out = json.loads(bh.browser_handoff(reason="x", url="file:///etc/passwd", task_id="t"))
