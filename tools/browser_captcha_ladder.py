@@ -59,7 +59,20 @@ HARD_STOP = "hard_stop"
 REPORT_ONLY = "report_only"
 
 MAX_FAILURES = 3            # the same challenge failing this many times is a hard stop
-TOTAL_DEADLINE_S = 45.0     # the whole ladder, per browser_exec call
+#: The whole ladder's ceiling, counted from the moment the challenge was DETECTED (never from the start of
+#: the browser_exec call: the page load before it is not the ladder's time). Within it every configured
+#: attempt gets its turn. 2026-09-29 on forums.macrumors.com the old 45 s whole-ladder budget ran out after
+#: ONE hCaptcha click -- steps ["clicked (cdp)", "ladder deadline reached"] -- because on a loaded Mac (a
+#: browser with ~40 tabs) each look at the page took seconds, and the next two configured tries never ran.
+#: 180 s holds three tries at the pace that run implies (a click plus one look at the page used 45 s: about
+#: 25 s a look -> ~50 s a try); the call's own timeout_s (300 s by default) still bounds it, see below.
+TOTAL_DEADLINE_S = 180.0
+#: The browser_exec call's own time limit (its timeout_s) is not the ladder's to overrun: an attempt starts
+#: only with at least its watch time plus this much left, and otherwise the result says why it stopped.
+CALL_RESERVE_S = 5.0
+#: After a checkbox click that did not pass: how long to look for the image-challenge frame to be shown
+#: (hCaptcha's frame=challenge, reCAPTCHA's bframe), so the result can say an image puzzle is up.
+IMAGE_FRAME_WAIT_S = 8.0
 
 
 @dataclass(frozen=True)
@@ -152,12 +165,15 @@ class Outcome:
     solver: str = ""                 # tier C: the provider asked (never its key)
     rounds: Optional[int] = None     # tier C: image challenges attempted
     solves: Optional[int] = None     # tier C: recognition requests spent
+    image_puzzle: Optional[bool] = None  # a checkbox click was answered with an image challenge
+    seconds: Optional[float] = None  # the ladder's own time, from detection to this outcome
 
     def to_dict(self) -> Dict[str, Any]:
         d = {"kind": self.kind, "host": self.host, "outcome": self.outcome, "reason": self.reason,
              "attempts": self.attempts, "tier": self.tier, "delivery": self.delivery,
              "hard_stop": self.hard_stop, "steps": self.steps, "url": self.url, "solver": self.solver,
-             "rounds": self.rounds, "solves": self.solves}
+             "rounds": self.rounds, "solves": self.solves, "image_puzzle": self.image_puzzle,
+             "seconds": self.seconds}
         return {k: v for k, v in d.items() if v not in ("", [], None) or k in ("attempts",)}
 
 
@@ -234,9 +250,23 @@ class Ladder:
 
     # -- the machine --
 
-    def run(self, surface: Surface, ch: bc.Challenge, task_id: Optional[str] = None) -> Outcome:
+    def run(self, surface: Surface, ch: bc.Challenge, task_id: Optional[str] = None, *,
+            detected_at: Optional[float] = None, call_deadline: Optional[float] = None) -> Outcome:
+        """``detected_at``: when the challenge was found (``clock()`` time; default now) -- the ladder's own
+        time starts there. ``call_deadline``: the ``clock()`` time by which the browser_exec call must
+        return (its timeout_s); an attempt that cannot finish before it is not started."""
+        start = self.clock() if detected_at is None else detected_at
+        out = self._run(surface, ch, task_id, start, call_deadline)
+        if out.seconds is None:
+            out.seconds = round(max(0.0, self.clock() - start), 1)
+        return out
+
+    def _run(self, surface: Surface, ch: bc.Challenge, task_id: Optional[str], start: float,
+             call_deadline: Optional[float]) -> Outcome:
         steps: List[str] = []
-        end = self.clock() + self.deadline_s
+        end = start + self.deadline_s
+        if call_deadline is not None:
+            end = min(end, call_deadline - CALL_RESERVE_S)
 
         # 1. Hard stops: never automated.
         if ch.hard_stop == bc.HARD_STOP_TICKETING:
@@ -266,19 +296,26 @@ class Ladder:
                 _clear_failures(task_id, ch)
                 return self._out(ch, PASSED, "the check cleared on its own", tier="A", steps=steps, url=facts.url)
             if state == "changed" and now is not None and now.hard_stop:
-                return self.run(surface, now, task_id)
+                return self._run(surface, now, task_id, start, call_deadline)
 
         # 4. Image / puzzle stages: tier C, or the person.
         if budget is None or budget.attempts == 0 or ch.stage in ("image", "slider"):
             return self._tier_c(surface, ch, steps, task_id)
 
-        # 5. Tier A inputs.
+        # 5. Tier A inputs: every configured attempt gets its turn within the ladder's ceiling.
         delivery, why = surface.delivery()
         attempts = 0
         current = ch
+        stopped = ""
         for _ in range(budget.attempts):
+            need = budget.poll_s + (budget.hold_max_s if ch.kind == bc.PERIMETERX else 0.0)
+            if call_deadline is not None and self.clock() + need > call_deadline - CALL_RESERVE_S:
+                stopped = "call"
+                steps.append(f"stopped at {self._t(start)}: this browser_exec call's own time limit was nearly used up")
+                break
             if self.clock() >= end:
-                steps.append("ladder deadline reached")
+                stopped = "ladder"
+                steps.append(f"ladder deadline reached at {self._t(start)}")
                 break
             box = surface.locate(current)  # re-located before every try: widgets move and re-render
             if box is None:
@@ -295,10 +332,15 @@ class Ladder:
                     steps.append(f"held {held:.1f}s: {'done' if verdict else 'failed' if verdict is False else 'no verdict'}")
                 else:
                     delivery.click(box, self.rng)
-                    steps.append(f"clicked ({delivery.name})")
+                    steps.append(f"clicked ({delivery.name}) at {self._t(start)}")
             except NotImplementedError as exc:
                 return self._out(ch, NEEDS_PERSON, str(exc), tier="A", delivery=delivery.name, attempts=attempts, steps=steps)
-            state, now, facts = self._watch(surface, ch, budget.poll_s, end)
+            # The usual answer to a checkbox click is the image challenge, and it can take a moment to be
+            # shown: watch long enough to see it before counting the click as failed, and say what was seen.
+            image_kind = ch.kind in (bc.HCAPTCHA, bc.RECAPTCHA_V2)
+            state, now, facts = self._watch(surface, ch, budget.poll_s + (IMAGE_FRAME_WAIT_S if image_kind else 0.0), end)
+            if state == "waiting" and image_kind:
+                steps.append(f"image challenge frame: {self._image_frame(ch, facts)}")
             if state == "passed":
                 _clear_failures(task_id, ch)
                 return self._out(ch, PASSED, f"passed after {attempts} {'hold' if ch.kind == bc.PERIMETERX else 'click'}"
@@ -306,11 +348,12 @@ class Ladder:
                                  steps=steps, url=facts.url)
             if state == "changed" and now is not None:
                 if now.hard_stop:
-                    return self.run(surface, now, task_id)
+                    return self._run(surface, now, task_id, start, call_deadline)
                 if now.stage in ("image", "slider"):
-                    steps.append(f"escalated to {now.kind} {now.stage}")
+                    steps.append(f"escalated to {now.kind} {now.stage} at {self._t(start)}")
                     out = self._tier_c(surface, now, steps, task_id)
                     out.attempts, out.tier, out.delivery = attempts, out.tier or "A", out.delivery or delivery.name
+                    out.image_puzzle = now.stage == "image" or None
                     return out
                 if now.kind != ch.kind:
                     steps.append(f"page now shows {now.kind}")
@@ -321,9 +364,32 @@ class Ladder:
                                  hard_stop=bc.HARD_STOP_REPEATED, tier="A", delivery=delivery.name,
                                  attempts=attempts, steps=steps)
             current = now or current
-        return self._out(ch, NEEDS_PERSON, f"the {ch.kind} check did not pass after {attempts} "
-                         f"{'try' if attempts == 1 else 'tries'}", tier="A", delivery=delivery.name,
-                         attempts=attempts, steps=steps)
+        tries = f"{attempts} {'try' if attempts == 1 else 'tries'}"
+        if stopped == "call":
+            reason = (f"this browser_exec call's own time limit ran out after {tries} at the {ch.kind} check, so the "
+                      f"engine stopped (it had {budget.attempts}). Run browser_exec again with just "
+                      "print(page_info()) and room in timeout_s: the engine tries the check again after the code")
+        elif stopped == "ladder":
+            reason = (f"the {ch.kind} check did not pass after {tries} in {self._t(start)} -- Moe's browser answered "
+                      "slowly, so the other tries did not fit")
+        else:
+            reason = f"the {ch.kind} check did not pass after {tries}"
+        return self._out(ch, NEEDS_PERSON, reason, tier="A", delivery=delivery.name, attempts=attempts, steps=steps)
+
+    def _t(self, start: float) -> str:
+        return f"{max(0.0, self.clock() - start):.1f}s"
+
+    @staticmethod
+    def _image_frame(ch: bc.Challenge, facts: bc.PageFacts) -> str:
+        """Whether the image challenge frame is on the page: "shown", "parked" (loaded but held off-screen,
+        where both vendors keep it until they decide to ask), or "absent"."""
+        if ch.kind == bc.HCAPTCHA:
+            frames = [f for f in facts.frames if bc._RE_HCAPTCHA.search(f.url or "") and "frame=challenge" in (f.url or "")]
+        else:
+            frames = [f for f in facts.frames if bc._RE_RECAPTCHA_BFRAME.search(f.url or "")]
+        if any(f.visible for f in frames):
+            return "shown"
+        return "parked" if frames else "absent"
 
     def _hold_verdict(self, surface: Surface, first: bc.Challenge) -> Optional[bool]:
         """During a press-and-hold: True once passed, False if the page swapped to another challenge, else None."""
@@ -342,6 +408,9 @@ class Ladder:
         what = {"image": "an image puzzle", "slider": "a slider puzzle"}.get(ch.stage, "a puzzle")
         if solver is None:
             steps.append(f"tier C: {why}")
+            if ch.stage == "image" and ch.kind in (bc.HCAPTCHA, bc.RECAPTCHA_V2):
+                return self._out(ch, NEEDS_PERSON, f"the {ch.kind} check is an image puzzle: it needs a solver key or "
+                                 f"the person ({why})", tier="C", steps=steps, image_puzzle=True)
             return self._out(ch, NEEDS_PERSON, f"the {ch.kind} check is {what}, and {why}", tier="C", steps=steps)
         from tools import browser_captcha_grid as grid
         if ch.kind not in grid.GRID_KINDS or ch.stage != "image":
@@ -814,7 +883,9 @@ def run_for_exec(result: Dict[str, Any], stdout: str, env: Dict[str, str], brows
             if not said_wall and (ch.solved or ch.kind == bc.RECAPTCHA_V3):
                 return None  # a widget already passed, or a score-only badge: nothing to report
             ladder = ladder_factory(browser_cfg)
-            out = ladder.run(CdpSurface(conn, page, browser_cfg, sleep=ladder.sleep), ch, task_id)
+            detected = ladder.clock()  # the ladder's time starts HERE, not when the call started
+            out = ladder.run(CdpSurface(conn, page, browser_cfg, sleep=ladder.sleep), ch, task_id,
+                             detected_at=detected, call_deadline=_call_deadline(env, ladder.clock))
     except Exception as exc:
         logger.debug("captcha ladder failed: %s", exc)
         return None
@@ -826,6 +897,16 @@ def run_for_exec(result: Dict[str, Any], stdout: str, env: Dict[str, str], brows
             presence = {"live": False, "why": ""}
     apply_outcome(result, out, presence)
     return out.outcome
+
+
+def _call_deadline(env: Dict[str, str], clock: Callable[[], float]) -> Optional[float]:
+    """The browser_exec call's own deadline (``HERMES_BU_DEADLINE``, epoch seconds, set from its timeout_s by
+    tools/browser_exec_health.exec_env) on the ladder's clock, or None when the call carries none."""
+    try:
+        at = float(env.get("HERMES_BU_DEADLINE") or 0)
+    except (TypeError, ValueError):
+        return None
+    return clock() + (at - time.time()) if at else None
 
 
 def apply_outcome(result: Dict[str, Any], out: Outcome, presence: Optional[dict]) -> None:

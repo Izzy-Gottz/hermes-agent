@@ -370,7 +370,9 @@ def test_press_and_hold_is_released_when_the_page_says_so_not_after_a_fixed_time
 
 def test_press_and_hold_that_never_completes_is_bounded_and_counted():
     out, s, clock = run(lambda st, dt: px())
-    assert out.outcome == bl.HARD_STOP and s.fd.holds == 3 and clock() - 1000 <= bl.TOTAL_DEADLINE_S + 1
+    budget = bl.BUDGETS[bc.PERIMETERX]
+    assert out.outcome == bl.HARD_STOP and s.fd.holds == 3
+    assert clock() - 1000 <= budget.attempts * (budget.hold_max_s + budget.poll_s) + 1 <= bl.TOTAL_DEADLINE_S
 
 
 def test_missing_target_goes_to_the_person():
@@ -386,6 +388,70 @@ def test_the_whole_ladder_respects_its_deadline():
     s = FakeSurface(lambda st, dt: cf_managed(), clock)
     out = bl.Ladder({}, sleep=clock.sleep, clock=clock, rng=random.Random(1), deadline_s=5).run(s, bc.classify(cf_managed()))
     assert out.outcome != bl.PASSED and clock() - 1000 <= 6
+
+
+class SlowSurface(FakeSurface):
+    """A page on a loaded Mac: every look at it costs ``cost`` seconds. 2026-09-29, forums.macrumors.com: steps
+    ["clicked (cdp)", "ladder deadline reached"] -- one click plus one look used the whole 45 s, i.e. a look
+    cost about 25 s (the re-locate before the click is a look too)."""
+
+    def __init__(self, page, clock, cost):
+        super().__init__(page, clock)
+        self.cost = cost
+
+    def facts(self):
+        self.clock.sleep(self.cost)
+        return super().facts()
+
+
+def test_a_slow_page_still_gets_every_configured_try():
+    clock = Clock()
+    s = SlowSurface(lambda st, dt: hc(), clock, cost=25.0)
+    out = ladder(clock).run(s, bc.classify(hc()), "slow", detected_at=clock())
+    assert len(s.fd.clicks) == bl.BUDGETS[bc.HCAPTCHA].attempts == 3, out.steps
+    assert not any("deadline" in step for step in out.steps), out.steps
+    assert out.seconds is not None and out.seconds > 45          # the old whole-ladder budget
+
+
+def test_the_ladder_budget_starts_at_detection_not_at_the_call():
+    """The call's page load (129 s on MacRumors) is not the ladder's time: only detected_at counts."""
+    clock = Clock()
+    s = SlowSurface(lambda st, dt: hc(), clock, cost=25.0)
+    clock.sleep(129)                                              # the harness call ran first
+    out = ladder(clock).run(s, bc.classify(hc()), "slow2", detected_at=clock(), call_deadline=clock() + 300)
+    assert len(s.fd.clicks) == 3, out.steps
+
+
+def test_the_calls_own_time_limit_stops_the_ladder_with_a_reason():
+    clock = Clock()
+    s = FakeSurface(lambda st, dt: hc(), clock)
+    out = ladder(clock).run(s, bc.classify(hc()), "late", detected_at=clock(), call_deadline=clock() + 8)
+    assert out.outcome == bl.NEEDS_PERSON and s.fd.clicks == []
+    assert "own time limit" in out.reason and "print(page_info())" in out.reason
+    assert any("own time limit" in step for step in out.steps)
+
+
+def test_after_a_click_the_image_challenge_frame_is_looked_for_and_reported():
+    # Shown 7 s after the click: past the 6 s watch, inside the image-frame wait -> tier C, image puzzle.
+    out, s, _ = run(lambda st, dt: hc(image=st["inputs"] >= 1 and dt >= 7))
+    assert len(s.fd.clicks) == 1 and out.tier == "C" and out.image_puzzle is True
+    assert "image puzzle: it needs a solver key or the person" in out.reason
+    assert out.to_dict()["image_puzzle"] is True
+    # Never shown: each click's result says the frame was only parked off-screen.
+    out, s, _ = run(lambda st, dt: hc(), task="parked")
+    assert "image challenge frame: parked" in out.steps
+
+
+def test_the_hook_starts_the_ladder_at_detection_and_passes_the_calls_deadline(cli, canned):
+    cli["stdout"] = PH_WALL
+    canned["challenge"] = bc.classify(cf_managed())
+    canned["outcome"] = bl.Outcome(kind=bc.CF_MANAGED, host="www.producthunt.com", outcome=bl.PASSED, tier="A")
+    from tools import browser_use_cli as bu
+    before = time.monotonic()
+    json.loads(bu.browser_exec('print(page_info())', task_id="t", timeout_s=200))
+    timing = canned["timing"]
+    assert before <= timing["detected_at"] <= time.monotonic()
+    assert 190 <= timing["call_deadline"] - timing["detected_at"] <= 201
 
 
 # ---- tier C seam ----------------------------------------------------------------------------------------------
@@ -578,9 +644,11 @@ def canned(monkeypatch):
 
     class L:
         sleep = staticmethod(lambda s: None)
+        clock = staticmethod(time.monotonic)
 
-        def run(self, surface, ch, task_id):
+        def run(self, surface, ch, task_id, detected_at=None, call_deadline=None):
             state["ran"] += 1
+            state["timing"] = {"detected_at": detected_at, "call_deadline": call_deadline}
             return state["outcome"]
 
     monkeypatch.setattr(bl, "local_browser_ws", fake_ws)
