@@ -229,6 +229,14 @@ def _use_real_profile() -> bool:
     return _origin()._browser_cfg("use_real_profile", False, bool, "use_real_profile from config")
 
 
+def _use_kept_profile() -> bool:
+    """``browser.kept_profile``: the real-profile lane on a host with no person's browser to copy (a
+    cloud computer). The driven browser keeps its OWN profile under ``browser-profile/kept`` across
+    launches, so a sign-in made in it stays. Only meaningful with ``use_real_profile`` on; read on
+    every call, like the consent switch."""
+    return _origin()._browser_cfg("kept_profile", False, bool, "kept_profile from config")
+
+
 def _allow_private_urls() -> bool:
     """Whether the browser may navigate to private/internal addresses (default False: SSRF protection on).
 

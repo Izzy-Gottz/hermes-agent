@@ -278,6 +278,17 @@ browser:
 A pin naming a profile directory that doesn't exist fails closed with a
 fixable message — it never silently falls back to the last-used profile.
 
+On a machine with no browser of yours to copy — a cloud server — set
+`kept_profile` as well. The agent's browser then keeps its own profile at
+`~/.hermes/browser-profile/kept` from one launch to the next: nothing is
+copied into it, and a site you sign in to there stays signed in.
+
+```yaml
+browser:
+  use_real_profile: true
+  kept_profile: true
+```
+
 When you turn the toggle back off, Hermes deletes the snapshot store
 (`~/.hermes/browser-profile/`) on the next browser use, so the copied
 credentials don't linger after you revoke consent.

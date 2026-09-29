@@ -41,6 +41,21 @@ from tools import browser_tool_session as _session
 
 _RP = "browser.use_real_profile is on, but "
 
+#: The lane's "browser" on a host with no person's browser to copy (``browser.kept_profile``, a cloud
+#: computer): the driven browser runs on its OWN profile, ``browser-profile/kept``, kept across launches
+#: so a sign-in made in it -- by the person, through a hand-over -- stays. Nothing is snapshotted over it
+#: and no cookie jar is handed to it; it is the only copy of those sign-ins there is.
+KEPT = "kept"
+
+
+def _lane_browser() -> Optional[str]:
+    """The profile this lane drives: :data:`KEPT` under ``browser.kept_profile``, else the person's
+    default Chromium browser (None when there is none)."""
+    if _cloud._use_kept_profile():
+        return KEPT
+    from hermes_cli.browser_connect import detect_default_chromium
+    return detect_default_chromium()
+
 
 def _terminate_real_profile_chrome() -> None:
     """Terminate browser processes launched for real-profile sessions (idempotent, atexit-safe);
@@ -366,6 +381,8 @@ def _driven_browser_flags(identity: Optional[Dict[str, Any]], headless: bool) ->
 def _persons_identity(browser: Optional[str]) -> Optional[Dict[str, Any]]:
     """The person's browser's brand and version (from its Info.plist; the engine's version when
     the majors differ), or None."""
+    if browser == KEPT:
+        return None  # no person's browser to borrow a brand from; the engine speaks for itself
     from hermes_cli.browser_connect import chromium_executable
     try:
         driven = driven_browser_executable()
@@ -535,6 +552,8 @@ def google_wall_note(url: str = "") -> str:
 
 
 def _record_handover_target(cdp: str, browser: str, at: float = 0.0) -> None:
+    if browser == KEPT:
+        return  # nothing to refresh from: the kept profile IS the sign-ins, not a copy of someone's
     """Remember which browser the jar is kept current in. ``at`` is when a hand-over into it was taken;
     a browser this process did not hand over to (re-attached, another process's) starts at 0 -- its
     jar's age is unknown, so the next acquire refreshes it."""
@@ -831,8 +850,7 @@ def _real_profile_cdp() -> tuple:
         return None, (_RP + "browser.engine is set to 'lightpanda', which cannot load a real Chromium profile. "
                       "Set browser.engine to 'auto' or 'chrome' to use real-profile browsing, or turn the toggle off.")
 
-    from hermes_cli.browser_connect import (chromium_executable, detect_default_chromium,
-                                            real_profile_copy_dir, snapshot_real_profile)
+    from hermes_cli.browser_connect import chromium_executable, real_profile_copy_dir, snapshot_real_profile
 
     with _bt._real_profile_cdp_lock:
         _bt._real_profile_last_used = time.time()
@@ -840,7 +858,7 @@ def _real_profile_cdp() -> tuple:
         cached = _bt._real_profile_cdp_cache.get("cdp")
         if cached and _cdp_http_ready(cached):
             # The keeper is checked on EVERY acquire: one that died or stalled is restarted here.
-            _fidelity.ensure_keeper(int(cached.rsplit(":", 1)[1]), lambda: _persons_identity(detect_default_chromium()))
+            _fidelity.ensure_keeper(int(cached.rsplit(":", 1)[1]), lambda: _persons_identity(_lane_browser()))
             # Re-claim the shared daemon's socket dir so the orphan reaper's idle clock sees
             # this process still using it (a cache hit never runs a daemon command).
             _session._prepare_session_socket_dir(_bt._REAL_PROFILE_SESSION)
@@ -848,8 +866,8 @@ def _real_profile_cdp() -> tuple:
             return cached, None
         _bt._real_profile_cdp_cache.pop("cdp", None)
 
-        browser = detect_default_chromium()
-        unsupported = _real_profile_unsupported_reason(browser)
+        browser = _lane_browser()
+        unsupported = None if browser == KEPT else _real_profile_unsupported_reason(browser)
         if unsupported:
             return None, unsupported
 
@@ -907,6 +925,9 @@ def _real_profile_cdp() -> tuple:
             _refresh_jar_if_due(cdp)
             return cdp, None
 
+        if browser == KEPT:
+            return _launch_kept(copy_dir)
+
         handover_at = time.time()  # before the copy: a cookie written during it counts as newer
         copy_dir, err = snapshot_real_profile(browser)
         if err or not copy_dir:
@@ -941,6 +962,32 @@ def _real_profile_cdp() -> tuple:
         _bt.logger.info("real-profile browser ready for %s at %s (%s, %d cookie(s) handed over)",
                         browser, cdp, copy_dir, len(cookies))
         return cdp, None
+
+
+def _launch_kept(copy_dir: str) -> tuple:
+    """Cold start of the kept profile: the driven browser on ``copy_dir`` as it was left -- no
+    snapshot, no hand-over, no cookie import. Created owner-only on first use. ``(cdp, error)``."""
+    _bt = _origin()
+    try:
+        os.makedirs(copy_dir, mode=0o700, exist_ok=True)
+        os.chmod(copy_dir, 0o700)
+    except OSError as e:
+        return None, f"{_RP}the kept browser profile {copy_dir} could not be created: {e}"
+    driven = driven_browser_executable()
+    if driven is None and _install._maybe_autoinstall_chromium():
+        driven = driven_browser_executable()
+    if driven is None:
+        return None, _RP + "the browser engine's own Chrome is not installed. Run `agent-browser install`."
+    port, err = _launch_driven_browser(driven, copy_dir, None)
+    if port is None:
+        return None, err
+    cdp, err = _attach_agent_browser_to_real_profile(port, copy_dir)
+    if not cdp:
+        _terminate_real_profile_chrome()
+        return None, err
+    _bt._real_profile_cdp_cache["cdp"] = cdp
+    _bt.logger.info("real-profile: kept browser profile ready at %s (%s)", cdp, copy_dir)
+    return cdp, None
 
 
 # ---------------------------------------------------------------------------
@@ -1177,8 +1224,8 @@ def show_to_person(url_hint: str = "", task_id: str = "", target_id: str = "") -
                                          else "Moe's own browser has no web page open")}
         port = int(cached.rsplit(":", 1)[1])
         _bt._real_profile_last_used = time.time()
-        from hermes_cli.browser_connect import detect_default_chromium, real_profile_copy_dir
-        browser = detect_default_chromium()
+        from hermes_cli.browser_connect import real_profile_copy_dir
+        browser = _lane_browser()
         copy_dir = real_profile_copy_dir(browser)
         if not _is_headless_now(copy_dir):
             _shown_to_person.update(on=True, since=time.time())
