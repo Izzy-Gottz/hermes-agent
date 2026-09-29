@@ -36,7 +36,12 @@ _DURABLE_CLAIM_OPS = {
     "release": ("release_completion_delivery", "Could not release durable completion claim"),
     "defer": ("defer_completion_delivery", "Could not defer unadmitted completion claim"),
     "complete": ("complete_completion_delivery", "Could not acknowledge durable completion claim"),
+    "plugin": ("hand_completion_to_plugin", "Could not record the plugin hand-off of a completion claim"),
 }
+
+# Set (in memory only) on an async-delegation event whose completion a ``deliver_detached_completion`` plugin took:
+# its durable claim settles as ``plugin`` (unconfirmed), not ``delivered``.
+_PLUGIN_TOOK_KEY = "_delivered_by_plugin"
 
 
 def _raw_process_event_session_id(evt: dict) -> str:
@@ -952,6 +957,9 @@ class GatewayNotificationsMixin:
             # first callback to answer truthy has it; nothing is persisted
             # twice. Failures fall through to the durable row, never drop.
             if await self._offer_detached_completion(synth_text, raw_sid, evt):
+                # Taken — but a plugin's inbox is not the model. Settle the durable row as ``plugin`` so the next
+                # client turn of this session can still hand it over if the plugin's push never lands.
+                evt[_PLUGIN_TOOK_KEY] = True
                 return True
             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
             fail = "Async delegation delivery persist failed for session %s: %s"
@@ -982,7 +990,7 @@ class GatewayNotificationsMixin:
             logger.warning("deliver_detached_completion hook failed for session %s", raw_sid, exc_info=True)
             return False
         if any(bool(r) for r in results):
-            logger.info("Async delegation completion for api_server session %s delivered by a plugin", raw_sid)
+            logger.info("Async delegation completion for api_server session %s handed to a plugin (unconfirmed until the model sees it)", raw_sid)
             return True
         return False
 
@@ -1302,6 +1310,8 @@ class GatewayNotificationsMixin:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             operation = "complete" if accepted else "defer" if refused else "release"
+            if accepted and evt.get(_PLUGIN_TOOK_KEY):
+                operation = "plugin"
             if claim.claim_id:
                 self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
             for sibling, claim_id in sibling_claims:

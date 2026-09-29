@@ -118,13 +118,17 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            delivered_via TEXT
         )""")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
     # origin_session_id: raw api_server session id of the ORIGINATING request
     # (wake target); without it restart-recovered completions are unroutable there.
     for name, sql_type in (("owner_pid", "INTEGER"), ("owner_started_at", "INTEGER"), ("task_json", "TEXT"),
-                           ("delivery_claim", "TEXT"), ("delivery_claimed_at", "REAL"), ("origin_session_id", "TEXT")):
+                           ("delivery_claim", "TEXT"), ("delivery_claimed_at", "REAL"), ("origin_session_id", "TEXT"),
+                           # delivered_via: which route the model actually got the result by ("plugin" = handed
+                           # to a plugin, model not yet shown; "fallback"/"plugin-turn"/"result-read" = it saw it).
+                           ("delivered_via", "TEXT")):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
 
@@ -188,14 +192,14 @@ def _prune_durable_records() -> None:
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?", (cutoff,))
+            "DELETE FROM async_delegations WHERE delivery_state IN ('delivered','plugin') AND updated_at < ?", (cutoff,))
         terminal_count = conn.execute(
             "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
+                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 WHEN 'plugin' THEN 1 ELSE 2 END,
                               updated_at ASC LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
@@ -431,6 +435,33 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
              AND delivery_claim=?""", (now, now, delegation_id, claim_id))
+
+
+def hand_completion_to_plugin(delegation_id: str, claim_id: str) -> bool:
+    """A ``deliver_detached_completion`` plugin took this claimed completion.
+
+    The plugin putting it in its own inbox is not the model seeing it (Moe, 2026-09-29: seven finished helpers sat
+    in an inbox nobody read, the ledger said ``delivered``, and a later ``delegate_task list`` told the model it had
+    never started any). ``plugin`` is terminal for the gateway's retry machinery — the plugin owns the push — but
+    stays visibly unconfirmed, so the next client turn of the originating session can still hand the result to the
+    model (``tools.async_delegation_recall``), and ``list`` never claims it arrived."""
+    return _update_delivery("""UPDATE async_delegations SET delivery_state='plugin', delivered_via='plugin',
+                  updated_at=?, delivery_claim=NULL, delivery_claimed_at=NULL
+           WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?""",
+        (time.time(), delegation_id, claim_id))
+
+
+def mark_seen_by_model(delegation_id: str, via: str) -> bool:
+    """The model has this result now (``via``: fallback | plugin-turn | result-read). Exactly-once: True only for the
+    caller that moved it, so two turns racing on one row never both inject it. A pending row under a live gateway
+    claim is left to that consumer."""
+    now = time.time()
+    return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?,
+                  delivered_via=?, delivery_claim=NULL, delivery_claimed_at=NULL
+           WHERE delegation_id=? AND (delivery_state IN ('plugin','dropped')
+                 OR (delivery_state='pending' AND state NOT IN ('running','finalizing')
+                     AND (delivery_claim IS NULL OR delivery_claimed_at < ?)))""",
+        (now, now, via, delegation_id, now - 300))
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:

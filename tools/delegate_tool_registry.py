@@ -195,7 +195,7 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_CONTROL_ACTIONS = frozenset({"list", "result", "steer", "stop"})
 
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
     """Tip of a session id's compression lineage via the parent's live SessionDB (best-effort; input unchanged when
@@ -234,6 +234,28 @@ def _owns_subagent_record(record: Dict[str, Any], parent_agent: Any) -> bool:
     # Compression rotation on either side: compare lineage tips.
     return _resolve_session_lineage(owner_sid, parent_agent) in {parent_sid, _resolve_session_lineage(parent_sid, parent_agent)}
 
+def recall_scope(agent: Any) -> tuple[list, str]:
+    """``(session ids of this conversation, owner key)`` the durable ledger is read under.
+
+    Ids: the agent's session id, its compression-lineage tip, and — on api_server — the raw request session id the
+    delegation was stamped with. Owner: the routing key the gateway dispatched under (``moe`` for the Mac app), so a
+    new conversation of the same owner can see helpers an earlier one started. A key that is just this session's
+    own id (CLI/TUI) adds nothing."""
+    sid = str(getattr(agent, "session_id", "") or "")
+    ids = [sid, _resolve_session_lineage(sid, agent)] if sid else []
+    owner = ""
+    try:
+        from gateway.session_context import get_session_env
+        if get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server":
+            ids.append(get_session_env("HERMES_SESSION_CHAT_ID", "") or "")
+        from tools.approval_context import get_current_session_key
+        owner = str(get_current_session_key(default="") or "")
+    except Exception:
+        logger.debug("recall scope: session context unavailable", exc_info=True)
+    ids = [i for i in dict.fromkeys(ids) if i]
+    return ids, ("" if owner in ids else owner)
+
+
 def _list_payload(parent_agent: Any) -> Dict[str, Any]:
     with _active_subagents_lock:
         records = list(_active_subagents.values())
@@ -253,19 +275,51 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })
     payload: Dict[str, Any] = {"action": "list", "count": len(entries), "subagents": entries}
+    # The live registry forgets a child the moment it finishes; the durable ledger does not. Without it, a
+    # finished background batch whose result never reached the model read as "you never started any"
+    # (Moe, 2026-09-29).
+    from tools.async_delegation_recall import list_view
+    ids, owner = recall_scope(parent_agent)
+    recent = list_view(ids, owner)
+    if recent["finished"]:
+        payload["finished"] = recent["finished"]
+    if recent["other_conversations"]:
+        payload["other_conversations"] = recent["other_conversations"]
+    unseen = [v for v in recent["finished"] + recent["other_conversations"]
+              if not v["reached_model"] and v.get("completed_at")]
+    notes = []
     if not entries:
-        payload["note"] = (
-            "No live subagents right now. Children that already finished "
-            "have delivered (or will deliver) their results as normal "
-            "completion messages — there is nothing to steer or stop."
-        )
+        notes.append("No live subagents right now.")
+    if recent["finished"] or recent["other_conversations"]:
+        notes.append("Background helpers from the last 24 h are listed under 'finished' (this conversation) and "
+                     "'other_conversations' (started by the same owner elsewhere).")
+    if unseen:
+        notes.append(f"{len(unseen)} of them finished but their results never reached you (reached_model=false) — "
+                     "read one with delegate_task(action='result', subagent_id=<delegation_id>).")
+    elif not entries and not recent["finished"] and not recent["other_conversations"]:
+        notes.append("No background helpers in this conversation or from its owner in the last 24 h.")
+    payload["note"] = " ".join(notes)
     return payload
+
+def _result_payload(delegation_id: Optional[str], parent_agent: Any) -> str:
+    from tools.async_delegation_recall import result_view
+    did = (delegation_id or "").strip()
+    if not did:
+        return tool_error("action='result' requires subagent_id — the delegation_id from action='list'.")
+    ids, owner = recall_scope(parent_agent)
+    view = result_view(did, ids, owner)
+    if view is None:
+        return tool_error(f"No finished background helper '{did}' from this conversation or its owner. "
+                          "Use action='list' to see recent ones.")
+    return json.dumps({"action": "result", **view}, ensure_ascii=False)
 
 def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any) -> str:
     """Synchronous control plane for delegate_task: list/steer/stop. Runs in-turn (never backgrounded) over the same
     registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
     if action == "list":
         return json.dumps(_list_payload(parent_agent), ensure_ascii=False)
+    if action == "result":
+        return _result_payload(subagent_id, parent_agent)
 
     # steer / stop need a resolvable, owned target.
     sid = (subagent_id or "").strip()
@@ -276,8 +330,9 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
     if record is None or not _owns_subagent_record(record, parent_agent):
         return tool_error(
             f"No live subagent '{sid}' in this conversation's spawn tree. It "
-            "may have already finished (its result arrives as a normal "
-            "completion message). Use action='list' to see live children."
+            "may have already finished — action='list' shows recently finished "
+            "ones and whether each completion message actually reached you "
+            "(action='result' reads one)."
         )
     if action == "steer" and not (message or "").strip():
         return tool_error("action='steer' requires a non-empty 'message' describing the course correction.")
