@@ -12,6 +12,7 @@ import functools
 import json
 import logging
 import math
+import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -440,6 +441,38 @@ def _string_list_arg(args: Dict[str, Any], key: str, *, dedupe: bool, max_items:
     return out, None
 
 
+# A client's namespaced spelling of one of OUR tools: Claude Code calls an MCP server's tools
+# ``mcp__<server>__<tool>``, and on 2026-09-29 a model asked tool_describe for
+# "mcp__hermes-tools__browser_vault_login" and was told not_found -- the bare name was loaded all along.
+_CLIENT_PREFIX_RE = re.compile(r"^mcp__[A-Za-z0-9_.-]+?__(?=[A-Za-z0-9])")
+
+
+def _bare_name(name: str, known: Iterable[str] = ()) -> str:
+    """``name`` without a client's ``mcp__<server>__`` prefix when what is left is a tool this process
+    knows (in ``known`` or registered); otherwise ``name`` unchanged."""
+    m = _CLIENT_PREFIX_RE.match(name or "")
+    if not m:
+        return name
+    bare = name[m.end():]
+    return bare if (bare in set(known) or _registry_entry(bare) is not None) else name
+
+
+def _bare_query(query: str, known: Iterable[str]) -> str:
+    """A search query with each client-prefixed tool name replaced by its bare name."""
+    known = set(known)
+    return " ".join(_bare_name(word, known) for word in str(query).split(" "))
+
+
+def _loaded_direct_matches(query: str, current_tool_defs: List[Dict[str, Any]], limit: int = 3) -> List[str]:
+    """Tools loaded DIRECTLY in this session (never behind the bridge, so not in the search catalog) that
+    answer ``query``: a search for "browser_handoff" returned only process_manage on 2026-09-29 because
+    browser_handoff is a core tool and the catalog holds only deferred ones."""
+    direct = [td for td in current_tool_defs
+              if (_fn(td).get("name") or "") and _fn(td).get("name") not in BRIDGE_TOOL_NAMES
+              and not is_deferrable_tool_name(_fn(td).get("name"), load_config_readonly().effective_defer_tools)]
+    return [e.name for e in search_catalog(build_catalog(direct), query, limit=limit)]
+
+
 def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[str, Any]],
                          config: Optional[ToolSearchConfig] = None,
                          connector_search: Optional[Any] = None) -> str:
@@ -458,6 +491,7 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
     raw_limit = args.get("limit")
     limit = (config.search_default_limit if raw_limit is None
              else _clamped_int(raw_limit, config.search_default_limit, 1, config.max_search_limit))
+    queries = [_bare_query(q, _tool_def_names(current_tool_defs)) for q in queries]
     catalog = build_catalog(_deferrable_in(current_tool_defs))
     remote_entries: List[List[CatalogEntry]] = [[] for _ in queries]
     if connections_in_scope(current_tool_defs):
@@ -472,7 +506,12 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
             tools_map.setdefault(h.name, _shared_tool_record(h))
         matches = [h.name for h in hits]
         group: Dict[str, Any] = {"query": query, "matches": matches}
-        if not matches and catalog:
+        loaded = _quiet_direct(query, current_tool_defs)
+        if loaded:
+            group["loaded"] = loaded
+            group["loaded_hint"] = ("These tools are already loaded in this session: call them directly by name "
+                                    "(no tool_describe / tool_call needed).")
+        if not matches and not loaded and catalog:
             group["available_sources"] = available_sources
             group["hint"] = (
                 "This query returned no lexical matches, but the sources above "
@@ -483,6 +522,14 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
     remote_count = sum(1 for name in tools_map if is_connector_name(name))
     return json.dumps({"queries": queries, "total_available": len(catalog) + remote_count, "results": results,
                        "tools": tools_map}, ensure_ascii=False)
+
+
+def _quiet_direct(query: str, current_tool_defs: List[Dict[str, Any]]) -> List[str]:
+    try:
+        return _loaded_direct_matches(query, current_tool_defs)
+    except Exception as exc:  # a lookup failure must never fail a bridge call
+        logger.debug("tool_search: direct-tool lookup failed: %s", exc)
+        return []
 
 
 def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict[str, Any]],
@@ -497,6 +544,7 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
         retry_hint="Retry with fewer names per call.")
     if err:
         return err
+    names = list(dict.fromkeys(_bare_name(n, _tool_def_names(current_tool_defs)) for n in names))
     deferrable = _deferrable_in(current_tool_defs)
     by_name = {name: _fn(td) for td, name in zip(deferrable, _tool_def_names(deferrable)) if name}
     remote_schemas = remote_schemas_for(names, current_tool_defs, connector_describe)

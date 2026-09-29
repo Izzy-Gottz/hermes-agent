@@ -562,3 +562,51 @@ class TestConfigAndSchema:
         name_description = describe_params["properties"]["names"]["description"]
         assert "single string is accepted" in name_description
         assert "one name" in name_description
+
+
+class TestClientPrefixedNamesAndLoadedTools:
+    """2026-09-29, Moe under Claude Code: tool_describe(["mcp__hermes-tools__browser_vault_login", ...]) answered
+    not_found, and tool_search("browser_handoff") answered process_manage -- while both tools were loaded."""
+
+    def _defs(self):
+        from tools import browser_handoff_tool, browser_vault_tool  # noqa: F401 (registers)
+        from tools.registry import registry
+        names = ("browser_vault_login", "browser_vault_regenerate", "browser_vault_confirm", "browser_handoff",
+                 "process_manage")
+        defs = []
+        for n in names:
+            entry = registry.get_entry(n)
+            if entry is None:                       # process_manage lives elsewhere: a deferred stand-in
+                defs.append(_register(n, "terminal", "Poll, wait on, or kill background terminal processes."))
+            else:
+                defs.append({"type": "function", "function": entry.schema})
+        return defs
+
+    def test_describe_understands_the_claude_code_spelling(self):
+        from tools.tool_search import ToolSearchConfig, dispatch_tool_describe
+        result = json.loads(dispatch_tool_describe(
+            {"names": ["mcp__hermes-tools__browser_vault_login", "mcp__hermes-tools__browser_vault_regenerate"]},
+            current_tool_defs=self._defs(), config=ToolSearchConfig.from_raw({})))
+        assert "not_found" not in result, result
+        # core tools: the answer is "call it directly", under their bare names
+        assert set(result["errors"]) == {"browser_vault_login", "browser_vault_regenerate"}
+        assert "call it directly" in result["errors"]["browser_vault_login"]
+
+    def test_an_unknown_prefixed_name_is_still_not_found(self):
+        from tools.tool_search import ToolSearchConfig, dispatch_tool_describe
+        result = json.loads(dispatch_tool_describe(
+            {"names": ["mcp__hermes-tools__no_such_tool"]}, current_tool_defs=self._defs(),
+            config=ToolSearchConfig.from_raw({})))
+        assert result["not_found"] == ["mcp__hermes-tools__no_such_tool"]
+
+    def test_search_names_a_loaded_tool_instead_of_an_unrelated_deferred_one(self):
+        from tools.tool_search import ToolSearchConfig, dispatch_tool_search
+        cfg = ToolSearchConfig.from_raw({})
+        for q in ("browser_handoff", "mcp__hermes-tools__browser_handoff"):
+            group = json.loads(dispatch_tool_search({"queries": [q]}, current_tool_defs=self._defs(),
+                                                    config=cfg))["results"][0]
+            assert group["loaded"][0] == "browser_handoff", group
+            assert "call them directly" in group["loaded_hint"]
+        group = json.loads(dispatch_tool_search({"queries": ["browser vault login regenerate confirm password"]},
+                                                current_tool_defs=self._defs(), config=cfg))["results"][0]
+        assert {"browser_vault_login", "browser_vault_regenerate"} & set(group["loaded"]), group
