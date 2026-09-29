@@ -565,6 +565,18 @@ class TestHandoff:
         assert "END YOUR TURN" in out["next"] and "unless page_says" in out["next"]
         assert state["opened"] == [] and state["chrome"] == []
 
+    def test_the_engine_names_the_exact_tab_by_target_id(self, handoff):
+        """The CAPTCHA ladder hands over the tab it worked on, not whatever tab is first."""
+        bh, state = handoff
+        state["harness_tab"] = {"url": "https://launchllama.co/products/weeny", "targetId": "OTHER"}
+        state["shown"] = {"ok": True, "url": "https://forums.macrumors.com/login", "title": "", "relaunched": False,
+                          "front": True, "form_state_lost": False, "reopened": 0}
+        out = json.loads(bh.browser_handoff(reason="complete the hcaptcha check", task_id="t",
+                                            url="https://forums.macrumors.com/login", target_id="TAB7"))
+        assert out["route"] == "driven_browser"
+        assert state["show_calls"] == [("https://forums.macrumors.com/login", "t", "TAB7")]
+        assert "target_id" not in json.dumps(bh.BROWSER_HANDOFF_SCHEMA)   # never the model's to pass
+
     def test_a_window_macos_did_not_bring_forward_is_said_honestly(self, handoff):
         bh, state = handoff
         state["shown"] = {"ok": True, "url": "https://accounts.google.com/pk", "title": "", "relaunched": False,

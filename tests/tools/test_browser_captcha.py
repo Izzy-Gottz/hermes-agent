@@ -798,6 +798,110 @@ def test_hook_needs_person_points_at_browser_handoff_or_the_person(cli, canned, 
     assert "browser_handoff" not in out["captcha"]["next"] and "in your reply" in out["captcha"]["next"]
 
 
+class _Tab:
+    target_id = "TAB7"
+
+
+MR_WALL = "{'url': 'https://forums.macrumors.com/login', 'title': 'Just a moment...'}"
+MR_CODE = 'new_tab("https://forums.macrumors.com/login")\nprint(page_info())'
+
+
+@pytest.fixture()
+def engine_handoff(cli, canned, monkeypatch, tmp_path):
+    """The person is at the Mac; browser_handoff is recorded, and answers ``state['shown']``."""
+    from tools import browser_handoff_tool as bh
+    stamp = tmp_path / "presence.json"
+    stamp.write_text(json.dumps({"active": True, "at": time.time(), "idle": 1}))
+    monkeypatch.setenv("HERMES_PRESENCE_FILE", str(stamp))
+    monkeypatch.setattr("tools.browser_chrome_extension.turn_presence",
+                        lambda: {"live": True, "why": "", "surface": "local"})
+    monkeypatch.setattr(bl, "handoff_available", lambda: True)
+    monkeypatch.setattr(bl, "find_challenge", lambda conn, hosts, **kw: (_Tab(), canned["challenge"]))
+    state = {"calls": [], "shown": {"success": True, "route": "driven_browser", "url": "https://forums.macrumors.com/login",
+                                    "front": True, "relaunched": True}}
+
+    def fake(**kw):
+        state["calls"].append(kw)
+        return json.dumps(state["shown"])
+    monkeypatch.setattr(bh, "browser_handoff", fake)
+    monkeypatch.setattr(bh, "_on_cloud_computer", lambda: False)
+    cli["stdout"] = MR_WALL
+    canned["challenge"] = bc.classify(hc())
+    canned["outcome"] = bl.Outcome(kind=bc.HCAPTCHA, host="forums.macrumors.com", outcome=bl.NEEDS_PERSON,
+                                   reason="the hcaptcha check did not pass after 2 tries", tier="A", attempts=2,
+                                   url="https://forums.macrumors.com/login")
+    return state
+
+
+def test_engine_hands_the_exact_tab_to_a_person_at_the_mac_and_tells_the_model_to_wait(engine_handoff, cli, monkeypatch):
+    """2026-09-29: needs_person carried next "Call browser_handoff(...)" and the model only reported to the
+    person. Now the engine shows the page itself and the model is told to wait for "done"."""
+    cli["cfg"] = {"chrome_extension": {"enabled": True}}
+    from tools import browser_chrome_extension as lane
+    monkeypatch.setattr(lane, "read_bridge", lambda hermes_home=None: {"ws_url": "ws://127.0.0.1:1/devtools/browser/x"})
+    monkeypatch.setattr(lane, "remember_blocking_host", lambda host, **kw: None)
+    out = _exec(MR_CODE)
+    assert engine_handoff["calls"] == [{"reason": "complete the hcaptcha check on forums.macrumors.com",
+                                        "url": "https://forums.macrumors.com/login", "task_id": "t",
+                                        "target_id": "TAB7"}]
+    c = out["captcha"]
+    assert c["outcome"] == "needs_person" and c["handed_over"]["route"] == "driven_browser"
+    assert c["tell_person"].startswith("forums.macrumors.com wants you to prove you're human: tick the box in the "
+                                       "window I just opened")
+    assert "do not call it again" in c["next"] and "browser_handoff(done=true)" in c["next"]
+    assert "END YOUR TURN" in c["next"] and "Call browser_handoff(reason=" not in c["next"]
+    assert out["hint"] == c["next"] and 'where="chrome"' not in out["hint"]   # not "try it in Chrome"
+
+
+def test_engine_hand_over_not_in_front_says_the_dock(engine_handoff):
+    engine_handoff["shown"] = {**engine_handoff["shown"], "front": False}
+    c = _exec(MR_CODE)["captcha"]
+    assert "click it in the Dock" in c["tell_person"] and "did not bring it forward" in c["next"]
+
+
+@pytest.mark.parametrize("presence", [{"live": False, "why": "a scheduled job"},
+                                      {"live": True, "why": "the person's message on telegram", "surface": "chat",
+                                       "platform": "telegram"},
+                                      {"live": False, "why": "a background note from the app"}])
+def test_engine_opens_nothing_for_cron_away_or_relayed_turns(engine_handoff, monkeypatch, presence):
+    monkeypatch.setattr("tools.browser_chrome_extension.turn_presence", lambda: presence)
+    c = _exec(MR_CODE)["captcha"]
+    assert engine_handoff["calls"] == [] and "handed_over" not in c
+    assert "Call browser_handoff" not in c["next"]
+
+
+def test_engine_opens_nothing_when_the_mac_is_locked(engine_handoff, monkeypatch, tmp_path):
+    stamp = tmp_path / "locked.json"
+    stamp.write_text(json.dumps({"active": False, "locked": True, "at": time.time(), "idle": 900}))
+    monkeypatch.setenv("HERMES_PRESENCE_FILE", str(stamp))
+    c = _exec(MR_CODE)["captcha"]
+    assert engine_handoff["calls"] == [] and "handed_over" not in c
+
+
+@pytest.mark.parametrize("change", [{"engine_retry": True},
+                                    {"outcome": bl.HARD_STOP, "hard_stop": bc.HARD_STOP_IP_BANNED},
+                                    {"outcome": bl.PASSED}])
+def test_engine_opens_nothing_for_a_retry_an_ip_ban_or_a_pass(engine_handoff, canned, change):
+    import dataclasses
+    canned["outcome"] = dataclasses.replace(canned["outcome"], **change)
+    _exec(MR_CODE)
+    assert engine_handoff["calls"] == []
+
+
+def test_engine_hand_over_that_fails_keeps_today_s_next(engine_handoff):
+    engine_handoff["shown"] = {"success": False, "error": "busy"}
+    c = _exec(MR_CODE)["captcha"]
+    assert len(engine_handoff["calls"]) == 1 and "handed_over" not in c
+    assert "browser_handoff(reason=" in c["next"]
+
+
+def test_engine_hands_over_a_hard_stop_too_with_the_hard_stop_words(engine_handoff, canned):
+    import dataclasses
+    canned["outcome"] = dataclasses.replace(canned["outcome"], outcome=bl.HARD_STOP, hard_stop=bc.HARD_STOP_REPEATED)
+    c = _exec(MR_CODE)["captcha"]
+    assert c["handed_over"] and "hard stop" in c["next"] and "browser_handoff(done=true)" in c["next"]
+
+
 def test_hook_hard_stop_replaces_the_try_it_in_chrome_hint(cli, canned, monkeypatch, tmp_path):
     cli["stdout"] = PH_WALL
     cli["cfg"] = {"chrome_extension": {"enabled": True}}

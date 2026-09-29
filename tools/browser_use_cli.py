@@ -801,7 +801,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         blocked_by = None if captcha == "passed" else chrome_lane.detect_block(proc.stdout)
         if blocked_by:
             result["blocked_by"] = blocked_by
-            if chrome_lane.lane_enabled(browser_cfg) and captcha != "hard_stop":
+            # The ladder already put the page in front of the person: its hint (wait for them) stands.
+            handed = bool((result.get("captcha") or {}).get("handed_over"))
+            if chrome_lane.lane_enabled(browser_cfg) and captcha != "hard_stop" and not handed:
                 wall = chrome_lane.wall_host(proc.stdout)  # the host that served the wall, signature-grade only
                 if wall:
                     chrome_lane.remember_blocking_host(wall[1])

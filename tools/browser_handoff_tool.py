@@ -257,7 +257,9 @@ def _hand_back(task_id: str) -> str:
 
 
 def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done: bool = False,
-                    task_id: Optional[str] = None) -> str:
+                    task_id: Optional[str] = None, target_id: str = "") -> str:
+    """``target_id`` (engine callers only, never the model's schema): the exact tab to show -- the CAPTCHA
+    ladder hands over the very page it worked on (tools/browser_captcha_ladder.hand_over)."""
     from tools.registry import tool_error, tool_result
     task = task_id or "default"
     if done:
@@ -275,8 +277,8 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
     # With no url, the page is the one browser_exec was working on: the harness's own tab (its record,
     # tools/browser_exec_health.current_tab). 2026-09-29 the "most recently active tab" fallback put an
     # unrelated tab (launchllama.co/products/weeny) in front of the owner instead of forums.macrumors.com.
-    current, target_id = url, ""
-    if not current:
+    current, target_id = url, str(target_id or "")
+    if not current and not target_id:
         record = _harness_tab(task)
         if record:
             current, target_id = record["url"], record["targetId"]
@@ -389,7 +391,9 @@ BROWSER_HANDOFF_SCHEMA = {
         "carried over). Then tell them in one line what to do and END YOUR TURN: they say when they are done, and "
         "you call browser_handoff(done=true) and carry on in the same browser_exec session. The rule: whenever a "
         "page needs a check only the person can complete, use this -- whether or not a result says needs_person "
-        "(that note is only a hint and can miss one), and when browser_vault_enter_code finds no code field. A window is only ever put up for a "
+        "(that note is only a hint and can miss one), and when browser_vault_enter_code finds no code field. When a "
+        "browser_exec result's captcha.handed_over is set, Moe already showed the page: do not call this again -- tell "
+        "them captcha.tell_person, wait, then call browser_handoff(done=true). A window is only ever put up for a "
         "person at this Mac: when they are writing from their phone, or nobody is there (a scheduled job), it opens "
         "nothing and returns code person_needed with tell_owner -- say it in your reply, or pass it to "
         "reach_owner(text) on a job, and stop. On a cloud computer it returns person_needed with next="

@@ -167,13 +167,14 @@ class Outcome:
     solves: Optional[int] = None     # tier C: recognition requests spent
     image_puzzle: Optional[bool] = None  # a checkbox click was answered with an image challenge
     seconds: Optional[float] = None  # the ladder's own time, from detection to this outcome
+    engine_retry: Optional[bool] = None  # stopped by the call's own time limit: the engine tries again next call
 
     def to_dict(self) -> Dict[str, Any]:
         d = {"kind": self.kind, "host": self.host, "outcome": self.outcome, "reason": self.reason,
              "attempts": self.attempts, "tier": self.tier, "delivery": self.delivery,
              "hard_stop": self.hard_stop, "steps": self.steps, "url": self.url, "solver": self.solver,
              "rounds": self.rounds, "solves": self.solves, "image_puzzle": self.image_puzzle,
-             "seconds": self.seconds}
+             "seconds": self.seconds, "engine_retry": self.engine_retry}
         return {k: v for k, v in d.items() if v not in ("", [], None) or k in ("attempts",)}
 
 
@@ -386,7 +387,8 @@ class Ladder:
                       "slowly, so the other tries did not fit")
         else:
             reason = f"the {ch.kind} check did not pass after {tries}"
-        return self._out(ch, NEEDS_PERSON, reason, tier="A", delivery=delivery.name, attempts=attempts, steps=steps)
+        return self._out(ch, NEEDS_PERSON, reason, tier="A", delivery=delivery.name, attempts=attempts, steps=steps,
+                         engine_retry=True if stopped == "call" else None)
 
     def _t(self, start: float) -> str:
         return f"{max(0.0, self.clock() - start):.1f}s"
@@ -902,6 +904,13 @@ def run_for_exec(result: Dict[str, Any], stdout: str, env: Dict[str, str], brows
             detected = ladder.clock()  # the ladder's time starts HERE, not when the call started
             out = ladder.run(CdpSurface(conn, page, browser_cfg, sleep=ladder.sleep), ch, task_id,
                              detected_at=detected, call_deadline=_call_deadline(env, ladder.clock))
+            target_id, page_url = str(getattr(page, "target_id", "") or ""), out.url
+            if out.outcome in (NEEDS_PERSON, HARD_STOP) and not page_url:
+                try:
+                    page_url = str((conn.call("Target.getTargetInfo", {"targetId": target_id}).get("targetInfo")
+                                    or {}).get("url") or "")
+                except Exception:
+                    page_url = ""
     except Exception as exc:
         logger.debug("captcha ladder failed: %s", exc)
         return None
@@ -912,7 +921,82 @@ def run_for_exec(result: Dict[str, Any], stdout: str, env: Dict[str, str], brows
         except Exception:
             presence = {"live": False, "why": ""}
     apply_outcome(result, out, presence)
+    # Outside the CDP connection: showing the page may relaunch Moe's browser in a window.
+    hand_over(result, out, presence, task_id, target_id, page_url)
     return out.outcome
+
+
+#: What the person does, in one plain line, per kind of check (the model passes it on as is).
+_PERSON_LINES = {
+    bc.HCAPTCHA: "{host} wants you to prove you're human: tick the box{where}, and do the picture puzzle if one "
+                 "comes up. Tell me when it's done.",
+    bc.RECAPTCHA_V2: "{host} wants you to prove you're human: tick \"I'm not a robot\"{where}, and do the picture "
+                     "puzzle if one comes up. Tell me when it's done.",
+    bc.TURNSTILE: "{host} is showing a Cloudflare check{where}: tick the box if there is one, and tell me when the "
+                  "page loads.",
+    bc.CF_MANAGED: "{host} is showing a Cloudflare check{where}: tick the box if there is one, and tell me when the "
+                   "page loads.",
+    bc.PERIMETERX: "{host} wants you to press and hold its button{where} until it lets go. Tell me when it's done.",
+}
+
+
+def person_line(out: Outcome, front: bool) -> str:
+    where = " in the window I just opened" if front else " in Moe's browser (click it in the Dock if it isn't in front)"
+    tmpl = _PERSON_LINES.get(out.kind, "{host} needs you to finish its " + out.kind.replace("_", " ")
+                             + " check{where}. Tell me when it's done.")
+    return tmpl.format(host=out.host or "The site", where=where)
+
+
+def hand_over(result: Dict[str, Any], out: Outcome, presence: Optional[dict], task_id: Optional[str],
+              target_id: str, url: str) -> bool:
+    """The ladder could not pass the check and the person is AT this Mac: put that exact tab in front of them
+    now (browser_handoff's show path), instead of leaving it to the model -- 2026-09-29 the result said
+    ``next: "Call browser_handoff(...)"`` and the model only reported to the person. Nothing is opened for a
+    turn nobody is at, a chat from away (both keep ``next``'s person_needed wording), an IP ban nothing on the
+    page can pass, or a stop the engine itself retries on the next call. True when the page was shown."""
+    if out.outcome not in (NEEDS_PERSON, HARD_STOP) or out.engine_retry or out.hard_stop == bc.HARD_STOP_IP_BANNED:
+        return False
+    if not (presence or {}).get("live") or not target_id or not url.startswith(("http://", "https://")):
+        return False
+    try:
+        from tools.browser_chrome_extension import at_this_mac
+        here, _why = at_this_mac(presence)
+    except Exception:
+        return False
+    if not here or not handoff_available():
+        return False
+    try:
+        from tools import browser_handoff_tool as bh
+        if bh._on_cloud_computer():
+            return False
+        raw = bh.browser_handoff(reason=f"complete the {out.kind.replace('_', ' ')} check on {out.host}", url=url,
+                                 task_id=task_id, target_id=target_id)
+        shown = json.loads(raw)
+    except Exception as exc:
+        logger.info("captcha ladder: the hand-over failed: %s", exc)
+        return False
+    if not isinstance(shown, dict) or shown.get("success") is not True or not shown.get("route"):
+        return False  # not shown (busy browser, person not here after all): the model keeps today's next
+    front = bool(shown.get("front")) and shown.get("route") == "driven_browser"
+    line = person_line(out, front)
+    d = result.get("captcha") or {}
+    d["handed_over"] = {k: shown[k] for k in ("route", "url", "front", "relaunched") if k in shown}
+    d["tell_person"] = line
+    where = {"driven_browser": ("in Moe's browser window, in front of them" if front else
+                                "in Moe's browser window (macOS did not bring it forward)"),
+             "chrome": "in their Chrome, in the \"Moe\" tab group",
+             "default_browser": "in their default browser, without Moe's sign-ins"}.get(shown["route"], "on their screen")
+    stop = (" This is a hard stop: never try to solve it yourself, retry it or try another browser."
+            if out.outcome == HARD_STOP else " Never try to solve it yourself.")
+    d["next"] = (f"Moe already put the page in front of the person ({where}); browser_handoff was called for you, so "
+                 f"do not call it again now. Tell them in one line, as is: \"{line}\" Then END YOUR TURN and wait -- "
+                 "do not keep working and do not poll the page. When they say they are done, call "
+                 "browser_handoff(done=true) and carry on with the task." + stop)
+    if shown.get("form_state"):
+        d["form_state"] = shown["form_state"]
+    result["captcha"] = d
+    result["hint"] = d["next"]
+    return True
 
 
 def _call_deadline(env: Dict[str, str], clock: Callable[[], float]) -> Optional[float]:
