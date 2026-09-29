@@ -16,7 +16,11 @@ and this module holds the fix for each:
   itself still answers, and what to do.
 * ``new_tab()`` never closes anything. The same patch records every target the harness creates
   and, when the process exits, closes the oldest beyond :data:`TAB_CAP` — never the attached tab,
-  never a tab Hermes did not open, and only in Moe's own browser.
+  never a tab Hermes did not open, and only in Moe's own browser. That ledger only knows the tabs the
+  harness opened in THIS browser (it is keyed by the CDP endpoint, so it starts empty after every
+  relaunch), and on 2026-09-29 the hand-over window showed ~45 tabs. :func:`sweep_own_browser` closes,
+  after every call in Moe's own driven browser, every page but the tabs in use and the most recent
+  :data:`TAB_CAP` -- whoever opened them. Never in the person's own browser.
 * The CDP supervisor's dialog bridge holds a page's JS thread for up to 300 s waiting for
   ``browser_dialog``, a tool the model does not have in Browser Use mode.
   :func:`exec_dialog_policy` dismisses those at once instead, and :func:`dialog_report` puts
@@ -30,7 +34,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +284,73 @@ def exec_env(env: dict, *, timeout_s: float, session: str, own_lane: bool, task_
         env[ENV_TAB_CAP] = str(TAB_CAP)
     except Exception as e:
         logger.debug("browser_exec tab ledger unavailable: %s", e)
+
+
+#: A conversation's tab is protected from the sweep while its current-tab record is this fresh: another
+#: conversation working in the same browser must not lose the page it is on.
+SWEEP_PROTECT_SECONDS = 10 * 60
+
+
+def tabs_in_use(*, now: Optional[float] = None, within_s: float = SWEEP_PROTECT_SECONDS) -> List[str]:
+    """Target ids the harness of ANY conversation was left on within ``within_s`` (their current-tab
+    records)."""
+    path = current_tab_path("default")
+    if not path:
+        return []
+    now = time.time() if now is None else now
+    out: List[str] = []
+    d = os.path.dirname(path)
+    try:
+        names = [n for n in os.listdir(d) if n.startswith("current-tab-") and n.endswith(".json")]
+    except OSError:
+        return out
+    for name in names:
+        try:
+            with open(os.path.join(d, name), encoding="utf-8") as fh:
+                data = json.load(fh)
+            at = float(data.get("at") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if data.get("targetId") and 0 <= now - at <= within_s:
+            out.append(str(data["targetId"]))
+    return out
+
+
+def sweep_own_browser(cdp_http: str, keep_ids: Iterable[str] = (), keep_recent: int = TAB_CAP,
+                      timeout: float = 2.0) -> int:
+    """Close every page of Moe's OWN driven browser at ``cdp_http`` except ``keep_ids`` (the tabs in use)
+    and the ``keep_recent`` most recently active others. Returns how many were closed. The caller
+    guarantees ``cdp_http`` is Moe's own browser -- this is never pointed at the person's.
+
+    Recency is Chrome's own: ``/json/list`` lists pages most recently active first (measured on Chrome
+    for Testing 154, 2026-09-29: tabs made t0..t4, t1 activated -> ``/json/list`` t1, t4, t3, t2, t0;
+    ``Target.getTargets`` returned t2, t3, t1, t4, t0 whatever was activated, so it cannot say). A popup
+    opened by the page (an OAuth window) is new, so it is among the most recent."""
+    import urllib.request
+    root = str(cdp_http or "").rstrip("/")
+    if not root.startswith("http://"):
+        return 0
+    try:
+        with urllib.request.urlopen(root + "/json/list", timeout=timeout) as r:  # noqa: S310 -- loopback CDP
+            pages = [t for t in json.loads(r.read().decode("utf-8")) if t.get("type") == "page" and t.get("id")]
+    except Exception as e:
+        logger.debug("tab sweep: list failed: %s", e)
+        return 0
+    keep = {str(k) for k in keep_ids if k}
+    recent = [t["id"] for t in pages if t["id"] not in keep][:max(0, int(keep_recent))]
+    closed = 0
+    for t in pages:
+        if t["id"] in keep or t["id"] in recent:
+            continue
+        try:
+            with urllib.request.urlopen(f"{root}/json/close/{t['id']}", timeout=timeout):  # noqa: S310
+                closed += 1
+        except Exception as e:
+            logger.debug("tab sweep: close %s failed: %s", t["id"], e)
+    if closed:
+        logger.info("browser_exec: closed %d old tab(s) in Moe's own browser (kept %d in use + the %d most recent)",
+                    closed, len(keep), len(recent))
+    return closed
 
 
 def _dialog_tool_available() -> bool:

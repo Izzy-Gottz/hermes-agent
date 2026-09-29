@@ -425,27 +425,43 @@ class TestBrowserExec:
         assert "browser_handoff" in out["hint"]
         assert "phone" not in out["hint"].replace("their phone or another device", "")  # the rule, not a claim
 
-    def test_a_google_sign_in_wall_says_google_sessions_stay_in_the_persons_chrome(self, cli, monkeypatch):
-        """Ticket #18: every Google session cookie was handed over and sent, and Google still asked for the
-        passkey -- it ties the session to the person's own Chrome. The result says so, in words to pass on."""
-        from tools.browser_tool_real_profile import GOOGLE_SESSION_NOTE
+    def test_a_google_passkey_wall_hands_that_page_over_and_carries_on(self, cli, monkeypatch):
+        """Google asked for the passkey: the result says to hand THAT page over and carry on -- never that
+        Google sign-in cannot work here (2026-09-24 it did, on Peerlist, through the account chooser)."""
+        from tools.browser_tool_real_profile import google_wall_note
         _probe_returns(monkeypatch, cli, PASSKEY_PROBE)
         cli["stdout"] = GOOGLE_PASSKEY_STDOUT
         out = json.loads(bu.browser_exec('print(js("document.body.innerText"))', task_id="t"))
-        assert out["google_sign_in"] == GOOGLE_SESSION_NOTE
-        assert "ties them to the person's own Chrome" in out["google_sign_in"]
+        assert out["google_sign_in"] == google_wall_note(PASSKEY_PROBE["url"])
+        note = out["google_sign_in"]
+        assert f'url="{PASSKEY_PROBE["url"]}"' in note and "browser_handoff(done=true)" in note
+        assert "carry on" in note
+        for refusal in ("do not carry over", "ties them to the person's own Chrome", "Memoe extension"):
+            assert refusal not in note
 
-    def test_the_signed_out_google_account_page_says_so_too(self, cli, monkeypatch):
+    @pytest.mark.parametrize("wall", [
+        "https://accounts.google.com/v3/signin/challenge/pwd?TL=x",
+        "https://accounts.google.com/signin/v2/challenge/sk/webauthn?x=1",
+        "https://accounts.google.com/v3/signin/challenge/ipp/consent?x=1",
+        "https://accounts.google.com/signin/v2/speedbump/idvreenable?x=1",
+        "https://accounts.google.com/v3/signin/rejected?x=1",
+    ])
+    def test_each_google_wall_found_in_the_output_is_named_by_its_url(self, cli, monkeypatch, wall):
         _probe_returns(monkeypatch, cli, None)
-        cli["stdout"] = "{'url': 'https://myaccount.google.com/intro/security', 'title': 'Google Account'}\n"
+        cli["stdout"] = f"{{'url': '{wall}', 'title': 'Sign in - Google Accounts'}}\n"
         out = json.loads(bu.browser_exec('print(page_info())', task_id="t"))
-        assert "google_sign_in" in out
+        assert f'url="{wall}"' in out["google_sign_in"]
 
-    def test_other_pages_and_signed_in_google_pages_carry_no_google_note(self, cli, monkeypatch):
+    def test_the_account_chooser_and_signed_out_google_pages_are_not_walls(self, cli, monkeypatch):
+        """The chooser and the consent screen are the model's to click (the Peerlist sign-in did). A signed-out
+        Google Account landing page -- myaccount.google.com/intro, or www.google.com/account/about, the redirect
+        seen 2026-09-29 -- says nothing about "Continue with Google" on another site."""
         _probe_returns(monkeypatch, cli, None)
-        for stdout in ("{'url': 'https://fazier.com/dashboard', 'title': 'Fazier'}\n",
-                       "{'url': 'https://myaccount.google.com/security', 'title': 'Security'}\n",
-                       "{'url': 'https://www.google.com/search?q=signin', 'title': 'signin - Google Search'}\n"):
+        for stdout in ("{'url': 'https://accounts.google.com/o/oauth2/auth/oauthchooseaccount?client_id=x', 'title': 'Sign in - Google Accounts'}\n",
+                       "{'url': 'https://accounts.google.com/v3/signin/accountchooser?continue=x', 'title': 'Choose an account'}\n",
+                       "{'url': 'https://accounts.google.com/signin/oauth/id?authuser=0&part=x', 'title': 'Sign in - Google Accounts'}\n",
+                       "{'url': 'https://myaccount.google.com/intro/security', 'title': 'Google Account'}\n",
+                       "{'url': 'https://www.google.com/account/about/', 'title': 'Google Account'}\n"):
             cli["stdout"] = stdout
             out = json.loads(bu.browser_exec('print(page_info())', task_id="t"))
             assert "google_sign_in" not in out, stdout
@@ -522,9 +538,12 @@ def handoff(monkeypatch):
     from tools import browser_tool_real_profile as rp
     state = {"shown": {"ok": False, "why": "Moe's own browser is not running"}, "pages": [], "opened": [],
              "chrome": [], "bridge": None}
-    monkeypatch.setattr(rp, "show_to_person",
-                        lambda url="", task="": state.setdefault("show_calls", []).append((url, task)) or state["shown"])
+    def fake_show(url="", task="", target_id=""):
+        state.setdefault("show_calls", []).append((url, task) + ((target_id,) if target_id else ()))
+        return state["shown"]
+    monkeypatch.setattr(rp, "show_to_person", fake_show)
     monkeypatch.setattr(rp, "driven_pages", lambda: state["pages"])
+    monkeypatch.setattr(bh, "_harness_tab", lambda task: state.get("harness_tab"))
     monkeypatch.setattr(rp, "hand_back", lambda: {"url": "https://accounts.google.com/after", "title": "Done"})
     monkeypatch.setattr(bh, "_open_default_browser", lambda url: state["opened"].append(url) or None)
     monkeypatch.setattr(bh, "_open_in_chrome_group", lambda bridge, url: state["chrome"].append(url) or None)
@@ -624,6 +643,34 @@ class TestHandoff:
         out = json.loads(bh.browser_handoff(reason="confirm", url="https://x.example/", task_id="t"))
         assert out["code"] == "person_needed" and state.get("show_calls") is None
 
+    def test_with_no_url_the_page_browser_exec_was_on_is_shown_not_the_most_recent_tab(self, handoff):
+        """2026-09-29: browser_handoff with no url picked driven_pages()[0] and put launchllama.co's Weeny
+        page in front of the owner instead of the MacRumors hCaptcha the model was on."""
+        bh, state = handoff
+        state["pages"] = [{"id": "W", "url": "https://tools.launchllama.co/products/weeny", "title": "", "ws": ""},
+                          {"id": "M", "url": "https://forums.macrumors.com/login/register", "title": "", "ws": ""}]
+        state["harness_tab"] = {"url": "https://forums.macrumors.com/login/register", "targetId": "M"}
+        state["shown"] = {"ok": True, "url": "https://forums.macrumors.com/login/register", "title": "", "front": True}
+        out = json.loads(bh.browser_handoff(reason="complete the hcaptcha check", task_id="t"))
+        assert state["show_calls"] == [("https://forums.macrumors.com/login/register", "t", "M")]
+        assert out["url"] == "https://forums.macrumors.com/login/register"
+
+    def test_the_harness_record_is_read_for_this_task(self, monkeypatch, tmp_path):
+        from tools import browser_exec_health as eh
+        from tools import browser_handoff_tool as bh
+        monkeypatch.setattr(eh, "current_tab_path", lambda task: str(tmp_path / f"current-tab-{task}.json"))
+        (tmp_path / "current-tab-t.json").write_text(json.dumps(
+            {"targetId": "M", "url": "https://forums.macrumors.com/login/register", "at": time.time()}))
+        assert bh._harness_tab("t") == {"url": "https://forums.macrumors.com/login/register", "targetId": "M"}
+        assert bh._harness_tab("other") is None
+        (tmp_path / "current-tab-t.json").write_text(json.dumps({"targetId": "X", "url": "about:blank", "at": time.time()}))
+        assert bh._harness_tab("t") is None                        # not a web page: nothing to hand over
+
+    def test_the_url_is_asked_for_in_the_schema(self):
+        from tools import browser_handoff_tool as bh
+        assert "pass it every time" in bh.BROWSER_HANDOFF_SCHEMA["parameters"]["properties"]["url"]["description"]
+        assert "(pass its url)" in bh.BROWSER_HANDOFF_SCHEMA["description"]
+
     def test_the_task_is_passed_so_other_conversations_are_protected(self, handoff):
         bh, state = handoff
         state["shown"] = {"ok": True, "url": "https://x.example/", "title": "", "front": True}
@@ -700,19 +747,26 @@ class TestShowToPerson:
         monkeypatch.setitem(rp._launched_headless, "headless", True)
         return rp, calls
 
-    def test_a_headless_browser_is_relaunched_headed_with_every_tab_and_the_same_sign_ins(self, rp):
+    def test_a_headless_browser_is_relaunched_headed_with_only_the_handed_page_and_the_same_sign_ins(self, rp):
+        """2026-09-29: "relaunched headed, 38 tab(s)" -- every tab came back in the person's window, and so into
+        every later launch. Only the page being handed over is reopened."""
         rp, calls = rp
         out = rp.show_to_person()
         assert out["ok"] and out["relaunched"] and out["form_state_lost"] and out["front"]
         assert calls["launched_headless"] == [False]                     # the relaunch is a window
         assert calls["cookies_in"] == (9200, [{"name": "SID", "value": "v", "domain": ".google.com"}])
         made = [p["url"] for port, m, p in calls["cdp"] if m == "Target.createTarget"]
-        # every tab back, the chosen one last so it is in front
-        assert made == ["https://tinylaunch.com/", "https://accounts.google.com/v3/signin/challenge/pk/presend"]
+        assert made == ["https://accounts.google.com/v3/signin/challenge/pk/presend"]
         assert (9200, "Target.closeTarget", {"targetId": "BLANK"}) in calls["cdp"]
-        assert calls["front"] == [(9200, "NEW2", 4242)]
-        assert out["reopened"] == 2 and out["tabs_lost"] == 0
+        assert calls["front"] == [(9200, "NEW1", 4242)]
+        assert out["reopened"] == 1 and out["tabs_closed"] == 1
         assert rp._origin()._real_profile_cdp_cache["cdp"] == "http://127.0.0.1:9200"
+
+    def test_the_harness_tab_is_picked_by_id(self, rp):
+        rp, calls = rp
+        out = rp.show_to_person("https://tinylaunch.com/", target_id="B")
+        made = [p["url"] for port, m, p in calls["cdp"] if m == "Target.createTarget"]
+        assert out["url"] == "https://tinylaunch.com/" and made == ["https://tinylaunch.com/"]
 
     def test_another_conversation_using_the_browser_is_never_cut_off(self, rp, monkeypatch):
         rp, calls = rp

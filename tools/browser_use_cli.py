@@ -121,19 +121,26 @@ def _cloud_backend_configured() -> bool:
             or is_legacy_browser_use_cloud_config(_read_browser_cfg()))
 
 
-# A Google sign-in wall: the accounts pages that ask for a password / passkey / account choice, and
-# the signed-out landing page of the Google Account.
+# A Google sign-in WALL: a page where Google asks the person to prove it is them -- a passkey
+# (challenge/pk), a security key (challenge/sk), a password (challenge/pwd), a code or phone prompt
+# (challenge/ipp, /totp, /az, /dp, /selection...), a "verify it's you" speedbump, or a refused sign-in.
+# NOT the account chooser or the consent screen (the model clicks through those: 2026-09-24 on Peerlist it
+# did), and NOT a signed-out Google Account landing page (myaccount.google.com/intro,
+# www.google.com/account/about -- seen 2026-09-29): being signed out of myaccount says nothing about
+# whether "Continue with Google" on another site will work.
 _GOOGLE_WALL_RE = re.compile(
-    r"https?://accounts\.google\.com/[^\s'\"]*?(?:signin|ServiceLogin|AccountChooser|challenge|passkey)"
-    r"|https?://myaccount\.google\.com/intro", re.IGNORECASE)
+    r"https?://accounts\.google\.com/[^\s'\"]*?(?:/challenge/|passkey|webauthn|/speedbump|/signin/rejected)"
+    r"[^\s'\"]*", re.IGNORECASE)
 
 
-def _google_sign_in_wall(stdout: str, step: Optional[dict]) -> bool:
-    """True when this call ended on a Google account sign-in / passkey wall (see ``GOOGLE_SESSION_NOTE``)."""
+def _google_sign_in_wall(stdout: str, step: Optional[dict]) -> Optional[str]:
+    """The URL of the Google wall this call ended on (see ``_GOOGLE_WALL_RE``), else None. A person-step
+    the page probe found on accounts.google.com (a passkey prompt read from the page) is one too."""
     url = str((step or {}).get("url") or "")
     if re.match(r"https?://accounts\.google\.com(?:[/:?#]|$)", url, re.IGNORECASE):
-        return True
-    return bool(_GOOGLE_WALL_RE.search(stdout or ""))
+        return url
+    hits = _GOOGLE_WALL_RE.findall(stdout or "")
+    return hits[-1] if hits else None
 
 
 def _set_cdp_env(env: dict, cdp: str) -> None:
@@ -576,6 +583,21 @@ def _captcha_ladder(result: dict, stdout: str, env: dict, browser_cfg: dict, tas
         result, stdout, env, browser_cfg, task_id, presence, stderr=stderr), None, "captcha ladder failed")
 
 
+def _sweep_old_tabs(env: dict, task_id: Optional[str]) -> None:
+    """After a call in Moe's OWN driven browser: close every page but the tabs in use (this and other
+    conversations' harness tabs) and the most recent few (tools/browser_exec_health.sweep_own_browser).
+    Never the person's browser, never while its window is in front of them. Never raises."""
+    def sweep() -> None:
+        from tools.browser_tool_real_profile import own_browser_to_sweep
+        root = own_browser_to_sweep(str(env.get("BU_CDP_URL") or env.get("BU_CDP_WS") or ""))
+        if not root:
+            return
+        mine = exec_health.current_tab(task_id)
+        keep = set(exec_health.tabs_in_use()) | ({mine["targetId"]} if mine else set())
+        exec_health.sweep_own_browser(root, keep)
+    _quiet(sweep, None, "tab sweep failed")
+
+
 def _captcha_prepare(code: str, env: dict, browser_cfg: dict, task_id: Optional[str], session: str) -> str:
     """Own lane: have the harness note which tab it is attached to, for the ladder's every-call probe."""
     return _quiet(lambda: importlib.import_module("tools.browser_captcha_ladder").prepare_exec(
@@ -802,10 +824,13 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         step = _person_step(proc.stdout, env)
         if step:
             _note_person_step(result, step, presence if chrome_lane.lane_enabled(browser_cfg) else None)
-    if lane == chrome_lane.LANE_OWN and _google_sign_in_wall(proc.stdout, result.get("needs_person")):
-        # Ticket #18: Google keeps its account sessions to the person's own Chrome; no refresh helps.
-        from tools.browser_tool_real_profile import GOOGLE_SESSION_NOTE
-        result["google_sign_in"] = GOOGLE_SESSION_NOTE
+    if lane == chrome_lane.LANE_OWN:
+        _sweep_old_tabs(env, task_id)
+    google_wall = _google_sign_in_wall(proc.stdout, result.get("needs_person")) if lane == chrome_lane.LANE_OWN else None
+    if google_wall:
+        # Google asks the person to prove it is them: hand THAT page over, then carry on (never "give up").
+        from tools.browser_tool_real_profile import google_wall_note
+        result["google_sign_in"] = google_wall_note(google_wall)
     if workspace:
         result["workspace"] = workspace
     if session:
@@ -893,7 +918,7 @@ def _description_header() -> str:
 
 def _real_profile_description(cloud: bool) -> str:
     """What the model must know about sign-ins when real-profile browsing is on (ticket #18): where the
-    default runs, and that Google account sign-ins stay with the person's own Chrome."""
+    default runs, and that "Continue with Google" is worth trying (only Google's own wall is handed over)."""
     from tools.browser_tool_real_profile import GOOGLE_SESSION_NOTE
     where = ("By default the code runs in the configured cloud browser, which is signed in as nobody; pass "
              "local=true to use Moe's own browser on this Mac, which carries the person's sign-ins."

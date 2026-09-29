@@ -489,8 +489,8 @@ def _import_cookies_into_driven_browser(port: int, cookies: List[Dict[str, Any]]
 # a browser whose jar's age is unknown). No timer: every refresh starts a hidden second instance of the
 # person's own browser, and on 2026-09-20 one hijacked that browser's Launch Services identity. Once per
 # launch is accepted; once a minute of browsing when nothing changed is not. Chrome writes its cookie
-# file lazily, so a sign-in can take a little while to show. Google account sessions are the exception
-# no refresh fixes: see GOOGLE_SESSION_NOTE.
+# file lazily, so a sign-in can take a little while to show. Google may still ask the person for a
+# passkey on a sign-in: see GOOGLE_SESSION_NOTE.
 
 #: Never more often than this, however many calls arrive: a burst of browser_exec calls must not start
 #: the person's browser for every one.
@@ -508,15 +508,30 @@ REFRESH_SKIPPED_NOTE = ("sign-ins the person made in their own browser in the la
                         "reached Moe's browser yet (bringing them over did not finish this time); if a site "
                         "shows them signed out, try again in a moment")
 
-#: Said to the model (tool description, and a result that lands on a Google sign-in wall) in words it can
-#: pass on. Measured on ticket #18: every Google session cookie was handed over and sent, and Google still
-#: served the signed-out page and asked for the passkey -- it binds the session to the person's own
-#: browser. Copying cookies cannot fix that, and nothing here tries to get around it.
-GOOGLE_SESSION_NOTE = ("Google account sign-ins do not carry over into Moe's browser: Google ties them to the "
-                       "person's own Chrome, so signing in to Google there asks for their passkey even when they "
-                       "are signed in on their own Chrome. Tell them that plainly. To go on, hand the page to them "
-                       "with browser_handoff so they can sign in themselves, or work in their own Chrome through "
-                       "the Memoe extension (where=\"chrome\") if it is set up.")
+#: Said to the model in browser_exec's description (one line) and, as :func:`google_wall_note`, in a
+#: result that ends on a page where Google asks the PERSON to prove it is them. History: ticket #18
+#: measured Google asking for the passkey after every session cookie was handed over, and the note that
+#: followed told the model Google sign-ins "do not carry over" -- so on 2026-09-29 it refused "Continue
+#: with Google" up front. But Moe HAS signed in with Google in its own browser: 2026-09-24 21:02 on
+#: Peerlist -- Google's account chooser offered the person's account, the model clicked it, "Continue",
+#: and peerlist.io/authCallback?provider=google signed it in. Google asks for a passkey on some sign-ins
+#: and not others; the model cannot know which until it tries. So: try; hand over only the wall.
+GOOGLE_SESSION_NOTE = ("Sign in with Google works here: on a site's \"Continue with Google\" / \"Sign in with "
+                       "Google\", pick the person's account in Google's chooser and continue. Only if Google then asks "
+                       "for a passkey, a security key, a verification step or a password, call browser_handoff with "
+                       "that page's url so the person approves it in Moe's window, then carry on. Never tell the "
+                       "person up front that Google sign-in is theirs to do.")
+
+
+def google_wall_note(url: str = "") -> str:
+    """What to do on a page where Google asks the person to prove it is them (passkey, security key,
+    verification, password): hand THAT page over, then carry on with the site's sign-in."""
+    where = f"url=\"{url}\", " if url else ""
+    return ("Google is asking the person to prove it is them on this page (a passkey, a security key, a "
+            "verification step or a password). That is the one step that is theirs: call browser_handoff("
+            f"{where}reason=\"approve the Google sign-in\") so they approve it in Moe's window, and when they say "
+            "done, call browser_handoff(done=true) and carry on with the site's sign-in. Do not give up on Google "
+            "sign-in or send them to do it somewhere else.")
 
 
 def _record_handover_target(cdp: str, browser: str, at: float = 0.0) -> None:
@@ -1016,9 +1031,29 @@ def driven_pages() -> List[Dict[str, str]]:
     return page_targets(cached) if cached else []
 
 
-def _pick_page(pages: List[Dict[str, str]], url_hint: str) -> Optional[Dict[str, str]]:
-    """The tab to show: the one at ``url_hint`` when given (None when no tab is there -- showing a
-    different page than the one named would be worse than none), else the first."""
+def own_browser_to_sweep(env_cdp: str) -> Optional[str]:
+    """The HTTP CDP root of Moe's own driven browser when ``env_cdp`` (the endpoint a browser_exec call
+    drove) IS that browser and it is not in front of the person right now -- else None. Only then may
+    its tabs be tidied (tools/browser_exec_health.sweep_own_browser): never the person's own browser
+    (a /browser connect override never lands in this cache), never a window the person is working in."""
+    cached = str(_origin()._real_profile_cdp_cache.get("cdp") or "")
+    if not cached or _shown_to_person["on"]:
+        return None
+    port = re.search(r":(\d+)", cached)
+    other = re.search(r"127\.0\.0\.1:(\d+)|localhost:(\d+)|\[::1\]:(\d+)", str(env_cdp or ""))
+    if not port or not other or port.group(1) not in other.groups():
+        return None
+    return cached if cached.startswith("http://") else f"http://127.0.0.1:{port.group(1)}"
+
+
+def _pick_page(pages: List[Dict[str, str]], url_hint: str, target_id: str = "") -> Optional[Dict[str, str]]:
+    """The tab to show: the tab ``target_id`` names (the harness's own tab, browser_exec_health's
+    current-tab record) when it is still open; else the one at ``url_hint`` when given (None when no tab
+    is there -- showing a different page than the one named would be worse than none); else the first."""
+    if target_id:
+        hit = next((p for p in pages if p.get("id") == target_id), None)
+        if hit is not None:
+            return hit
     if url_hint:
         return next((p for p in pages if p["url"] == url_hint or p["url"].startswith(url_hint)), None)
     return pages[0] if pages else None
@@ -1115,26 +1150,28 @@ def _other_work(task_id: str) -> List[str]:
 SHOWN_MAX_SECONDS = 2 * 3600
 
 
-def show_to_person(url_hint: str = "", task_id: str = "") -> Dict[str, Any]:
+def show_to_person(url_hint: str = "", task_id: str = "", target_id: str = "") -> Dict[str, Any]:
     """Put the driven browser's page in front of the person, with the same sign-ins.
 
     * Already headed: select the tab, un-minimise, raise that process by pid.
     * Headless, launched by THIS process and nobody else using it: relaunched headed on the same
-      profile copy. Every cookie is read out first and loaded back; EVERY open tab is reopened at its
-      URL, the chosen one in front. A reload loses text typed into a form the site did not save and
-      sessionStorage-only steps (``form_state_lost``); the caller must say so.
+      profile copy. Every cookie is read out first and loaded back; ONLY the page being handed over is
+      reopened (2026-09-29: reopening every tab put ~40 of them in the person's window -- "relaunched
+      headed, 38 tab(s)" -- and carried them into every later launch). A reload loses text typed into a
+      form the site did not save and sessionStorage-only steps (``form_state_lost``); the caller must
+      say so.
     * Headless and launched by another Hermes process, or in use by another conversation: NOT
       restarted (``busy``) -- that would cut their work off. The caller routes elsewhere.
 
-    ``{"ok": True, "url", "title", "relaunched", "front", "form_state_lost", "reopened"}`` or
-    ``{"ok": False, "why", "url"?, "busy"?, "browser_gone"?}``."""
+    ``{"ok": True, "url", "title", "relaunched", "front", "form_state_lost", "reopened", "tabs_closed"?}``
+    or ``{"ok": False, "why", "url"?, "busy"?, "browser_gone"?}``."""
     _bt = _origin()
     with _bt._real_profile_cdp_lock:
         cached = _bt._real_profile_cdp_cache.get("cdp")
         if not cached or not _cdp_http_ready(cached):
             return {"ok": False, "why": "Moe's own browser is not running"}
         pages = driven_pages()
-        page = _pick_page(pages, url_hint)
+        page = _pick_page(pages, url_hint, target_id)
         if page is None:
             return {"ok": False, "why": ("that page is not open in Moe's own browser" if url_hint and pages
                                          else "Moe's own browser has no web page open")}
@@ -1191,31 +1228,24 @@ def show_to_person(url_hint: str = "", task_id: str = "") -> Dict[str, Any]:
                       if t.get("type") == "page"}
         except Exception:
             before = set()
-        # Every tab comes back, the chosen one last so it is the one in front.
-        order = [p for p in pages if p is not page] + [page]
-        target_id, reopened = "", 0
-        for p in order:
-            try:
-                tid = str(_cdp_call(new_port, "Target.createTarget", {"url": p["url"]}).get("targetId") or "")
-            except Exception as e:
-                if p is page:
-                    return {"ok": False, "why": f"the browser is up, but the page did not open again: {e}",
-                            "url": page["url"]}
-                continue
-            reopened += 1
-            if p is page:
-                target_id = tid
+        # Only the page being handed over comes back: the other tabs were Moe's own working tabs, and a
+        # window of forty of them is not "the page" (the person's own browser is never touched here).
+        try:
+            target_id = str(_cdp_call(new_port, "Target.createTarget", {"url": page["url"]}).get("targetId") or "")
+        except Exception as e:
+            return {"ok": False, "why": f"the browser is up, but the page did not open again: {e}", "url": page["url"]}
+        reopened = 1
         # The blank tab the engine's attach opened would otherwise be the first page a later call lands on.
         for blank in before:
             try:
                 _cdp_call(new_port, "Target.closeTarget", {"targetId": blank}, timeout=5)
             except Exception:
                 pass
-        _bt.logger.info("handoff: driven browser shown to the person at %s (relaunched headed, %d tab(s), %d cookie(s))",
-                        page["url"][:120], reopened, len(cookies))
+        _bt.logger.info("handoff: driven browser shown to the person at %s (relaunched headed, %d tab(s), %d other(s) "
+                        "closed, %d cookie(s))", page["url"][:120], reopened, len(pages) - reopened, len(cookies))
         return {"ok": True, "url": page["url"], "title": page["title"], "relaunched": True,
                 "front": _bring_to_front(new_port, target_id, _main_browser_pid(copy_dir)), "form_state_lost": True,
-                "reopened": reopened, "tabs_lost": len(pages) - reopened}
+                "reopened": reopened, "tabs_closed": len(pages) - reopened}
 
 
 def hand_back() -> Dict[str, Any]:

@@ -160,6 +160,20 @@ def _open_default_browser(url: str) -> Optional[str]:
         return str(exc)
 
 
+def _harness_tab(task_id: str) -> Optional[Dict[str, str]]:
+    """The tab the last browser_exec call of ``task_id`` left the harness on (fresh records only), when
+    it is a web page: ``{"url", "targetId"}``, else None."""
+    try:
+        from tools.browser_exec_health import current_tab
+        rec = current_tab(task_id)
+    except Exception:
+        return None
+    url = str((rec or {}).get("url") or "")
+    if not rec or not url.startswith(("http://", "https://")):
+        return None
+    return {"url": url, "targetId": str(rec.get("targetId") or "")}
+
+
 def _record(task_id: str, route: str, url: str) -> None:
     with _lock:
         _handoffs[task_id] = {"route": route, "url": url, "at": time.time()}
@@ -204,10 +218,17 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
     from tools import browser_chrome_extension as chrome_lane
     from tools import browser_tool_real_profile as rp
 
-    current = url
+    # With no url, the page is the one browser_exec was working on: the harness's own tab (its record,
+    # tools/browser_exec_health.current_tab). 2026-09-29 the "most recently active tab" fallback put an
+    # unrelated tab (launchllama.co/products/weeny) in front of the owner instead of forums.macrumors.com.
+    current, target_id = url, ""
     if not current:
-        pages = rp.driven_pages()
-        current = pages[0]["url"] if pages else ""
+        record = _harness_tab(task)
+        if record:
+            current, target_id = record["url"], record["targetId"]
+        else:
+            pages = rp.driven_pages()
+            current = pages[0]["url"] if pages else ""
 
     presence = _presence()
     here, why = chrome_lane.at_this_mac(presence)
@@ -235,7 +256,9 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
                                      + " " + _GROUNDED)})
 
     # 1. Moe's own browser, shown. The URL the model names only picks the tab; it is never a new site.
-    shown = rp.show_to_person(url, task)
+    shown = rp.show_to_person(url or current, task, target_id) if target_id else rp.show_to_person(url, task)
+    # (with a harness record, its url also names the tab if the id is gone; a closed tab is never swapped
+    # for whichever tab happens to be first -- it goes to the routes below at that url instead)
     if shown.get("ok"):
         _record(task, ROUTE_DRIVEN, shown.get("url", ""))
         out = {**base, "route": ROUTE_DRIVEN, "url": shown.get("url"), "title": shown.get("title"),
@@ -244,8 +267,9 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
             out["form_state"] = ("lost: Moe's browser had to restart in a window, so the page was reloaded at its "
                                  "address. Sign-ins came across; anything typed on the page that the site had not "
                                  "saved is gone. Say so if it matters, and re-enter it after they are done.")
-        if shown.get("tabs_lost"):
-            out["other_tabs"] = f"{shown['tabs_lost']} other tab(s) of Moe's browser did not reopen."
+        if shown.get("tabs_closed"):
+            out["other_tabs"] = (f"{shown['tabs_closed']} other tab(s) of Moe's browser were closed; only this page "
+                                 "was brought up. Open any you still need again with browser_exec.")
         if out["front"]:
             where = "The page is open in Moe's browser window, in front of them (macOS confirmed it)."
         else:
@@ -298,7 +322,7 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
 BROWSER_HANDOFF_SCHEMA = {
     "name": "browser_handoff",
     "description": (
-        "Show the person the page Moe is working on, so they can do a step only they can do -- a passkey or "
+        "Show the person the page Moe is working on (pass its url), so they can do a step only they can do -- a passkey or "
         "security key, a CAPTCHA, an identity check, an approval -- or whenever they ask to see it ('open that so "
         "I can approve it'). Moe's own browser runs out of sight; this brings it up in a window in front of them "
         "on the same tab with the same sign-ins (or, if that cannot be done, opens the page in their Chrome via "
@@ -318,8 +342,10 @@ BROWSER_HANDOFF_SCHEMA = {
         "properties": {
             "reason": {"type": "string", "description": "What the person needs to do there, in plain words "
                                                         "(e.g. \"confirm the Google passkey\")."},
-            "url": {"type": "string", "description": "Optional: which open page (its address), when Moe's browser "
-                                                     "has several, or the page to open when Moe's browser has none."},
+            "url": {"type": "string", "description": "The address of the page the person should see -- pass it every "
+                                                     "time (the page you were working on, e.g. the one that asks for "
+                                                     "the passkey or shows the CAPTCHA). Left out, the page browser_exec "
+                                                     "was last on is shown."},
             "resume_hint": {"type": "string", "description": "Optional: what you will do once they are done."},
             "done": {"type": "boolean", "default": False,
                      "description": "True when the person says they have finished: reads where the page is now."},

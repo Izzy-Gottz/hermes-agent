@@ -385,3 +385,105 @@ class TestFidelity:
         log = (tmp_path / "logs" / fid.KEEPER_LOG_NAME).read_text()
         assert f"fidelity keeper for port {port} ended" in log
         assert "keeper[" in log
+
+
+# ---- the sweep: Moe's own browser keeps the tabs in use and the most recent few --------------------------------
+
+def _cft():
+    root = Path.home() / ".agent-browser" / "browsers"
+    for app in sorted(root.glob("chrome-*/Google Chrome for Testing.app"), reverse=True):
+        exe = app / "Contents" / "MacOS" / "Google Chrome for Testing"
+        if exe.exists():
+            return str(exe)
+    return None
+
+
+_CFT = _cft()
+
+
+class TestSweep:
+    @pytest.mark.skipif(_CFT is None, reason="Chrome for Testing not installed under ~/.agent-browser/browsers")
+    def test_live_every_page_but_the_ones_in_use_and_the_six_most_recent_is_closed(self, tmp_path):
+        """A throwaway Chrome for Testing on a temp profile (never the person's browser): 12 tabs, the oldest
+        one is in use. After the sweep: that one plus the 6 most recently active remain -- whoever opened them."""
+        import urllib.request
+        d = tempfile.mkdtemp(prefix="sweep-")
+        proc = subprocess.Popen([_CFT, f"--user-data-dir={d}", "--remote-debugging-port=0", "--no-first-run",
+                                 "--no-default-browser-check", "--no-startup-window", "--headless=new",
+                                 "--use-mock-keychain"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        try:
+            port = None
+            for _ in range(240):
+                try:
+                    port = int(Path(d, "DevToolsActivePort").read_text().split()[0])
+                    break
+                except (OSError, ValueError, IndexError):
+                    time.sleep(0.25)
+            if port is None:
+                pytest.skip("Chrome for Testing did not start in 60 s (a loaded Mac is not a result)")
+            root = f"http://127.0.0.1:{port}"
+            made = []
+            for i in range(12):
+                req = urllib.request.Request(f"{root}/json/new?data:text/html,<title>t{i}</title>", method="PUT")
+                made.append(json.loads(urllib.request.urlopen(req, timeout=10).read())["id"])
+                time.sleep(0.1)
+            in_use = made[0]                                   # the oldest tab is the one a conversation is on
+            closed = health.sweep_own_browser(root, [in_use])
+            left = [t["id"] for t in json.loads(urllib.request.urlopen(root + "/json/list", timeout=10).read())
+                    if t["type"] == "page"]
+            assert closed == 12 - 1 - health.TAB_CAP
+            assert in_use in left and len(left) == 1 + health.TAB_CAP
+            assert set(made[-health.TAB_CAP:]) <= set(left)    # the newest six
+        finally:
+            os.killpg(proc.pid, 9)
+            proc.wait()
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_tabs_in_use_are_every_conversations_fresh_record(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(health, "current_tab_path", lambda task: str(tmp_path / f"current-tab-{task}.json"))
+        now = time.time()
+        (tmp_path / "current-tab-a.json").write_text(json.dumps({"targetId": "A", "at": now - 5}))
+        (tmp_path / "current-tab-b.json").write_text(json.dumps({"targetId": "B", "at": now - 3600}))
+        (tmp_path / "current-tab-c.json").write_text("{broken")
+        assert health.tabs_in_use(now=now) == ["A"]
+
+    def test_only_moe_s_own_browser_is_swept_and_never_while_shown(self, monkeypatch):
+        from tools import browser_tool_real_profile as rp
+        monkeypatch.setitem(rp._origin()._real_profile_cdp_cache, "cdp", "http://127.0.0.1:9100")
+        monkeypatch.setitem(rp._shown_to_person, "on", False)
+        assert rp.own_browser_to_sweep("http://127.0.0.1:9100") == "http://127.0.0.1:9100"
+        assert rp.own_browser_to_sweep("ws://127.0.0.1:9100/devtools/browser/x") == "http://127.0.0.1:9100"
+        assert rp.own_browser_to_sweep("http://127.0.0.1:9222") is None          # the person's (/browser connect)
+        assert rp.own_browser_to_sweep("wss://connect.browserbase.com/x") is None
+        monkeypatch.setitem(rp._shown_to_person, "on", True)
+        assert rp.own_browser_to_sweep("http://127.0.0.1:9100") is None          # their window: hands off
+        monkeypatch.setitem(rp._shown_to_person, "on", False)
+        monkeypatch.delitem(rp._origin()._real_profile_cdp_cache, "cdp")
+        assert rp.own_browser_to_sweep("http://127.0.0.1:9100") is None
+
+    def test_browser_exec_sweeps_after_an_own_lane_call_keeping_its_tab(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        from tools import browser_tool_real_profile as rp
+        from tools import browser_use_cli as bu
+        monkeypatch.setattr(bu, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(bu, "_run_cli_killing_process_group",
+                            lambda cmd, code, env, timeout: sp.CompletedProcess(cmd, 0, "ok\n", ""))
+        monkeypatch.setattr(bu, "_route_backend",
+                            lambda env, session, task_id, local: env.update(BU_CDP_URL="http://127.0.0.1:9100") or None)
+        monkeypatch.setattr(bu, "_attach_vault_supervisor", lambda env, task_id: None)
+        monkeypatch.setattr(bu, "_workspace_dir", lambda task_id: None)
+        monkeypatch.setattr(bu, "_read_browser_cfg", lambda: {})
+        monkeypatch.setitem(rp._origin()._real_profile_cdp_cache, "cdp", "http://127.0.0.1:9100")
+        monkeypatch.setitem(rp._shown_to_person, "on", False)
+        monkeypatch.setattr(health, "current_tab", lambda task: {"targetId": "MINE", "url": "https://x.example/"})
+        monkeypatch.setattr(health, "tabs_in_use", lambda: ["THEIRS"])
+        swept = []
+        monkeypatch.setattr(health, "sweep_own_browser", lambda root, keep: swept.append((root, set(keep))) or 0)
+        bu.browser_exec("print(1)", task_id="t")
+        assert swept == [("http://127.0.0.1:9100", {"MINE", "THEIRS"})]
+        swept.clear()
+        monkeypatch.setattr(bu, "_route_backend",
+                            lambda env, session, task_id, local: env.update(BU_CDP_URL="http://127.0.0.1:9222") or None)
+        bu.browser_exec("print(1)", task_id="t")
+        assert swept == []                                       # not Moe's own browser: never touched

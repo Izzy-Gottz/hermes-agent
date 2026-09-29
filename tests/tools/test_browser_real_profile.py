@@ -807,7 +807,10 @@ class TestBrowserExecSchemaGating:
             overrides = bu._dynamic_schema_overrides()
         assert "local" in overrides["parameters"]["properties"]
 
-    def test_the_description_says_google_sign_ins_stay_in_the_persons_chrome(self):
+    def test_the_description_says_to_try_google_sign_in_and_hand_over_only_its_wall(self):
+        """2026-09-29: the old line ("Google account sign-ins do not carry over ... hand the page to them") made
+        the model refuse "Continue with Google" up front, though Moe had signed in with Google on Peerlist
+        (2026-09-24) through the account chooser. The line says to try; only Google's own wall is handed over."""
         import tools.browser_use_cli as bu
         for provider in (None, object()):
             with patch.object(bu, "_real_profile_consented", return_value=True), \
@@ -818,7 +821,11 @@ class TestBrowserExecSchemaGating:
         with patch.object(bu, "_real_profile_consented", return_value=False):
             assert bt_real_profile.GOOGLE_SESSION_NOTE not in bu._dynamic_schema_overrides()["description"]
         note = bt_real_profile.GOOGLE_SESSION_NOTE
-        assert "passkey" in note and "browser_handoff" in note and "Memoe extension" in note
+        assert "Continue with Google" in note and "chooser" in note and "browser_handoff" in note
+        assert "Only if Google then asks for a passkey" in note and "Never tell the person up front" in note
+        for refusal in ("do not carry over", "ties them to the person's own Chrome", "Memoe extension"):
+            assert refusal not in note
+        assert len(note) < 420  # one line in an always-on description
 
 
 class TestNavigationRouting:
