@@ -24,7 +24,9 @@ tests/tools/test_browser_captcha_solver.py:
   ``GET ...?id=<job id>`` returns the answer, or HTTP 409 app code 14 "Incomplete job" (retry after
   500 ms). reCAPTCHA: ``{"task", "grid": "3x3"|"4x4"|"1x1", "image_data": [data URI]}`` -> ``{"data":
   [true, false, ...]}``; hCaptcha: ``{"data": {"request_type": "image_label_binary", "requester_question":
-  {"en": ...}, "tasklist": [{"datapoint_uri", "task_key"}]}}`` -> ``{"data": [[true, false, ...]]}``;
+  {"en": ...}, "tasklist": [{"datapoint_uri", "task_key"}]}}`` -> ``{"data": [[true, false, ...]]}``, and
+  ``"request_type": "image_label_area_select"`` with ONE datapoint (the whole picture) for hCaptcha's
+  "click the ..." scenes -> the spot, in percentages of the image (MEASURED, see the test);
   text: ``{"image_data": [data URI]}`` -> ``{"data": ["TEXT"]}``. The key goes in the header, never the
   ``key`` query parameter, so it cannot end up in a URL.
 """
@@ -201,6 +203,11 @@ class NopeCHA(_Provider):
         if request.kind == bc.RECAPTCHA_V2:
             endpoint = "recaptcha"
             body: dict = {"task": request.instruction, "grid": f"{rows}x{cols}", "image_data": [uri(request.image_png)]}
+        elif request.kind == bc.HCAPTCHA and request.mode == "area":
+            endpoint = "hcaptcha"
+            body = {"data": {"request_type": "image_label_area_select",
+                             "requester_question": {"en": request.instruction},
+                             "tasklist": [{"datapoint_uri": uri(request.image_png), "task_key": "0"}]}}
         elif request.kind == bc.HCAPTCHA:
             if not request.tiles_png:
                 raise SolverUnsupported("nopecha: hCaptcha needs one image per tile")
@@ -222,7 +229,9 @@ class NopeCHA(_Provider):
         while True:
             self.sleep(self.POLL_S)
             status, data = self._call("GET", f"{NOPECHA_URL}{endpoint}?id={job}", headers, None)
-            if status == 409 and isinstance(data, dict) and data.get("code") == self.INCOMPLETE:
+            # MEASURED 2026-09-29: the live API says {"error": 14, "message": "Incomplete job"} -- "error", not
+            # the "code" the reference page names -- so both are read; one missed poll failed every solve.
+            if status == 409 and isinstance(data, dict) and self.INCOMPLETE in (data.get("error"), data.get("code")):
                 if self.clock() >= deadline:
                     raise self._fail(f"no answer in {self.timeout_s:g}s")
                 continue
@@ -232,7 +241,7 @@ class NopeCHA(_Provider):
 
     def _error(self, status: int, data: Any) -> SolverError:
         msg = data.get("message") if isinstance(data, dict) else ""
-        code = data.get("code") if isinstance(data, dict) else None
+        code = (data.get("code") if data.get("code") is not None else data.get("error")) if isinstance(data, dict) else None
         return self._fail(f"HTTP {status} code {code}: {msg or 'error'}")
 
     def _answer(self, request: SolveRequest, got: Any) -> SolveAnswer:
@@ -240,11 +249,41 @@ class NopeCHA(_Provider):
             if not isinstance(got, list) or not got or not isinstance(got[0], str):
                 raise self._fail("no text in the answer")
             return SolveAnswer(text=got[0])
+        if request.kind == bc.HCAPTCHA and request.mode == "area":
+            return SolveAnswer(points=tuple(_points(got)))
         if request.kind == bc.HCAPTCHA:
             got = [b for page in (got or []) if isinstance(page, list) for b in page]
         if not isinstance(got, list) or not all(isinstance(b, bool) for b in got):
             raise self._fail("the answer is not a list of booleans")
         return SolveAnswer(tiles=tuple(i for i, b in enumerate(got) if b))
+
+
+def _area_point(d: Any) -> Optional[Tuple[float, float]]:
+    """One answer object of an area-select job -> the spot to click, as fractions of the image. NopeCHA gives
+    percentages of the image (``x``, ``y``, and ``w``/``h`` for a box, whose centre is the spot)."""
+    if not isinstance(d, dict):
+        return None
+    try:
+        x, y = float(d["x"]), float(d["y"])
+        w, h = float(d.get("w") or 0), float(d.get("h") or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (x + w / 2) / 100.0, (y + h / 2) / 100.0
+
+
+def _flat_dicts(got: Any, depth: int = 0) -> list:
+    if isinstance(got, dict):
+        return [got]
+    if isinstance(got, list) and depth < 3:
+        return [d for g in got for d in _flat_dicts(g, depth + 1)]
+    return []
+
+
+def _points(got: Any) -> list:
+    pts = [p for p in (_area_point(d) for d in _flat_dicts(got)) if p is not None]
+    if not pts:
+        raise SolverError(f"nopecha: no point in the area answer ({type(got).__name__})")
+    return pts
 
 
 def _factory(cls):

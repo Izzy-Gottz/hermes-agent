@@ -485,7 +485,7 @@ def test_solver_answers_are_validated_and_the_request_has_no_audio_route():
     with pytest.raises(ValueError):
         bs.validate_answer(bs.SolveAnswer(tiles=(9,)), (3, 3))
     fields = set(bs.SolveRequest.__dataclass_fields__)
-    assert fields == {"kind", "image_png", "instruction", "grid", "tiles_png"}   # pixels only: no audio, no URL
+    assert fields == {"kind", "image_png", "instruction", "grid", "tiles_png", "mode"}   # pixels only: no audio, no URL
 
 
 def test_a_configured_solver_hands_over_a_grid_it_cannot_read():

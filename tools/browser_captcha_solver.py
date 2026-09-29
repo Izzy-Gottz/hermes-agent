@@ -41,6 +41,10 @@ class SolveRequest:
     instruction: str                 # the challenge's own words, e.g. "Select all images with buses"
     grid: Tuple[int, int] = (3, 3)   # rows, cols; (1, 1) for a single text image
     tiles_png: Tuple[bytes, ...] = ()  # the same grid as one image per tile, row-major (hCaptcha's shape)
+    #: "grid": which tiles match. "area": ONE picture, and the instruction names one spot in it ("click the
+    #: animal the ball never touches" -- hCaptcha's image_label_area_select, measured 2026-09-29 on
+    #: forums.macrumors.com); the answer is ``points``.
+    mode: str = "grid"
 
 
 class SolverError(RuntimeError):
@@ -56,6 +60,7 @@ class SolveAnswer:
     tiles: Tuple[int, ...] = ()      # 0-based, row-major
     text: str = ""                   # for image_text
     confidence: Optional[float] = None
+    points: Tuple[Tuple[float, float], ...] = ()  # mode "area": where to click, as fractions (0..1) of the image
 
 
 class RecognitionSolver(Protocol):
@@ -117,6 +122,24 @@ def _load_builtin() -> None:
     if not _builtin_loaded:
         _builtin_loaded = True
         import tools.browser_captcha_solvers  # noqa: F401 -- registers capsolver + nopecha
+
+
+def validate_points(answer: SolveAnswer) -> List[Tuple[float, float]]:
+    """Mode "area": the points, each inside the image (fractions 0..1), at most 6, or ValueError."""
+    out: List[Tuple[float, float]] = []
+    for p in answer.points:
+        try:
+            x, y = float(p[0]), float(p[1])
+        except (TypeError, ValueError, IndexError):
+            raise ValueError(f"point {p!r} is not an (x, y) pair") from None
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise ValueError(f"point {p!r} is outside the image")
+        out.append((x, y))
+    if not out:
+        raise ValueError("no point in the answer")
+    if len(out) > 6:
+        raise ValueError(f"{len(out)} points is not an answer to one question")
+    return out
 
 
 def validate_answer(answer: SolveAnswer, grid: Tuple[int, int]) -> List[int]:
