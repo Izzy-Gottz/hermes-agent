@@ -471,6 +471,31 @@ class TestPending:
             refused = json.loads(_run(Page(), bvt.browser_vault_regenerate, handle, task_id="t"))
         assert refused["error_type"] == "not_pending" and store.resolve_secret(handle)["password"] == second
 
+    def test_a_signup_the_site_refused_is_discarded_and_the_created_result_says_so(self, store):
+        """2026-09-29 fazier: "Email has already been taken" -- the pending login for an account that was never
+        made stayed in the vault. The created result tells the model to discard it; discard removes only a
+        pending login."""
+        from tools import browser_vault_tool as bvt
+        page = Page()
+        with _live(True):
+            created = json.loads(_run(page, bvt.browser_vault_save_login, task_id="t", url=FAZIER,
+                                      username="tek@fazier.test", generate=True))
+        assert "browser_vault_discard(handle)" in created["next"] and "already been taken" in created["next"]
+        handle = created["handle"]
+        out = json.loads(bvt.browser_vault_discard(handle))
+        assert out == {"success": True, "handle": handle, "origin": FAZIER, "discarded": True}
+        assert store.get_meta(handle) is None and store.list_items() == []
+        assert json.loads(bvt.browser_vault_discard(handle))["error_type"] == "unknown_handle"
+
+    def test_discard_never_removes_a_confirmed_login(self, store):
+        from tools import browser_vault_tool as bvt
+        meta = store.add_item("login", "f", {"identifier_type": "email", "identifier": "a@b.test", "password": "keep-1"},
+                              origin=FAZIER, pending=True, generated=True)
+        store.confirm_item(meta.id)
+        out = json.loads(bvt.browser_vault_discard(meta.id))
+        assert out["error_type"] == "not_pending" and store.resolve_secret(meta.id)["password"] == "keep-1"
+        assert store.discard_pending(meta.id) is False and store.get_meta(meta.id) is not None
+
     def test_the_store_never_rewrites_a_confirmed_login(self, store):
         meta = store.add_item("login", "f", {"identifier_type": "email", "identifier": "a@b.test", "password": "keep-1"},
                               origin=FAZIER, pending=True, generated=True)
@@ -666,5 +691,28 @@ def test_new_tools_are_registered_in_the_browser_toolset():
     from tools.registry import registry
 
     names = {e.name for e in registry.get_all_entries()}
-    for name in ("browser_vault_login", "browser_vault_confirm", "browser_vault_regenerate"):
+    for name in ("browser_vault_login", "browser_vault_confirm", "browser_vault_regenerate", "browser_vault_discard"):
         assert name in names and name in toolsets.TOOLSETS["browser"]["tools"]
+
+
+@pytest.mark.parametrize("said, meant", [("new", "signup"), ("register", "signup"), ("create", "signup"),
+                                         ("Sign-Up", "signup"), ("create_account", "signup"),
+                                         ("signin", "login"), ("sign_in", "login"), ("Log-In", "login")])
+def test_the_modes_models_say_are_understood(store, said, meant):
+    """2026-09-29: the owner approved browser_vault_login(mode="new") in Moe's dialog, and it then failed
+    bad_mode -- an approval spent on an argument the tool could have understood."""
+    from tools import browser_vault_tool as bvt
+    seen = {}
+    with patch.object(bvt, "_bind_page", lambda task, kind, url: seen.update(bound=True) or (None, json.dumps({"stop": 1}))):
+        out = json.loads(bvt.browser_vault_login(FAZIER, mode=said, username="a@b.test", task_id="t"))
+    assert out == {"stop": 1} and seen["bound"], said               # got past the mode check
+    assert bvt._MODE_SYNONYMS[re.sub(r"[\s_-]+", "", said.lower())] == meant
+
+
+def test_an_unknown_mode_is_still_refused_and_the_schema_says_what_is_required():
+    from tools import browser_vault_tool as bvt
+    out = json.loads(bvt.browser_vault_login(FAZIER, mode="maybe", task_id="t"))
+    assert out["error_type"] == "bad_mode"
+    schema = bvt.BROWSER_VAULT_LOGIN_SCHEMA
+    assert "REQUIRED when mode is 'signup'" in schema["parameters"]["properties"]["username"]["description"]
+    assert "username too when mode is 'signup'" in schema["description"]

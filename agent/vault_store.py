@@ -413,6 +413,17 @@ class VaultStore:
             self._write_all(remaining)
             return True
 
+    def discard_pending(self, item_id: str) -> bool:
+        """Remove a PENDING (generated, unconfirmed) login -- the site refused the account. False when there
+        is no such pending item: a confirmed login is never removed this way."""
+        with self._locked():
+            items = self._read_all()
+            remaining = [rec for rec in items if not (rec.get("id") == item_id and rec.get("pending"))]
+            if len(remaining) == len(items):
+                return False
+            self._write_all(remaining)
+            return True
+
     def confirm_item(self, item_id: str) -> Optional[VaultItemMeta]:
         """A pending (generated, unconfirmed) login becomes final. None when there is no such pending item."""
         with self._locked():

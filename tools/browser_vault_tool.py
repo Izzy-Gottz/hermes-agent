@@ -8,6 +8,7 @@ Model-facing tools riding with the browser toolset. Moe ticket #17 added the acc
   private prompt (``saved``), or for a signup a password is generated in this process, stored
   pending and put into every new/confirm field (``created``); ``needs_person`` when nobody is here.
 - ``browser_vault_confirm`` / ``browser_vault_regenerate`` -> finish or redo a pending signup.
+- ``browser_vault_discard`` -> drop a pending signup the site refused (e.g. "email already taken").
 - the page is the tab browser_exec is on (or the given ``url``), never "the first tab with a
   password field" -- that bound a fazier.com login to a stale indiehackers.com tab.
 
@@ -485,7 +486,9 @@ def _fill_signup(task_id: str, origin: str, controls: list, nonce: str, password
 _SIGNUP_NEXT = ("Type the username/email into its field if it is not there yet, fill anything else the form needs, "
                 "and submit. When the site shows the account was created (or asks to verify an email), call "
                 "browser_vault_confirm(handle). If the site rejects the password, call browser_vault_regenerate(handle, "
-                "policy) with the rules the site states (length, symbols); nothing else is needed. ")
+                "policy) with the rules the site states (length, symbols); nothing else is needed. If the site refuses "
+                "the account for any other reason (\"email has already been taken\", the sign-up failed), call "
+                "browser_vault_discard(handle) so no login is kept for an account that does not exist. ")
 
 
 def _generate_signup(task_id: str, origin: str, *, label: str, username: str, policy_request: Any = None) -> str:
@@ -627,6 +630,15 @@ def _choose(found: list, origin: str) -> str:
                                  "person means (or browser_vault_fill with its handle).")}, ensure_ascii=False)
 
 
+#: What models call the two modes. 2026-09-29 the owner approved a call with mode="new" in Moe's dialog and it
+#: then failed bad_mode: an argument the tool can understand must not cost the person a second approval.
+_MODE_SYNONYMS = {
+    "login": "login", "signin": "login", "logon": "login", "logins": "login", "existing": "login", "auth": "login",
+    "signup": "signup", "new": "signup", "register": "signup", "registration": "signup", "create": "signup",
+    "createaccount": "signup", "newaccount": "signup", "join": "signup", "enroll": "signup",
+}
+
+
 def browser_vault_login(url: str, mode: str = "login", username: str = "", label: str = "",
                         task_id: Optional[str] = None) -> str:
     """The one call for a login or signup form: look for a saved login for exactly this site first, and
@@ -634,9 +646,10 @@ def browser_vault_login(url: str, mode: str = "login", username: str = "", label
     (``mode='login'``: they type it into a pop-up). ``outcome`` says which: used_existing, created,
     saved, existing_account, choose, needs_person, declined."""
     effective_task_id = task_id or "default"
-    mode = (mode or "login").strip().lower()
+    mode = _MODE_SYNONYMS.get(re.sub(r"[\s_-]+", "", (mode or "login").strip().lower()), mode)
     if mode not in ("login", "signup"):
-        return json.dumps({"success": False, "error_type": "bad_mode", "error": "mode is 'login' or 'signup'."})
+        return json.dumps({"success": False, "error_type": "bad_mode",
+                           "error": "mode is 'login' (sign in to an existing account) or 'signup' (make a new one)."})
     if not url:
         return json.dumps({"success": False, "error_type": "missing_argument",
                            "error": "url is required: the address of the page with the form."})
@@ -698,6 +711,19 @@ def browser_vault_confirm(handle: str) -> str:
                            "already_confirmed": True})
     done = store.confirm_item(handle)
     return json.dumps({"success": done is not None, "handle": handle, "origin": meta.origin, "pending": False})
+
+
+def browser_vault_discard(handle: str) -> str:
+    """The site refused the new account (e.g. "Email has already been taken"): drop its PENDING generated
+    login, so nothing is kept for an account that does not exist. A confirmed login is never removed here."""
+    store, meta = _pending_local(handle)
+    if meta is None:
+        return json.dumps({"success": False, "error_type": "unknown_handle", "error": f"No saved login {handle!r}."})
+    if not meta.pending:
+        return json.dumps({"success": False, "error_type": "not_pending",
+                           "error": "That login is confirmed; it is not removed here. Nothing changed."})
+    done = store.discard_pending(handle)
+    return json.dumps({"success": bool(done), "handle": handle, "origin": meta.origin, "discarded": bool(done)})
 
 
 def browser_vault_regenerate(handle: str, policy: Any = None, task_id: Optional[str] = None) -> str:
@@ -1281,14 +1307,19 @@ BROWSER_VAULT_LOGIN_SCHEMA = {
         "or handle the password. Other outcomes: existing_account (signup on a site with a saved login: sign in "
         "instead), choose (several saved logins: pass username), needs_person (nobody is here to be asked, or "
         "this is not a turn the person started: nothing was created -- report it), declined (stop asking this "
-        "turn). Never ask the person to type a password in chat, and never type one yourself."
+        "turn). If the site then refuses the new account for another reason (email already taken), call "
+        "browser_vault_discard(handle). Required: url and mode always; username too when mode is 'signup'. "
+        "Never ask the person to type a password in chat, and never type one yourself."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "url": _URL_PARAM,
-            "mode": {"type": "string", "enum": ["login", "signup"], "description": "login = sign in to an account; signup = make a new one."},
-            "username": {"type": "string", "description": "The email or username of the account (required for signup; for login, picks one of several saved logins)."},
+            "mode": {"type": "string", "enum": ["login", "signup"],
+                     "description": "Exactly 'login' (sign in to an existing account) or 'signup' (make a new one)."},
+            "username": {"type": "string", "description": ("REQUIRED when mode is 'signup': the email or username the "
+                                                           "new account is made with. For 'login', optional: picks one "
+                                                           "of several saved logins.")},
             "label": {"type": "string", "description": "Optional short site name for a saved item (default: the host)."},
         },
         "required": ["url", "mode"],
@@ -1325,6 +1356,16 @@ BROWSER_VAULT_CONFIRM_SCHEMA = {
     "description": ("The site accepted the new account made with a generated password (it says the account exists, "
                     "or asks to verify the email): keep that login for good. Until confirmed it is pending, and a "
                     "pending login nobody confirms is dropped after a day."),
+    "parameters": {"type": "object", "properties": {"handle": {"type": "string", "description": "The handle from the created result."}},
+                   "required": ["handle"]},
+}
+
+BROWSER_VAULT_DISCARD_SCHEMA = {
+    "name": "browser_vault_discard",
+    "description": ("The site refused the new account made with a generated password for a reason other than the "
+                    "password (\"email has already been taken\", the sign-up failed): drop that pending login so no "
+                    "login is kept for an account that does not exist. Works only while the login is pending; a "
+                    "confirmed login is never removed here."),
     "parameters": {"type": "object", "properties": {"handle": {"type": "string", "description": "The handle from the created result."}},
                    "required": ["handle"]},
 }
@@ -1388,6 +1429,10 @@ def _handle_vault_login(args: Dict[str, Any], **kwargs) -> str:
 
 def _handle_vault_confirm(args: Dict[str, Any], **kwargs) -> str:
     return browser_vault_confirm(str(args.get("handle") or ""))
+
+
+def _handle_vault_discard(args: Dict[str, Any], **kwargs) -> str:
+    return browser_vault_discard(str(args.get("handle") or ""))
 
 
 def _handle_vault_regenerate(args: Dict[str, Any], **kwargs) -> str:
@@ -1459,6 +1504,7 @@ registry.register(
 
 for _name, _schema, _handler in (("browser_vault_login", BROWSER_VAULT_LOGIN_SCHEMA, _handle_vault_login),
                                  ("browser_vault_confirm", BROWSER_VAULT_CONFIRM_SCHEMA, _handle_vault_confirm),
-                                 ("browser_vault_regenerate", BROWSER_VAULT_REGENERATE_SCHEMA, _handle_vault_regenerate)):
+                                 ("browser_vault_regenerate", BROWSER_VAULT_REGENERATE_SCHEMA, _handle_vault_regenerate),
+                                 ("browser_vault_discard", BROWSER_VAULT_DISCARD_SCHEMA, _handle_vault_discard)):
     registry.register(name=_name, toolset="browser", schema=_schema, handler=_handler,
                       check_fn=_check_vault_available, emoji="🔐")
