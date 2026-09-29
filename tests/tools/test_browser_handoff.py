@@ -708,10 +708,27 @@ class TestHandoff:
         assert out["next"] == "browser_sign_in_link" and out["route"] == "sign_in_link"
         assert out["url"] == "https://x.com/login" and out["site"] == "x.com" and out["reason"] == "sign in to x.com"
         assert 'browser_sign_in_link(site="x.com", url="https://x.com/login")' in out["error"]
-        assert "OWNER only" in out["error"] and "reach_owner(text)" in out["error"]
-        assert "recipient check refuses" in out["error"] and "END YOUR TURN" in out["error"]
+        assert out["deliver"] == "owner_chat_by_memoe" and "you never see it" in out["error"]
+        assert "not in your reply" in out["error"] and "END YOUR TURN" in out["error"]
         # No window, no Chrome tab, no default browser: nobody sees this machine's screen.
         assert state.get("show_calls") is None and state["opened"] == [] and state["chrome"] == []
+
+    @pytest.mark.parametrize("platform,origin", [("telegram", ""), ("telegram", "other_person"),
+                                                 ("slack", "knock"), ("api_server", "person")])
+    def test_no_sender_is_ever_told_to_put_a_link_in_the_reply(self, handoff, monkeypatch, platform, origin):
+        """The owner, a knock-admitted chat, a group member, unknown: the words are the same, because
+        the link goes to the owner's own chat from the edge and never into this conversation. A text that
+        said "in your reply when they are writing to you" would hand a stranger the owner's browser."""
+        bh, state = handoff
+        self._host(monkeypatch, "linux", kept=True)
+        bound = _bind(platform=platform, origin=origin)
+        try:
+            out = json.loads(bh.browser_handoff(reason="sign in", url="https://x.com/login", task_id="t"))
+        finally:
+            _unbind(bound)
+        assert out["deliver"] == "owner_chat_by_memoe"
+        assert "in your reply when" not in out["error"] and "give that link" not in out["error"].lower()
+        assert "tell_owner" not in out                       # no words carrying a link to pass on
 
     def test_done_after_the_link_carries_on_in_the_same_browser(self, handoff, monkeypatch):
         bh, state = handoff

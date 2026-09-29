@@ -160,14 +160,16 @@ def _sign_in_link_route(reason: str, url: str, task: str, step: Optional[dict] =
     _record(task, ROUTE_LINK, url)
     msg = (f"{host or 'This page'} needs the person for this step: {what}. The page is in the browser on their "
            f"cloud computer, which nobody can see, so nothing was opened anywhere. Next: call "
-           f"{SIGN_IN_LINK_TOOL}(site=\"{host or 'the site'}\"" + (f", url=\"{url}\"" if url else "") + ") -- it "
-           "returns a one-time link to this same browser. Give that link to the OWNER only: in your reply when "
-           "they are writing to you, or through reach_owner(text) when nobody is (a scheduled job). Never send it "
-           "to anyone else or with a send tool to a contact -- it opens their browser; the recipient check refuses "
-           "that anyway. Then END YOUR TURN; when they say they are done, call browser_handoff(done=true). "
-           + _GROUNDED)
+           f"{SIGN_IN_LINK_TOOL}(site=\"{host or 'the site'}\"" + (f", url=\"{url}\"" if url else "") + "). "
+           "Memoe sends a one-time link to this same browser straight to the owner's own chat; you never see it. "
+           "Never write, invent or pass on a link for this -- not in your reply, not with any send tool: it opens "
+           "the owner's signed-in browser, and whoever you are talking to may not be the owner. Say only that a "
+           "link was sent to them. Then END YOUR TURN; when they say they are done, call "
+           "browser_handoff(done=true). " + _GROUNDED)
+    # ``deliver`` is fixed, not chosen per sender: the link never reaches this conversation, so no
+    # sender -- the owner, a chat let in by a knock, a group -- can be handed it (moe-04's review).
     extra: Dict[str, Any] = {"reason": reason, "next": SIGN_IN_LINK_TOOL, "route": ROUTE_LINK,
-                             "site": host or ""}
+                             "site": host or "", "deliver": "owner_chat_by_memoe"}
     if url:
         extra["url"] = url
     if step:
@@ -391,7 +393,8 @@ BROWSER_HANDOFF_SCHEMA = {
         "person at this Mac: when they are writing from their phone, or nobody is there (a scheduled job), it opens "
         "nothing and returns code person_needed with tell_owner -- say it in your reply, or pass it to "
         "reach_owner(text) on a job, and stop. On a cloud computer it returns person_needed with next="
-        "browser_sign_in_link: call that for a one-time link and give it to the owner only. "
+        "browser_sign_in_link: call that and Memoe sends a one-time link to the owner's own chat itself -- never "
+        "write or pass on a link yourself. "
         "Only tell the person that something was sent, or is waiting on their phone or another device, when a "
         "tool result shows the site said so (page_says)."
     ),
