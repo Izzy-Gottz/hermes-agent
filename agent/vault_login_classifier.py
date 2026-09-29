@@ -22,7 +22,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 LOGIN_AUTOFILL_TOKENS = ("username", "email", "tel", "current-password")
 
@@ -199,6 +199,94 @@ def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginC
         if _RE_CODE_WORD.search(seen) and not _RE_NOT_A_SIGNIN_CODE.search(seen):
             out.append(ClassifiedLoginControl(c, 50, "one-time-code"))
     return out
+
+
+# ---- passcode / PIN the person knows ---------------------------------------------------------------------
+
+#: A secret the person KNOWS (not one a site sends): a passcode, a PIN, a security / access code. 2026-09-29,
+#: X's encrypted chat asked "Enter Passcode" over four bare <input>s with no name, id or label -- nothing the
+#: one-time-code reading could see ("passcode" is not "code" to \bcode\b, and bare boxes say nothing).
+_RE_PASSCODE_WORD = re.compile(r"\b(pass\s?code|passcodes|pin|pins|pin\s?code|pin\s?number|security\s?code|"
+                               r"access\s?code|\d\s?digit)\b")
+#: Fields that are plainly something else, whatever the page says around them.
+_RE_OTHER_FIELD = re.compile(r"\b(e\s?mail|user\s?name|username|phone|telephone|mobile|search|first\s?name|"
+                             r"last\s?name|full\s?name|address|city)\b")
+_RE_LOGIN_PASSWORD_WORD = re.compile(r"\bpassword\b")
+_PASSCODE_TYPES = ("text", "tel", "number", "password", "")
+PASSCODE_MIN_BOXES, PASSCODE_MAX_BOXES = 4, 8
+
+
+def passcode_words(text: str) -> bool:
+    """Whether ``text`` (a label, nearby words, the page) asks for a passcode / PIN / security code."""
+    return bool(_RE_PASSCODE_WORD.search(_normalize_text(text or "")))
+
+
+def _own_words(c: LoginControl) -> str:
+    return " ".join(p for p in (_identifier_words(c.name), _normalize_text(c.label)) if p)
+
+
+def _passcode_candidate(c: LoginControl) -> bool:
+    tokens = c.autocomplete.lower().split()
+    if c.type not in _PASSCODE_TYPES:
+        return False
+    if any(t in tokens for t in ("username", "email", "tel", "current-password", "new-password")):
+        return False
+    own = _own_words(c)
+    if _RE_OTHER_FIELD.search(own):
+        return False
+    if _RE_LOGIN_PASSWORD_WORD.search(own) and not _RE_PASSCODE_WORD.search(own):
+        return False  # the account password: never a PIN box
+    if _RE_NOT_A_SIGNIN_CODE.search(own):
+        return False
+    return c.max_length is None or c.max_length <= 12
+
+
+def classify_passcode_controls(controls: List[LoginControl], page_text: str = "") -> Tuple[List[ClassifiedLoginControl], str]:
+    """Where a passcode / PIN goes: ``(controls, "split" | "single")``, or ``([], "")``.
+
+    * ``split``: 4-8 inputs adjacent in DOM order, in one form, each either ``maxlength=1`` or bare (no name,
+      id or label -- the X passcode widget), with the passcode asked for by their own words, their nearby
+      text or the page. ``type=password`` digit boxes count. Returned in DOM order, one character each.
+    * ``single``: one field whose own name/label says passcode / PIN / security code (score 80), or whose
+      nearby text does (60); failing that, the page asks for a passcode and exactly one plausible field is
+      on it (40). Never an email, username, phone or account-password field."""
+    cands = [c for c in controls if _passcode_candidate(c)]
+    page_says = passcode_words(page_text)
+
+    runs: List[List[LoginControl]] = []
+    for c in sorted(cands, key=lambda c: c.index):
+        if runs and c.index - runs[-1][-1].index == 1 and c.form_index == runs[-1][-1].form_index:
+            runs[-1].append(c)
+        else:
+            runs.append([c])
+    for run in runs:
+        if not (PASSCODE_MIN_BOXES <= len(run) <= PASSCODE_MAX_BOXES):
+            continue
+        boxy = all(c.max_length == 1 or (not c.name.strip() and not c.label.strip()) for c in run)
+        asked = page_says or any(passcode_words(_own_words(c) + " " + c.context) for c in run)
+        if boxy and asked:
+            return [ClassifiedLoginControl(c, 70, "passcode") for c in run], "split"
+
+    scored: List[ClassifiedLoginControl] = []
+    for c in cands:
+        if passcode_words(_own_words(c)):
+            scored.append(ClassifiedLoginControl(c, 80, "passcode"))
+        elif passcode_words(c.context):
+            scored.append(ClassifiedLoginControl(c, 60, "passcode"))
+    if scored:
+        best = sorted(scored, key=lambda k: (-k.score, k.control.index))[0]
+        return [best], "single"
+    if page_says and len(cands) == 1:
+        return [ClassifiedLoginControl(cands[0], 40, "passcode")], "single"
+    return [], ""
+
+
+def build_passcode_fills(chosen: List[ClassifiedLoginControl], layout: str, passcode: str) -> List[Dict[str, Any]]:
+    """One character per box for ``split`` (the caller checks the length first), the whole value otherwise."""
+    if layout == "split":
+        boxes = sorted(chosen, key=lambda c: c.control.index)
+        return [{"index": b.control.index, "token": "passcode", "value": ch} for b, ch in zip(boxes, passcode)]
+    return [{"index": chosen[0].control.index, "token": "passcode", "value": passcode}]
 
 
 def select_password_fill(

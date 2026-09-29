@@ -716,3 +716,232 @@ def test_an_unknown_mode_is_still_refused_and_the_schema_says_what_is_required()
     schema = bvt.BROWSER_VAULT_LOGIN_SCHEMA
     assert "REQUIRED when mode is 'signup'" in schema["parameters"]["properties"]["username"]["description"]
     assert "username too when mode is 'signup'" in schema["description"]
+
+
+# ---------------------------------------------------------------------------
+# 7. a passcode / PIN the person knows (X's "Enter Passcode" for encrypted chats, 2026-09-29)
+# ---------------------------------------------------------------------------
+
+X = "https://x.com"
+#: What X showed: four bare <input>s -- no name, no id, no label -- under "Enter Passcode".
+X_BOXES = [{"index": i, "type": "text", "name": " ", "label": "    ", "autocomplete": "", "formIndex": None}
+           for i in range(4)]
+X_WORDS = "X / Chat \n Enter Passcode Enter your passcode to access your encrypted messages. Forgot passcode?"
+PASSCODE_PROGRAM = """
+import json, os, sys
+req = json.loads(sys.stdin.read())
+with open(os.environ["FAKE_PROMPT_SEEN"], "w") as fh:
+    json.dump({"request": req, "argv": sys.argv}, fh)
+print(json.dumps({"ok": True, "code": "__PASSCODE__"}))
+"""
+
+
+class WordsPage(Page):
+    def __init__(self, words=X_WORDS, **kw):
+        super().__init__(**kw)
+        self.words = words
+
+    def eval(self, task_id, expr):
+        if "document.body.innerText" in expr:
+            self.plain_exprs.append(expr)
+            return {"success": True, "result": self.words}
+        return super().eval(task_id, expr)
+
+
+class TestPasscode:
+    def _program(self, monkeypatch, tmp_path, *, here=True, passcode="4821"):
+        from agent.vault_backends import secret_prompt as sp
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        seen = tmp_path / "seen.json"
+        monkeypatch.setenv("FAKE_PROMPT_SEEN", str(seen))
+        # the value lives in the program, never in the environment (_no_secret_anywhere checks it)
+        monkeypatch.setenv(sp.ENV_CMD, _program(tmp_path, "pc.py", PASSCODE_PROGRAM.replace("__PASSCODE__", passcode)))
+        return seen, patch("tools.browser_chrome_extension.at_this_mac",
+                           return_value=(True, "here") if here else (False, "a turn from the person's phone"))
+
+    @staticmethod
+    def _no_mail():
+        return patch("agent.vault_code_sources.find_code", side_effect=AssertionError("the mail was read"))
+
+    def test_the_x_boxes_are_a_split_passcode_and_were_invisible_to_the_code_reader(self):
+        from agent.vault_login_classifier import LoginControl, classify_otp_controls, classify_passcode_controls
+        controls = [LoginControl.from_dict(c) for c in X_BOXES]
+        assert classify_otp_controls(controls) == []                 # the gap: nothing to type into
+        chosen, layout = classify_passcode_controls(controls, X_WORDS)
+        assert layout == "split" and [c.control.index for c in chosen] == [0, 1, 2, 3]
+        assert classify_passcode_controls(controls, "Welcome to X") == ([], "")   # bare boxes alone are not a passcode
+
+    @pytest.mark.parametrize("control, found", [
+        ({"type": "password", "name": "pin", "label": "", "maxLength": 6}, True),          # a password-type PIN box
+        ({"type": "tel", "name": "x1", "label": "Security code", "maxLength": 8}, True),
+        ({"type": "text", "name": "q", "label": "", "context": "Enter your passcode"}, True),
+        ({"type": "password", "name": "password", "label": "Password", "autocomplete": "current-password"}, False),
+        ({"type": "email", "name": "email", "label": "Email"}, False),
+        ({"type": "text", "name": "promo", "label": "Promo code"}, False),
+    ])
+    def test_single_fields(self, control, found):
+        from agent.vault_login_classifier import LoginControl, classify_passcode_controls
+        c = LoginControl.from_dict({"index": 3, "autocomplete": "", "formIndex": 0, **control})
+        chosen, layout = classify_passcode_controls([c], "")
+        assert bool(chosen) is found and (layout == "single" if found else layout == "")
+
+    def test_split_password_type_digit_boxes(self):
+        from agent.vault_login_classifier import LoginControl, classify_passcode_controls
+        boxes = [LoginControl.from_dict({"index": 5 + i, "type": "password", "name": f"d{i}", "label": "",
+                                         "maxLength": 1, "formIndex": 1}) for i in range(6)]
+        chosen, layout = classify_passcode_controls(boxes, "Enter your 6-digit PIN")
+        assert layout == "split" and len(chosen) == 6
+
+    def test_x_passcode_goes_from_moe_s_window_into_the_four_boxes(self, store, tmp_path, monkeypatch, caplog):
+        from tools import browser_vault_tool as bvt
+        caplog.set_level(logging.DEBUG)
+        seen, here = self._program(monkeypatch, tmp_path)
+        page = WordsPage(url=X + "/i/chat/pin/recovery", controls=X_BOXES)
+        with here, _live(True), self._no_mail():
+            raw = _run(page, bvt.browser_vault_enter_code, task_id="t", url=X, kind="passcode")
+        out = json.loads(raw)
+        assert out["success"] and out["kind"] == "passcode" and out["layout"] == "split" and out["source"] == "person_prompt"
+        assert page.fills() == [{"index": i, "token": "passcode", "value": ch} for i, ch in enumerate("4821")]
+        request = json.loads(seen.read_text())["request"]
+        assert request == {"kind": "code", "origin": "https://x.com", "label": "x.com",
+                           "message": "Enter your passcode for x.com (4 digits). Moe types it into the page without seeing it.",
+                           "fields": ["code"]}
+        assert "remembered" not in out and store.list_items() == []
+        _no_secret_anywhere("4821", raw, caplog.text, page.plain_exprs)
+
+    def test_code_mode_on_a_passcode_page_redirects_without_reading_mail_or_typing(self, tmp_path, monkeypatch):
+        from tools import browser_vault_tool as bvt
+        page = WordsPage(url=X + "/i/chat", controls=X_BOXES)
+        with _live(True), self._no_mail(), patch("agent.vault_code_sources.registered_sources", return_value=["gmail"]):
+            out = json.loads(_run(page, bvt.browser_vault_enter_code, task_id="t", url=X))
+        assert out["error_type"] == "passcode_page" and 'kind=\"passcode\"' in out["error"]
+        assert page.secret_exprs == []
+
+    def test_code_mode_on_a_sent_code_page_is_unchanged(self, monkeypatch):
+        from tools import browser_vault_tool as bvt
+        controls = [{"index": 0, "type": "text", "name": "otp", "label": "Code", "autocomplete": "one-time-code"}]
+        page = WordsPage(url=FAZIER + "/2fa", controls=controls, words="We sent a 6-digit code to your email. Enter it below.")
+        with _live(True), patch("agent.vault_code_sources.registered_sources", return_value=["gmail"]), \
+                patch("agent.vault_code_sources.find_code", return_value=("482913", "gmail")):
+            out = json.loads(_run(page, bvt.browser_vault_enter_code, task_id="t"))
+        assert out["success"] and out["source"].startswith("email")
+
+    def test_remember_keeps_it_with_the_saved_login_and_next_time_nobody_is_asked(self, store, tmp_path, monkeypatch, caplog):
+        from tools import browser_vault_tool as bvt
+        from agent.vault_backends import secret_prompt as sp
+        caplog.set_level(logging.DEBUG)
+        meta = store.add_item("login", "x", {"identifier_type": "username", "identifier": "izzy", "password": "pw-1"},
+                              origin=X)
+        seen, here = self._program(monkeypatch, tmp_path)
+        page = WordsPage(url=X + "/i/chat", controls=X_BOXES)
+        with here, _live(True), self._no_mail():
+            first = json.loads(_run(page, bvt.browser_vault_enter_code, task_id="t", kind="passcode", remember=True))
+        assert first["remembered"] is True and first["handle"] == meta.id
+        assert store.get_meta(meta.id).has_passcode and store.resolve_secret(meta.id)["password"] == "pw-1"
+        seen.unlink()
+        monkeypatch.delenv(sp.ENV_CMD)                      # no window at all now
+        page2 = WordsPage(url=X + "/i/chat", controls=X_BOXES)
+        with _live(True), self._no_mail():
+            raw = _run(page2, bvt.browser_vault_enter_code, task_id="t", kind="passcode")
+        again = json.loads(raw)
+        assert again["success"] and again["source"] == "saved" and not seen.exists()
+        assert [f["value"] for f in page2.fills()] == list("4821")
+        _no_secret_anywhere("4821", json.dumps(first), raw, caplog.text, page.plain_exprs, page2.plain_exprs)
+
+    def test_remember_without_a_saved_login_is_used_once_and_not_stored(self, store, tmp_path, monkeypatch):
+        from tools import browser_vault_tool as bvt
+        seen, here = self._program(monkeypatch, tmp_path)
+        page = WordsPage(url=X + "/i/chat", controls=X_BOXES)
+        with here, _live(True), self._no_mail():
+            out = json.loads(_run(page, bvt.browser_vault_enter_code, task_id="t", kind="passcode", remember=True))
+        assert out["success"] and out["remembered"] is False and "no login" in out["why"] and store.list_items() == []
+
+    def test_wrong_length_types_nothing_and_never_says_the_value(self, tmp_path, monkeypatch):
+        from tools import browser_vault_tool as bvt
+        seen, here = self._program(monkeypatch, tmp_path, passcode="482177")
+        page = WordsPage(url=X + "/i/chat", controls=X_BOXES)
+        with here, _live(True), self._no_mail():
+            raw = _run(page, bvt.browser_vault_enter_code, task_id="t", kind="passcode")
+        out = json.loads(raw)
+        assert out["error_type"] == "passcode_length" and page.secret_exprs == [] and "482177" not in raw
+
+    def test_nobody_at_the_mac_opens_no_window(self, tmp_path, monkeypatch):
+        from tools import browser_vault_tool as bvt
+        seen, away = self._program(monkeypatch, tmp_path, here=False)
+        page = WordsPage(url=X + "/i/chat", controls=X_BOXES)
+        with away, _live(False), self._no_mail():
+            cron = json.loads(_run(page, bvt.browser_vault_enter_code, task_id="t", kind="passcode"))
+        with away, _live(True), self._no_mail():
+            phone = json.loads(_run(page, bvt.browser_vault_enter_code, task_id="t", kind="passcode"))
+        assert cron["code"] == "person_needed" and phone["error_type"] == "prompt_unavailable"
+        assert "browser_handoff" in phone["error"] and "chat" in phone["error"]
+        assert not seen.exists() and page.secret_exprs == []
+
+    def test_the_schema_says_never_refuse_and_never_in_chat(self):
+        from tools import browser_vault_tool as bvt
+        s = bvt.BROWSER_VAULT_ENTER_CODE_SCHEMA
+        assert "never refuse and never ask them to type it in chat" in s["description"]
+        assert s["parameters"]["properties"]["kind"]["enum"] == ["passcode"]
+        assert s["parameters"]["properties"]["remember"]["default"] is False
+
+
+def _cft():
+    for app in sorted((Path.home() / ".agent-browser" / "browsers").glob("chrome-*/Google Chrome for Testing.app"), reverse=True):
+        exe = app / "Contents" / "MacOS" / "Google Chrome for Testing"
+        if exe.exists():
+            return str(exe)
+    return None
+
+
+@pytest.mark.skipif(_cft() is None, reason="Chrome for Testing not installed under ~/.agent-browser/browsers")
+def test_live_passcode_boxes_are_found_and_filled_in_a_real_page(tmp_path):
+    """X's shape on a local page in Chrome for Testing: four bare inputs (two of them type=password) that
+    move focus on input, under "Enter Passcode". Found by the real inspection script, filled one digit each."""
+    import base64
+    import signal
+    from agent.vault_login_classifier import (LoginControl, build_fill_js, build_inspection_js,
+                                              build_passcode_fills, classify_passcode_controls)
+    from tools import browser_captcha_ladder as bl
+    from tools import browser_vault_tool as bvt
+    html = """<html><body><h1>Enter Passcode</h1><div>
+<input type="text" style="width:2em"><input type="password" style="width:2em"><input type="password" style="width:2em"><input type="text" style="width:2em">
+</div><script>
+window.__got = [];
+document.querySelectorAll('input').forEach((el, i, all) => el.addEventListener('input', () => {
+  window.__got.push(i); if (all[i + 1]) all[i + 1].focus(); }));
+</script></body></html>"""
+    url = "data:text/html;base64," + base64.b64encode(html.encode()).decode()
+    ud = tmp_path / "ud"
+    proc = subprocess.Popen([_cft(), "--headless=new", f"--user-data-dir={ud}", "--remote-debugging-port=0",
+                             "--no-first-run", "--no-proxy-server", "about:blank"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        port_file = ud / "DevToolsActivePort"
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not (port_file.exists() and port_file.read_text().strip()):
+            time.sleep(0.3)
+        if not (port_file.exists() and port_file.read_text().strip()):
+            pytest.skip("Chrome for Testing did not start in 90 s (a loaded Mac is not a result)")
+        port, path = port_file.read_text().split("\n")[:2]
+        with bl.CdpConn(f"ws://127.0.0.1:{port}{path}", timeout=30) as conn:
+            tid = conn.call("Target.createTarget", {"url": "about:blank"})["targetId"]
+            sid = conn.call("Target.attachToTarget", {"targetId": tid, "flatten": True})["sessionId"]
+            conn.call("Page.navigate", {"url": url}, session_id=sid)
+
+            def ev(expr):
+                r = conn.call("Runtime.evaluate", {"expression": expr, "returnByValue": True}, session_id=sid)
+                return (r.get("result") or {}).get("value")
+            for _ in range(100):
+                if ev("document.readyState + document.querySelectorAll('input').length") == "complete4":
+                    break
+                time.sleep(0.2)
+            controls = [LoginControl.from_dict(c) for c in json.loads(ev(build_inspection_js("n1")))]
+            chosen, layout = classify_passcode_controls(controls, ev(bvt._PAGE_WORDS_JS))
+            assert layout == "split" and [c.control.index for c in chosen] == [0, 1, 2, 3]
+            out = json.loads(ev(build_fill_js(build_passcode_fills(chosen, layout, "4821"), expected_origin="null",
+                                              nonce="n1")))
+            assert out == {"filled": 4}
+            assert ev("Array.from(document.querySelectorAll('input'), e => e.value).join('')") == "4821"
+            assert ev("JSON.stringify(window.__got)") == "[0,1,2,3]"
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)

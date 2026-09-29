@@ -175,6 +175,9 @@ class VaultItemMeta:
     pending: bool = False
     #: Hermes made the password itself (browser_vault_save_login generate=True); nobody ever saw it.
     generated: bool = False
+    #: The person asked Moe to remember this site's passcode / PIN with the login
+    #: (browser_vault_enter_code kind="passcode", remember=true).
+    has_passcode: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -193,6 +196,8 @@ class VaultItemMeta:
             out["pending"] = True
         if self.generated:
             out["generated"] = True
+        if self.has_passcode:
+            out["has_passcode"] = True
         return out
 
 
@@ -451,6 +456,20 @@ class VaultStore:
                     return self._meta(rec)
         return None
 
+    def set_passcode(self, item_id: str, passcode: str) -> Optional[VaultItemMeta]:
+        """Keep a site's passcode / PIN with its (confirmed) saved login, encrypted like the password. None when
+        there is no such login; a pending (unconfirmed) signup is not an account to attach it to."""
+        if not passcode:
+            raise VaultError("passcode is required")
+        with self._locked():
+            items = self._read_all()
+            for rec in items:
+                if rec.get("id") == item_id and rec.get("kind") == "login" and not rec.get("pending"):
+                    rec["secret"] = {**(rec.get("secret") or {}), "passcode": passcode}
+                    self._write_all(items)
+                    return self._meta(rec)
+        return None
+
     def prune_pending(self, max_age_s: float = PENDING_MAX_AGE_S, *, now: Optional[float] = None) -> int:
         """Drop pending logins older than ``max_age_s``: a signup that never got confirmed is not an
         account anyone can use, and a stale one would be offered as a saved login forever."""
@@ -496,6 +515,7 @@ class VaultStore:
             has_otp=bool((rec.get("secret") or {}).get("otp_secret")),
             pending=bool(rec.get("pending")),
             generated=bool(rec.get("generated")),
+            has_passcode=bool((rec.get("secret") or {}).get("passcode")),
         )
 
 

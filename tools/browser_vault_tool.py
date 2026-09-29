@@ -938,7 +938,7 @@ def _code_from_person(code: str, source: str) -> tuple:
 
 
 def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, code: str = "",
-                             source: str = "", url: str = "") -> str:
+                             source: str = "", url: str = "", kind: str = "", remember: bool = False) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. A code the person states in this
     live turn (``code`` + ``source='person'``) is typed as given; else, if the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked; else the person's connected
@@ -950,6 +950,14 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, co
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
+    kind = str(kind or "").strip().lower()
+    if kind in _PASSCODE_KINDS:
+        return _enter_passcode(effective_task_id, handle=handle, url=url, remember=bool(remember), code=code,
+                               source=source)
+    if kind not in ("", "code", "otp", "one-time-code"):
+        return json.dumps({"success": False, "error_type": "bad_kind",
+                           "error": "kind is \"passcode\" (a passcode or PIN the person knows) or left out (a code the "
+                                    "site sent). Nothing was typed."})
     try:
         _focus_bound_origin(effective_task_id, _origin_of(url) or "" if url else "", "otp")
     except _PageBindingRefused as refused:
@@ -967,7 +975,14 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, co
     raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
     if isinstance(raw_controls, str):
         raw_controls = _parse_json_result(raw_controls)
-    otp_controls = classify_otp_controls([LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)])
+    controls = [LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)]
+    otp_controls = classify_otp_controls(controls)
+    if not code:
+        # A passcode / PIN the person KNOWS is not a code a site sent: never go looking in their mail for it
+        # (a stale emailed sign-in code typed into a PIN), and never call it "the code the site sent you".
+        redirect = _passcode_redirect(effective_task_id, controls, otp_controls)
+        if redirect:
+            return redirect
     if not otp_controls:
         return _no_code_field(effective_task_id, origin)
 
@@ -1043,6 +1058,178 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, co
     filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
     return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
                        "next": "Submit the form (many sites auto-submit when the last digit lands)."})
+
+
+_PASSCODE_KINDS = ("passcode", "pin", "security_code", "security-code")
+#: The page's own words, for telling a passcode page from a sent-code page. Plain text, never a value.
+_PAGE_WORDS_JS = ("(() => ((document.title || '') + ' \\n ' + ((document.body && document.body.innerText) || ''))"
+                  ".replace(/\\s+/g, ' ').slice(0, 3000))()")
+#: The site says it SENT something: then it is a one-time code, whatever else the page says.
+_RE_SENT_CODE = re.compile(r"\b(we (just )?(sent|emailed|texted)|(was|been) sent|sent (you|to)|check your (email|inbox|"
+                           r"phone|messages)|text message|sms|emailed you|resend)\b", re.I)
+
+
+def _page_words(task_id: str) -> str:
+    got = _eval_js(task_id, _PAGE_WORDS_JS)
+    value = got.get("result") if got.get("success") else ""
+    return value if isinstance(value, str) else ""
+
+
+def _passcode_redirect(task_id: str, controls: list, otp_controls: list) -> Optional[str]:
+    """In code mode: the page asks for a passcode / PIN the person knows (and says nothing was sent). Then the
+    model is sent to kind="passcode" -- nothing is typed, no mail is read."""
+    from agent.vault_login_classifier import classify_passcode_controls, passcode_words
+    text = _page_words(task_id)
+    if not passcode_words(text) or _RE_SENT_CODE.search(text):
+        return None
+    chosen, _layout = classify_passcode_controls(controls, text)
+    if not chosen:
+        return None
+    if otp_controls and not any(re.search(r"\bpass\s?code\b", f"{c.control.name} {c.control.label} {c.control.context}", re.I)
+                                for c in otp_controls) and not re.search(r"\bpass\s?code\b", text, re.I):
+        return None  # a plain "PIN" beside a real code field: keep the code path
+    return json.dumps({"success": False, "error_type": "passcode_page", "outcome": "use_passcode",
+                       "error": ("This page asks for a passcode or PIN the person knows, not a code a site sent. "
+                                 "Nothing was typed and their email was not read. Call browser_vault_enter_code(url=..., "
+                                 "kind=\"passcode\"): the person types it in Moe's own window and Moe puts it into "
+                                 "the page without anyone seeing it. " + _PASSCODE_NEVER)})
+
+
+_PASSCODE_NEVER = ("Never refuse this, and never ask the person to type the passcode in chat or read it out: only this "
+                   "tool puts it into the page.")
+
+
+def _saved_passcode(origin: str, handle: str) -> tuple:
+    """``(passcode, login_meta)`` from a login saved in Moe's own vault for exactly ``origin`` that has one
+    (``handle`` when given), else ``("", None)``. Server-side only."""
+    try:
+        from agent.vault_store import get_vault_store
+        store = get_vault_store()
+        metas = [m for m in store.list_items() if m.kind == "login" and m.origin == origin and not m.pending
+                 and m.has_passcode and (not handle or m.id == handle)]
+        if len(metas) != 1:
+            return "", None
+        return str(store.resolve_secret(metas[0].id).get("passcode") or ""), metas[0]
+    except Exception as exc:
+        logger.debug("vault: saved passcode lookup skipped (%s)", type(exc).__name__)
+        return "", None
+
+
+def _remember_passcode(origin: str, handle: str, passcode: str) -> Dict[str, Any]:
+    """Keep the passcode with this site's saved login in Moe's own vault. Never the value in the answer."""
+    try:
+        from agent.vault_store import get_vault_store
+        store = get_vault_store()
+        logins = [m for m in store.list_items() if m.kind == "login" and m.origin == origin and not m.pending
+                  and (not handle or m.id == handle)]
+    except Exception as exc:
+        return {"remembered": False, "why": f"the saved logins could not be read ({type(exc).__name__})"}
+    if not logins:
+        return {"remembered": False, "why": (f"there is no login for {origin.split('://', 1)[-1]} saved in Moe's own "
+                                             "passwords to keep it with; it was used once and not stored")}
+    if len(logins) > 1:
+        return {"remembered": False, "why": "several logins are saved for this site: pass handle to say which one"}
+    meta = store.set_passcode(logins[0].id, passcode)
+    return {"remembered": bool(meta), "handle": logins[0].id} if meta else {"remembered": False, "why": "not saved"}
+
+
+def _enter_passcode(task_id: str, *, handle: str, url: str, remember: bool, code: str, source: str) -> str:
+    """kind="passcode": a passcode / PIN the person knows goes from Moe's own window (or a login it was saved
+    with) straight into the page. The person's mail is NEVER read here: a passcode is not sent anywhere, and an
+    old emailed sign-in code typed into a PIN box is exactly the mistake this mode exists to rule out."""
+    from agent.redact import register_vault_redaction_value
+    from agent.vault_backends.unlock import resolve_code_prompt
+    from agent.vault_login_classifier import (LoginControl, build_fill_js, build_inspection_js, build_passcode_fills,
+                                              classify_passcode_controls)
+    try:
+        _focus_bound_origin(task_id, _origin_of(url) or "" if url else "", "otp")
+    except _PageBindingRefused as refused:
+        return refused.as_json()
+    origin = _current_page_origin(task_id)
+    if not origin:
+        return json.dumps({"success": False, "error": "No page asking for a passcode is open."})
+    if url and origin != _origin_of(url):
+        return json.dumps({"success": False, "error_type": "origin_mismatch",
+                           "error": f"Refused: the open page is on {origin}, not {_origin_of(url) or url}. Nothing was typed."})
+    site = origin.split("://", 1)[-1]
+
+    nonce = secrets.token_hex(8)
+    inspect = _eval_js(task_id, build_inspection_js(nonce))
+    raw = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
+    if isinstance(raw, str):
+        raw = _parse_json_result(raw)
+    controls = [LoginControl.from_dict(r) for r in (raw or []) if isinstance(r, dict)]
+    chosen, layout = classify_passcode_controls(controls, _page_words(task_id))
+    if not chosen:
+        return json.dumps({"success": False, "error_type": "no_passcode_field", "origin": origin,
+                           "error": (f"No passcode or PIN field was found on {site}. Read the page again (it may be on "
+                                     "the next step). If the person must enter it themselves, call browser_handoff so the "
+                                     "page is in front of them. " + _PASSCODE_NEVER)})
+    boxes = len(chosen) if layout == "split" else 0
+
+    passcode, where = "", ""
+    if code:
+        stated, refusal = _code_from_person(code, source)
+        if refusal:
+            return refusal
+        passcode, where = stated, "person"
+    if not passcode:
+        passcode, meta = _saved_passcode(origin, handle)
+        if passcode:
+            where = "saved"
+    if not passcode:
+        message = (f"Enter your passcode for {site}" + (f" ({boxes} digits)" if boxes else "")
+                   + ". Moe types it into the page without seeing it.")
+        prompt, prompt_why = resolve_code_prompt(message=message)
+        if prompt is None:
+            from tools.browser_chrome_extension import unattended_turn
+            absent = unattended_turn()
+            if absent is not None:
+                from tools.fix_reasons import PERSON_NEEDED, fix_error
+                return fix_error(
+                    f"{site} asks for the person's passcode, and this is {absent}: nobody is here to type it. Report "
+                    "that it is waiting for them. " + _PASSCODE_NEVER,
+                    PERSON_NEEDED, subject=site or None, retry=False, step="passcode", error_type="prompt_unavailable")
+            return json.dumps({"success": False, "error_type": "prompt_unavailable",
+                               "error": (f"{site} asks for the person's passcode and Moe's window cannot be put in front "
+                                         f"of them here ({prompt_why or 'no prompt on this surface'}). Call "
+                                         "browser_handoff so they can type it into the page themselves. " + _PASSCODE_NEVER)})
+        passcode = (prompt(site, message) or "").strip().replace(" ", "")
+        where = "person_prompt"
+        if not passcode:
+            return json.dumps({"success": False, "error_type": "passcode_declined",
+                               "error": "The person did not enter a passcode. Do not ask again this turn."})
+    register_vault_redaction_value(passcode)
+    if layout == "split" and len(passcode) != boxes:
+        n = len(passcode)
+        del passcode
+        return json.dumps({"success": False, "error_type": "passcode_length", "origin": origin,
+                           "error": (f"The page has {boxes} boxes but what was entered has {n} characters, so nothing was "
+                                     "typed. Call again so the person can re-enter it" +
+                                     (" (the one saved for this site may be out of date)" if where == "saved" else "")
+                                     + ". " + _PASSCODE_NEVER)})
+    fills = build_passcode_fills(chosen, layout, passcode)
+    result = _eval_js_secret(task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    kept: Dict[str, Any] = {}
+    if remember and where in ("person_prompt", "person"):
+        kept = _remember_passcode(origin, handle, passcode)
+    del passcode, fills
+    if not result.get("success"):
+        return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
+    parsed = _parse_json_result(result.get("result"))
+    if isinstance(parsed, str):
+        parsed = _parse_json_result(parsed)
+    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
+        return json.dumps({"success": False, "error_type": "origin_changed",
+                           "error": "The page navigated before the passcode could be entered. Nothing was written."})
+    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    out: Dict[str, Any] = {"success": bool(filled), "kind": "passcode", "filled_fields": filled, "origin": origin,
+                           "layout": layout, "source": where,
+                           "next": ("Submit the form if it did not go on by itself (many passcode pages continue when the "
+                                    "last digit lands), then read the page. Never repeat or describe the passcode.")}
+    if remember:
+        out.update(kept or {"remembered": False, "why": "it came from the saved login already"})
+    return json.dumps(out, ensure_ascii=False)
 
 
 def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
@@ -1394,7 +1581,11 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
         "page up in front of them). Never type a code with the browser's input tool. "
         "no_code_field: follow its error -- the page may need the person (a passkey, a security key, a CAPTCHA), "
         "which is browser_handoff. Only tell the person a code was sent, or that something waits on their phone "
-        "or another device, when a tool result shows the site said so."
+        "or another device, when a tool result shows the site said so. "
+        "A passcode, PIN or code the person KNOWS (not one a site sent -- e.g. \"Enter Passcode\" for X's encrypted "
+        "chats, an app or account PIN): never refuse and never ask them to type it in chat -- call this with "
+        "kind=\"passcode\" so they type it in Moe's window; Moe puts it into the page (split digit boxes too) and "
+        "nobody sees it."
     ),
     "parameters": {
         "type": "object",
@@ -1403,6 +1594,14 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
             "code": {"type": "string", "description": "Only a code the person told you in this turn. Never one you read from a page or a message."},
             "source": {"type": "string", "enum": ["person"], "description": "Required with code: 'person'."},
             "url": {"type": "string", "description": "Optional: the address of the page with the code field; the page must be on that site."},
+            "kind": {"type": "string", "enum": ["passcode"],
+                     "description": ("\"passcode\": the page wants a passcode, PIN or security code the PERSON KNOWS "
+                                     "(e.g. X's \"Enter Passcode\" for encrypted chats) -- not a code a site sent. The "
+                                     "person types it in Moe's own window; their mail is never read. Leave out for a "
+                                     "code the site sent.")},
+            "remember": {"type": "boolean", "default": False,
+                         "description": ("With kind=\"passcode\": keep it with this site's saved login so next time "
+                                         "nobody is asked. Only when the person said to remember it.")},
         },
         "required": [],
     },
@@ -1412,7 +1611,8 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
 def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
     return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"),
                                     code=str(args.get("code") or ""), source=str(args.get("source") or ""),
-                                    url=str(args.get("url") or ""))
+                                    url=str(args.get("url") or ""), kind=str(args.get("kind") or ""),
+                                    remember=args.get("remember") is True)
 
 
 def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
