@@ -354,6 +354,13 @@ def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str
 #: (a wedge restart, say) must not hide the page they are working in. Cleared on hand-back and when
 #: the browser is released, so the next launch is headless again.
 _shown_to_person: Dict[str, Any] = {"on": False, "since": 0.0}
+#: True after a hand-back hid the window (Cmd-H) instead of restarting it: the page the person finished on is
+#: still live in it. MEASURED 2026-09-29 (Chrome for Testing 154, macOS 27): a hidden Chrome stays hidden while a
+#: page is driven in it, but a NEW TAB unhides it -- once also taking the front from the app the person was in
+#: -- and a new window always does. So a parked browser is only ever driven in the tab it has; before a call
+#: that opens a tab it goes back to being headless (:func:`back_out_of_sight`), and after every call it is hidden
+#: again (:func:`keep_out_of_sight`).
+_parked: Dict[str, Any] = {"on": False, "pid": 0}
 #: Whether the browser THIS process launched is headless (None: not launched here, e.g. re-attached).
 _launched_headless: Dict[str, Optional[bool]] = {"headless": None}
 
@@ -403,6 +410,7 @@ def _launch_driven_browser(binary: str, copy_dir: str,
                                           headless=headless)
     if port is not None:
         _launched_headless["headless"] = headless
+        _parked["on"] = False  # a fresh launch is never the hidden window of a hand-back
         _fidelity.ensure_keeper(port, identity)
     return port, err
 
@@ -782,6 +790,7 @@ def release_if_idle(now: Optional[float] = None) -> bool:
         _terminate_real_profile_chrome()
         _shown_to_person["on"] = False  # the next launch is out of sight again
         _launched_headless["headless"] = None
+        _parked["on"] = False
     _bt.logger.info("real-profile: driven browser released after %ds idle", _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT)
     return True
 
@@ -1033,7 +1042,7 @@ def _main_browser_pid(copy_dir: str) -> Optional[int]:
 _ACTIVATE_PID_JXA = ("ObjC.import('AppKit');"
                      "var a=$.NSRunningApplication.runningApplicationWithProcessIdentifier(%d);"
                      "var r='no_app';"
-                     "if (a && !a.isNil()) { a.activateWithOptions(3); delay(0.3);"
+                     "if (a && !a.isNil()) { a.unhide; a.activateWithOptions(3); delay(0.3);"
                      "var f=$.NSWorkspace.sharedWorkspace.frontmostApplication;"
                      "r=(f && !f.isNil() && f.processIdentifier == %d) ? 'front' : 'not_front'; }"
                      "r")
@@ -1052,6 +1061,119 @@ def _activate_pid(pid: int) -> bool:
         _origin().logger.debug("handoff: activating pid %s failed: %s", pid, e)
         return False
     return out.returncode == 0 and out.stdout.strip() == "front"
+
+
+#: Hides one running application by pid (NSRunningApplication.hide -- what Cmd-H does): its windows go out of
+#: sight but the process, its tabs and whatever is typed in them stay exactly as they are. macOS gives the
+#: front back to the app the person was in; nothing else is activated or touched. Prints "hidden",
+#: "not_hidden" or "no_app".
+_HIDE_PID_JXA = ("ObjC.import('AppKit');"
+                 "var a=$.NSRunningApplication.runningApplicationWithProcessIdentifier(%d);"
+                 "var r='no_app';"
+                 "if (a && !a.isNil()) { a.hide; delay(0.3); r = a.isHidden ? 'hidden' : 'not_hidden'; }"
+                 "r")
+
+
+def _hide_pid(pid: int) -> bool:
+    """Put the process ``pid`` (Moe's own browser) out of sight after a hand-back, without restarting it: a
+    relaunch headless would reload the page the person just finished on (a cleared CAPTCHA's token, a
+    half-filled form). True only when macOS reports it hidden."""
+    if sys.platform != "darwin" or not pid:
+        return False
+    try:
+        out = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", _HIDE_PID_JXA % int(pid)],
+                             capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (subprocess.SubprocessError, OSError) as e:
+        _origin().logger.debug("handoff: hiding pid %s failed: %s", pid, e)
+        return False
+    return out.returncode == 0 and out.stdout.strip() == "hidden"
+
+
+# ---- the form the person was handed, across a relaunch ---------------------------------------------------
+
+#: Reads what has been typed into the page's form fields (not hidden fields, not files, not a CAPTCHA's own
+#: response): each with its position among the page's fields, id, name, and the words that label it -- so it
+#: can be found again after a reload even where a site randomises field names per load (forums.macrumors.com's
+#: XenForo register form does: "99bc30e37fc7fd1f998b" one load, "855d4ba6311427a7ab64" the next, measured
+#: 2026-09-29). Values stay in this process's memory for the relaunch only; they are never logged or returned.
+FORM_CAPTURE_JS = r"""(() => {
+  const all = Array.from(document.querySelectorAll('input, textarea, select'));
+  const skip = new Set(['hidden', 'file', 'submit', 'button', 'image', 'reset']);
+  const label = e => { const l = (e.labels && e.labels[0]) ? e.labels[0].innerText : '';
+    return (l || e.getAttribute('aria-label') || e.placeholder || '').replace(/\s+/g, ' ').trim().slice(0, 80); };
+  const out = [];
+  all.forEach((e, i) => {
+    const t = (e.type || e.tagName).toLowerCase();
+    if (skip.has(t) || /captcha/i.test(e.name || '') || e.closest('[class*="captcha" i]')) return;
+    const box = t === 'checkbox' || t === 'radio';
+    const changed = box ? e.checked !== e.defaultChecked
+      : e.tagName === 'SELECT' ? Array.from(e.options).some(o => o.selected !== o.defaultSelected)
+      : e.value !== e.defaultValue;
+    if (!changed) return;
+    out.push({i, tag: e.tagName, type: t, id: e.id || '', name: e.name || '', label: label(e),
+              value: box ? null : e.value, checked: box ? e.checked : null});
+  });
+  return JSON.stringify({count: all.length, fields: out});
+})()"""
+
+#: Puts captured fields back after the reload: by id, else by name, else by the same position with the same
+#: kind of field and the same label. Sets the value the way typing does (the native setter, then input and
+#: change events), and reads it back. Returns how many were restored and the labels of those that were not.
+FORM_RESTORE_JS = r"""((saved) => {
+  const all = Array.from(document.querySelectorAll('input, textarea, select'));
+  const label = e => { const l = (e.labels && e.labels[0]) ? e.labels[0].innerText : '';
+    return (l || e.getAttribute('aria-label') || e.placeholder || '').replace(/\s+/g, ' ').trim().slice(0, 80); };
+  const kind = e => (e.type || e.tagName).toLowerCase();
+  let restored = 0; const missing = [];
+  for (const f of saved.fields) {
+    let e = (f.id && document.getElementById(f.id)) || null;
+    if (e && kind(e) !== f.type) e = null;
+    if (!e && f.name) e = all.find(x => x.name === f.name && kind(x) === f.type) || null;
+    if (!e && all.length === saved.count) { const x = all[f.i];
+      if (x && x.tagName === f.tag && kind(x) === f.type && label(x) === f.label) e = x; }
+    if (!e) { missing.push(f.label || f.name || f.type); continue; }
+    if (f.checked !== null) { if (e.checked !== f.checked) e.click(); }
+    else { const proto = e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype
+             : e.tagName === 'SELECT' ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(e, f.value);
+      e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); }
+    const ok = f.checked !== null ? e.checked === f.checked : e.value === f.value;
+    ok ? restored++ : missing.push(f.label || f.name || f.type);
+  }
+  return JSON.stringify({restored, missing});
+})"""
+
+
+def _capture_form(ws_url: str) -> Optional[Dict[str, Any]]:
+    """The page's typed-in fields (see :data:`FORM_CAPTURE_JS`), or None when it cannot be read."""
+    if not ws_url:
+        return None
+    try:
+        from tools.browser_person_step import _evaluate
+        got = json.loads(str(_evaluate(ws_url, FORM_CAPTURE_JS, 3.0) or "null"))
+        return got if isinstance(got, dict) and isinstance(got.get("fields"), list) else None
+    except Exception as e:
+        _origin().logger.debug("handoff: the form could not be read before the relaunch: %s", e)
+        return None
+
+
+def _restore_form(port: int, target_id: str, saved: Dict[str, Any], wait: float = 15.0) -> Dict[str, Any]:
+    """Put ``saved`` back into the reopened tab once it has loaded: ``{"restored": n, "missing": [labels]}``."""
+    from tools.browser_person_step import _evaluate, page_targets
+    n = len(saved.get("fields") or [])
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        tab = next((t for t in page_targets(f"http://127.0.0.1:{port}") if t.get("id") == target_id), None)
+        try:
+            ready = tab and _evaluate(tab["ws"], "document.readyState === 'complete' && "
+                                                 "document.querySelectorAll('input, textarea, select').length", 2.0)
+            if ready:
+                got = json.loads(str(_evaluate(tab["ws"], f"({FORM_RESTORE_JS})({json.dumps(saved)})", 5.0)))
+                return {"restored": int(got.get("restored") or 0), "missing": [str(m) for m in got.get("missing") or []]}
+        except Exception as e:
+            _origin().logger.debug("handoff: restoring the form: %s", e)
+        time.sleep(0.4)
+    return {"restored": 0, "missing": [str(f.get("label") or f.get("name") or f.get("type")) for f in saved["fields"]][:n]}
 
 
 def _bring_to_front(port: int, target_id: str, pid: Optional[int]) -> bool:
@@ -1173,6 +1295,14 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def task_key(task_id: Optional[str]) -> str:
+    """One spelling for "no task id". browser_exec records its lane under ``str(task_id or "")`` while
+    browser_handoff calls every task-less hand-over ``"default"``; under Claude Code every tool runs with no
+    task id, so on 2026-09-29 (21:29Z) the conversation's OWN browser_exec call read as "1 other
+    conversation(s) used it", Moe's window was never shown, and the CAPTCHA went to the default browser."""
+    return str(task_id or "") or "default"
+
+
 def _other_work(task_id: str) -> List[str]:
     """Who else is using the driven browser now, in words: another conversation in this process
     (a browser_exec lane used within the inactivity window), or another Hermes process (its claim on
@@ -1181,7 +1311,8 @@ def _other_work(task_id: str) -> List[str]:
     reasons: List[str] = []
     try:
         from tools.browser_chrome_extension import recent_tasks
-        others = [t for t in recent_tasks(_bt.BROWSER_SESSION_INACTIVITY_TIMEOUT) if t != str(task_id or "")]
+        mine = task_key(task_id)
+        others = [t for t in recent_tasks(_bt.BROWSER_SESSION_INACTIVITY_TIMEOUT) if task_key(t) != mine]
         if others:
             reasons.append(f"{len(others)} other conversation(s) used it in the last few minutes")
     except Exception:
@@ -1229,6 +1360,7 @@ def show_to_person(url_hint: str = "", task_id: str = "", target_id: str = "") -
         copy_dir = real_profile_copy_dir(browser)
         if not _is_headless_now(copy_dir):
             _shown_to_person.update(on=True, since=time.time())
+            _parked["on"] = False
             return {"ok": True, "url": page["url"], "title": page["title"], "relaunched": False,
                     "front": _bring_to_front(port, page["id"], _main_browser_pid(copy_dir)),
                     "form_state_lost": False, "reopened": 0}
@@ -1246,61 +1378,156 @@ def show_to_person(url_hint: str = "", task_id: str = "", target_id: str = "") -
             # Not the browser this home launched on its profile copy: never relaunch what is not ours.
             return {"ok": False, "why": "Moe's own browser could not be shown (it is not the one this Mac launched)",
                     "url": page["url"]}
-        try:
-            cookies = list(_cdp_call(port, "Storage.getCookies").get("cookies") or [])
-        except Exception as e:
-            return {"ok": False, "why": f"could not read the browser's sign-ins before showing it: {e}", "url": page["url"]}
+        got = _relaunch(cached, copy_dir, browser, binary, page, headed=True)
+        if not got.get("ok"):
+            return got
+        _bt.logger.info("handoff: driven browser shown to the person at %s (relaunched headed, 1 tab, %d other(s) "
+                        "closed, %d cookie(s), %d/%d typed field(s) put back)", page["url"][:120], len(pages) - 1,
+                        got["cookies"], got["form"]["restored"], got["form"]["typed"])
+        out = {"ok": True, "url": page["url"], "title": page["title"], "relaunched": True,
+               "front": _bring_to_front(got["port"], got["target_id"], _main_browser_pid(copy_dir)),
+               # Kept only when every field that had been typed in is back; unreadable counts as lost.
+               "form_state_lost": got["form"]["lost"], "reopened": 1, "tabs_closed": len(pages) - 1}
+        if got["form"]["typed"]:
+            out["form_fields"] = {k: got["form"][k] for k in ("typed", "restored", "missing")}
+        return out
 
-        _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
-        _terminate_real_profile_chrome()
-        _bt._real_profile_cdp_cache.pop("cdp", None)
-        _await_holders_gone(copy_dir)
+
+def _relaunch(cached: str, copy_dir: str, browser: Optional[str], binary: str, page: Dict[str, str], *,
+              headed: bool) -> Dict[str, Any]:
+    """Restart Moe's own browser on the same profile copy -- with a window (``headed``, for the person) or out
+    of sight -- carrying every cookie, reopening ONLY ``page`` at its address and putting back what had been
+    typed into its form. Called under ``_real_profile_cdp_lock``.
+
+    Chrome's headless mode cannot grow a window, and a window cannot be put back into headless mode (both are
+    launch switches; no CDP call changes them), so each switch IS a relaunch. What a reload loses is the page's
+    own memory: sessionStorage, a half-run script, a CAPTCHA's one-time token. What was typed goes across by
+    hand (:data:`FORM_CAPTURE_JS`), and the result says how much of it made it (``form``).
+
+    ``{"ok": True, "port", "cdp", "target_id", "cookies": n, "form": {"typed", "restored", "missing", "lost"}}``
+    or ``{"ok": False, "why", "url", "browser_gone"?}``."""
+    _bt = _origin()
+    port = int(cached.rsplit(":", 1)[1])
+    try:
+        cookies = list(_cdp_call(port, "Storage.getCookies").get("cookies") or [])
+    except Exception as e:
+        return {"ok": False, "why": f"could not read the browser's sign-ins before restarting it: {e}", "url": page["url"]}
+    form = _capture_form(page.get("ws") or "")
+
+    _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
+    _terminate_real_profile_chrome()
+    _bt._real_profile_cdp_cache.pop("cdp", None)
+    _await_holders_gone(copy_dir)
+    _parked["on"] = False
+    if headed:
         _shown_to_person.update(on=True, since=time.time())
-        new_port, err = _launch_driven_browser(binary, copy_dir, _persons_identity(browser))
-        if new_port is None:
-            _shown_to_person["on"] = False
-            return {"ok": False, "why": err or "the browser did not start again", "url": page["url"], "browser_gone": True}
-        err = _import_cookies_into_driven_browser(new_port, cookies)
-        cdp, attach_err = (None, err) if err else _attach_agent_browser_to_real_profile(new_port, copy_dir)
-        if not cdp:
-            _terminate_real_profile_chrome()
-            _shown_to_person["on"] = False
-            return {"ok": False, "why": attach_err or "the browser did not start again", "url": page["url"],
-                    "browser_gone": True}
-        _bt._real_profile_cdp_cache["cdp"] = cdp
-        if _handover.get("cdp") == cached:
-            _handover["cdp"] = cdp  # the same jar, carried across; its age is unchanged
+    else:
+        _shown_to_person["on"] = False
+    new_port, err = _launch_driven_browser(binary, copy_dir, _persons_identity(browser))
+    if new_port is None:
+        _shown_to_person["on"] = False
+        return {"ok": False, "why": err or "the browser did not start again", "url": page["url"], "browser_gone": True}
+    err = _import_cookies_into_driven_browser(new_port, cookies)
+    cdp, attach_err = (None, err) if err else _attach_agent_browser_to_real_profile(new_port, copy_dir)
+    if not cdp:
+        _terminate_real_profile_chrome()
+        _shown_to_person["on"] = False
+        return {"ok": False, "why": attach_err or "the browser did not start again", "url": page["url"],
+                "browser_gone": True}
+    _bt._real_profile_cdp_cache["cdp"] = cdp
+    if _handover.get("cdp") == cached:
+        _handover["cdp"] = cdp  # the same jar, carried across; its age is unchanged
+    try:
+        before = {t.get("targetId") for t in (_cdp_call(new_port, "Target.getTargets").get("targetInfos") or [])
+                  if t.get("type") == "page"}
+    except Exception:
+        before = set()
+    # Only this page comes back: the other tabs were Moe's own working tabs, and a window of forty of them
+    # is not "the page" (2026-09-29: "relaunched headed, 38 tab(s)"). The person's own browser is never touched.
+    try:
+        target_id = str(_cdp_call(new_port, "Target.createTarget", {"url": page["url"]}).get("targetId") or "")
+    except Exception as e:
+        return {"ok": False, "why": f"the browser is up, but the page did not open again: {e}", "url": page["url"]}
+    # The blank tab the engine's attach opened would otherwise be the first page a later call lands on.
+    for blank in before:
         try:
-            before = {t.get("targetId") for t in (_cdp_call(new_port, "Target.getTargets").get("targetInfos") or [])
-                      if t.get("type") == "page"}
+            _cdp_call(new_port, "Target.closeTarget", {"targetId": blank}, timeout=5)
         except Exception:
-            before = set()
-        # Only the page being handed over comes back: the other tabs were Moe's own working tabs, and a
-        # window of forty of them is not "the page" (the person's own browser is never touched here).
-        try:
-            target_id = str(_cdp_call(new_port, "Target.createTarget", {"url": page["url"]}).get("targetId") or "")
-        except Exception as e:
-            return {"ok": False, "why": f"the browser is up, but the page did not open again: {e}", "url": page["url"]}
-        reopened = 1
-        # The blank tab the engine's attach opened would otherwise be the first page a later call lands on.
-        for blank in before:
-            try:
-                _cdp_call(new_port, "Target.closeTarget", {"targetId": blank}, timeout=5)
-            except Exception:
-                pass
-        _bt.logger.info("handoff: driven browser shown to the person at %s (relaunched headed, %d tab(s), %d other(s) "
-                        "closed, %d cookie(s))", page["url"][:120], reopened, len(pages) - reopened, len(cookies))
-        return {"ok": True, "url": page["url"], "title": page["title"], "relaunched": True,
-                "front": _bring_to_front(new_port, target_id, _main_browser_pid(copy_dir)), "form_state_lost": True,
-                "reopened": reopened, "tabs_closed": len(pages) - reopened}
+            pass
+    typed = len((form or {}).get("fields") or [])
+    put_back = _restore_form(new_port, target_id, form) if typed else {"restored": 0, "missing": []}
+    return {"ok": True, "port": new_port, "cdp": cdp, "target_id": target_id, "cookies": len(cookies),
+            "form": {"typed": typed, "restored": put_back["restored"], "missing": put_back["missing"][:10],
+                     "lost": form is None or put_back["restored"] < typed}}
 
 
 def hand_back() -> Dict[str, Any]:
-    """The person is done: where the page is now, and the next launch goes back out of sight. The window
-    is left as it is -- relaunching it hidden again would reload the page they just finished on. The
-    idle clock restarts now, so the reaper does not close the window the moment they finish."""
+    """The person is done: where the page is now, and Moe's browser goes back out of sight AS IT IS -- hidden
+    (Cmd-H, by pid), never relaunched: a relaunch would reload the page they just finished on and lose what
+    they did there (a cleared CAPTCHA's token lives in the page). It keeps running in the background and
+    browser_exec drives it as before; macOS gives the front back to whatever the person was using, and the
+    person's own browser is never touched. The next launch is headless again. The idle clock restarts now,
+    so the reaper does not close the window the moment they finish."""
     _shown_to_person["on"] = False
     _origin()._real_profile_last_used = time.time()
     pages = driven_pages()
     page = pages[0] if pages else None
-    return {"url": page["url"], "title": page["title"]} if page else {}
+    out: Dict[str, Any] = {"url": page["url"], "title": page["title"]} if page else {}
+    hidden = False
+    try:
+        from hermes_cli.browser_connect import real_profile_copy_dir
+        copy_dir = real_profile_copy_dir(_lane_browser())
+        if not _is_headless_now(copy_dir):
+            pid = _main_browser_pid(copy_dir) or 0
+            hidden = _hide_pid(pid)
+            _parked.update(on=hidden, pid=pid)
+        else:
+            hidden = True  # it never had a window
+    except Exception as e:
+        _origin().logger.debug("handoff: hiding the window after hand-back: %s", e)
+    out["out_of_sight"] = hidden
+    return out
+
+
+def keep_out_of_sight() -> bool:
+    """After a browser_exec call on a parked browser (hidden after a hand-back): hide it again, in case the call
+    brought a window back. Never while the page is in front of the person; never anything but that pid."""
+    if not _parked["on"] or _shown_to_person["on"]:
+        return False
+    return _hide_pid(int(_parked.get("pid") or 0))
+
+
+#: Code that opens a tab or a window: what brings a hidden Chrome back on screen (measured, see ``_parked``).
+_OPENS_TAB = re.compile(r"\bnew_tab\s*\(|Target\.createTarget|newWindow|window\.open\s*\(|ensure_real_tab\s*\(")
+
+
+def opens_a_tab(code: str) -> bool:
+    return bool(_OPENS_TAB.search(code or ""))
+
+
+def back_out_of_sight(task_id: Optional[str] = None) -> Dict[str, Any]:
+    """A parked browser (hidden after a hand-back) is about to open a tab: restart it headless first, carrying
+    the sign-ins, the page it is on and what is typed there -- a tab opened in a hidden Chrome would put it back
+    on the person's screen and can take the front from them. ``{"ok": True, "relaunched": bool, ...}``."""
+    _bt = _origin()
+    if not _parked["on"] or _shown_to_person["on"]:
+        return {"ok": True, "relaunched": False}
+    with _bt._real_profile_cdp_lock:
+        cached = _bt._real_profile_cdp_cache.get("cdp")
+        if not cached or not _cdp_http_ready(cached):
+            _parked["on"] = False
+            return {"ok": True, "relaunched": False}
+        from hermes_cli.browser_connect import real_profile_copy_dir
+        browser = _lane_browser()
+        copy_dir = real_profile_copy_dir(browser)
+        binary = driven_browser_executable()
+        pages = driven_pages()
+        page = _pick_page(pages, "", "")
+        if not binary or page is None or not _cdp_on_data_dir(cached, copy_dir) or _other_work(task_id or ""):
+            return {"ok": False, "relaunched": False}  # leave it; keep_out_of_sight re-hides after the call
+        got = _relaunch(cached, copy_dir, browser, binary, page, headed=False)
+        if got.get("ok"):
+            _bt.logger.info("handoff: Moe's browser went back out of sight (headless) before opening a tab, at %s",
+                            page["url"][:120])
+        return {"ok": bool(got.get("ok")), "relaunched": bool(got.get("ok")), "url": page["url"],
+                **({"form_state_lost": got["form"]["lost"]} if got.get("ok") else {"why": got.get("why")})}

@@ -8,8 +8,10 @@ to "approve it on your phone" when nothing had been sent to a phone. This tool i
 Routes, first that works:
 
 1. ``driven_browser`` -- Moe's own browser, shown: relaunched headed on the SAME profile copy with the
-   same cookies, the tab reopened at its URL, raised in front. A reload loses typed-but-unsaved form
-   state, and the result says so (``form_state_lost``).
+   same cookies, the tab reopened at its URL, what had been typed into its form put back, raised in
+   front (Chrome cannot give a headless browser a window without a relaunch). The result says whether
+   the form made it (``form_state``). After ``done=true`` the window is HIDDEN, not restarted -- the page
+   the person finished on (a cleared CAPTCHA) stays live -- and Moe carries on in the background.
 2. ``chrome`` -- the extension lane is connected: the URL opens in Moe's own tab group in the
    person's Chrome (signed in as them; Moe's own browser's page state does not carry over). The
    extension never focuses a window by design, so the tab is there but not raised (``front: false``).
@@ -242,9 +244,14 @@ def _hand_back(task_id: str) -> str:
     elif route == ROUTE_DRIVEN:
         from tools import browser_tool_real_profile as rp
         out.update(rp.hand_back())
-        out["next"] = ("Carry on with browser_exec in the same session: it drives this same window. Read the page "
-                       "first (page_info()) -- the person may have moved it on. Moe's browser goes back out of sight "
-                       "the next time it starts.")
+        hidden = out.get("out_of_sight")
+        out["next"] = ("Carry on with browser_exec in the same session: it drives this same page, with what the person "
+                       "did there (a CAPTCHA they cleared, what they typed). Read the page first (page_info()) -- they may "
+                       "have moved it on. "
+                       + ("Moe's browser is out of sight again and carries on in the background; the person's own apps "
+                          "and browser were not touched." if hidden else
+                          "macOS did not hide Moe's window, so it may still be on their screen: if they mind, they can "
+                          "press Cmd-H in it; it goes out of sight by itself the next time it starts."))
     elif route == ROUTE_CHROME:
         out["next"] = ("Carry on with browser_exec(where=\"chrome\"): the page is in Moe's tab group in the person's "
                        "Chrome. Read it first; they may have moved it on.")
@@ -324,10 +331,20 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
         _record(task, ROUTE_DRIVEN, shown.get("url", ""))
         out = {**base, "route": ROUTE_DRIVEN, "url": shown.get("url"), "title": shown.get("title"),
                "front": bool(shown.get("front")), "relaunched": bool(shown.get("relaunched"))}
-        if shown.get("form_state_lost"):
+        fields = shown.get("form_fields") or {}
+        if shown.get("relaunched") and not shown.get("form_state_lost"):
+            out["form_state"] = ("kept: Moe's browser had to restart in a window, so the page was reloaded at its address; "
+                                 "sign-ins came across" + (f" and the {fields['restored']} field(s) Moe had filled in were "
+                                                          "put back" if fields.get("typed") else "")
+                                 + ". Anything only the page itself remembered (a step it kept in memory) starts over.")
+        elif shown.get("form_state_lost"):
+            missing = ", ".join(fields.get("missing") or [])
             out["form_state"] = ("lost: Moe's browser had to restart in a window, so the page was reloaded at its "
-                                 "address. Sign-ins came across; anything typed on the page that the site had not "
-                                 "saved is gone. Say so if it matters, and re-enter it after they are done.")
+                                 "address. Sign-ins came across; "
+                                 + (f"{fields.get('restored', 0)} of {fields['typed']} filled-in field(s) were put back, "
+                                    f"not: {missing}. " if fields.get("typed") else
+                                    "anything typed on the page that the site had not saved is gone. ")
+                                 + "Say so if it matters, and re-enter it after they are done.")
         if shown.get("tabs_closed"):
             out["other_tabs"] = (f"{shown['tabs_closed']} other tab(s) of Moe's browser were closed; only this page "
                                  "was brought up. Open any you still need again with browser_exec.")

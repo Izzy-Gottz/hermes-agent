@@ -583,6 +583,17 @@ def _captcha_ladder(result: dict, stdout: str, env: dict, browser_cfg: dict, tas
         result, stdout, env, browser_cfg, task_id, presence, stderr=stderr), None, "captcha ladder failed")
 
 
+def _park_check(code: str, task_id: Optional[str]) -> None:
+    """Before a call in Moe's own browser: when it is parked (hidden after a hand-back) and this code opens a tab,
+    it goes back to headless first -- a new tab in a hidden Chrome puts it back on the person's screen (measured,
+    tools/browser_tool_real_profile._parked). Never raises."""
+    def check() -> None:
+        rp = importlib.import_module("tools.browser_tool_real_profile")
+        if rp._parked["on"] and rp.opens_a_tab(code):
+            rp.back_out_of_sight(task_id)
+    _quiet(check, None, "sending Moe's window back out of sight failed")
+
+
 def _sweep_old_tabs(env: dict, task_id: Optional[str]) -> None:
     """After a call in Moe's OWN driven browser: close every page but the tabs in use (this and other
     conversations' harness tabs) and the most recent few (tools/browser_exec_health.sweep_own_browser).
@@ -744,6 +755,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             return chrome_lane.not_connected_error()  # fixable: code browser_extension_missing
         chrome_lane.chrome_lane_env(env, bridge, session)
     else:
+        _park_check(code, task_id)
         route_err = _route_backend(env, session, task_id, bool(local))
         if route_err:
             from tools.fix_reasons import as_tool_error
@@ -828,6 +840,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             _note_person_step(result, step, presence if chrome_lane.lane_enabled(browser_cfg) else None)
     if lane == chrome_lane.LANE_OWN:
         _sweep_old_tabs(env, task_id)
+        # After a hand-back Moe's window is hidden, not closed (the page the person finished on lives in it):
+        # whatever this call did, it goes back out of sight (tools/browser_tool_real_profile.keep_out_of_sight).
+        _lazy_call("tools.browser_tool_real_profile", "keep_out_of_sight", False, "keeping Moe's window hidden failed")
     google_wall = _google_sign_in_wall(proc.stdout, result.get("needs_person")) if lane == chrome_lane.LANE_OWN else None
     if google_wall:
         # Google asks the person to prove it is them: hand THAT page over, then carry on (never "give up").

@@ -19,7 +19,10 @@ import pytest
 
 from tools import browser_chrome_extension as lane
 from tools import browser_person_step as ps
+from tools import browser_tool_real_profile as _rp_module
 from tools import browser_use_cli as bu
+
+_REAL_OTHER_WORK = _rp_module._other_work
 
 #: browser_exec stdout from the transcript, verbatim (trimmed of the account list).
 GOOGLE_PASSKEY_STDOUT = ("clicked\nLoading\nSign in with Google\nChoose an account\nto continue to TinyLaunch\n"
@@ -689,6 +692,34 @@ class TestHandoff:
         bh.browser_handoff(reason="confirm", task_id="conv-7")
         assert state["show_calls"] == [("", "conv-7")]
 
+    def test_a_relaunch_that_kept_the_form_says_kept(self, handoff):
+        bh, state = handoff
+        state["shown"] = {"ok": True, "url": "https://forums.macrumors.com/login/register", "title": "", "front": True,
+                          "relaunched": True, "form_state_lost": False, "form_fields": {"typed": 4, "restored": 4,
+                                                                                        "missing": []}}
+        out = json.loads(bh.browser_handoff(reason="complete the hcaptcha check", task_id="t"))
+        assert out["form_state"].startswith("kept") and "4 field(s)" in out["form_state"]
+        state["shown"] = {**state["shown"], "form_state_lost": True,
+                          "form_fields": {"typed": 4, "restored": 3, "missing": ["Email"]}}
+        out = json.loads(bh.browser_handoff(reason="complete the hcaptcha check", task_id="t"))
+        assert out["form_state"].startswith("lost") and "3 of 4" in out["form_state"] and "Email" in out["form_state"]
+
+    def test_done_says_moe_s_window_is_out_of_sight_and_carries_on(self, handoff, monkeypatch):
+        from tools import browser_tool_real_profile as rp
+        bh, state = handoff
+        state["shown"] = {"ok": True, "url": "https://forums.macrumors.com/login/register", "title": "", "front": True}
+        monkeypatch.setattr(rp, "hand_back", lambda: {"url": "https://forums.macrumors.com/login/register",
+                                                       "title": "Register", "out_of_sight": True})
+        bh.browser_handoff(reason="complete the hcaptcha check", task_id=None)
+        out = json.loads(bh.browser_handoff(done=True, task_id=None))
+        assert out["route"] == "driven_browser" and out["out_of_sight"] is True
+        assert "out of sight again and carries on in the background" in out["next"]
+        assert "same page" in out["next"] and "CAPTCHA they cleared" in out["next"]
+        monkeypatch.setattr(rp, "hand_back", lambda: {"url": "https://x/", "title": "", "out_of_sight": False})
+        bh.browser_handoff(reason="complete the hcaptcha check", task_id=None)
+        out = json.loads(bh.browser_handoff(done=True, task_id=None))
+        assert "did not hide" in out["next"] and "carries on in the background" not in out["next"]
+
     def test_done_reads_where_the_page_is_now(self, handoff):
         bh, state = handoff
         state["shown"] = {"ok": True, "url": "https://accounts.google.com/pk", "title": "", "front": True}
@@ -832,6 +863,11 @@ class TestShowToPerson:
         monkeypatch.setattr(rp, "_bring_to_front", lambda port, tid, pid: calls["front"].append((port, tid, pid)) or True)
         monkeypatch.setitem(rp._shown_to_person, "on", False)
         monkeypatch.setitem(rp._launched_headless, "headless", True)
+        monkeypatch.setitem(rp._parked, "on", False)
+        monkeypatch.setattr(rp, "_hide_pid", lambda pid: calls.setdefault("hidden", []).append(pid) or True)
+        monkeypatch.setattr(rp, "_capture_form", lambda ws: calls.get("form"))
+        monkeypatch.setattr(rp, "_restore_form", lambda port, tid, saved: calls.get("put_back",
+                            {"restored": len(saved["fields"]), "missing": []}))
         return rp, calls
 
     def test_a_headless_browser_is_relaunched_headed_with_only_the_handed_page_and_the_same_sign_ins(self, rp):
@@ -899,6 +935,108 @@ class TestShowToPerson:
         assert rp._other_work("mine") == []
         lane.record_lane("theirs", "s2", lane.LANE_OWN)
         assert any("other conversation" in r for r in rp._other_work("mine"))
+
+    def test_this_conversation_s_own_task_less_call_is_not_other_work(self, monkeypatch, tmp_path):
+        """2026-09-29 21:29Z, measured: under Claude Code every tool runs with no task id. browser_exec recorded
+        its lane under "" and the ladder's hand-over asked as "default", so the conversation's OWN call read as
+        "1 other conversation(s) used it" -- Moe's window was refused and the page went to the default browser."""
+        monkeypatch.setattr("tools.browser_tool_real_profile._claims_dir", lambda: str(tmp_path / "none"))
+        from tools import browser_tool_real_profile as rp
+        lane.reset_sticky_lanes()
+        lane.record_lane(None, "macrumors", lane.LANE_OWN)       # browser_exec(session="macrumors"), no task id
+        assert rp._other_work("default") == [] and rp._other_work(None) == [] and rp._other_work("") == []
+        lane.record_lane("conv-2", "", lane.LANE_OWN)
+        assert any("1 other conversation" in r for r in rp._other_work("default"))
+        lane.reset_sticky_lanes()
+
+    def test_the_ladder_s_hand_over_with_no_task_id_shows_moe_s_window(self, rp, monkeypatch, tmp_path):
+        """The same, end to end through show_to_person with the real _other_work: relaunched with a window."""
+        rp, calls = rp
+        monkeypatch.setattr(rp, "_other_work", _REAL_OTHER_WORK)
+        monkeypatch.setattr(rp, "_claims_dir", lambda: str(tmp_path / "none"))
+        lane.reset_sticky_lanes()
+        lane.record_lane(None, "macrumors", lane.LANE_OWN)
+        out = rp.show_to_person("https://tinylaunch.com/", "default", "B")
+        lane.reset_sticky_lanes()
+        assert out["ok"] and out["relaunched"], out
+        assert calls["launched_headless"] == [False]
+
+    def test_what_was_typed_goes_across_the_relaunch_and_is_said_honestly(self, rp):
+        rp, calls = rp
+        calls["form"] = {"count": 30, "fields": [{"i": 21, "type": "text", "label": "Username"},
+                                                  {"i": 23, "type": "email", "label": "Email"}]}
+        out = rp.show_to_person()
+        assert out["relaunched"] and out["form_state_lost"] is False
+        assert out["form_fields"] == {"typed": 2, "restored": 2, "missing": []}
+        calls["put_back"] = {"restored": 1, "missing": ["Email"]}
+        out = rp.show_to_person()
+        assert out["form_state_lost"] is True and out["form_fields"]["missing"] == ["Email"]
+        calls["form"] = None                                       # unreadable: never claimed kept
+        assert rp.show_to_person()["form_state_lost"] is True
+
+    def test_hand_back_hides_the_window_as_it_is_never_restarting_it(self, rp, monkeypatch):
+        """Done: the page the person finished on (a cleared CAPTCHA) stays live -- hidden by pid, not relaunched."""
+        rp, calls = rp
+        rp.show_to_person()                                        # relaunched headed
+        monkeypatch.setitem(rp._launched_headless, "headless", False)
+        launched_before, terminated_before = list(calls["launched_headless"]), calls["terminated"]
+        out = rp.hand_back()
+        assert out["out_of_sight"] is True and calls["hidden"] == [4242]
+        assert calls["launched_headless"] == launched_before and calls["terminated"] == terminated_before
+        assert rp._parked["on"] is True and rp._shown_to_person["on"] is False
+        # after each later call it is hidden again; never while the person has it in front of them
+        assert rp.keep_out_of_sight() is True and calls["hidden"] == [4242, 4242]
+        rp.show_to_person()                                        # shown again: raised in place, not parked
+        assert rp._parked["on"] is False and rp.keep_out_of_sight() is False
+
+    def test_hand_back_of_a_browser_that_never_had_a_window_hides_nothing(self, rp):
+        rp, calls = rp
+        out = rp.hand_back()                                       # still headless
+        assert out["out_of_sight"] is True and "hidden" not in calls and rp._parked["on"] is False
+
+    @pytest.mark.parametrize("code,opens", [
+        ('new_tab("https://example.com")', True), ("ensure_real_tab()", True),
+        ('cdp("Target.createTarget", url="x")', True), ("js('window.open(\"/x\")')", True),
+        ('click(120, 300)\nprint(page_info())', False), ('goto_url("https://example.com/next")', False)])
+    def test_code_that_opens_a_tab_is_known(self, code, opens):
+        from tools import browser_tool_real_profile as rp
+        assert rp.opens_a_tab(code) is opens
+
+    def test_a_parked_browser_goes_headless_before_it_opens_a_tab(self, rp, monkeypatch):
+        """MEASURED 2026-09-29 (Chrome for Testing 154): a new tab in a hidden Chrome unhid it and once took the
+        front from Terminal; a new window always did. So a parked browser opens no tab while it can show one."""
+        rp, calls = rp
+        rp.show_to_person()
+        monkeypatch.setitem(rp._launched_headless, "headless", False)
+        rp.hand_back()
+        calls["form"] = {"count": 3, "fields": [{"i": 0, "type": "text", "label": "Username"}]}
+        out = rp.back_out_of_sight("default")
+        assert out["relaunched"] and out["form_state_lost"] is False
+        assert calls["launched_headless"][-1] is True               # out of sight: headless again
+        assert rp._parked["on"] is False and rp._shown_to_person["on"] is False
+        assert rp.back_out_of_sight("default") == {"ok": True, "relaunched": False}   # nothing parked: no-op
+
+    def test_browser_exec_sends_a_parked_browser_back_before_a_tab_and_rehides_after(self, monkeypatch):
+        from tools import browser_tool_real_profile as rp
+        seen = []
+        monkeypatch.setitem(rp._parked, "on", True)
+        monkeypatch.setattr(rp, "back_out_of_sight", lambda task=None: seen.append(("back", task)) or {})
+        bu._park_check('new_tab("https://x.example")', None)
+        bu._park_check("click(1, 2)", None)
+        assert seen == [("back", None)]
+        monkeypatch.setitem(rp._parked, "on", False)
+        bu._park_check('new_tab("https://x.example")', None)
+        assert seen == [("back", None)]
+        src = open(bu.__file__).read()
+        body = src[src.index("def browser_exec("):]
+        assert body.index("_park_check(code, task_id)") < body.index("route_err = _route_backend(")
+        assert '"keep_out_of_sight"' in body
+
+    def test_hiding_and_raising_are_by_pid_and_raising_unhides_first(self):
+        from tools import browser_tool_real_profile as rp
+        assert "a.hide;" in rp._HIDE_PID_JXA and "isHidden" in rp._HIDE_PID_JXA
+        assert "(4242)" in rp._HIDE_PID_JXA % 4242 and "activate" not in rp._HIDE_PID_JXA
+        assert rp._ACTIVATE_PID_JXA.index("a.unhide;") < rp._ACTIVATE_PID_JXA.index("activateWithOptions")
 
     def test_a_headless_browser_another_process_launched_is_not_restarted_from_here(self, rp, monkeypatch):
         rp, calls = rp

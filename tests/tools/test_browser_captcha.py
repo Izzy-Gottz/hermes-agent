@@ -888,6 +888,29 @@ def test_engine_opens_nothing_for_a_retry_an_ip_ban_or_a_pass(engine_handoff, ca
     assert engine_handoff["calls"] == []
 
 
+def test_engine_hand_over_to_the_default_browser_says_it_is_theirs_not_moes(engine_handoff):
+    """2026-09-29 21:29Z, verbatim: handed_over.route "default_browser" while tell_person said "tick the box in
+    Moe's browser (click it in the Dock if it isn't in front)". The words now follow the route."""
+    engine_handoff["shown"] = {"success": True, "route": "default_browser", "url": "https://forums.macrumors.com/login",
+                               "driven_browser": "Moe's browser was not restarted with a window: 1 other conversation(s) "
+                                                 "used it in the last few minutes"}
+    c = _exec(MR_CODE)["captcha"]
+    assert c["handed_over"]["route"] == "default_browser"
+    assert "Moe's browser" not in c["tell_person"] and "Dock" not in c["tell_person"]
+    assert "your own browser" in c["tell_person"] and "finish that step there yourself" in c["tell_person"]
+    assert "That's your browser, not mine" in c["tell_person"]
+    assert "Moe cannot read" in c["next"] and "their own default browser" in c["next"]
+    assert "other conversation" in c["handed_over"]["why_not_moes_window"]
+
+
+def test_engine_hand_over_to_their_chrome_says_so(engine_handoff):
+    engine_handoff["shown"] = {"success": True, "route": "chrome", "url": "https://forums.macrumors.com/login",
+                               "front": False}
+    c = _exec(MR_CODE)["captcha"]
+    assert "your Chrome, in the \"Moe\" tab group" in c["tell_person"] and "Moe's browser" not in c["tell_person"]
+    assert "finish that step there yourself" in c["tell_person"]
+
+
 def test_engine_hand_over_that_fails_keeps_today_s_next(engine_handoff):
     engine_handoff["shown"] = {"success": False, "error": "busy"}
     c = _exec(MR_CODE)["captcha"]

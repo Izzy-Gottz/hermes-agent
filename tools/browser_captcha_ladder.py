@@ -940,11 +940,33 @@ _PERSON_LINES = {
 }
 
 
-def person_line(out: Outcome, front: bool) -> str:
+#: The same checks, for a page that had to go to the person's OWN browser: they do the whole step there.
+_THEIR_STEP = {
+    bc.HCAPTCHA: "tick the box, do the picture puzzle if one comes up, and anything else that page asks",
+    bc.RECAPTCHA_V2: "tick \"I'm not a robot\", do the picture puzzle if one comes up, and anything else that page asks",
+    bc.TURNSTILE: "tick the box if there is one, and anything else that page asks",
+    bc.CF_MANAGED: "tick the box if there is one, and anything else that page asks",
+    bc.PERIMETERX: "press and hold its button until it lets go, and anything else that page asks",
+}
+
+
+def person_line(out: Outcome, front: bool, route: str = "driven_browser") -> str:
+    """The one line the person is told -- true to where the page actually went. Moe's own window keeps Moe's
+    session (sign-ins, the form half filled); the person's own browser has none of it, so there they finish
+    the step themselves. 2026-09-29 the page went to the default browser while the line said "in Moe's
+    browser"."""
+    host = out.host or "The site"
+    if route not in ("driven_browser", ""):
+        their = ("your Chrome, in the \"Moe\" tab group" if route == "chrome" else "your own browser")
+        step = _THEIR_STEP.get(out.kind, "finish its " + out.kind.replace("_", " ") + " check and anything else "
+                               "that page asks")
+        return (f"{host} wants you to prove you're human, and I couldn't bring up my own browser window, so I opened "
+                f"the page in {their}. That's your browser, not mine: what I'd filled in isn't there, so you'll need "
+                f"to finish that step there yourself -- {step}. Tell me when it's done.")
     where = " in the window I just opened" if front else " in Moe's browser (click it in the Dock if it isn't in front)"
     tmpl = _PERSON_LINES.get(out.kind, "{host} needs you to finish its " + out.kind.replace("_", " ")
                              + " check{where}. Tell me when it's done.")
-    return tmpl.format(host=out.host or "The site", where=where)
+    return tmpl.format(host=host, where=where)
 
 
 def hand_over(result: Dict[str, Any], out: Outcome, presence: Optional[dict], task_id: Optional[str],
@@ -977,21 +999,28 @@ def hand_over(result: Dict[str, Any], out: Outcome, presence: Optional[dict], ta
         return False
     if not isinstance(shown, dict) or shown.get("success") is not True or not shown.get("route"):
         return False  # not shown (busy browser, person not here after all): the model keeps today's next
-    front = bool(shown.get("front")) and shown.get("route") == "driven_browser"
-    line = person_line(out, front)
+    route = str(shown.get("route"))
+    front = bool(shown.get("front")) and route == "driven_browser"
+    line = person_line(out, front, route)
     d = result.get("captcha") or {}
     d["handed_over"] = {k: shown[k] for k in ("route", "url", "front", "relaunched") if k in shown}
+    if route != "driven_browser" and shown.get("driven_browser"):
+        d["handed_over"]["why_not_moes_window"] = shown["driven_browser"]  # what stopped Moe's own window
     d["tell_person"] = line
     where = {"driven_browser": ("in Moe's browser window, in front of them" if front else
                                 "in Moe's browser window (macOS did not bring it forward)"),
-             "chrome": "in their Chrome, in the \"Moe\" tab group",
-             "default_browser": "in their default browser, without Moe's sign-ins"}.get(shown["route"], "on their screen")
+             "chrome": "in their own Chrome, in the \"Moe\" tab group, without Moe's page state",
+             "default_browser": "in their own default browser, without Moe's sign-ins or anything Moe typed"
+             }.get(route, "on their screen")
     stop = (" This is a hard stop: never try to solve it yourself, retry it or try another browser."
             if out.outcome == HARD_STOP else " Never try to solve it yourself.")
+    after = ("When they say they are done, call browser_handoff(done=true) and carry on with the task in the same "
+             "page." if route == "driven_browser" else
+             "When they say they are done, call browser_handoff(done=true): the step happened in THEIR browser, which "
+             "Moe cannot read, so ask what they finished there before carrying on -- Moe's own page did not change.")
     d["next"] = (f"Moe already put the page in front of the person ({where}); browser_handoff was called for you, so "
                  f"do not call it again now. Tell them in one line, as is: \"{line}\" Then END YOUR TURN and wait -- "
-                 "do not keep working and do not poll the page. When they say they are done, call "
-                 "browser_handoff(done=true) and carry on with the task." + stop)
+                 "do not keep working and do not poll the page. " + after + stop)
     if shown.get("form_state"):
         d["form_state"] = shown["form_state"]
     result["captcha"] = d
