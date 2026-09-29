@@ -1738,7 +1738,9 @@ def _run_claude_code_turn_body(
         # memory rebuilt, /model, a new per-request system message —
         # respawn so the CLI sees the new one (same CLI session, resumed).
         wanted_prompt = combined_system_prompt(agent)
+        fresh_child = created
         if not created and session.needs_respawn(wanted_prompt):
+            fresh_child = True
             logger.info("claude-code: system prompt changed; respawning session")
             _note_respawn(entry, registry_key)
             try:
@@ -1777,7 +1779,7 @@ def _run_claude_code_turn_body(
             # may have left armed (a turn that ended on a tool call).
             agent._stream_needs_break = False
             turn = session.run_turn(
-                user_input=user_message,
+                user_input=_with_helper_preamble(agent, user_message, fresh=fresh_child),
                 turn_timeout=float(cfg.get("turn_timeout") or 600.0),
                 idle_timeout=float(cfg.get("silence_timeout") or 300.0),
             )
@@ -1831,6 +1833,37 @@ def _run_claude_code_turn_body(
         user_message=user_message, original_user_message=original_user_message,
         messages=messages, should_review_memory=should_review_memory,
     )
+
+
+def _with_helper_preamble(agent, user_message: Any, *, fresh: bool) -> Any:
+    """``user_message`` with any background-helper context in front of it (see
+    ``tools.async_delegation_recall.turn_preamble``).
+
+    In the USER turn, never the system prompt: the system prompt is baked into the process at spawn and any
+    change to it respawns the child (+5–7 s), and this changes whenever a helper finishes. Only what the child is
+    sent changes — ``messages`` and the transcript keep the person's own words. Conversations only: a lane (the
+    background review, /btw) or a subagent is not the one the helpers report to."""
+    if str(getattr(agent, "_claude_code_lane", "") or "").strip() or _is_subagent(agent):
+        return user_message
+    try:
+        from tools.async_delegation_recall import turn_preamble
+        from tools.delegate_tool_registry import recall_scope
+
+        ids, owner = recall_scope(agent)
+        if not ids and not owner:
+            return user_message
+        from agent.transports.claude_code_session import _coerce_input_text
+
+        preamble = turn_preamble(ids, owner, _coerce_input_text(user_message), fresh=fresh)
+    except Exception:
+        logger.debug("claude-code: background-helper preamble failed", exc_info=True)
+        return user_message
+    if not preamble:
+        return user_message
+    logger.info("claude-code: telling the model about background helpers (%d chars)", len(preamble))
+    if isinstance(user_message, list):
+        return [{"type": "text", "text": preamble}, *user_message]
+    return f"{preamble}\n\n{user_message if isinstance(user_message, str) else str(user_message or '')}"
 
 
 def _approval_callback():

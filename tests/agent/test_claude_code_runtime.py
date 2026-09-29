@@ -1338,3 +1338,71 @@ class TestTurnLedgerSurvivesARebuild:
         assert seen == {"live": True, "token": second._turn_id, "same": True, "ping": "ok"}
         # And after the turn, the rebuilt session's ledger says so.
         assert rt._human_wait_state(second, "toolu_DURING", "x") == "ended"
+
+
+class TestBackgroundHelperPreamble:
+    """Background helpers the model has not been told about go in front of the USER turn — never the system
+    prompt (a change there respawns the child) — and only a fresh or respawned child gets the other-conversation
+    line (Moe, 2026-09-29: seven finished helpers, and the model told the owner it never started any)."""
+
+    def _spy(self, monkeypatch):
+        import tools.async_delegation_recall as recall
+        from agent.transports.claude_code_session import ClaudeCodeSession
+
+        seen, calls = [], []
+        original = ClaudeCodeSession.run_turn
+
+        def run_turn(self, *, user_input, **kw):
+            seen.append(user_input)
+            return original(self, user_input=user_input, **kw)
+
+        def preamble(ids, owner, text, *, fresh, **kw):
+            calls.append((tuple(ids), owner, text, fresh))
+            return "HELPERS-NOTE" if fresh else ""
+
+        monkeypatch.setattr(ClaudeCodeSession, "run_turn", run_turn)
+        monkeypatch.setattr(recall, "turn_preamble", preamble)
+        return seen, calls
+
+    def test_first_turn_of_a_new_child_carries_it_and_a_warm_turn_does_not(self, monkeypatch):
+        seen, calls = self._spy(monkeypatch)
+        agent = _agent("helpers-1", ephemeral="E")
+        _turn(agent, "did it finish?")
+        _turn(_agent("helpers-1", ephemeral="E"), "and now?")
+        assert seen[0] == "HELPERS-NOTE\n\ndid it finish?"
+        assert seen[1] == "and now?"
+        assert [c[3] for c in calls] == [True, False]
+        assert calls[0][0][0] == "helpers-1" and calls[0][2] == "did it finish?"
+        assert "HELPERS-NOTE" not in _prompt_file_text(agent._claude_code_session)
+
+    def test_a_respawn_counts_as_fresh(self, monkeypatch):
+        seen, calls = self._spy(monkeypatch)
+        _turn(_agent("helpers-2", ephemeral="ONE"), "a")
+        _turn(_agent("helpers-2", ephemeral="TWO"), "b")
+        assert [c[3] for c in calls] == [True, True]
+        assert seen[1] == "HELPERS-NOTE\n\nb"
+
+    def test_multipart_input_keeps_its_parts(self, monkeypatch):
+        self._spy(monkeypatch)
+        agent = _agent("helpers-3")
+        parts = [{"type": "text", "text": "look"}]
+        assert rt._with_helper_preamble(agent, parts, fresh=True) == [{"type": "text", "text": "HELPERS-NOTE"}, *parts]
+
+    def test_lanes_and_subagents_are_not_told(self, monkeypatch):
+        _seen, calls = self._spy(monkeypatch)
+        lane = _agent("helpers-4")
+        lane._claude_code_lane = "review"
+        sub = _agent("helpers-5")
+        sub.platform = "subagent"
+        assert rt._with_helper_preamble(lane, "x", fresh=True) == "x"
+        assert rt._with_helper_preamble(sub, "x", fresh=True) == "x"
+        assert calls == []
+
+    def test_a_broken_ledger_never_costs_the_turn(self, monkeypatch):
+        import tools.async_delegation_recall as recall
+
+        def boom(*a, **kw):
+            raise RuntimeError("ledger gone")
+
+        monkeypatch.setattr(recall, "turn_preamble", boom)
+        assert rt._with_helper_preamble(_agent("helpers-6"), "hello", fresh=True) == "hello"

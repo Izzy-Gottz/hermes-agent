@@ -479,7 +479,7 @@ def delegate_task(
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
     if normalized_action and normalized_action != "spawn":
-        return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
+        return tool_error(f"Unknown action '{action}'. Use spawn (default), list, result, steer, or stop.")
 
     # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
     if is_spawn_paused():
@@ -706,14 +706,17 @@ DELEGATE_TASK_SCHEMA = {
             "action": _p(
                 "string",
                 "Default 'spawn'. Live control of running children: "
-                "'list' = ids/goals/status/transcripts; 'steer' = queue "
+                "'list' = live ids/goals/status/transcripts, plus background helpers "
+                "finished in the last 24 h (this conversation and its owner's others) "
+                "and whether each result reached you; 'result' = read one finished "
+                "helper's full result (subagent_id = its delegation_id); 'steer' = queue "
                 "course-correction text into one child (subagent_id + "
                 "message) without stopping it; 'stop' = end one child "
                 "early (subagent_id; partial result still returns). "
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
-                enum=["spawn", "list", "steer", "stop"],
+                enum=["spawn", "list", "result", "steer", "stop"],
             ),
-            "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
+            "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list'), or the delegation_id for action='result'."),
             "message": _p(
                 "string",
                 "For action='steer': the course correction, appended to "
