@@ -48,7 +48,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from tools import browser_captcha as bc
-from tools.browser_captcha_input import Box, Delivery, pick_delivery
+from tools.browser_captcha_input import Box, Delivery, describe_timing, pick_delivery
 from tools.browser_captcha_solver import solver_for
 
 logger = logging.getLogger(__name__)
@@ -199,6 +199,11 @@ class Surface:
         """Tier C: a PNG of ``box`` (top-level viewport CSS px), or None."""
         return None
 
+    def prepare_input(self) -> Optional[Dict[str, Any]]:
+        """Before an input: make the page render if it is a hidden background tab
+        (tools.browser_captcha_input.ensure_rendering). What was done, or None."""
+        return None
+
 
 class Ladder:
     """One run of the state machine against one surface. ``sleep``/``clock``/``rng`` are injectable."""
@@ -325,6 +330,10 @@ class Ladder:
                                      tier="A", delivery=delivery.name, steps=steps)
                 break
             attempts += 1
+            woke = surface.prepare_input()
+            if woke and woke.get("before") not in ("visible", ""):
+                steps.append(f"tab was {woke['before']}: {woke.get('via') or 'nothing worked'} -> {woke.get('after')} "
+                             f"({woke.get('ms', 0)} ms)")
             try:
                 if ch.kind == bc.PERIMETERX:
                     verdict, held = delivery.hold(box, self.rng, lambda: self._hold_verdict(surface, ch),
@@ -333,6 +342,9 @@ class Ladder:
                 else:
                     delivery.click(box, self.rng)
                     steps.append(f"clicked ({delivery.name}) at {self._t(start)}")
+                timing = describe_timing(getattr(delivery, "last_timing", None) or {})
+                if timing:
+                    steps.append(timing)
             except NotImplementedError as exc:
                 return self._out(ch, NEEDS_PERSON, str(exc), tier="A", delivery=delivery.name, attempts=attempts, steps=steps)
             # The usual answer to a checkbox click is the image challenge, and it can take a moment to be
@@ -494,8 +506,8 @@ class PageSession:
     def __init__(self, conn: CdpConn, target_id: str, session_id: str):
         self.conn, self.target_id, self.session_id = conn, target_id, session_id
 
-    def call(self, method: str, params: Optional[dict] = None) -> dict:
-        return self.conn.call(method, params, session_id=self.session_id)
+    def call(self, method: str, params: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
+        return self.conn.call(method, params, session_id=self.session_id, timeout=timeout)
 
 
 def _frame_ids(tree: dict) -> List[str]:
@@ -606,6 +618,10 @@ class CdpSurface(Surface):
     def screenshot(self, box: Box) -> Optional[bytes]:
         from tools.browser_captcha_grid import screenshot_cdp
         return screenshot_cdp(self.page, box)
+
+    def prepare_input(self) -> Optional[Dict[str, Any]]:
+        from tools.browser_captcha_input import ensure_rendering
+        return ensure_rendering(self.page)
 
     def delivery(self) -> Tuple[Delivery, str]:
         if self._delivery is None:

@@ -541,6 +541,91 @@ def test_cdp_click_moves_along_a_path_then_presses_inside_the_box():
     assert 0.3 <= clock() - 1000 <= 1.3
 
 
+class SlowAckPage(RecPage):
+    """A page that acks every mouseMoved ``ack_s`` late (a hidden headless tab: measured ~5.1 s)."""
+
+    def __init__(self, clock, ack_s):
+        super().__init__()
+        self.clock, self.ack_s, self.timeouts = clock, ack_s, []
+
+    def call(self, method, params=None, timeout=None):
+        self.timeouts.append(timeout)
+        self.events.append((method, dict(params or {})))
+        if (params or {}).get("type") == "mouseMoved":
+            if timeout is not None and self.ack_s > timeout:
+                self.clock.sleep(timeout)
+                raise TimeoutError("CDP Input.dispatchMouseEvent timed out")
+            self.clock.sleep(self.ack_s)
+        return {}
+
+
+def test_cdp_click_on_a_slow_page_is_bounded_and_goes_straight_to_the_target():
+    clock = Clock()
+    page = SlowAckPage(clock, ack_s=5.1)
+    d = bi.CdpDelivery(page, sleep=clock.sleep, clock=clock)
+    box = bi.Box(300, 200, 26, 24)
+    target = d.click(box, random.Random(2))
+    types = [p["type"] for _, p in page.events]
+    assert types.count("mouseMoved") <= 2 and types[-2:] == ["mousePressed", "mouseReleased"]
+    assert set(page.timeouts) == {bi.INPUT_TIMEOUT_S}          # every input call bounded
+    assert clock() - 1000 < 2 * bi.INPUT_TIMEOUT_S + 1.5        # not 8-30 x 5 s
+    moved_to = [p for _, p in page.events if p["type"] == "mouseMoved"][-1]
+    assert (moved_to["x"], moved_to["y"]) == target             # the pointer is over the target when pressed
+    t = d.last_timing
+    assert t["cut"] == "slow acks" and t["timeouts"] >= 1 and t["planned"] > t["moves"]
+    assert "path cut short (slow acks)" in bi.describe_timing(t)
+
+
+def test_cdp_click_on_a_prompt_page_keeps_the_whole_path():
+    clock = Clock()
+    page = SlowAckPage(clock, ack_s=0.015)
+    d = bi.CdpDelivery(page, sleep=clock.sleep, clock=clock)
+    d.click(bi.Box(300, 200, 26, 24), random.Random(2))
+    assert "cut" not in d.last_timing and d.last_timing["moves"] == d.last_timing["planned"] >= bi.MIN_STEPS
+
+
+class VisPage:
+    def __init__(self, wakes_on):
+        self.vis, self.wakes_on, self.calls = "hidden", wakes_on, []
+
+    def call(self, method, params=None):
+        self.calls.append(method)
+        if method == "Runtime.evaluate":
+            return {"result": {"value": self.vis}}
+        if method in self.wakes_on:
+            self.vis = "visible"
+        return {}
+
+
+def test_ensure_rendering_uses_focus_emulation_first_and_bring_to_front_only_if_still_hidden():
+    p = VisPage({"Emulation.setFocusEmulationEnabled"})
+    out = bi.ensure_rendering(p)
+    assert out["before"] == "hidden" and out["after"] == "visible" and out["via"] == "Emulation.setFocusEmulationEnabled"
+    assert "Page.bringToFront" not in p.calls and "Page.setWebLifecycleState" not in p.calls
+    p = VisPage({"Page.bringToFront"})
+    out = bi.ensure_rendering(p)
+    assert out["after"] == "visible" and out["via"] == "Emulation.setFocusEmulationEnabled+Page.bringToFront"
+    p = VisPage(set())
+    p.vis = "visible"
+    assert bi.ensure_rendering(p)["via"] == "" and p.calls == ["Runtime.evaluate"]
+
+
+def test_ladder_wakes_a_hidden_tab_before_each_click_and_records_the_input_timing():
+    clock = Clock()
+    s = FakeSurface(lambda st, t: ts(solved=st["inputs"] >= 1), clock)
+    woke = []
+
+    def prepare():
+        woke.append(1)
+        return {"before": "hidden", "after": "visible", "via": "Emulation.setFocusEmulationEnabled", "ms": 3}
+    s.prepare_input = prepare
+    s.fd.last_timing = {"moves": 12, "planned": 12, "move_s": 0.6, "slowest_ack_ms": 20, "press_ms": 3, "release_ms": 4}
+    out = bl.Ladder({}, sleep=clock.sleep, clock=clock, rng=random.Random(1)).run(s, bc.classify(s.facts()), "t")
+    assert out.outcome == bl.PASSED and woke == [1]
+    assert "tab was hidden: Emulation.setFocusEmulationEnabled -> visible (3 ms)" in out.steps
+    assert any(st.startswith("input: 12/12 moves in 0.6s, slowest ack 20 ms") for st in out.steps)
+
+
 def test_cdp_hold_releases_on_the_verdict():
     page, clock = RecPage(), Clock()
     d = bi.CdpDelivery(page, sleep=clock.sleep, clock=clock)
@@ -1089,6 +1174,34 @@ def test_live_ladder_press_and_hold_until_the_page_lets_go(chrome, conn):
     out = bl.Ladder({}, rng=random.Random(5)).run(bl.CdpSurface(conn, page), ch, "live-px")
     assert out.outcome == bl.PASSED, out.to_dict()
     assert out.attempts == 1 and time.monotonic() - t0 < 15
+
+
+@live
+def test_live_a_hidden_background_tab_is_made_to_render_and_the_click_lands(chrome, conn):
+    """2026-09-29, forums.macrumors.com: the tab reported visibilityState "hidden" in the headless browser and
+    the hCaptcha click took ~a minute and never landed. MEASURED here (CfT 154, a newer tab in front): each
+    mouseMoved acked after ~5.1 s and the iframe never saw the click; after ensure_rendering, 2-29 ms and it did."""
+    page = _open(conn, f"http://127.0.0.1:{chrome['top']}/login", settle=lambda p: _frame_ready(conn))
+    other = conn.call("Target.createTarget", {"url": "about:blank"})["targetId"]  # a newer tab takes the front
+    try:
+        deadline = time.monotonic() + 10
+        while bi._visibility(page) != "hidden" and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert bi._visibility(page) == "hidden", "the page never went to the background"
+        found = bl.find_challenge(conn, ["127.0.0.1"], prefer_target=page.target_id)
+        assert found is not None and found[0].target_id == page.target_id
+        fast = {**bl.BUDGETS, bc.TURNSTILE: bl.Budget(wait_s=0.5, attempts=2, poll_s=4.0)}
+        t0 = time.monotonic()
+        out = bl.Ladder({}, rng=random.Random(3), budgets=fast).run(bl.CdpSurface(conn, found[0]), found[1], "live-hidden")
+        took = time.monotonic() - t0
+        print("measured:", json.dumps({"took_s": round(took, 1), "steps": out.steps}))
+        assert out.outcome == bl.PASSED, out.to_dict()
+        assert any(st.startswith("tab was hidden:") and st.endswith(")") and "-> visible" in st for st in out.steps)
+        assert took < 20
+        clicks = [e for e in _events(page) if e["type"] == "click"]
+        assert clicks and all(e["isTrusted"] for e in clicks)
+    finally:
+        conn.call("Target.closeTarget", {"targetId": other})
 
 
 _BU_CLI = Path.home() / ".local" / "share" / "uv" / "tools" / "browser-use" / "bin" / "browser-use"

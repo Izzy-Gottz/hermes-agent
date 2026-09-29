@@ -28,7 +28,7 @@ import math
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 Point = Tuple[float, float]
 
@@ -106,20 +106,96 @@ class Delivery:
         raise NotImplementedError
 
 
+#: Each ``Input.dispatchMouseEvent`` waits for the renderer's ack; this bounds one. MEASURED 2026-09-29, Chrome
+#: for Testing 154.0.8037.92 ``--headless=new``, a page with a cross-site iframe put in the background by a
+#: newer tab (``document.visibilityState == "hidden"``, as the forums.macrumors.com tab was): every
+#: ``mouseMoved`` acked after 5.06-5.68 s (10 of 10, three runs), press/release after 3-51 ms, and the click
+#: NEVER reached the iframe. A 8-30 move path is then 40-150 s a click -- the "clicked (cdp) at 98.1s" seen
+#: live. After :func:`ensure_rendering` the same moves acked in 2-29 ms and the iframe saw the click.
+INPUT_TIMEOUT_S = 2.0
+#: The whole pointer approach (all the moves before the press) is bounded to this; past it the pointer goes
+#: straight to the target and presses.
+MOVE_BUDGET_S = 3.0
+#: One ack slower than this means the page is not rendering promptly: the rest of the path is skipped (a
+#: shorter path, not a slower one) and the pointer goes straight to the target.
+SLOW_ACK_S = 0.5
+
+VISIBILITY_JS = "document.visibilityState"
+
+
+def _visibility(page: Any) -> str:
+    try:
+        return str(((page.call("Runtime.evaluate", {"expression": VISIBILITY_JS, "returnByValue": True})
+                     .get("result") or {}).get("value")) or "")
+    except Exception:
+        return ""
+
+
+def ensure_rendering(page: Any, clock: Callable[[], float] = time.monotonic) -> Dict[str, Any]:
+    """Make a background tab render before input is delivered to it. ``{"before", "after", "via", "ms"}``.
+
+    A headless tab that is not the browser's foreground tab reports ``visibilityState == "hidden"``, does not
+    produce frames, and then acks every mouse event ~5 s late and never hit-tests into its cross-origin
+    iframes (measured: see INPUT_TIMEOUT_S). MEASURED on the same page, one call each, fresh browser each:
+    ``Emulation.setFocusEmulationEnabled {enabled: true}`` -> "visible" (moves then 2-25 ms, click landed);
+    ``Page.bringToFront`` -> "visible" (2-29 ms, click landed); ``Page.setWebLifecycleState {state: "active"}``
+    -> still "hidden" (5.1 s acks, no click) -- so it is not used. Focus emulation goes first: it is scoped to
+    this CDP session (it ends when the ladder detaches) and does not take the foreground from another
+    conversation's tab; bringToFront only if the page is still hidden."""
+    t0 = clock()
+    before = _visibility(page)
+    out: Dict[str, Any] = {"before": before, "after": before, "via": ""}
+    if before in ("visible", ""):
+        out["ms"] = round((clock() - t0) * 1000)
+        return out
+    for method, params in (("Emulation.setFocusEmulationEnabled", {"enabled": True}), ("Page.bringToFront", {})):
+        try:
+            page.call(method, params)
+        except Exception:
+            continue
+        out["via"] = f"{out['via']}+{method}" if out["via"] else method
+        out["after"] = _visibility(page)
+        if out["after"] == "visible":
+            break
+    out["ms"] = round((clock() - t0) * 1000)
+    return out
+
+
 class CdpDelivery(Delivery):
-    """``Input.dispatchMouseEvent`` on a page session (``page.call(method, params)``)."""
+    """``Input.dispatchMouseEvent`` on a page session (``page.call(method, params)``).
+
+    Every input call is bounded (INPUT_TIMEOUT_S) and so is the whole approach (MOVE_BUDGET_S): a page that
+    acks slowly gets fewer moves, never a minute-long click. ``last_timing`` says what one click cost."""
     name = "cdp"
     verified = True
 
     def __init__(self, page: Any, sleep: Callable[[float], None] = time.sleep, start: Optional[Point] = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, input_timeout_s: float = INPUT_TIMEOUT_S,
+                 move_budget_s: float = MOVE_BUDGET_S, slow_ack_s: float = SLOW_ACK_S):
         self.page = page
         self.sleep = sleep
         self.clock = clock
         self.pos: Optional[Point] = start
+        self.input_timeout_s = input_timeout_s
+        self.move_budget_s = move_budget_s
+        self.slow_ack_s = slow_ack_s
+        self.last_timing: Dict[str, Any] = {}
 
     def available(self) -> Tuple[bool, str]:
         return True, "cdp"
+
+    def _input(self, params: dict) -> float:
+        """One bounded ``Input.dispatchMouseEvent``; returns its ack time in seconds (the bound on a timeout)."""
+        t = self.clock()
+        try:
+            try:
+                self.page.call("Input.dispatchMouseEvent", params, timeout=self.input_timeout_s)
+            except TypeError:  # a page object without per-call timeouts
+                self.page.call("Input.dispatchMouseEvent", params)
+        except TimeoutError:
+            self.last_timing["timeouts"] = self.last_timing.get("timeouts", 0) + 1
+            return max(self.input_timeout_s, self.clock() - t)
+        return self.clock() - t
 
     def _start(self, rng: random.Random, box: Box) -> Point:
         if self.pos is None:  # enter from somewhere plausible below/left of the target
@@ -128,24 +204,41 @@ class CdpDelivery(Delivery):
 
     def _move(self, to: Point, rng: random.Random, box: Box, buttons: int = 0) -> None:
         pts, delays = human_path(self._start(rng, box), to, rng)
-        for (x, y), d in zip(pts, delays):
+        started = self.clock()
+        sent, slowest, cut = 0, 0.0, ""
+        for i, ((x, y), d) in enumerate(zip(pts, delays)):
+            last = i == len(pts) - 1
+            if not last:
+                if slowest > self.slow_ack_s:
+                    cut = "slow acks"
+                elif self.clock() - started > self.move_budget_s:
+                    cut = "move budget"
+                if cut:
+                    x, y = pts[-1]  # straight to the target: a shorter path, never a slower one
+                    last = True
             self.sleep(d)
-            self.page.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y, "buttons": buttons,
-                                                        "pointerType": "mouse"})
+            ack = self._input({"type": "mouseMoved", "x": x, "y": y, "buttons": buttons, "pointerType": "mouse"})
+            sent += 1
+            slowest = max(slowest, ack)
+            if last:
+                break
         self.pos = to
+        self.last_timing.update(moves=sent, planned=len(pts), move_s=round(self.clock() - started, 2),
+                                slowest_ack_ms=round(slowest * 1000), **({"cut": cut} if cut else {}))
 
-    def _button(self, kind: str, p: Point) -> None:
-        self.page.call("Input.dispatchMouseEvent", {"type": kind, "x": p[0], "y": p[1], "button": "left",
-                                                    "buttons": 1 if kind == "mousePressed" else 0, "clickCount": 1,
-                                                    "pointerType": "mouse"})
+    def _button(self, kind: str, p: Point) -> float:
+        return self._input({"type": kind, "x": p[0], "y": p[1], "button": "left",
+                            "buttons": 1 if kind == "mousePressed" else 0, "clickCount": 1, "pointerType": "mouse"})
 
     def click(self, box: Box, rng: random.Random) -> Point:
+        self.last_timing = {}
         target = point_inside(box, rng)
         self._move(target, rng, box)
         self.sleep(rng.uniform(0.04, 0.16))
-        self._button("mousePressed", target)
+        press = self._button("mousePressed", target)
         self.sleep(rng.uniform(0.05, 0.14))
-        self._button("mouseReleased", target)
+        release = self._button("mouseReleased", target)
+        self.last_timing.update(press_ms=round(press * 1000), release_ms=round(release * 1000))
         return target
 
     def hold(self, box: Box, rng: random.Random, until: Callable[[], Optional[bool]], max_s: float,
@@ -153,6 +246,7 @@ class CdpDelivery(Delivery):
         """Press inside ``box`` and keep it pressed, polling ``until()`` -- True (done: release), False (failed:
         release), None (keep holding) -- for at most ``max_s``. No fixed hold time: the page decides.
         A pressed hand is never perfectly still: an occasional sub-pixel drift with the button down."""
+        self.last_timing = {}
         target = point_inside(box, rng)
         self._move(target, rng, box)
         self.sleep(rng.uniform(0.05, 0.15))
@@ -164,8 +258,7 @@ class CdpDelivery(Delivery):
                 self.sleep(poll_s)
                 if rng.random() < 0.3:
                     jx, jy = target[0] + rng.uniform(-0.6, 0.6), target[1] + rng.uniform(-0.6, 0.6)
-                    self.page.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": jx, "y": jy, "buttons": 1,
-                                                                "pointerType": "mouse"})
+                    self._input({"type": "mouseMoved", "x": jx, "y": jy, "buttons": 1, "pointerType": "mouse"})
                 verdict = until()
                 if verdict is not None:
                     break
@@ -173,6 +266,21 @@ class CdpDelivery(Delivery):
             self.sleep(rng.uniform(0.03, 0.1))
             self._button("mouseReleased", target)
         return verdict, self.clock() - started
+
+
+def describe_timing(t: Dict[str, Any]) -> str:
+    """One step line for the ladder's record: what the last input cost."""
+    if not t:
+        return ""
+    parts = [f"{t.get('moves', 0)}/{t.get('planned', 0)} moves in {t.get('move_s', 0):g}s",
+             f"slowest ack {t.get('slowest_ack_ms', 0)} ms"]
+    if "press_ms" in t:
+        parts.append(f"press {t['press_ms']} ms, release {t.get('release_ms', 0)} ms")
+    if t.get("cut"):
+        parts.append(f"path cut short ({t['cut']})")
+    if t.get("timeouts"):
+        parts.append(f"{t['timeouts']} input call(s) timed out")
+    return "input: " + ", ".join(parts)
 
 
 @dataclass
