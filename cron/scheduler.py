@@ -908,6 +908,37 @@ def _consume_interrupted_flag(job_id: str, token: Optional[object] = None) -> bo
         return hit
 
 
+def _awake_idle_seconds(agent, state: dict) -> float:
+    """Seconds the agent has been idle WHILE THIS MACHINE WAS AWAKE.
+
+    ``seconds_since_activity`` is wall-clock, and a laptop's maintenance sleep
+    counts in it: Memoe, 2026-09-30 — a Mac dozed 09:01:49–09:16:49 and the
+    watchdog killed the job 6 s after it woke ("idle 905s, last activity:
+    initializing"), five mornings running. ``time.monotonic`` does not advance
+    while macOS sleeps (and Linux's does not either), so idle time is carried
+    here on the monotonic clock, restarting whenever the agent reports new
+    activity. ``state`` is this run's: {"at", "idle", "mono"}."""
+    if not hasattr(agent, "get_activity_summary"):
+        return 0.0
+    try:
+        _act = agent.get_activity_summary()
+        raw = float(_act.get("seconds_since_activity", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+    now_mono = time.monotonic()
+    step = max(0.0, now_mono - state["mono"])
+    state["mono"] = now_mono
+    activity_at = time.time() - raw
+    if state["at"] is None or activity_at > state["at"] + 1.0:
+        # New activity since the last look: idle restarts from what is left
+        # of it, never more than one poll's worth of awake time.
+        state["at"] = activity_at
+        state["idle"] = min(raw, step) if state["at"] is not None and step else 0.0
+        return state["idle"]
+    state["idle"] += min(step, raw)
+    return state["idle"]
+
+
 def _inactivity_watchdog_loop(
     *, get_idle_seconds: Callable[[], float], limit_s: float, poll_s: float, stop: threading.Event,
     future_done: Callable[[], bool],
@@ -1721,14 +1752,10 @@ def _run_agent_with_watchdog(
     _inactivity_timeout = False
     _watch_stop = threading.Event()
 
+    _awake = {"at": None, "idle": 0.0, "mono": time.monotonic()}
+
     def _idle_seconds() -> float:
-        if not hasattr(agent, "get_activity_summary"):
-            return 0.0
-        try:
-            _act = agent.get_activity_summary()
-            return float(_act.get("seconds_since_activity", 0.0) or 0.0)
-        except Exception:
-            return 0.0
+        return _awake_idle_seconds(agent, _awake)
 
     def _watch_inactivity() -> None:
         nonlocal _inactivity_timeout

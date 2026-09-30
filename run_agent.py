@@ -748,6 +748,12 @@ class AIAgent(
         # Gates run at enqueue/spawn time; the idle dispatcher re-checks `enabled` at dispatch time.
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
             return
+        # The agent's own "no review" (cron sets it) holds for every runtime. Only the classic
+        # turn finalizer checked it; the claude_code and codex runtimes spawned a review after
+        # every cron turn anyway (Memoe, 2026-09-30: a second claude session after each
+        # marketing job, retired after 120 s of silence or failed, ~2 min each).
+        if focus is None and not explicit and getattr(self, "skip_background_review", False) is True:
+            return
         task_cfg = None
         if focus is None:
             from agent.background_review import load_background_review_settings
