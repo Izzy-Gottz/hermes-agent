@@ -1779,6 +1779,9 @@ def _run_agent_with_watchdog(
     return result
 
 
+_TOOL_CALL_TEXT = re.compile(r"<\s*(?:invoke|parameter)\s+name\s*=|<\s*/?\s*(?:function_calls|invoke)\s*>", re.I)
+
+
 def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgent) -> str:
     """Deliverable final response from a ``run_conversation`` result. Raises RuntimeError on
     `failed=True`/`completed=False`: the error text may sit in `final_response` and would otherwise
@@ -1805,6 +1808,14 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
             job_name)
 
     final_response = result.get("final_response", "") or ""
+    # Tool calls written out as text are not an answer. A claude-code child whose hermes-tools MCP
+    # server failed to connect still has the tools described in its prompt, so it types the calls it
+    # meant to make (`<invoke name="skill_view">…`) and ends the turn; that was booked `ok` and
+    # delivered as the job's reply (Memoe, 2026-09-30: three jobs started at once, the MCP server
+    # timed out, one job's "reply" was its unrun tool calls). A failed run, so it is never delivered.
+    if _TOOL_CALL_TEXT.search(final_response):
+        raise RuntimeError("the job's tools did not load, so its answer was tool calls written out as "
+                           "text; nothing was delivered")
     # Repair model-mangled computer_use media paths before delivery (fail-open, as in gateway).
     if final_response:
         from gateway.media_repair import repair_explicit_computer_use_media_paths
