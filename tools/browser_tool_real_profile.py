@@ -551,10 +551,14 @@ GOOGLE_SESSION_NOTE = ("Sign in with Google works here: on a site's \"Continue w
 def google_wall_note(url: str = "") -> str:
     """What to do on a page where Google asks the person to prove it is them (passkey, security key,
     verification, password): hand THAT page over, then carry on with the site's sign-in."""
+    from tools.browser_person_step import PASSKEY_OTHER_WAY, is_passkey_challenge
     where = f"url=\"{url}\", " if url else ""
+    passkey = is_passkey_challenge(url)
     return ("Google is asking the person to prove it is them on this page (a passkey, a security key, a "
-            "verification step or a password). That is the one step that is theirs: call browser_handoff("
-            f"{where}reason=\"approve the Google sign-in\") so they approve it in Moe's window, and when they say "
+            "verification step or a password). "
+            + (PASSKEY_OTHER_WAY + " The step that then needs them is theirs: call browser_handoff(" if passkey else
+               "That is the one step that is theirs: call browser_handoff(")
+            + f"{where}reason=\"approve the Google sign-in\") so they approve it in Moe's window, and when they say "
             "done, call browser_handoff(done=true) and carry on with the site's sign-in. Do not give up on Google "
             "sign-in or send them to do it somewhere else.")
 
@@ -739,9 +743,12 @@ def _live_holders(copy_dir: str) -> list:
 
 def _terminate_orphaned_browsers_on_dir(copy_dir: str) -> int:
     """Terminate browsers holding ``copy_dir`` whose launching Hermes died. A holder whose owner is
-    alive (another Hermes process sharing this home) is left alone."""
+    alive (another Hermes process sharing this home) is left alone -- and so is a window the person can
+    see or has just handed back (:func:`window_state`): its launcher may be a tool process that was
+    restarted while they were in it, and the page they worked on lives only there."""
     own = _own_browser_pids()
-    orphans = [p for p in _browsers_on_data_dir(copy_dir) if p.pid not in own and _is_orphan(p)]
+    keep = window_state().get("pid")
+    orphans = [p for p in _browsers_on_data_dir(copy_dir) if p.pid not in own and p.pid != keep and _is_orphan(p)]
     return _terminate_processes(orphans, "orphaned driven-browser") if orphans else 0
 
 
@@ -785,6 +792,8 @@ def release_if_idle(now: Optional[float] = None) -> bool:
         # would take the page out from under them.
         return False
     with _bt._real_profile_cdp_lock:
+        if window_state().get("pid") in _own_browser_pids():
+            _set_window_state(None)
         _bt._real_profile_cdp_cache.pop("cdp", None)
         _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
         _terminate_real_profile_chrome()
@@ -1008,8 +1017,9 @@ def _is_headless_now(copy_dir: str) -> bool:
     command line (the browser holding ``copy_dir``). NOT ``/json/version``: measured 2026-09-25, Chrome
     for Testing 154 under ``--headless=new`` reports ``Browser: Chrome/154…``, the same as a window.
     Unknown counts as hidden -- a needless relaunch costs a reload; a wrong "it's in front of you" costs
-    the person looking for a window that is not there."""
-    if _launched_headless["headless"] is not None:
+    the person looking for a window that is not there. What this process launched is believed only while
+    that launch is still running: another tool process may have restarted it with a window since."""
+    if _launched_headless["headless"] is not None and _own_browser_pids():
         return bool(_launched_headless["headless"])
     try:
         cmdlines = [" ".join(p.cmdline()) for p in _browsers_on_data_dir(copy_dir)]
@@ -1157,6 +1167,11 @@ def _capture_form(ws_url: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _typed_count(page: Dict[str, str]) -> int:
+    """How many fields Moe has typed into on ``page`` (0 when none, or it cannot be read)."""
+    return len((_capture_form(page.get("ws") or "") or {}).get("fields") or [])
+
+
 def _restore_form(port: int, target_id: str, saved: Dict[str, Any], wait: float = 15.0) -> Dict[str, Any]:
     """Put ``saved`` back into the reopened tab once it has loaded: ``{"restored": n, "missing": [labels]}``."""
     from tools.browser_person_step import _evaluate, page_targets
@@ -1192,11 +1207,27 @@ def _bring_to_front(port: int, target_id: str, pid: Optional[int]) -> bool:
     return _activate_pid(pid or 0) and ok
 
 
-def driven_pages() -> List[Dict[str, str]]:
-    """Open http(s) tabs of the running driven browser, most recently active first (measured: Chrome's
-    ``/json/list`` moves an activated tab to the front), none when it is not running."""
-    from tools.browser_person_step import page_targets
+def running_cdp() -> Optional[str]:
+    """The HTTP CDP root of Moe's own browser while it runs: the one this process attached to, else the one on
+    this home's profile copy -- a tool process restarted since it was launched (see :func:`conversation_key`)
+    has not attached to it yet, and must still find the page the person is waiting on. None when not running."""
     cached = _origin()._real_profile_cdp_cache.get("cdp")
+    if cached and _cdp_http_ready(cached):
+        return cached
+    try:
+        from hermes_cli.browser_connect import real_profile_copy_dir
+        return _surviving_chrome_cdp(real_profile_copy_dir(_lane_browser()))
+    except Exception as e:
+        _origin().logger.debug("handoff: looking for Moe's browser on its profile copy: %s", e)
+        return None
+
+
+def driven_pages(cdp: str = "") -> List[Dict[str, str]]:
+    """Open http(s) tabs of the running driven browser (``cdp``, else :func:`running_cdp`), most recently
+    active first (measured: Chrome's ``/json/list`` moves an activated tab to the front), none when it is
+    not running."""
+    from tools.browser_person_step import page_targets
+    cached = cdp or running_cdp()
     return page_targets(cached) if cached else []
 
 
@@ -1206,7 +1237,7 @@ def own_browser_to_sweep(env_cdp: str) -> Optional[str]:
     its tabs be tidied (tools/browser_exec_health.sweep_own_browser): never the person's own browser
     (a /browser connect override never lands in this cache), never a window the person is working in."""
     cached = str(_origin()._real_profile_cdp_cache.get("cdp") or "")
-    if not cached or _shown_to_person["on"]:
+    if not cached or _shown_now():
         return None
     port = re.search(r":(\d+)", cached)
     other = re.search(r"127\.0\.0\.1:(\d+)|localhost:(\d+)|\[::1\]:(\d+)", str(env_cdp or ""))
@@ -1215,16 +1246,46 @@ def own_browser_to_sweep(env_cdp: str) -> Optional[str]:
     return cached if cached.startswith("http://") else f"http://127.0.0.1:{port.group(1)}"
 
 
+def _same_page(url: str, hint: str) -> int:
+    """How surely the open tab at ``url`` is the page ``hint`` names: 3 the same address (or it starts with the
+    hint); 2 the same scheme, host and path with every query parameter the hint gives, at the same value; 1 the
+    same scheme, host and path of a sign-in in progress, whose one-time parameters move on (a fresh ``TL=`` or
+    ``state=``); 0 not it.
+
+    2026-09-30 (Moe transcript b3e9d36e): the model named Google's passkey page with 11 of its 15 parameters --
+    it left out ``continue``, ``dsh``, ``opparams`` and ``state`` and changed none -- so the prefix test missed the
+    open tab, the hand-over said "that page is not open in Moe's own browser" and opened it in the person's own
+    browser, where a sign-in that lives in Moe's browser cannot finish."""
+    if url == hint or url.startswith(hint):
+        return 3
+    from urllib.parse import parse_qsl, urlparse
+    from tools.browser_person_step import session_bound
+    try:
+        a, b = urlparse(url), urlparse(hint)
+    except ValueError:
+        return 0
+    if (a.scheme, (a.hostname or "").lower(), a.path.rstrip("/")) != (b.scheme, (b.hostname or "").lower(),
+                                                                       b.path.rstrip("/")) or not b.hostname:
+        return 0
+    have = parse_qsl(a.query, keep_blank_values=True)
+    if all(pair in have for pair in parse_qsl(b.query, keep_blank_values=True)):
+        return 2
+    return 1 if session_bound(hint) else 0
+
+
 def _pick_page(pages: List[Dict[str, str]], url_hint: str, target_id: str = "") -> Optional[Dict[str, str]]:
     """The tab to show: the tab ``target_id`` names (the harness's own tab, browser_exec_health's
-    current-tab record) when it is still open; else the one at ``url_hint`` when given (None when no tab
-    is there -- showing a different page than the one named would be worse than none); else the first."""
+    current-tab record) when it is still open; else the one at ``url_hint`` when given (:func:`_same_page`; the
+    most recently active of the surest matches; None when no tab is there -- showing a different page than the
+    one named would be worse than none); else the first."""
     if target_id:
         hit = next((p for p in pages if p.get("id") == target_id), None)
         if hit is not None:
             return hit
     if url_hint:
-        return next((p for p in pages if p["url"] == url_hint or p["url"].startswith(url_hint)), None)
+        scored = [(_same_page(p["url"], url_hint), p) for p in pages]
+        best = max((s for s, _ in scored), default=0)
+        return next((p for s, p in scored if s == best), None) if best else None
     return pages[0] if pages else None
 
 
@@ -1239,23 +1300,37 @@ def _claims_dir() -> str:
     return os.path.join(str(get_hermes_home()), "browser-profile", _CLAIMS_DIRNAME)
 
 
+def conversation_key() -> str:
+    """The conversation this process's tools serve, the same across tool-process restarts; "" when unknown.
+
+    Under Claude Code the tools run in ``agent.transports.hermes_tools_mcp_server``, one process per ``claude``
+    child, and the child is restarted often -- MEASURED 2026-09-30: four such processes at once, and a new one
+    (started 11:22:12) for a conversation whose browser an earlier one had launched at 10:54:58. The CLI gives
+    each server the conversation it resumed: ``CLAUDE_CODE_SESSION_ID`` was ``b3e9d36e-...`` in that new process,
+    the transcript's own id. Unknown (the gateway's own process, a helper) is never taken for a match."""
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    return f"cc:{sid}" if sid else ""
+
+
 def claim_driven_browser(now: Optional[float] = None) -> None:
-    """This process is using the driven browser (called on every acquire). Never raises."""
+    """This process is using the driven browser (called on every acquire), for :func:`conversation_key`'s
+    conversation. Never raises."""
     try:
         d = _claims_dir()
         os.makedirs(d, mode=0o700, exist_ok=True)
         path = os.path.join(d, str(os.getpid()))
-        with open(path, "a", encoding="utf-8"):
-            pass
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(conversation_key())
         now = time.time() if now is None else now
         os.utime(path, (now, now))
     except OSError as e:
         _origin().logger.debug("real-profile: claim not written: %s", e)
 
 
-def other_live_claims(within_s: float, now: Optional[float] = None) -> List[int]:
+def other_live_claims(within_s: float, now: Optional[float] = None, *, conversation: str = "") -> List[int]:
     """Pids of OTHER live processes that used the driven browser within ``within_s`` seconds. A claim
-    whose process is gone is removed."""
+    whose process is gone is removed. A claim for ``conversation`` (when known) is this conversation's own
+    work from before its tool process was restarted -- not someone else's -- and is left out."""
     now = time.time() if now is None else now
     out: List[int] = []
     try:
@@ -1276,8 +1351,13 @@ def other_live_claims(within_s: float, now: Optional[float] = None) -> List[int]
                 pass
             continue
         try:
-            if 0 <= now - os.path.getmtime(path) <= within_s:
-                out.append(pid)
+            if not 0 <= now - os.path.getmtime(path) <= within_s:
+                continue
+            if conversation:
+                with open(path, encoding="utf-8") as fh:
+                    if fh.read().strip() == conversation:
+                        continue
+            out.append(pid)
         except OSError:
             continue
     return sorted(out)
@@ -1293,6 +1373,70 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+#: Whether Moe's browser has a window the person can see, for EVERY tool process, not only the one that put it
+#: there: ``shown`` (in front of them for a hand-over) or ``parked`` (hidden after one, its page still live), with
+#: the browser's pid. In memory alone (``_shown_to_person`` / ``_parked``) it died with the process: under Claude
+#: Code the tool process is restarted often (see :func:`conversation_key`), and the next one's orphan reaper closed
+#: the window whose launcher was gone -- measured 2026-09-30, the browser at :64182 stopped answering at 11:24,
+#: two minutes after its conversation's tool process was replaced -- and saw no parked window to keep hidden.
+_WINDOW_FILENAME = "driven-browser-window.json"
+
+
+def _window_path() -> str:
+    from hermes_cli.browser_connect import get_hermes_home
+    return os.path.join(str(get_hermes_home()), "browser-profile", _WINDOW_FILENAME)
+
+
+def _set_window_state(state: Optional[str], pid: int = 0) -> None:
+    """Record ``state`` ("shown" / "parked") for the browser ``pid``, or clear it (None). Never raises."""
+    try:
+        path = _window_path()
+        if not state or not pid:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            return
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"state": state, "pid": int(pid), "at": time.time()}, fh)
+        os.replace(tmp, path)
+    except OSError as e:
+        _origin().logger.debug("handoff: window state not written: %s", e)
+
+
+def window_state(now: Optional[float] = None) -> Dict[str, Any]:
+    """``{"state", "pid", "at"}`` while the recorded browser is alive and the record is current -- a shown window
+    for :data:`SHOWN_MAX_SECONDS`, a parked one for the idle timeout since it was last driven -- else ``{}``."""
+    try:
+        with open(_window_path(), encoding="utf-8") as fh:
+            rec = json.load(fh)
+        pid, at, state = int(rec.get("pid") or 0), float(rec.get("at") or 0), str(rec.get("state") or "")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+    now = time.time() if now is None else now
+    keep = SHOWN_MAX_SECONDS if state == "shown" else _origin().BROWSER_SESSION_INACTIVITY_TIMEOUT
+    if state not in ("shown", "parked") or not pid or not 0 <= now - at <= keep or not _pid_alive(pid):
+        return {}
+    return {"state": state, "pid": pid, "at": at}
+
+
+def _shown_now() -> bool:
+    """The page is in front of the person, by this process or another."""
+    return bool(_shown_to_person["on"]) or window_state().get("state") == "shown"
+
+
+def is_parked() -> bool:
+    """Moe's browser is parked (hidden after a hand-back, by this process or another) and not in front of the
+    person."""
+    return not _shown_now() and (bool(_parked["on"]) or window_state().get("state") == "parked")
+
+
+def _parked_browser_pid() -> int:
+    return int(_parked.get("pid") or 0) if _parked["on"] else int(window_state().get("pid") or 0)
 
 
 def task_key(task_id: Optional[str]) -> str:
@@ -1317,7 +1461,7 @@ def _other_work(task_id: str) -> List[str]:
             reasons.append(f"{len(others)} other conversation(s) used it in the last few minutes")
     except Exception:
         pass
-    others = other_live_claims(_bt.BROWSER_SESSION_INACTIVITY_TIMEOUT)
+    others = other_live_claims(_bt.BROWSER_SESSION_INACTIVITY_TIMEOUT, conversation=conversation_key())
     if others:
         reasons.append(f"{len(others)} other part(s) of Moe (a different conversation's tools) used it in the last few minutes")
     return reasons
@@ -1332,60 +1476,71 @@ def show_to_person(url_hint: str = "", task_id: str = "", target_id: str = "") -
     """Put the driven browser's page in front of the person, with the same sign-ins.
 
     * Already headed: select the tab, un-minimise, raise that process by pid.
-    * Headless, launched by THIS process and nobody else using it: relaunched headed on the same
-      profile copy. Every cookie is read out first and loaded back; ONLY the page being handed over is
-      reopened (2026-09-29: reopening every tab put ~40 of them in the person's window -- "relaunched
-      headed, 38 tab(s)" -- and carried them into every later launch). A reload loses text typed into a
-      form the site did not save and sessionStorage-only steps (``form_state_lost``); the caller must
-      say so.
-    * Headless and launched by another Hermes process, or in use by another conversation: NOT
-      restarted (``busy``) -- that would cut their work off. The caller routes elsewhere.
+    * Headless, and nobody else using it: relaunched headed on the same profile copy. Every cookie is
+      read out first and loaded back; ONLY the page being handed over is reopened (2026-09-29: reopening
+      every tab put ~40 of them in the person's window -- "relaunched headed, 38 tab(s)" -- and carried
+      them into every later launch). A reload loses text typed into a form the site did not save and
+      sessionStorage-only steps (``form_state_lost``); the caller must say so.
+    * Headless and in use by another conversation (in this process, or another live process's claim
+      within the idle window): NOT restarted (``busy``) -- that would cut their work off. The caller
+      routes elsewhere.
+
+    Whose browser it is is read from the Mac, not from which process launched it: it runs on this home's
+    profile copy (``_cdp_on_data_dir``) and nobody else's live work is on it (:func:`_other_work`). A
+    launcher that has exited, or that was this conversation's own tool process before a restart, is
+    nobody else's work. 2026-09-30 (Moe transcript b3e9d36e, 15:22Z): the browser had been launched by
+    the conversation's previous tool process; the new one refused it as "started by another part of Moe
+    (another conversation's tools)", and the hand-over went to the person's default browser.
 
     ``{"ok": True, "url", "title", "relaunched", "front", "form_state_lost", "reopened", "tabs_closed"?}``
-    or ``{"ok": False, "why", "url"?, "busy"?, "browser_gone"?}``."""
+    or ``{"ok": False, "why", "url"?, "busy"?, "browser_gone"?, "typed"?}`` (``typed``: fields Moe filled in on
+    the page that was not shown)."""
     _bt = _origin()
     with _bt._real_profile_cdp_lock:
+        from hermes_cli.browser_connect import real_profile_copy_dir
+        browser = _lane_browser()
+        copy_dir = real_profile_copy_dir(browser)
         cached = _bt._real_profile_cdp_cache.get("cdp")
         if not cached or not _cdp_http_ready(cached):
+            # A tool process started after the browser was (a restarted Claude Code child) knows nothing of it
+            # until its first browser_exec: find it by the profile copy it runs on, as the acquire does.
+            cached = _surviving_chrome_cdp(copy_dir)
+        if not cached:
             return {"ok": False, "why": "Moe's own browser is not running"}
-        pages = driven_pages()
+        pages = driven_pages(cached)
         page = _pick_page(pages, url_hint, target_id)
         if page is None:
             return {"ok": False, "why": ("that page is not open in Moe's own browser" if url_hint and pages
                                          else "Moe's own browser has no web page open")}
         port = int(cached.rsplit(":", 1)[1])
         _bt._real_profile_last_used = time.time()
-        from hermes_cli.browser_connect import real_profile_copy_dir
-        browser = _lane_browser()
-        copy_dir = real_profile_copy_dir(browser)
         if not _is_headless_now(copy_dir):
             _shown_to_person.update(on=True, since=time.time())
             _parked["on"] = False
+            pid = _main_browser_pid(copy_dir)
+            _set_window_state("shown", pid or 0)
             return {"ok": True, "url": page["url"], "title": page["title"], "relaunched": False,
-                    "front": _bring_to_front(port, page["id"], _main_browser_pid(copy_dir)),
-                    "form_state_lost": False, "reopened": 0}
-        if _launched_headless["headless"] is None:
-            return {"ok": False, "busy": True, "url": page["url"],
-                    "why": ("Moe's browser was started by another part of Moe (another conversation's tools) and "
-                            "runs out of sight; it cannot get a window from here without closing it under that work")}
-        others = _other_work(task_id)
-        if others:
-            return {"ok": False, "busy": True, "url": page["url"],
-                    "why": "Moe's browser was not restarted with a window: " + "; ".join(others)}
-
+                    "front": _bring_to_front(port, page["id"], pid), "form_state_lost": False, "reopened": 0}
         binary = driven_browser_executable()
         if not binary or not _cdp_on_data_dir(cached, copy_dir):
             # Not the browser this home launched on its profile copy: never relaunch what is not ours.
             return {"ok": False, "why": "Moe's own browser could not be shown (it is not the one this Mac launched)",
-                    "url": page["url"]}
+                    "url": page["url"], "typed": _typed_count(page)}
+        others = _other_work(task_id)
+        if others:
+            return {"ok": False, "busy": True, "url": page["url"], "typed": _typed_count(page),
+                    "why": "Moe's browser was not restarted with a window: " + "; ".join(others)}
+
         got = _relaunch(cached, copy_dir, browser, binary, page, headed=True)
         if not got.get("ok"):
             return got
         _bt.logger.info("handoff: driven browser shown to the person at %s (relaunched headed, 1 tab, %d other(s) "
                         "closed, %d cookie(s), %d/%d typed field(s) put back)", page["url"][:120], len(pages) - 1,
                         got["cookies"], got["form"]["restored"], got["form"]["typed"])
+        pid = _main_browser_pid(copy_dir)
+        _set_window_state("shown", pid or 0)
         out = {"ok": True, "url": page["url"], "title": page["title"], "relaunched": True,
-               "front": _bring_to_front(got["port"], got["target_id"], _main_browser_pid(copy_dir)),
+               "front": _bring_to_front(got["port"], got["target_id"], pid),
                # Kept only when every field that had been typed in is back; unreadable counts as lost.
                "form_state_lost": got["form"]["lost"], "reopened": 1, "tabs_closed": len(pages) - 1}
         if got["form"]["typed"]:
@@ -1416,9 +1571,16 @@ def _relaunch(cached: str, copy_dir: str, browser: Optional[str], binary: str, p
 
     _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
     _terminate_real_profile_chrome()
+    # One launched by an earlier tool process (this conversation's own, before a restart, or one whose owner has
+    # gone -- the callers have ruled out anyone else's live work) is not in this process's list: stopped by its
+    # hold on the profile copy, or the new launch finds the copy taken and exits.
+    leftover = _browsers_on_data_dir(copy_dir)
+    if leftover:
+        _terminate_processes(leftover, "driven-browser (launched by an earlier tool process)")
     _bt._real_profile_cdp_cache.pop("cdp", None)
     _await_holders_gone(copy_dir)
     _parked["on"] = False
+    _set_window_state(None)
     if headed:
         _shown_to_person.update(on=True, since=time.time())
     else:
@@ -1481,8 +1643,10 @@ def hand_back() -> Dict[str, Any]:
             pid = _main_browser_pid(copy_dir) or 0
             hidden = _hide_pid(pid)
             _parked.update(on=hidden, pid=pid)
+            _set_window_state("parked" if hidden else None, pid)  # so a restarted tool process keeps it hidden
         else:
             hidden = True  # it never had a window
+            _set_window_state(None)
     except Exception as e:
         _origin().logger.debug("handoff: hiding the window after hand-back: %s", e)
     out["out_of_sight"] = hidden
@@ -1491,10 +1655,15 @@ def hand_back() -> Dict[str, Any]:
 
 def keep_out_of_sight() -> bool:
     """After a browser_exec call on a parked browser (hidden after a hand-back): hide it again, in case the call
-    brought a window back. Never while the page is in front of the person; never anything but that pid."""
-    if not _parked["on"] or _shown_to_person["on"]:
+    brought a window back. Never while the page is in front of the person; never anything but that pid. Parked by
+    this tool process or an earlier one (:func:`window_state`); each call it is driven in keeps it current."""
+    if not is_parked():
         return False
-    return _hide_pid(int(_parked.get("pid") or 0))
+    pid = _parked_browser_pid()
+    hidden = _hide_pid(pid)
+    if hidden:
+        _set_window_state("parked", pid)
+    return hidden
 
 
 #: Code that opens a tab or a window: what brings a hidden Chrome back on screen (measured, see ``_parked``).
@@ -1510,18 +1679,21 @@ def back_out_of_sight(task_id: Optional[str] = None) -> Dict[str, Any]:
     the sign-ins, the page it is on and what is typed there -- a tab opened in a hidden Chrome would put it back
     on the person's screen and can take the front from them. ``{"ok": True, "relaunched": bool, ...}``."""
     _bt = _origin()
-    if not _parked["on"] or _shown_to_person["on"]:
+    if not is_parked():
         return {"ok": True, "relaunched": False}
     with _bt._real_profile_cdp_lock:
-        cached = _bt._real_profile_cdp_cache.get("cdp")
-        if not cached or not _cdp_http_ready(cached):
-            _parked["on"] = False
-            return {"ok": True, "relaunched": False}
         from hermes_cli.browser_connect import real_profile_copy_dir
         browser = _lane_browser()
         copy_dir = real_profile_copy_dir(browser)
+        cached = _bt._real_profile_cdp_cache.get("cdp")
+        if not cached or not _cdp_http_ready(cached):
+            cached = _surviving_chrome_cdp(copy_dir)  # parked by an earlier tool process (see show_to_person)
+        if not cached:
+            _parked["on"] = False
+            _set_window_state(None)
+            return {"ok": True, "relaunched": False}
         binary = driven_browser_executable()
-        pages = driven_pages()
+        pages = driven_pages(cached)
         page = _pick_page(pages, "", "")
         if not binary or page is None or not _cdp_on_data_dir(cached, copy_dir) or _other_work(task_id or ""):
             return {"ok": False, "relaunched": False}  # leave it; keep_out_of_sight re-hides after the call

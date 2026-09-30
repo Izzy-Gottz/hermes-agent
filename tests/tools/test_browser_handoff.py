@@ -31,6 +31,28 @@ GOOGLE_PASSKEY_STDOUT = ("clicked\nLoading\nSign in with Google\nChoose an accou
 #: What Moe told the owner, verbatim: the sentence no tool result grounded.
 INVENTED = "Passkey confirmation needed again — Google's asking you to approve this sign-in on your phone, same as yesterday."
 
+#: 2026-09-30 (Moe transcript b3e9d36e, 14:47Z): Google's passkey page of an Indie Hackers sign-up, reached from the
+#: Firebase popup indie-hackers.firebaseapp.com/__/auth/handler. The parameters are the page's, in its order; the
+#: one-time values (TL, continue, dsh, state) are stand-ins of the same kind, not the owner's.
+_PK = "https://accounts.google.com/v3/signin/challenge/pk/presend"
+_PK_PARAMS = [
+    ("TL", "ADG-GRTGZrXDDLLJ4pek_e67QiA8H5dq36d4oJ2rMeMOx4vk9EqYyWyBweuBjovo"),
+    ("app_domain", "https%3A%2F%2Findie-hackers.firebaseapp.com"), ("cid", "1"),
+    ("client_id", "831124528331-j8tlal1oeeok6rmiopg46nalmd3lu5j0.apps.googleusercontent.com"),
+    ("continue", "https%3A%2F%2Faccounts.google.com%2Fsignin%2Foauth%2Fv3%2Fconsent%3Fauthuser%3Dunknown%26part%3DAJi8x"),
+    ("dsh", "S740726778%3A1790779630232392"), ("flowName", "GeneralOAuthFlow"), ("o2v", "1"),
+    ("opparams", "%253Fcontext_uri%253Dhttps%25253A%25252F%25252Fwww.indiehackers.com"), ("prompt", "select_account"),
+    ("redirect_uri", "https%3A%2F%2Findie-hackers.firebaseapp.com%2F__%2Fauth%2Fhandler"), ("response_type", "code"),
+    ("scope", "openid%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email%20profile"), ("service", "lso"),
+    ("state", "AMbdmDl6_5oJ4Gun6oLjw_tvGjSu5a5kruTS8oTHA3nv00eQhLpVkRjIP1d"),
+]
+#: The open tab's address, and the one the model passed: the same, with continue, dsh, opparams and state left out.
+GOOGLE_PK_TAB = _PK + "?" + "&".join(f"{k}={v}" for k, v in _PK_PARAMS)
+GOOGLE_PK_NAMED = _PK + "?" + "&".join(f"{k}={v}" for k, v in _PK_PARAMS
+                                       if k not in ("continue", "dsh", "opparams", "state"))
+MACRUMORS_THREAD = ("https://forums.macrumors.com/threads/developer-memoe-a-mac-assistant-you-talk-to-instead-of-type-at"
+                    ".2490816/?post=34834177#post-34834177")
+
 
 def _bind(platform="api_server", origin="person", cron=""):
     from gateway.session_context import set_session_vars, set_turn_origin
@@ -442,6 +464,24 @@ class TestBrowserExec:
         for refusal in ("do not carry over", "ties them to the person's own Chrome", "Memoe extension"):
             assert refusal not in note
 
+    def test_on_a_passkey_page_the_way_round_is_tried_first(self, cli, monkeypatch):
+        """2026-09-30: Moe's browser (Chrome for Testing, unsigned -- measured) cannot reach the person's passkeys;
+        the page's own "Try another way" is the usual way through, and Moe can click it itself."""
+        from tools.browser_tool_real_profile import google_wall_note
+        _probe_returns(monkeypatch, cli, {**PASSKEY_PROBE, "url": GOOGLE_PK_TAB})
+        cli["stdout"] = GOOGLE_PASSKEY_STDOUT
+        out = json.loads(bu.browser_exec('print(js("document.body.innerText"))', task_id="t"))
+        note = out["google_sign_in"]
+        assert "Try another way" in note and note.index("Try another way") < note.index("browser_handoff(")
+        assert "Try another way" not in out["hint"]                     # said once, in Google's own note
+        assert "Try another way" not in google_wall_note("https://accounts.google.com/v3/signin/challenge/pwd?TL=x")
+        # a passkey page elsewhere: said in the needs_person hint
+        _probe_returns(monkeypatch, cli, {**PASSKEY_PROBE, "url": "https://github.com/sessions/two-factor/webauthn"})
+        cli["stdout"] = "Use your passkey to confirm it's really you"
+        out = json.loads(bu.browser_exec('print(js("document.body.innerText"))', task_id="t"))
+        assert out["hint"].startswith(ps.PASSKEY_OTHER_WAY) and "google_sign_in" not in out
+        assert "usually cannot" in ps.PASSKEY_OTHER_WAY          # said as what usually happens, not a certainty
+
     @pytest.mark.parametrize("wall", [
         "https://accounts.google.com/v3/signin/challenge/pwd?TL=x",
         "https://accounts.google.com/signin/v2/challenge/sk/webauthn?x=1",
@@ -545,8 +585,9 @@ def handoff(monkeypatch):
         state.setdefault("show_calls", []).append((url, task) + ((target_id,) if target_id else ()))
         return state["shown"]
     monkeypatch.setattr(rp, "show_to_person", fake_show)
-    monkeypatch.setattr(rp, "driven_pages", lambda: state["pages"])
+    monkeypatch.setattr(rp, "driven_pages", lambda *a: state["pages"])
     monkeypatch.setattr(bh, "_harness_tab", lambda task: state.get("harness_tab"))
+    monkeypatch.setattr(rp, "running_cdp", lambda: None)
     monkeypatch.setattr(rp, "hand_back", lambda: {"url": "https://accounts.google.com/after", "title": "Done"})
     monkeypatch.setattr(bh, "_open_default_browser", lambda url: state["opened"].append(url) or None)
     monkeypatch.setattr(bh, "_open_in_chrome_group", lambda bridge, url: state["chrome"].append(url) or None)
@@ -807,6 +848,63 @@ class TestHandoff:
         out = json.loads(bh.browser_handoff(reason="x", url="file:///etc/passwd", task_id="t"))
         assert "error" in out and state["opened"] == []
 
+    # -- 2026-09-30, Moe transcript b3e9d36e: two hand-overs of Google's passkey page that went to the wrong place --
+
+    def test_with_no_url_the_page_asking_for_the_person_is_shown_not_the_harness_s_other_tab(self, handoff,
+                                                                                           monkeypatch):
+        """15:22Z: no url; the harness record named the MacRumors thread, the active tab asked for the passkey --
+        and the MacRumors thread is what opened, "to approve the Google passkey"."""
+        bh, state = handoff
+        from tools import browser_tool_real_profile as rp
+        state["pages"] = [{"id": "G", "url": GOOGLE_PK_TAB, "title": "Sign in - Google Accounts", "ws": ""},
+                          {"id": "M", "url": MACRUMORS_THREAD, "title": "", "ws": ""}]
+        state["harness_tab"] = {"url": MACRUMORS_THREAD, "targetId": "M"}
+        monkeypatch.setattr(rp, "running_cdp", lambda: "http://127.0.0.1:9100")
+        monkeypatch.setattr(ps, "probe_active_page", lambda cdp, **k: {
+            "kind": "passkey", "page_says": "Use your passkey to confirm it’s really you", "why": "imperative",
+            "url": GOOGLE_PK_TAB, "title": "Sign in - Google Accounts"})
+        state["shown"] = {"ok": True, "url": GOOGLE_PK_TAB, "title": "", "front": True}
+        out = json.loads(bh.browser_handoff(reason="approve the Google passkey for srulynj@gmail.com", task_id=None))
+        assert state["show_calls"] == [(GOOGLE_PK_TAB, "default", "G")]
+        assert out["route"] == "driven_browser" and "Try another way" in out["passkey"]
+
+    def test_a_sign_in_in_progress_is_never_opened_in_the_person_s_own_browser(self, handoff, monkeypatch):
+        """14:47Z and 15:22Z: Moe's window could not be shown, and Google's passkey page of a sign-in that lives in
+        Moe's browser was opened in the person's default browser -- a dead end there."""
+        bh, state = handoff
+        state["bridge"] = {"ws_url": "ws://127.0.0.1:1/devtools/browser/x"}           # the Chrome lane too
+        state["shown"] = {"ok": False, "busy": True, "url": GOOGLE_PK_TAB,
+                          "why": "Moe's browser was not restarted with a window: 1 other part(s) of Moe (a different "
+                                 "conversation's tools) used it in the last few minutes"}
+        out = json.loads(bh.browser_handoff(reason="approve the Google passkey", url=GOOGLE_PK_NAMED, task_id="t"))
+        assert state["opened"] == [] and state["chrome"] == []
+        assert out["code"] == "not_shown" and out["retry"] is True and "sign-in in progress" in out["session_bound"]
+        assert "Nothing was opened" in out["error"] and "never send them to their own browser" in out["error"]
+        assert "wait a minute and call browser_handoff again" in out["error"]
+        assert "Try another way" in out["error"]                                        # a passkey page
+        state["shown"] = {"ok": False, "why": "that page is not open in Moe's own browser"}
+        out = json.loads(bh.browser_handoff(reason="approve it", task_id="t",
+                                            url="https://indie-hackers.firebaseapp.com/__/auth/handler?apiKey=x"))
+        assert state["opened"] == [] and "open it again with browser_exec" in out["error"]
+        assert "Try another way" not in out["error"]
+
+    def test_a_form_moe_filled_in_is_not_opened_empty_in_the_person_s_browser(self, handoff):
+        bh, state = handoff
+        state["shown"] = {"ok": False, "busy": True, "url": "https://forums.macrumors.com/login/register", "typed": 4,
+                          "why": "Moe's browser was not restarted with a window: 1 other conversation(s) used it"}
+        out = json.loads(bh.browser_handoff(reason="complete the hcaptcha check", task_id="t",
+                                            url="https://forums.macrumors.com/login/register"))
+        assert state["opened"] == [] and "a form Moe has filled in (4 field(s))" in out["session_bound"]
+
+    def test_with_no_url_and_several_tabs_nothing_is_guessed(self, handoff):
+        bh, state = handoff
+        state["pages"] = [{"id": "M", "url": MACRUMORS_THREAD, "title": "", "ws": ""},
+                          {"id": "I", "url": "https://www.indiehackers.com/sign-up", "title": "", "ws": ""}]
+        state["shown"] = {"ok": True, "url": MACRUMORS_THREAD, "title": "", "front": True}
+        out = json.loads(bh.browser_handoff(reason="approve the Google passkey", task_id="t"))
+        assert state.get("show_calls") is None and state["opened"] == [] and state["chrome"] == []
+        assert "did not guess" in out["error"] and "url=" in out["error"]
+
     def test_it_is_registered_in_the_browser_toolset(self):
         import toolsets
         from tools import browser_handoff_tool  # noqa: F401 (registers)
@@ -822,10 +920,16 @@ class TestShowToPerson:
     def rp(self, monkeypatch):
         from tools import browser_tool_real_profile as rp
         _bt = rp._origin()
-        calls = {"cdp": [], "launched_headless": [], "cookies_in": None, "terminated": 0, "front": [], "made": 0}
+        calls = {"cdp": [], "launched_headless": [], "cookies_in": None, "terminated": 0, "front": [], "made": 0,
+                 "own": {4242}, "holders": [], "killed": []}
         monkeypatch.setitem(_bt._real_profile_cdp_cache, "cdp", "http://127.0.0.1:9100")
         monkeypatch.setattr(rp, "_cdp_http_ready", lambda cdp: True)
-        monkeypatch.setattr(rp, "driven_pages", lambda: [
+        # This process launched the browser (pid 4242) unless a test says otherwise; nothing else holds the copy.
+        monkeypatch.setattr(rp, "_own_browser_pids", lambda: set(calls["own"]))
+        monkeypatch.setattr(rp, "_browsers_on_data_dir", lambda d: list(calls["holders"]))
+        monkeypatch.setattr(rp, "_terminate_processes",
+                            lambda procs, what: calls["killed"].extend(getattr(p, "pid", p) for p in procs) or len(procs))
+        monkeypatch.setattr(rp, "driven_pages", lambda *a: [
             {"id": "A", "url": "https://accounts.google.com/v3/signin/challenge/pk/presend", "title": "Sign in", "ws": ""},
             {"id": "B", "url": "https://tinylaunch.com/", "title": "TinyLaunch", "ws": ""}])
         monkeypatch.setattr("hermes_cli.browser_connect.detect_default_chromium", lambda: "chrome")
@@ -1038,13 +1142,178 @@ class TestShowToPerson:
         assert "(4242)" in rp._HIDE_PID_JXA % 4242 and "activate" not in rp._HIDE_PID_JXA
         assert rp._ACTIVATE_PID_JXA.index("a.unhide;") < rp._ACTIVATE_PID_JXA.index("activateWithOptions")
 
-    def test_a_headless_browser_another_process_launched_is_not_restarted_from_here(self, rp, monkeypatch):
-        rp, calls = rp
+    # -- whose browser it is, read from the Mac: 2026-09-30, Moe transcript b3e9d36e, 15:22Z ---------------------
+    # Under Claude Code the tools run in one process per `claude` child, and the child is restarted often. The
+    # browser had been launched by the conversation's PREVIOUS tool process (10:54:58); the new one (11:22:12)
+    # refused it as "started by another part of Moe (another conversation's tools)".
+
+    CONV = "b3e9d36e-1e86-4659-a6e8-d58b64ad7506"
+
+    @staticmethod
+    def _launched_elsewhere(rp, calls, monkeypatch, tmp_path, conversation=CONV):
+        """This tool process launched nothing; the headless browser on the copy is pid 5555."""
+        class P:
+            pid = 5555
+
+            def cmdline(self):
+                return ["/x/Google Chrome for Testing", "--user-data-dir=/tmp/copy", "--headless=new"]
+        calls["own"], calls["holders"] = set(), [P()]
         monkeypatch.setitem(rp._launched_headless, "headless", None)
-        monkeypatch.setattr(rp, "_is_headless_now", lambda d: True)
+        monkeypatch.setattr(rp, "_other_work", _REAL_OTHER_WORK)
+        monkeypatch.setattr(rp, "_claims_dir", lambda: str(tmp_path / "claims"))
+        if conversation is None:
+            monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", conversation)
+        lane.reset_sticky_lanes()
+        (tmp_path / "claims").mkdir()
+
+    @staticmethod
+    def _claim_by(tmp_path, pid, conversation, age=5.0):
+        path = tmp_path / "claims" / str(pid)
+        path.write_text(conversation)
+        at = time.time() - age
+        os.utime(path, (at, at))
+
+    def test_this_conversation_s_browser_from_before_a_tool_process_restart_is_shown(self, rp, monkeypatch,
+                                                                                    tmp_path):
+        rp, calls = rp
+        self._launched_elsewhere(rp, calls, monkeypatch, tmp_path)
+        before = subprocess.Popen(["/bin/sleep", "30"])     # the previous tool process, still alive
+        try:
+            self._claim_by(tmp_path, before.pid, f"cc:{self.CONV}")
+            out = rp.show_to_person("https://accounts.google.com/v3/signin/challenge/pk/presend", "default")
+        finally:
+            before.kill()
+            before.wait()
+        assert out["ok"] and out["relaunched"], out
+        assert calls["launched_headless"] == [False]
+        assert calls["killed"] == [5555]                     # the headless one it launched, by its hold on the copy
+
+    def test_a_browser_whose_launcher_has_exited_is_shown(self, rp, monkeypatch, tmp_path):
+        rp, calls = rp
+        self._launched_elsewhere(rp, calls, monkeypatch, tmp_path, conversation="someone-else")
+        gone = subprocess.Popen(["/usr/bin/true"])
+        gone.wait()
+        self._claim_by(tmp_path, gone.pid, "cc:another-conversation")
         out = rp.show_to_person()
-        assert not out["ok"] and out["busy"] and "another part of Moe" in out["why"]
-        assert calls["terminated"] == 0 and calls["launched_headless"] == []
+        assert out["ok"] and out["relaunched"] and calls["killed"] == [5555]
+        assert not (tmp_path / "claims" / str(gone.pid)).exists()      # a dead launcher's claim is pruned
+
+    @pytest.mark.parametrize("theirs,ours", [("cc:another-conversation", CONV),   # a different live conversation
+                                             ("", CONV),                          # a process that names none
+                                             (f"cc:{CONV}", None)])               # we cannot say who we are
+    def test_another_live_conversation_s_browser_is_still_never_restarted(self, rp, monkeypatch, tmp_path,
+                                                                           theirs, ours):
+        rp, calls = rp
+        self._launched_elsewhere(rp, calls, monkeypatch, tmp_path, conversation=ours)
+        other = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            self._claim_by(tmp_path, other.pid, theirs)
+            out = rp.show_to_person()
+        finally:
+            other.kill()
+            other.wait()
+        assert not out["ok"] and out["busy"] and "other part(s) of Moe" in out["why"]
+        assert calls["killed"] == [] and calls["terminated"] == 0 and calls["launched_headless"] == []
+
+    def test_an_idle_launcher_of_another_conversation_does_not_block(self, rp, monkeypatch, tmp_path):
+        rp, calls = rp
+        self._launched_elsewhere(rp, calls, monkeypatch, tmp_path)
+        other = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            self._claim_by(tmp_path, other.pid, "cc:another-conversation",
+                           age=rp._origin().BROWSER_SESSION_INACTIVITY_TIMEOUT + 30)
+            out = rp.show_to_person()
+        finally:
+            other.kill()
+            other.wait()
+        assert out["ok"] and out["relaunched"]
+
+    def test_every_claim_names_its_conversation(self, monkeypatch, tmp_path):
+        from tools import browser_tool_real_profile as rp
+        monkeypatch.setattr(rp, "_claims_dir", lambda: str(tmp_path / "c"))
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", self.CONV)
+        rp.claim_driven_browser()
+        assert (tmp_path / "c" / str(os.getpid())).read_text() == f"cc:{self.CONV}"
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+        assert rp.conversation_key() == ""
+
+    def test_a_restarted_tool_process_finds_the_running_browser_by_its_profile_copy(self, rp, monkeypatch):
+        """No browser_exec yet in the new process: its cache is empty, the browser is running all the same."""
+        rp, calls = rp
+        monkeypatch.delitem(rp._origin()._real_profile_cdp_cache, "cdp")
+        monkeypatch.setattr(rp, "_surviving_chrome_cdp", lambda d: "http://127.0.0.1:9100" if d == "/tmp/copy" else None)
+        out = rp.show_to_person()
+        assert out["ok"] and out["relaunched"]
+        monkeypatch.setattr(rp, "_surviving_chrome_cdp", lambda d: None)
+        monkeypatch.delitem(rp._origin()._real_profile_cdp_cache, "cdp")
+        assert rp.show_to_person() == {"ok": False, "why": "Moe's own browser is not running"}
+
+    def test_what_this_process_launched_is_not_believed_once_its_launch_is_gone(self, rp, monkeypatch):
+        """Launched headless here, relaunched with a window by another tool process since: read the Mac."""
+        rp, calls = rp
+        monkeypatch.setitem(rp._launched_headless, "headless", True)
+
+        class P:
+            pid = 6000
+
+            def cmdline(self):
+                return ["/x/Google Chrome for Testing", "--user-data-dir=/tmp/copy"]
+        calls["own"], calls["holders"] = set(), [P()]
+        assert rp._is_headless_now("/tmp/copy") is False
+        calls["own"] = {4242}
+        assert rp._is_headless_now("/tmp/copy") is True
+
+    def test_a_shown_window_survives_the_orphan_reaper_of_another_tool_process(self, rp, monkeypatch):
+        rp, calls = rp
+        person = subprocess.Popen(["/bin/sleep", "30"])     # stands in for the shown browser's pid
+
+        class P:
+            pid = person.pid
+        try:
+            calls["own"], calls["holders"] = set(), [P()]
+            monkeypatch.setattr(rp, "_is_orphan", lambda p: True)
+            rp._set_window_state("shown", person.pid)
+            assert rp._terminate_orphaned_browsers_on_dir("/tmp/copy") == 0 and calls["killed"] == []
+            assert rp.window_state()["state"] == "shown" and rp._shown_now()
+            rp._set_window_state(None)
+            rp._terminate_orphaned_browsers_on_dir("/tmp/copy")
+            assert calls["killed"] == [person.pid]            # nobody's window: an orphan like any other
+        finally:
+            person.kill()
+            person.wait()
+        rp._set_window_state("shown", person.pid)
+        assert rp.window_state() == {}                        # a dead browser's record is nothing
+
+    def test_a_window_parked_by_an_earlier_tool_process_stays_hidden(self, rp, monkeypatch):
+        rp, calls = rp
+        parked = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            monkeypatch.setitem(rp._parked, "on", False)
+            rp._set_window_state("parked", parked.pid)
+            assert rp.is_parked()
+            assert rp.keep_out_of_sight() is True and calls["hidden"] == [parked.pid]
+            seen = []
+            monkeypatch.setattr(rp, "back_out_of_sight", lambda task=None: seen.append(task) or {})
+            bu._park_check('new_tab("https://x.example")', None)
+            assert seen == [None]
+            rp._set_window_state("shown", parked.pid)          # in front of the person: never hidden
+            assert not rp.is_parked() and rp.keep_out_of_sight() is False
+        finally:
+            parked.kill()
+            parked.wait()
+            rp._set_window_state(None)
+
+    def test_show_and_hand_back_record_the_window_for_other_tool_processes(self, rp, monkeypatch):
+        rp, calls = rp
+        seen = []
+        monkeypatch.setattr(rp, "_set_window_state", lambda state, pid=0: seen.append((state, pid)))
+        rp.show_to_person()
+        assert seen[-1] == ("shown", 4242)
+        monkeypatch.setitem(rp._launched_headless, "headless", False)
+        rp.hand_back()
+        assert seen[-1] == ("parked", 4242)
 
     def test_a_headed_browser_another_process_launched_is_raised_in_place(self, rp, monkeypatch):
         rp, calls = rp
@@ -1053,6 +1322,21 @@ class TestShowToPerson:
         out = rp.show_to_person()
         assert out["ok"] and not out["relaunched"] and calls["front"] == [(9100, "A", 4242)]
         assert calls["terminated"] == 0
+
+    def test_the_passkey_page_named_with_some_of_its_parameters_is_found(self):
+        """14:47Z: "that page is not open in Moe's own browser" -- it was; the model had left four parameters out."""
+        from tools.browser_tool_real_profile import _pick_page
+        pages = [{"id": "M", "url": MACRUMORS_THREAD, "title": "", "ws": ""},
+                 {"id": "G", "url": GOOGLE_PK_TAB, "title": "", "ws": ""}]
+        assert _pick_page(pages, GOOGLE_PK_NAMED)["id"] == "G"
+        moved_on = GOOGLE_PK_NAMED.replace("TL=ADG-GRTG", "TL=ADG-NEWR")        # a fresh one-time token since
+        assert _pick_page(pages, moved_on)["id"] == "G"
+        assert _pick_page(pages, "https://accounts.google.com/v3/signin/challenge/pwd?TL=x") is None
+        # a plain page with a different value is a different page, not a near match
+        assert _pick_page([{"id": "S", "url": "https://shop.example/search?q=b", "title": "", "ws": ""}],
+                          "https://shop.example/search?q=a") is None
+        assert _pick_page([{"id": "S", "url": "https://shop.example/search?q=a&page=2", "title": "", "ws": ""}],
+                          "https://shop.example/search?q=a")["id"] == "S"
 
     def test_the_named_tab_is_the_one_shown_and_an_unknown_one_is_refused(self, rp):
         rp, calls = rp
@@ -1209,3 +1493,36 @@ def test_asked_from_the_mac_but_gone_reaches_their_channels_from_exec_and_the_la
     o = bl.Outcome(kind="recaptcha_v2", host="forms.example", outcome=bl.NEEDS_PERSON, reason="an image puzzle", tier="C")
     step = bl.next_step(o, {"live": True, "why": "", "surface": "local"})
     assert "reach_owner" in step and "waiting in Moe's browser on their Mac" in step and "browser_handoff" not in step
+
+
+class TestSessionBound:
+    @pytest.mark.parametrize("url", [
+        GOOGLE_PK_TAB, GOOGLE_PK_NAMED,
+        "https://indie-hackers.firebaseapp.com/__/auth/handler?apiKey=x&authType=signInViaPopup",
+        "https://github.com/login/oauth/authorize?client_id=x&redirect_uri=https%3A%2F%2Fx",
+        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=x",
+        "https://appleid.apple.com/auth/authorize?client_id=x",
+        "https://id.example.com/sso/saml?SAMLRequest=x",
+        "https://auth.example.com/login?response_type=code&client_id=x",
+    ])
+    def test_a_sign_in_in_progress_is_bound_to_the_browser_it_is_in(self, url):
+        assert "sign-in in progress" in ps.session_bound(url)
+
+    @pytest.mark.parametrize("url", [
+        "https://shop.example/checkout", "https://forums.macrumors.com/login/register", MACRUMORS_THREAD,
+        "https://www.indiehackers.com/sign-up", "https://developers.google.com/identity/passkeys",
+        "https://example.com/challenge/2026", "https://www.authorize.net/",
+    ])
+    def test_a_plain_page_is_not(self, url):
+        assert ps.session_bound(url) == ""
+
+    def test_an_identity_check_or_a_filled_form_is(self):
+        step = {"kind": "identity_check", "url": "https://bank.example/verify"}
+        assert "identity check" in ps.session_bound("https://bank.example/verify", step)
+        assert ps.session_bound("https://bank.example/verify", {**step, "kind": "captcha"}) == ""
+        assert "(2 field(s))" in ps.session_bound("https://forums.macrumors.com/login/register", None, 2)
+
+    def test_passkey_pages(self):
+        assert ps.is_passkey_challenge(GOOGLE_PK_TAB)
+        assert not ps.is_passkey_challenge("https://accounts.google.com/v3/signin/challenge/pwd?TL=x")
+        assert ps.is_passkey_challenge("https://x.example/", {"kind": "passkey"})

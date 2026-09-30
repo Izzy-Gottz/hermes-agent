@@ -356,3 +356,65 @@ def describe(step: Dict[str, str]) -> str:
 
 GROUNDING_RULE = ("Only tell the person that something was sent, or is waiting on their phone or another device, "
                   "when a tool result shows the site said so (page_says). Otherwise say what the page shows.")
+
+
+# ── Pages that only mean something inside Moe's own browser ──────────────────
+#
+# 2026-09-30 (Moe transcript b3e9d36e): an Indie Hackers sign-up via Google reached Google's passkey page
+# (accounts.google.com/v3/signin/challenge/pk/presend?..., opened from indie-hackers.firebaseapp.com/__/auth/handler).
+# Moe's window could not be shown, and browser_handoff opened that address in the person's own browser --
+# where it is a dead end: the sign-in it belongs to (its state, its one-time TL token, the popup waiting for its
+# answer) lives in Moe's browser. The person's browser would at best start a sign-in nobody asked for.
+
+#: Sign-in services whose pages are all steps of a sign-in in progress.
+_SIGN_IN_HOSTS = ("accounts.google.com", "login.microsoftonline.com", "login.live.com", "appleid.apple.com")
+#: Paths of a sign-in or an OAuth hand-back on any site (Firebase's ``/__/auth/handler``, ``/oauth2/``,
+#: ``/authorize``, SSO / SAML).
+_SIGN_IN_PATH = re.compile(r"/__/auth/|/oauth2?(?:/|$)|/authori[sz]e(?:/|$)|/sso(?:/|$)|/saml", re.I)
+#: Query parameters only an OAuth / OpenID request carries.
+_OAUTH_PARAMS = re.compile(r"(?:^|&)(?:redirect_uri|response_type|code_challenge)=", re.I)
+
+
+def session_bound(url: str, step: Optional[Dict[str, str]] = None, typed: int = 0) -> str:
+    """Why ``url`` is a page that only works inside the browser it is open in -- a sign-in in progress, an
+    identity check, a form Moe filled in -- in words; "" for a plain page anyone can open (the only kind a
+    hand-over may send to the person's own browser)."""
+    try:
+        u = urlparse(url or "")
+    except ValueError:
+        return ""
+    host = (u.hostname or "").lower()
+    if host in _SIGN_IN_HOSTS or any(host.endswith("." + h) for h in _SIGN_IN_HOSTS):
+        return f"a step of a sign-in in progress in Moe's browser ({host})"
+    if _SIGN_IN_PATH.search(u.path or "") or _OAUTH_PARAMS.search(u.query or ""):
+        return f"a step of a sign-in in progress in Moe's browser ({host or 'this site'})"
+    if (step or {}).get("kind") in (PASSKEY, IDENTITY_CHECK, DEVICE_PROMPT) and host_of(step.get("url") or "") == host:
+        return "an identity check in Moe's browser's own session"
+    if typed:
+        return f"a form Moe has filled in ({typed} field(s)) in its own browser"
+    return ""
+
+
+def is_passkey_challenge(url: str, step: Optional[Dict[str, str]] = None) -> bool:
+    """A page asking for a passkey: the probe said so, or it is Google's passkey step (``/challenge/pk``)."""
+    if (step or {}).get("kind") == PASSKEY:
+        return True
+    try:
+        u = urlparse(url or "")
+    except ValueError:
+        return False
+    return (u.hostname or "").lower() == "accounts.google.com" and bool(re.search(r"/challenge/pk(?:/|$)", u.path or ""))
+
+
+#: The way through a passkey page in Moe's own browser. MEASURED 2026-09-30 (codesign -d --entitlements): the
+#: driven Chrome for Testing is unsigned ("TeamIdentifier=not set") and has no entitlements at all, while the
+#: person's Google Chrome carries com.apple.developer.web-browser.public-key-credential -- the entitlement macOS
+#: asks of a browser before it lets it use passkeys saved in iCloud Keychain. Moe's browser also runs on a copy of
+#: the profile with a mock keychain, so it is not signed in to their Chrome's passkeys either. NOT measured: whether
+#: a security key or the phone QR code works there. So it is said as what usually happens, and as a thing to try.
+PASSKEY_OTHER_WAY = ("This is a passkey page, and Moe's own browser usually cannot use the person's passkeys: they "
+                     "live in iCloud Keychain and in their own Chrome, and Moe's browser is a separate copy of Chrome "
+                     "that macOS does not let reach them. So first try the page's own \"Try another way\" (or \"Use "
+                     "another method\") yourself with browser_exec, read the choices, and pick one that works from any "
+                     "browser -- a prompt on their phone, a code, their password. Hand the page over only for the step "
+                     "that then needs them, and say only what the page shows was sent.")

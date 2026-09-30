@@ -589,7 +589,7 @@ def _park_check(code: str, task_id: Optional[str]) -> None:
     tools/browser_tool_real_profile._parked). Never raises."""
     def check() -> None:
         rp = importlib.import_module("tools.browser_tool_real_profile")
-        if rp._parked["on"] and rp.opens_a_tab(code):
+        if rp.opens_a_tab(code) and rp.is_parked():  # parked by this tool process or an earlier one
             rp.back_out_of_sight(task_id)
     _quiet(check, None, "sending Moe's window back out of sight failed")
 
@@ -685,6 +685,8 @@ def _note_person_step(result: dict, step: dict, presence: Optional[dict]) -> Non
     if here:
         hint = (f"The page needs the person: {what}. Moe's browser is out of sight, so they cannot do it yet: call "
                 "browser_handoff(reason=...) to put the page in front of them, then wait for them. " + ps.GROUNDING_RULE)
+        if ps.is_passkey_challenge(step.get("url") or "", step) and ps.host_of(step.get("url") or "") != "accounts.google.com":
+            hint = ps.PASSKEY_OTHER_WAY + " " + hint  # on Google's own page the google_sign_in note says it
     else:
         from tools.browser_handoff_tool import owner_message
         result["needs_person"]["code"] = "person_needed"
