@@ -386,6 +386,40 @@ class TestRealProfileCdpLaunch:
         assert cdp == "http://127.0.0.1:41000"
         self._reset()
 
+    def test_stale_resolver_holder_fails_fast(self, monkeypatch):
+        """A timed-out worker holding the launch lock must not wedge later calls."""
+        import threading
+
+        import tools.browser_tool as bt
+
+        self._reset()
+        monkeypatch.setattr(bt, "_REAL_PROFILE_CDP_LOCK_TIMEOUT_S", 0.05, raising=False)
+        result = {}
+        started = threading.Event()
+
+        def resolve():
+            started.set()
+            result.setdefault("value", bt_real_profile._real_profile_cdp())
+
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
+             patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=False), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value=None):
+            bt._real_profile_cdp_lock.acquire()
+            worker = threading.Thread(target=resolve, daemon=True)
+            try:
+                worker.start()
+                assert started.wait(timeout=2.0), "resolver worker was not scheduled"
+                worker.join(timeout=2.0)
+                stalled = worker.is_alive()
+            finally:
+                bt._real_profile_cdp_lock.release()
+                worker.join(timeout=2.0)
+
+        assert not stalled, "real-profile resolver waited indefinitely on a stale holder"
+        cdp, err = result["value"]
+        assert cdp is None
+        assert err and "already being prepared" in err
+
     def test_driven_browser_is_never_the_persons_browser_app(self, tmp_path):
         """The person's browser binary runs ONLY for the hand-over: headless, no window, and gone
         before the driven browser starts. What Hermes drives — the process agent-browser attaches
