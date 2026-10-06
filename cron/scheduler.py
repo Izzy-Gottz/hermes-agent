@@ -3772,6 +3772,30 @@ def _sweep_mcp_orphans_when_all_done(futures: list) -> None:
         _f.add_done_callback(_on_done)
 
 
+# Memoe: the host app writes `$HERMES_HOME/cron/AWAY` when the Mac goes to sleep and removes it on
+# a real wake. While it exists this host fires nothing — the cloud computer owns the schedule, and a
+# Power Nap darkwake (no didWake, no network to speak of) must not race it. Measured 2026-10-03/04:
+# darkwake runs failed on provider timeouts and missing credentials and ran beside the cloud's
+# claims. Cron only — unlike ESTOP, gateway turns are untouched. Missed occurrences catch up once
+# on the wake, as after any sleep.
+AWAY_SENTINEL = "AWAY"
+_away_logged = False
+
+
+def _host_away() -> bool:
+    global _away_logged
+    try:
+        away = (_get_hermes_home() / "cron" / AWAY_SENTINEL).exists()
+    except OSError:
+        away = False
+    if away and not _away_logged:
+        logger.info("Cron paused: the host says it is away (cron/%s)", AWAY_SENTINEL)
+    elif not away and _away_logged:
+        logger.info("Cron resumed: the host is back")
+    _away_logged = away
+    return away
+
+
 def tick(
     verbose: bool = True, adapters=None, loop=None, sync: bool = True, *, can_dispatch=None):
     """Check and run all due jobs. File-locked so only one tick runs at a time (gateway ticker vs
@@ -3797,6 +3821,9 @@ def tick(
             from agent.estop import check_paused as _estop_check_paused
             if _estop_check_paused("cron", logger):
                 return 0
+
+        if _host_away():
+            return 0
 
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
