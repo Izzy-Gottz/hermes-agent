@@ -924,6 +924,62 @@ class TestSkillTextDescription:
         assert overrides["description"].endswith(bu_cli._HELPERS_DIGEST)
 
 
+    def test_digest_prefers_trusted_clicks(self):
+        # Ticket #19 (Moe, 2026-10-01): X's Follow buttons ignored js(...click()); only a trusted
+        # click_at_xy press registers on sites that check isTrusted (X, many React apps).
+        digest = bu_cli._HELPERS_DIGEST
+        assert "Prefer click_at_xy (trusted input" in digest
+        assert "ignore synthetic clicks" in digest
+
+    def test_text_only_header_prefers_trusted_clicks(self):
+        # The text-only header once said js("…click()") "for clicks" -- the very synthetic click X ignored
+        # (Moe ticket #19). click_at_xy must be the way to click; js .click() only a named fallback.
+        header = bu_cli._HEADER_TEXT_ONLY
+        assert "click_at_xy(x, y) for clicks" in header
+        assert ".click()\") for clicks" not in header
+        fallback = header.find("click()")
+        assert fallback > header.find("click_at_xy") >= 0
+        assert "only as a fallback" in header[:fallback + 60]
+
+    def test_static_fallback_carries_digest_and_install_hint(self):
+        desc = bu_cli.BROWSER_EXEC_SCHEMA["description"]
+        assert bu_cli._HELPERS_DIGEST in desc
+        assert "uv tool install browser-use" in desc
+
+
+class TestProxyFailureNote:
+    """Moe ticket #20: a page load that ends on Chrome's proxy error page says it is the Mac's proxy."""
+
+    # The tool result the model saw on 2026-10-01, verbatim (the error page's innerText).
+    CHROME_PROXY_PAGE = ("No internet\n\nThere is something wrong with the proxy server, or the address is "
+                         "incorrect.\n\nTry:\n\nContacting the system admin\nChecking the proxy address\n"
+                         "ERR_PROXY_CONNECTION_FAILED\nDetails\n")
+
+    def test_chrome_proxy_error_page_is_named_as_the_macs_proxy(self, tmp_path, monkeypatch):
+        page = self.CHROME_PROXY_PAGE.replace("\n", "\\n")
+        cli = _fake_cli(tmp_path, f'cat > /dev/null\nprintf "{page}"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec('new_tab("https://tools.launchllama.co/products/memoe")'))
+        note = result["network_note"]
+        assert "ERR_PROXY_CONNECTION_FAILED" in note
+        assert "system proxy" in note and "scutil --proxy" in note
+        assert "System Settings › Network › Proxies" in note
+        assert "not the site" in note
+
+    def test_tunnel_failure_after_a_chrome_error_url(self):
+        out = "chrome-error://chromewebdata/ This site can't be reached net::ERR_TUNNEL_CONNECTION_FAILED"
+        assert "ERR_TUNNEL_CONNECTION_FAILED" in bu_cli._proxy_failure_note(out)
+
+    def test_other_proxy_codes_count(self):
+        assert "ERR_PROXY_AUTH_UNSUPPORTED" in bu_cli._proxy_failure_note("x\nERR_PROXY_AUTH_UNSUPPORTED\n")
+
+    def test_a_page_that_only_mentions_the_code_is_not_a_proxy_failure(self):
+        ticket = "Couldn't post reply: browser tool fails with ERR_PROXY_CONNECTION_FAILED (ticket #20)"
+        assert bu_cli._proxy_failure_note(ticket) == ""
+
+    def test_other_load_errors_get_no_proxy_note(self):
+        assert bu_cli._proxy_failure_note("chrome-error://chromewebdata/\nERR_NAME_NOT_RESOLVED\n") == ""
+        assert bu_cli._proxy_failure_note("") == ""
 
 
 class TestBrowserExec:

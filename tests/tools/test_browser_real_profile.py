@@ -266,7 +266,7 @@ class TestRealProfileCdpLaunch:
         bt._real_profile_cdp_cache.clear()
         bt._real_profile_chrome_procs.clear()
 
-    def _run(self, tmp_path, *, agent_get_cdp=None, cdp_calls=None, launches=None, run_side_effect=None,
+    def _run(self, tmp_path, *, agent_get_cdp=None, cdp_calls=None, launches=None, spawn_side_effect=None,
              extra_patches=()):
         """Drive the cold path with everything outside this module faked; returns (cdp, err)."""
         import tools.browser_tool as bt
@@ -295,7 +295,10 @@ class TestRealProfileCdpLaunch:
             patch.object(bt_real_profile, "_agent_browser_get_cdp",
                          side_effect=agent_get_cdp or [None, "http://127.0.0.1:41000"]),
             patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"),
-            patch.object(bt.subprocess, "run", side_effect=run_side_effect or (lambda *a, **k: proc)),
+            patch.object(bt.subprocess, "run", side_effect=lambda *a, **k: proc),
+            # agent-browser's CLI is captured through temp files (15485e0c8d), not subprocess.run pipes.
+            patch.object(bt_session, "_popen_agent_browser",
+                         side_effect=spawn_side_effect or (lambda *a, **k: Mock(wait=Mock(return_value=0), returncode=0))),
             patch.object(bt_cloud, "_is_headed_mode", return_value=False),
             *extra_patches,
         ]
@@ -336,6 +339,40 @@ class TestRealProfileCdpLaunch:
         assert err is None
         assert cdp == "http://127.0.0.1:41000"
         self._reset()
+
+    def test_stale_resolver_holder_fails_fast(self, monkeypatch):
+        """A timed-out worker holding the launch lock must not wedge later calls."""
+        import threading
+
+        import tools.browser_tool as bt
+
+        self._reset()
+        monkeypatch.setattr(bt, "_REAL_PROFILE_CDP_LOCK_TIMEOUT_S", 0.05, raising=False)
+        result = {}
+        started = threading.Event()
+
+        def resolve():
+            started.set()
+            result.setdefault("value", bt_real_profile._real_profile_cdp())
+
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
+             patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=False), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value=None):
+            bt._real_profile_cdp_lock.acquire()
+            worker = threading.Thread(target=resolve, daemon=True)
+            try:
+                worker.start()
+                assert started.wait(timeout=2.0), "resolver worker was not scheduled"
+                worker.join(timeout=2.0)
+                stalled = worker.is_alive()
+            finally:
+                bt._real_profile_cdp_lock.release()
+                worker.join(timeout=2.0)
+
+        assert not stalled, "real-profile resolver waited indefinitely on a stale holder"
+        cdp, err = result["value"]
+        assert cdp is None
+        assert err and "already being prepared" in err
 
     def test_driven_browser_is_never_the_persons_browser_app(self, tmp_path):
         """The person's browser binary runs ONLY for the hand-over: headless, no window, and gone
@@ -413,15 +450,14 @@ class TestRealProfileCdpLaunch:
         a reaper-visible socket dir claimed by this process and never self-terminates."""
         import tools.browser_tool as bt
         self._reset()
-        proc = Mock(return_value=None, returncode=0, stdout="", stderr="")
         captured = {}
 
-        def fake_run(argv, **kw):
+        def fake_agent_browser_spawn(argv, env, socket_dir, tag):
             captured["argv"] = argv
-            captured["env"] = kw["env"]
-            return proc
+            captured["env"] = env
+            return Mock(wait=Mock(return_value=0), returncode=0)
 
-        self._run(tmp_path, run_side_effect=fake_run,
+        self._run(tmp_path, spawn_side_effect=fake_agent_browser_spawn,
                   extra_patches=[patch.object(bt, "_socket_safe_tmpdir", return_value=str(tmp_path))])
         assert "--headless" not in captured["argv"]
         assert "--profile" not in captured["argv"]
@@ -590,6 +626,79 @@ class TestDrivenBrowserLifecycle:
         assert bt._real_profile_last_used >= before
         self._reset()
 
+class TestAgentBrowserCliCapture:
+    """#96731: agent-browser's resident daemon inherits the caller's stdio and
+    outlives the CLI, so pipe-based capture never sees EOF after the CLI
+    exits. Capture must go through temp files and wait only for the CLI."""
+
+    STUB_GRANDCHILD = (
+        "import subprocess, sys\n"
+        # A grandchild that inherits stdout and outlives the CLI — exactly
+        # what agent-browser's first-use daemon spawn does.
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "sys.stdout.write('ws://127.0.0.1:41022/devtools/browser/stub\\n')\n"
+        "sys.stderr.write('daemon warm\\n')\n"
+    )
+
+    def test_get_cdp_returns_despite_grandchild_holding_stdio(self, tmp_path):
+        """The blocking frame from the #96731 py-spy capture: get cdp-url."""
+        import sys
+        import time
+
+        stub = tmp_path / "agent_browser_daemon_stub.py"
+        stub.write_text(self.STUB_GRANDCHILD)
+        with patch.object(bt_install, "_find_agent_browser", return_value=str(stub)), \
+             patch.object(bt_session, "_agent_browser_argv", return_value=[sys.executable, str(stub)]), \
+             patch.object(bt_real_profile, "_real_profile_daemon_env", return_value=({}, str(tmp_path))):
+            start = time.monotonic()
+            cdp = bt_real_profile._agent_browser_get_cdp("hermes-real-profile")
+            elapsed = time.monotonic() - start
+
+        assert cdp == "http://127.0.0.1:41022"
+        # Pipe capture would stall here for the full 15s timeout on POSIX and
+        # hang past the outer tool deadline on Windows.
+        assert elapsed < 10, f"get cdp-url stalled {elapsed:.1f}s behind a grandchild"
+        # The capture temp files are cleaned up after the call.
+        assert not list(tmp_path.glob("_std*_rp-*"))
+
+    def test_capture_cli_surfaces_stdout_stderr_and_exit_code(self, tmp_path):
+        import sys
+
+        stub = tmp_path / "agent_browser_echo_stub.py"
+        stub.write_text(
+            "import sys\n"
+            "sys.stdout.write('out-42\\n')\n"
+            "sys.stderr.write('err-7\\n')\n"
+            "sys.exit(3)\n"
+        )
+        with patch.object(bt_real_profile, "_real_profile_daemon_env", return_value=({}, str(tmp_path))):
+            proc = bt_real_profile._capture_agent_browser_cli(
+                [sys.executable, str(stub)], timeout=15, tag="rp-test",
+            )
+        assert proc.returncode == 3
+        assert proc.stdout == "out-42"
+        assert proc.stderr == "err-7"
+
+    def test_capture_cli_timeout_kills_cli_and_cleans_files(self, tmp_path):
+        import subprocess
+        import sys
+        import time
+
+        stub = tmp_path / "agent_browser_sleep_stub.py"
+        stub.write_text("import time; time.sleep(30)\n")
+        with patch.object(bt_real_profile, "_real_profile_daemon_env", return_value=({}, str(tmp_path))):
+            start = time.monotonic()
+            with pytest.raises(subprocess.TimeoutExpired):
+                bt_real_profile._capture_agent_browser_cli(
+                    [sys.executable, str(stub)], timeout=2, tag="rp-timeout",
+                )
+            elapsed = time.monotonic() - start
+
+        # The CLI itself is killed at the deadline instead of draining pipes
+        # behind a daemon grandchild forever.
+        assert elapsed < 10, f"timeout path stalled {elapsed:.1f}s"
+        assert not (tmp_path / "_stdout_rp-timeout").exists()
+        assert not (tmp_path / "_stderr_rp-timeout").exists()
 
 
 class TestConsentConfigRead:
@@ -1193,7 +1302,7 @@ class TestReviewRound3:
              patch.object(bt_real_profile, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "run", return_value=proc), \
+             patch.object(bt_real_profile, "_capture_agent_browser_cli", return_value=proc), \
              patch.object(bt_cloud, "_is_headed_mode", return_value=False), \
              patch("hermes_cli.browser_connect.chromium_executable", return_value="/bin/true"), \
              patch.object(bt_real_profile, "driven_browser_executable", return_value="/bin/true"), \

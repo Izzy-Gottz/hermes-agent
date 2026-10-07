@@ -18,6 +18,7 @@ from tests.tools.test_browser_real_profile import TestRealProfileCdpLaunch as _L
 from tools import browser_tool_cloud as bt_cloud
 from tools import browser_tool_install as bt_install
 from tools import browser_tool_real_profile as bt_real_profile
+from tools import browser_tool_session as bt_session
 
 DRIVEN = "/opt/data/.agent-browser/browsers/chrome-153.0.8010.47/chrome-linux64/chrome"
 
@@ -58,6 +59,9 @@ def _cold_start(home, *, launches, cdp_calls, detect=None, snapshot=None):
         patch.object(bt_real_profile, "_agent_browser_get_cdp", side_effect=[None, "http://127.0.0.1:41000"]),
         patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"),
         patch.object(bt.subprocess, "run", side_effect=lambda *a, **k: ok),
+        # agent-browser's CLI output comes back through temp files (upstream 15485e0c8d), not pipes.
+        patch.object(bt_session, "_popen_agent_browser",
+                     side_effect=lambda *a, **k: type("W", (), {"returncode": 0, "wait": lambda self, timeout=None: 0})()),
     ]
     for p in patches:
         p.start()

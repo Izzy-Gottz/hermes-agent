@@ -736,6 +736,33 @@ def _note_person_step(result: dict, step: dict, presence: Optional[dict]) -> Non
     result["hint"] = (result["hint"] + " " + hint) if result.get("hint") else hint
 
 
+#: Chrome's own codes for "the proxy this machine is configured to use did not answer". Moe ticket #20
+#: (2026-10-01): every page load ended on chrome-error://chromewebdata with ERR_PROXY_CONNECTION_FAILED
+#: because the Mac's system proxy pointed at 127.0.0.1:9096 with nothing listening -- and the model
+#: blamed the site. Matched only as Chrome's error page carries them: the code alone on its own line
+#: (the page's innerText), or anywhere once the chrome-error:// URL is in the output, so a page that
+#: merely mentions the code (a support ticket about it) is not mistaken for one.
+_PROXY_ERROR_CODES = r"ERR_PROXY_[A-Z_]+|ERR_TUNNEL_CONNECTION_FAILED"
+_PROXY_ERROR_LINE = re.compile(r"(?m)^[ \t]*(?:net::)?(" + _PROXY_ERROR_CODES + r")[ \t]*$")
+_PROXY_ERROR_ANY = re.compile(r"(?<![A-Z_])(" + _PROXY_ERROR_CODES + r")(?![A-Z_])")
+
+
+def _proxy_failure_note(stdout: str, stderr: str = "") -> str:
+    """A plain note when a page load ended on Chrome's proxy error page; "" otherwise.
+    Never changes how the browser connects (no --no-proxy-server): the proxy is the person's setting."""
+    text = "\n".join(t for t in (stdout, stderr) if t)
+    if not text:
+        return ""
+    found = _PROXY_ERROR_LINE.search(text)
+    if not found and "chrome-error://" in text:
+        found = _PROXY_ERROR_ANY.search(text)
+    if not found:
+        return ""
+    return (f"{found.group(1)}: this Mac's system proxy (System Settings › Network › Proxies; `scutil --proxy` "
+            "shows it) isn't answering, so the page never loaded -- this is not the site. Tell the person their "
+            "proxy setting is pointing at something that isn't running; retrying the site will fail the same way.")
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False, where: str = ""):
     """Run Python code through the browser-use CLI, and return its output.
@@ -915,6 +942,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
     if stderr:
         result["stderr"] = stderr
+    proxy_note = _proxy_failure_note(proc.stdout, proc.stderr)
+    if proxy_note:
+        result["network_note"] = proxy_note
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:
         result["screenshot_path"] = screenshot
@@ -948,8 +978,9 @@ _HEADER_VISION = (
 
 _HEADER_TEXT_ONLY = (
     " Your model cannot view images, so work text-first: page_info() for state, js() for "
-    "reading/extracting DOM text, fill_input(selector, text) for inputs, and "
-    "js(\"document.querySelector('…').click()\") for clicks — skip the screenshot-driven workflow described below."
+    "reading/extracting DOM text, fill_input(selector, text) for inputs, and click_at_xy(x, y) for clicks "
+    "(trusted input; take the centre from js(\"…getBoundingClientRect()\")) — use js(\"…click()\") only as a "
+    "fallback for an element with no on-screen box. Skip the screenshot-driven workflow described below."
 )
 
 # Appended when the local engine is Lightpanda: no graphical renderer, and one CDP
@@ -970,6 +1001,9 @@ _HELPERS_DIGEST = (
     "state, js(expr) evaluates a JS expression and returns its value (js('document.title'); wrap function "
     "bodies as js('(() => {...})()') — a bare '() => {...}' returns the function itself, uncalled), "
     "fill_input(selector, text) types into inputs, click_at_xy(x, y) clicks viewport coordinates, "
+    "Prefer click_at_xy (trusted input: get the centre from getBoundingClientRect in js) over element.click() "
+    "in js -- many sites (X, React apps) ignore synthetic clicks, so a js click that 'did nothing' was not a "
+    "real click. "
     "capture_screenshot() saves and prints a screenshot path, cdp('Domain.method', **kwargs) is raw CDP — "
     "cdp('Accessibility.getFullAXTree')['nodes'] lists every element's role/name/backendDOMNodeId (filter "
     "in Python before printing; it is thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) "

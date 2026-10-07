@@ -1699,6 +1699,12 @@ def run_conversation(
 
     mark_turn_started()  # the in-process runtimes' turn start (browser hand-over's at-the-Mac grace)
 
+    # The keys this turn's words get filed under (agent/recipient_grounding.py record_turn),
+    # so its reply is filed beside them.
+    try:
+        agent._grounding_turn_keys = []
+    except Exception:
+        pass
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):
@@ -1718,6 +1724,13 @@ def run_conversation(
             turn_author=turn_author,
         )
     result = export_current_turn_boundary(agent, result, user_message)
+    # What the assistant said, for the send gate: an address it showed the person, which they
+    # then said yes to, is asked about on the card rather than refused (recipient_grounding).
+    try:
+        from agent.recipient_grounding import record_reply, reply_text
+        record_reply(agent, reply_text(result))
+    except Exception:
+        pass
     _close_durable_failed_turn(agent, result)
     return result
 

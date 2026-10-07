@@ -66,3 +66,44 @@ def test_a_person_turn_never_leaks_into_the_next_turn_on_a_reused_thread(monkeyp
     seen = asyncio.run(_turns([{"X-Hermes-Turn-Origin": "person"}] * 3, monkeypatch))
     assert seen.pop() == ("after", [""])
     assert [p["live"] for _, p in seen] == [True] * 3
+
+
+class _WordsAgent(_Agent):
+    def run_conversation(self, **_kw):
+        from gateway.session_context import get_turn_person_words
+        self.seen.append(get_turn_person_words())
+        return {"final_response": "ok", "messages": [], "api_calls": 0, "tools": []}
+
+
+def test_the_persons_own_words_reach_the_turn_only_on_a_person_turn(monkeypatch):
+    """X-Hermes-Person-Words: what the person typed, apart from the app's wrapper — for the send
+    gate's recipient grounding. Kept only when the turn is declared the person's, and never left
+    bound for the next turn on a reused executor thread."""
+    import base64
+
+    async def run():
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        seen = []
+        monkeypatch.setattr(adapter, "_create_agent", lambda **kw: _WordsAgent(seen))
+        app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
+
+        async def handler(request):
+            await adapter._run_agent("hello", [], session_id="s1")
+            return web.json_response({})
+
+        app.router.add_post("/turn", handler)
+        good = base64.b64encode("good — שלום".encode()).decode()
+        async with TestClient(TestServer(app)) as client:
+            for headers in ({"X-Hermes-Turn-Origin": "person", "X-Hermes-Person-Words": good},
+                            {"X-Hermes-Turn-Origin": "background", "X-Hermes-Person-Words": good},
+                            {"X-Hermes-Turn-Origin": "person"},
+                            {"X-Hermes-Turn-Origin": "person", "X-Hermes-Person-Words": "%%%"}):
+                assert (await client.post("/turn", headers=headers)).status == 200
+        from gateway.session_context import get_turn_person_words
+        loop = asyncio.get_running_loop()
+        after = {await loop.run_in_executor(None, get_turn_person_words) for _ in range(16)}
+        return seen, after
+
+    seen, after = asyncio.run(run())
+    assert seen == ["good — שלום", None, None, None]
+    assert after == {None}
