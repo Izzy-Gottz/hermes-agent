@@ -69,6 +69,15 @@ Spawned by: CodexAppServerSession.ensure_started() when the runtime is
 
 from __future__ import annotations
 
+# First, like every entry point: stdio, import-path and environ-lifetime fixes (hermes_bootstrap).
+# Only as ``python -m``: codex_runtime & co. import this module for a constant, and the
+# bootstrap's scratch/TMPDIR exports must not fire in those library importers.
+if __name__ == "__main__":
+    try:
+        import hermes_bootstrap  # noqa: F401
+    except ModuleNotFoundError:
+        pass  # a partial ``hermes update`` can leave the bootstrap unregistered
+
 import base64
 import inspect
 import keyword
@@ -81,6 +90,12 @@ import sys
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# The ``[mcp_servers.<name>]`` key under which the runtime migration registers this server. Every
+# codex-side reference to it (worker ``-c mcp_servers.<name>.env.*`` overrides, elicitation
+# auto-accept, display-name stripping) must use this constant: a drifted name materialises a
+# second env-only entry that codex rejects at bootstrap ("invalid transport").
+HERMES_TOOLS_MCP_SERVER_NAME = "hermes-tools"
 
 # JSON Schema type -> Python type mapping for signature generation
 _JSON_TO_PY = {
@@ -625,7 +640,7 @@ def _build_server(profile: Optional[str] = None) -> Any:
                 " if asked for one; switching runtimes (/codex-runtime auto)"
                 " is the user's call, not a workaround to invent."
             )
-    mcp = MCPServer("hermes-tools", instructions=instructions)
+    mcp = MCPServer(HERMES_TOOLS_MCP_SERVER_NAME, instructions=instructions)
 
     # Pull authoritative Hermes tool schemas for the ones we expose, so
     # MCP clients see the same parameter docs Hermes gives the model.

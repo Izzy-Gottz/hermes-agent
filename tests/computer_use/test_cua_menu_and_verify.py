@@ -244,20 +244,33 @@ def test_the_approval_dialog_says_which_menu_item():
         == "menu Terminal › Quit Terminal"
 
 
-def test_approving_one_menu_item_does_not_authorise_every_other():
+def test_approving_one_menu_item_does_not_authorise_every_other(monkeypatch):
     """A click needs a capture and coordinates, so each is a separate visible
     decision. One opaque menu approval would otherwise cover every future
     menu item in the session: approving "Terminal > Quit Terminal" once would
     silently authorise "File > Delete Everything" later, because the scope key
-    was only (action, delivery_mode)."""
-    import inspect
-
+    was only (action, delivery_mode). Since the upstream merge the grant lives in
+    the shared ``tools.approval`` store, so this is measured there."""
+    from tools import approval
+    from tools.approval_context import reset_current_session_key, set_current_session_key
     from tools.computer_use import tool as t
 
-    src = inspect.getsource(t._request_approval)
-    assert "scope_key = scope_key + tuple(" in src, \
-        "the menu path must be part of the approval scope key"
-    assert 'action == "invoke_menu"' in src
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+    prompts = []
+    t.set_approval_callback(lambda command, description, **kw: prompts.append(command) or "session")
+    token = set_current_session_key("cua-menu-scope")
+    try:
+        quit_ = {"path": ["Terminal", "Quit Terminal"]}
+        assert t._request_approval("invoke_menu", quit_) is None
+        assert t._request_approval("invoke_menu", quit_) is None
+        assert len(prompts) == 1, "the same menu item, granted for the session, is not asked twice"
+        assert t._request_approval("invoke_menu", {"path": ["File", "Delete Everything"]}) is None
+        assert len(prompts) == 2, "the menu path must be part of the approval scope key"
+    finally:
+        t.set_approval_callback(None)
+        reset_current_session_key(token)
+        approval.clear_session("cua-menu-scope")
 
 
 def test_invoking_a_menu_needs_approval_like_a_click():

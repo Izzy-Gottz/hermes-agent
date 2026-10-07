@@ -11,8 +11,27 @@ from typing import Any
 
 # Exact whole-response markers meaning "the agent intentionally chose not to
 # reply". Keep small and explicit; arbitrary empty output remains an
-# error/empty-response path, not silence.
-LIVE_GATEWAY_SILENT_MARKERS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
+# error/empty-response path, not silence. A lane that does not think in English
+# translates the sentinel rather than dropping it, and the whole control token
+# then reaches the user as content, so the translated forms are carried here
+# too. zh-Hans is the only non-English locale this project ships documentation
+# for, which is where the list stops.
+LIVE_GATEWAY_SILENT_MARKERS = frozenset({
+    "[SILENT]", "SILENT", "NO_REPLY", "NO REPLY",
+    "[静默]", "静默", "[沉默]", "沉默",
+})
+
+# Bracketed markers drive the autonomous lane's prefix rule ("[SILENT] nothing
+# new this tick"). Derived from the set above so a new marker cannot be added to
+# one rule and forgotten in the other.
+_BRACKETED_SILENCE_MARKERS = tuple(
+    sorted(m for m in LIVE_GATEWAY_SILENT_MARKERS if m.startswith("["))
+)
+
+# The persisted user-row kind of a self-injected MessageEvent(internal=True) turn — the only
+# machinery kind the gateway produces; only these may vanish on a bare silence marker.
+INTERNAL_NOTIFICATION_DISPLAY_KIND = "internal_notification"
+MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND})
 
 # Longer than any marker could plausibly be, even with stray punctuation.
 _MARKER_LENGTH_CAP = 64
@@ -71,14 +90,18 @@ def _split_silence_marker(response: Any) -> tuple[bool, str]:
     if not stripped:
         return False, ""
     lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
-    if _canonical_silence_candidate(stripped) in LIVE_GATEWAY_SILENT_MARKERS:
+    if is_intentional_silence_response(stripped):
         return True, ""
     # Bracketed form only for the prefix rule, so a bare "Silent retry succeeded" is NOT swallowed.
-    if lines[0].upper().startswith("[SILENT]"):
-        return True, "\n".join([lines[0][len("[SILENT]"):].strip(), *lines[1:]]).strip()
-    if _canonical_silence_candidate(lines[0]) in LIVE_GATEWAY_SILENT_MARKERS:
+    # Upstream's bracketed set (``[SILENT]`` and its translations) and its de-punctuating
+    # line rule, so ``【静默】`` / ``静默。`` cannot be suppressed in chat yet delivered by cron.
+    head = lines[0].upper()
+    for marker in _BRACKETED_SILENCE_MARKERS:
+        if head.startswith(marker):
+            return True, "\n".join([lines[0][len(marker):].strip(), *lines[1:]]).strip()
+    if is_intentional_silence_response(lines[0]):
         return True, "\n".join(lines[1:])
-    if _canonical_silence_candidate(lines[-1]) in LIVE_GATEWAY_SILENT_MARKERS:
+    if is_intentional_silence_response(lines[-1]):
         return True, "\n".join(lines[:-1])
     return False, stripped
 
@@ -146,6 +169,28 @@ def strip_blocked_marker(response: Any) -> str:
 def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
     """Silence markers suppress delivery only for successful agent turns."""
     return isinstance(agent_result, dict) and not agent_result.get("failed") and is_intentional_silence_response(response)
+
+
+def display_kind_for_event(event: Any) -> str | None:
+    """The persisted user-row kind for a gateway turn: only self-injected events are machinery.
+
+    A scheduled heartbeat prompt is self-injected too (``_heartbeat_session_id`` is stamped only
+    by the gateway poller, never inferred from inbound text), but it deliberately stays
+    non-internal so authorization and the emergency stop still apply to it.
+    """
+    if getattr(event, "internal", False) or getattr(event, "_heartbeat_session_id", None):
+        return INTERNAL_NOTIFICATION_DISPLAY_KIND
+    return None
+
+
+def is_machinery_display_kind(display_kind: Any) -> bool:
+    """Only a machinery turn may vanish on a bare silence marker; a human turn gets a visible fallback.
+
+    The caller passes the current turn's persisted display kind instead of inferring it from the
+    transcript: the inbound user row is not persisted yet, and a previous internal row must never
+    authorize silence on a human turn.
+    """
+    return display_kind in MACHINERY_DISPLAY_KINDS
 
 
 def is_partial_silence_marker(text: Any) -> bool:

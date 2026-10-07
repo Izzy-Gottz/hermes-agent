@@ -39,7 +39,6 @@ class TestSignatureFromSchema:
         assert param.default is inspect.Parameter.empty
 
 
-
     def test_skip_private_params(self):
         """Params starting with '_' are excluded from the signature."""
         schema = {
@@ -80,19 +79,7 @@ class TestSignatureFromSchema:
         assert annots["o"] == dict
 
 
-
-
-
-
-
-
 class TestModuleSurface:
-    def test_module_imports_clean(self):
-        from agent.transports import hermes_tools_mcp_server as m
-        assert callable(m.main)
-        assert callable(m._build_server)
-        assert isinstance(m.EXPOSED_TOOLS, tuple)
-        assert len(m.EXPOSED_TOOLS) > 0
 
     def test_exposed_tools_are_safe_subset(self):
         """We MUST NOT expose tools codex already has, because codex'
@@ -212,10 +199,6 @@ class TestClaudeCodeProfileGuards:
     def test_default_profile_has_no_terminal(self, monkeypatch):
         server = self._build(monkeypatch, None)
         assert "terminal" not in server.tools and "web_search" in server.tools
-
-
-
-
 
 
 class TestMain:

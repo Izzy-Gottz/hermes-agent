@@ -218,7 +218,7 @@ class TestSignedOutSession:
     def _run(self, session, commands, keeper_state="serving"):
         calls, keepers = [], []
 
-        def spawn(task_id, info, cmd, command, engine, timeout):
+        def spawn(task_id, info, cmd, command, engine, timeout, stdin_payload=None):
             calls.append(cmd[cmd.index("--json") + 1:])
             if cmd[-2:] == ["get", "cdp-url"]:
                 return {"success": True, "data": {"cdpUrl": "ws://127.0.0.1:53111/devtools/browser/abc"}}
@@ -287,7 +287,7 @@ class TestSignedOutSession:
         session = {"session_name": "h_1", "fidelity_launch": {
             "args": ["--disable-blink-features=AutomationControlled"], "executable": "/w.sh", "identity": CFT_154}}
 
-        def popen(argv, env, socket_dir, tag):
+        def popen(argv, env, socket_dir, tag, stdin_payload=None):
             captured.update(env)
             raise RuntimeError("stop here")
 

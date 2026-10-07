@@ -94,6 +94,9 @@ class CaptureResult:
     # A fixable cause (tools.fix_reasons contract: error/code/owner/pane/subject/retry) when the capture
     # failed for one; the tool boundary merges it into the result the model and the host read.
     fix: Optional[Dict[str, Any]] = None
+    # ``max_elements`` the backend asked the driver's AX walk to stop at (0 = unbounded / not applicable);
+    # ``len(elements) >= ax_max_elements > 0`` means the tree may be truncated.
+    ax_max_elements: int = 0
 
 
 @dataclass

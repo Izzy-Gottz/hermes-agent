@@ -25,7 +25,7 @@ class TestTheForkAnnouncesItsLane:
     def test_every_parity_fork_is_laned_by_its_write_origin(self, monkeypatch):
         built = {}
 
-        def _fake_init_kwargs(agent, rt, routed, max_iterations):
+        def _fake_init_kwargs(agent, rt, routed, max_iterations, *_rest):
             return {}
 
         class _FakeAgent:
@@ -37,13 +37,14 @@ class TestTheForkAnnouncesItsLane:
         monkeypatch.setattr(br, "_resolve_review_runtime", lambda a, c=None: {"routed": False})
         monkeypatch.setattr(br, "_detach_fork_compression", lambda a: None)
         monkeypatch.setattr(br, "_inherit_parent_tool_surface", lambda f, a: None)
-        monkeypatch.setattr(br, "_review_input_token_budget", lambda c: 0)
+        monkeypatch.setattr(br, "_review_input_token_budget", lambda *a: 0)
         import run_agent
 
         monkeypatch.setattr(run_agent, "AIAgent", _FakeAgent)
         parent = SimpleNamespace(
             session_id="sess-1", _memory_store=None, _memory_enabled=False,
             _user_profile_enabled=False, _cached_system_prompt="P", session_start=0,
+            _conversation_root_id=lambda: "sess-1",
         )
         fork, _rt, _routed = br.build_cache_parity_fork(
             parent, None, max_iterations=3, write_origin="background_review")

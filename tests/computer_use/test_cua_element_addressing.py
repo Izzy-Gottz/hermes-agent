@@ -35,6 +35,10 @@ class _Backend(CuaDriverBackend):
         class _S:
             def supports_capability(_s, cap, tool=None):
                 return capability
+
+            def supports_input_property(_s, tool, prop):
+                # cua-driver advertises element_token in its input schema only when the capability says so here
+                return capability
         self._session = _S()
 
 

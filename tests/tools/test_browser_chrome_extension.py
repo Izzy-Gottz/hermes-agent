@@ -379,7 +379,7 @@ def _presence_in_child(detached: bool):
         return {"status": "dispatched"}
 
     unit = types.SimpleNamespace(children=[(0, {"goal": "g"}, object())], task_list=[{"goal": "g"}],
-                                 context=None, top_role="leaf", creds={"model": "m"})
+                                 context=None, top_role="leaf", creds={"model": "m"}, live_writers=[])
     orig, orig_reg = dispatch._execute_and_aggregate, async_delegation.dispatch_async_delegation_batch
     dispatch._execute_and_aggregate = fake_execute
     async_delegation.dispatch_async_delegation_batch = fake_registry

@@ -43,7 +43,7 @@ class _FeatureSpec:
 _FEATURES: Dict[str, _FeatureSpec] = {
     "web": _FeatureSpec(
         "Web tools", True, "firecrawl", "firecrawl", ("web", "backend"),
-        "Web search & extract (Firecrawl)", "Firecrawl/Exa/Parallel/Tavily/Perplexity/Keenable key or SearXNG",
+        "Web search & extract", "Firecrawl/Exa/Parallel/Tavily/Perplexity/Keenable key or SearXNG",
         ("PARALLEL_API_KEY", "TAVILY_API_KEY", "PERPLEXITY_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL"),
     ),
     "image_gen": _FeatureSpec(
@@ -165,8 +165,9 @@ def _toolset_enabled(config: Dict[str, object], toolset_key: str) -> bool:
     target_tools = set(resolve_toolset(toolset_key))
     if not target_tools:
         return False
+    from hermes_cli.toolset_validation import parse_platform_toolsets_value
     for platform, raw_toolsets in platform_toolsets.items():
-        toolset_names = list(raw_toolsets) if isinstance(raw_toolsets, list) else []
+        toolset_names = list(parse_platform_toolsets_value(raw_toolsets) or [])
         if not toolset_names:
             toolset_names = [t for t in (_DEFAULT_PLATFORM_TOOLSETS.get(platform),) if t]
         available_tools: Set[str] = set()

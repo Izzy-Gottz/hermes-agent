@@ -52,14 +52,11 @@ def _check_vault_available() -> bool:
     """Schema-gate: the vault tools ride with the browser. An empty vault still needs
     browser_vault_save_login so the agent can offer to remember a login the first time it meets a
     form; hiding the tools until an item exists meant nobody ever discovered the feature."""
-    try:
-        from tools.browser_tool_install import check_browser_requirements
-        from tools.browser_use_cli import is_browser_use_cli_mode
-        # check_browser_requirements() is False by design in Browser Use mode (browser_exec replaces the
-        # built-in surface); the vault serves both stacks.
-        return bool(is_browser_use_cli_mode() or check_browser_requirements())
-    except Exception:
-        return False
+    from tools.browser_tool_install import check_browser_requirements
+    from tools.browser_use_cli import is_browser_use_cli_mode
+    # check_browser_requirements() is False by design in Browser Use mode (browser_exec replaces the
+    # built-in surface); the vault serves both stacks.
+    return bool(is_browser_use_cli_mode() or check_browser_requirements())
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +153,17 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
                 "session and retry."
             ),
         }
+
+    # Re-admit at the WRITE. The handler-level fence (_fenced_page_op) admitted before a possibly
+    # human-length prompt (enter_code waits for the user's code); a takeover during that wait must
+    # refuse here, before the credential lands in a page the human is now typing into. The outer
+    # epoch check only discards the result, and a fill is a side effect, not a result.
+    if _bot_desktop_browser_session(task_id):
+        from tools.bot_desktop import lease as _bd_lease
+        try:
+            _bd_lease.assert_agent_may_act()
+        except _bd_lease.HumanHasControl as exc:
+            return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
     sup = supervisor.evaluate_runtime(expression)
     if sup.get("ok"):
@@ -339,6 +347,8 @@ def browser_vault_list() -> str:
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
                      "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
+            if len(meta.allowed_origins) > 1:
+                entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
                 entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
             if meta.identifier:
@@ -1285,23 +1295,32 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     # ── Origin binding pre-check (cheap early exit; the authoritative check
     # runs synchronously inside the fill script itself) ──────────────────────
+    # Manager items can bind several websites (e.g. amazon.co.uk + www.amazon.co.uk);
+    # every saved origin is a valid fill target. Matching stays exact-origin —
+    # nothing wildcard/parent-domain is ever inferred.
+    allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
+    page_origin = None
     try:
-        page_origin = _focus_bound_origin(effective_task_id, str(meta.origin), meta.kind) or _current_page_origin(effective_task_id)
+        for candidate in allowed:
+            page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
+            if page_origin:
+                break
     except _PageBindingRefused as refused:
         return refused.as_json()
+    page_origin = page_origin or _current_page_origin(effective_task_id)
     if not page_origin:
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
         )
-    if page_origin != meta.origin:
+    if page_origin not in allowed:
         return json.dumps(
             {
                 "success": False,
                 "error_type": "origin_mismatch",
                 "error": (
                     f"Refused: current page origin ({page_origin}) does not match "
-                    f"the vault item's bound origin ({meta.origin}). Vault fills "
-                    "only run on the exact origin the credential was saved for."
+                    f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
+                    "only run on the exact origin(s) the credential was saved for."
                 ),
             }
         )
@@ -1355,7 +1374,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=str(meta.origin), nonce=nonce)
+            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
         )
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.
@@ -1379,7 +1398,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 "error_type": "origin_changed",
                 "error": (
                     "Refused: the page navigated away from the bound origin "
-                    f"({meta.origin}) before the fill could run "
+                    f"({page_origin}) before the fill could run "
                     f"(now on {parsed.get('found') or 'unknown'}). "
                     "Nothing was written."
                 ),
@@ -1388,7 +1407,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
-           "kind": meta.kind, "origin": meta.origin}
+           "kind": meta.kind, "origin": page_origin}
     if meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault_enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
@@ -1407,7 +1426,7 @@ def _confirm_payment_fill(label: str, origin: str) -> bool:
         f"Fill payment card '{label}' on {origin}",
         "The agent wants to enter your saved card details into this checkout page. The card number and "
         "CVC never enter the conversation. Approve only if you intend to pay here.",
-        surface="vault-payment") == "accept"
+        surface="vault-payment", title="Confirm payment card fill?") == "accept"
 
 
 # ---------------------------------------------------------------------------
@@ -1608,23 +1627,44 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
 }
 
 
+def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
+    from tools.browser_tool import _active_sessions, _last_session_key
+    from tools.browser_tool_session import _shares_bot_desktop_browser
+    return _shares_bot_desktop_browser(_active_sessions.get(_last_session_key(task_id or "default")) or {})
+
+
+def _fenced_page_op(task_id: Optional[str], fn) -> str:
+    """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
+    ``_run_browser_command``; they must honour the Bot Desktop lease like every other page access,
+    or a human typing a credential on the taken-over screen could be read or written to."""
+    from tools.browser_tool import _active_sessions, _last_session_key
+    from tools.browser_tool_session import run_fenced
+
+    session = _active_sessions.get(_last_session_key(task_id or "default")) or {}
+    res = run_fenced(session, lambda: {"raw": fn()})
+    return res["raw"] if "raw" in res else json.dumps(res)
+
+
 def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"),
-                                    code=str(args.get("code") or ""), source=str(args.get("source") or ""),
-                                    url=str(args.get("url") or ""), kind=str(args.get("kind") or ""),
-                                    remember=args.get("remember") is True)
+    tid = kwargs.get("task_id")
+    return _fenced_page_op(tid, lambda: browser_vault_enter_code(
+        handle=str(args.get("handle") or ""), task_id=tid, code=str(args.get("code") or ""),
+        source=str(args.get("source") or ""), url=str(args.get("url") or ""), kind=str(args.get("kind") or ""),
+        remember=args.get("remember") is True))
 
 
 def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_save_login(label=str(args.get("label") or ""), task_id=kwargs.get("task_id"),
-                                    url=str(args.get("url") or ""), username=str(args.get("username") or ""),
-                                    generate=args.get("generate") is True)
+    tid = kwargs.get("task_id")
+    return _fenced_page_op(tid, lambda: browser_vault_save_login(
+        label=str(args.get("label") or ""), task_id=tid, url=str(args.get("url") or ""),
+        username=str(args.get("username") or ""), generate=args.get("generate") is True))
 
 
 def _handle_vault_login(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_login(url=str(args.get("url") or ""), mode=str(args.get("mode") or "login"),
-                               username=str(args.get("username") or ""), label=str(args.get("label") or ""),
-                               task_id=kwargs.get("task_id"))
+    tid = kwargs.get("task_id")
+    return _fenced_page_op(tid, lambda: browser_vault_login(
+        url=str(args.get("url") or ""), mode=str(args.get("mode") or "login"),
+        username=str(args.get("username") or ""), label=str(args.get("label") or ""), task_id=tid))
 
 
 def _handle_vault_confirm(args: Dict[str, Any], **kwargs) -> str:
@@ -1636,7 +1676,9 @@ def _handle_vault_discard(args: Dict[str, Any], **kwargs) -> str:
 
 
 def _handle_vault_regenerate(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_regenerate(str(args.get("handle") or ""), policy=args.get("policy"), task_id=kwargs.get("task_id"))
+    tid = kwargs.get("task_id")
+    return _fenced_page_op(tid, lambda: browser_vault_regenerate(
+        str(args.get("handle") or ""), policy=args.get("policy"), task_id=tid))
 
 
 def _handle_vault_list(args: Dict[str, Any], **kwargs) -> str:
@@ -1648,9 +1690,8 @@ def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
 
 
 def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_fill(
-        handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id")
-    )
+    tid = kwargs.get("task_id")
+    return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
 
 
 from tools.registry import no_cache_check_fn, registry  # noqa: E402

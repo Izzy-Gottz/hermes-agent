@@ -26,10 +26,15 @@ class _Agent:
 
     def __init__(self, provider="anthropic"):
         self.provider, self.base_url, self.model = provider, "https://x", "m"
-        self.emitted, self.buffered = [], []
+        self.emitted, self.buffered, self.waits = [], [], []
 
     def _emit_status(self, m): self.emitted.append(m)
     def _buffer_status(self, m): self.buffered.append(m)
+    # Upstream's diagnostic rail (status_output.py): the engine line is buffered there, and the
+    # transient "retrying in Ns" spinner line is rewritten by the next frame — not a status.
+    def _emit_diagnostic_status(self, m): self.emitted.append(m)
+    def _buffer_diagnostic_status(self, m): self.buffered.append(m)
+    def _emit_diagnostic_wait(self, m): self.waits.append(m)
     def _client_log_context(self): return ""
 
 

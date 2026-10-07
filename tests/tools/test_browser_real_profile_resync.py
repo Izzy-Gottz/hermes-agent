@@ -193,7 +193,7 @@ class TestCopyOfADbTheBrowserHolds:
         holder = _hold(src, write=True)
         try:
             started = time.monotonic()
-            assert bc._copy_auth_file(str(src), str(dst)) is True
+            assert bc._copy_auth_file(str(src), str(dst)) is None  # None = copied
             elapsed = time.monotonic() - started
         finally:
             holder.close()
@@ -215,7 +215,7 @@ class TestCopyOfADbTheBrowserHolds:
             with open(src, "r+b") as fh:  # what a reader sees mid-write: a page half overwritten
                 fh.seek(4096 * 2 + 16)
                 fh.write(os.urandom(2048))
-            assert bc._copy_auth_file(str(src), str(dst)) is False
+            assert bc._copy_auth_file(str(src), str(dst)) is not None  # a reason: not copied
         finally:
             holder.close()
         assert _read(dst) == "good-old-copy"
@@ -227,13 +227,13 @@ class TestCopyOfADbTheBrowserHolds:
         whole copy of the committed state."""
         src, dst = tmp_path / "Login Data", tmp_path / "out" / "Login Data"
         _db(src, "committed")
-        monkeypatch.setattr(bc, "_AUTH_DB_BACKUP_SECONDS", 0.5)
+        monkeypatch.setattr(bc, "_AUTH_BACKUP_DEADLINE_S", 0.5)
         monkeypatch.setattr(bc, "_source_held_exclusively", lambda uri: False)
         holder = sqlite3.connect(src, isolation_level=None, timeout=0)
         holder.execute("BEGIN EXCLUSIVE")  # normal locking mode: released at COMMIT/ROLLBACK
         try:
             started = time.monotonic()
-            assert bc._copy_auth_file(str(src), str(dst)) is True
+            assert bc._copy_auth_file(str(src), str(dst)) is None  # None = copied
             elapsed = time.monotonic() - started
         finally:
             holder.rollback()
@@ -273,7 +273,7 @@ class TestCopyOfADbTheBrowserHolds:
             conn.executemany("insert into marker values(?)", [("new" * 300,)] * 50)
         old_bytes = dst.read_bytes()
         with open(dst, "rb") as reader:
-            assert bc._copy_auth_file(str(src), str(dst)) is True
+            assert bc._copy_auth_file(str(src), str(dst)) is None  # None = copied
             reader.seek(0)
             assert reader.read() == old_bytes
         assert _read(dst) == "new" * 300
@@ -288,7 +288,7 @@ class TestCopyOfADbTheBrowserHolds:
         monkeypatch.setattr(bc, "_db_in_use", lambda path: False)  # it opened after the probe
         holder = _hold(dst, write=True)
         try:
-            assert bc._copy_auth_file(str(src), str(dst)) is False
+            assert bc._copy_auth_file(str(src), str(dst)) is not None  # a reason: not copied
             inode = os.stat(dst).st_ino
         finally:
             holder.close()

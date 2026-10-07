@@ -131,6 +131,8 @@ def test_explicit_target_through_the_tool_is_a_clear_error(monkeypatch):
     from tools.computer_use import tool as cu_tool
     backend = _backend([DRIVER_WINDOW, SAFARI_WINDOW])
     monkeypatch.setattr(cu_tool, "_get_backend", lambda session_id=None: backend)
+    # upstream acquires through _backend_for_call (cache-validated); hand it the same backend
+    monkeypatch.setattr(cu_tool, "_backend_for_call", lambda session_id="": __import__("contextlib").nullcontext(cu_tool._get_backend(session_id)))
     out = json.loads(cu_tool.handle_computer_use({"action": "capture", "pid": 69038, "window_id": 405}))
     assert "belongs to the screen-control helper itself" in out["error"], out
 

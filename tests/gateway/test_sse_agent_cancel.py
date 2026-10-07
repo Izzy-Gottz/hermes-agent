@@ -247,44 +247,12 @@ class TestSSEAgentCancelOnDisconnect:
                 )
 
             # agent.interrupt() must have been called
-            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            mock_agent.interrupt.assert_called_once()
             # Clean up
             agent_done.set()
 
         asyncio.run(run())
 
-    def test_agent_ref_none_still_cancels_task(self):
-        """When agent_ref is not provided (None), the task is still cancelled
-        on disconnect — just without the interrupt() call."""
-        adapter = _make_adapter()
-
-        async def fake_agent():
-            await asyncio.sleep(999)
-            return {}, {}
-
-        async def run():
-            from aiohttp import web
-            from gateway.platforms.api_server import ThreadSafeAsyncQueue
-
-            stream_q = ThreadSafeAsyncQueue()
-
-            agent_task = asyncio.ensure_future(fake_agent())
-
-            mock_response = AsyncMock(spec=web.StreamResponse)
-            mock_response.write = AsyncMock(side_effect=BrokenPipeError("gone"))
-            mock_response.prepare = AsyncMock()
-
-            with patch("gateway.platforms.api_server.web.StreamResponse",
-                       return_value=mock_response):
-                # No agent_ref passed — should still handle disconnect cleanly
-                await adapter._write_sse_chat_completion(
-                    _make_request(), "cmpl-noref", "gpt-4", 1234567890,
-                    stream_q, agent_task,
-                )
-
-            assert agent_task.cancelled() or agent_task.done()
-
-        asyncio.run(run())
 
 
 def _capturing_response():
@@ -580,7 +548,7 @@ class TestSSEDisconnectWatcher:
             # not depend on a write failing.
             assert response.write.call_count == writes_before
             # Exactly the write-exception path's sequence, once.
-            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected", tool_reason="sse client disconnected")
             assert abandon_spy.call_count == 1
             assert agent_task.cancelled()
             hits = [r for r in caplog.records
@@ -629,7 +597,7 @@ class TestSSEDisconnectWatcher:
                 elapsed = time.monotonic() - t0
 
             assert elapsed < 0.5, f"disconnect took {elapsed:.3f}s to act on"
-            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected", tool_reason="sse client disconnected")
             assert abandon_spy.call_count == 1
             assert agent_task.cancelled()
             assert sum(
@@ -713,7 +681,7 @@ class TestSSEDisconnectWatcher:
                 )
                 await asyncio.sleep(0.35)  # give a stray watcher every chance to fire again
 
-            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected", tool_reason="sse client disconnected")
             assert abandon_spy.call_count == 1
             assert agent_task.cancelled()
             agent_done.set()

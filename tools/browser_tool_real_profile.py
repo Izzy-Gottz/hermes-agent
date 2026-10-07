@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from agent.proxy_bypass import loopback_request_kwargs
 from tools.browser_tool_origin import origin_module as _origin
 from tools import browser_tool_cloud as _cloud
 from tools import browser_tool_fidelity as _fidelity
@@ -166,7 +167,8 @@ def _surviving_chrome_cdp(data_dir: str) -> Optional[str]:
     http_cdp = f"http://127.0.0.1:{port}"
     try:
         import requests
-        ws_url = str(requests.get(f"{http_cdp}/json/version", timeout=2).json().get("webSocketDebuggerUrl") or "")
+        ws_url = str(requests.get(f"{http_cdp}/json/version", timeout=2, **loopback_request_kwargs(http_cdp))
+                     .json().get("webSocketDebuggerUrl") or "")
     except Exception:
         return None
     return http_cdp if ws_url.endswith(browser_path) else None
@@ -330,9 +332,12 @@ def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str
     argv = [binary, f"--user-data-dir={copy_dir}", *_REAL_PROFILE_CHROME_FLAGS, *extra_flags]
     if headless:
         argv.append("--headless=new")
+    else:
+        _session._ensure_screen_for_headed_chromium()
+    browser_env = _bt._build_browser_env()  # carries the Bot Desktop DISPLAY when one is running
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                stdin=subprocess.DEVNULL, start_new_session=True, env=_bt._build_browser_env())
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=browser_env)
     except (subprocess.SubprocessError, OSError) as e:
         return None, None, f"{_RP}the {what} launch failed: {e}"
     _bt._real_profile_chrome_procs.append(proc)
@@ -372,8 +377,14 @@ def _driven_browser_headless() -> bool:
     While the page is handed to the person (``_shown_to_person``) the browser is headed."""
     if _shown_to_person["on"]:
         return False
-    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    return not (_cloud._is_headed_mode() and (has_display or not sys.platform.startswith("linux")))
+    if not _cloud._is_headed_mode():
+        return True
+    if not sys.platform.startswith("linux"):
+        return False
+    _session._ensure_screen_for_headed_chromium()  # a Bot Desktop DISPLAY counts as a display (upstream)
+    browser_env = _origin()._build_browser_env()
+    has_display = bool(browser_env.get("DISPLAY") or browser_env.get("WAYLAND_DISPLAY"))
+    return not has_display
 
 
 def _driven_browser_flags(identity: Optional[Dict[str, Any]], headless: bool) -> Tuple[str, ...]:
@@ -423,7 +434,8 @@ def _cdp_call(port: int, method: str, params: Optional[Dict[str, Any]] = None, t
     """One browser-level CDP call over the debug port; returns the ``result`` dict. Raises on error."""
     import requests
     from websockets.sync.client import connect
-    ws_url = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=3).json()["webSocketDebuggerUrl"]
+    _http = f"http://127.0.0.1:{port}"
+    ws_url = requests.get(f"{_http}/json/version", timeout=3, **loopback_request_kwargs(_http)).json()["webSocketDebuggerUrl"]
     with connect(ws_url, max_size=None, open_timeout=timeout, close_timeout=2) as ws:
         ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
         deadline = time.monotonic() + timeout
@@ -607,7 +619,7 @@ def _snapshot_jar(src: str, profile: str, dst: str) -> Optional[str]:
     for rel in _COOKIE_DB_RELS:
         s = os.path.join(src, profile, rel)
         if os.path.isfile(s):
-            copied += bool(_copy_auth_file(s, os.path.join(dst, "Default", rel)))
+            copied += _copy_auth_file(s, os.path.join(dst, "Default", rel)) is None  # None = copied
     return None if copied else "the person's cookie jar could not be copied (their browser was writing it)"
 
 

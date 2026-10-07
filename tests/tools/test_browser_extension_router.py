@@ -426,12 +426,11 @@ def test_routeable_browser_tools_preserve_legacy_gate_without_bound_identity(mon
 
 
 def test_bound_browser_request_bypasses_availability_caches(monkeypatch):
+    from gateway import browser_control_broker
     from gateway.session_context import clear_session_vars, set_session_vars
     from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope
 
-    monkeypatch.setattr(
-        "gateway.browser_control_broker.browser_control_enabled", lambda: True
-    )
+    monkeypatch.setattr(browser_control_broker, "browser_control_enabled", lambda: True)
     tokens = set_session_vars(
         session_id="session-fixture",
         browser_control_principal="principal-fixture",
@@ -443,18 +442,15 @@ def test_bound_browser_request_bypasses_availability_caches(monkeypatch):
         clear_session_vars(tokens)
 
 
-def test_bound_identity_with_browser_control_off_keeps_availability_caches(monkeypatch):
-    """The api_server binds this identity on EVERY request; with the feature
-    off no controller can attach, so the bypass must not fire (it emptied the
-    tool-definition cache on every turn — see model_tools.get_tool_definitions)."""
+def test_bound_identity_without_extension_control_keeps_cache_scope(monkeypatch):
+    """api_server binds a principal on every request; without the feature flag
+    that identity must not bypass the availability caches (#79047)."""
+    from gateway import browser_control_broker
     from gateway.session_context import clear_session_vars, set_session_vars
     from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope
 
-    monkeypatch.setattr(
-        "gateway.browser_control_broker.browser_control_enabled", lambda: False
-    )
+    monkeypatch.setattr(browser_control_broker, "browser_control_enabled", lambda: False)
     tokens = set_session_vars(
-        platform="api_server",
         session_id="session-fixture",
         browser_control_principal="principal-fixture",
         browser_control_transport_family="local-api",

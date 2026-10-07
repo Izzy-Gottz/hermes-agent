@@ -454,6 +454,8 @@ def cu(monkeypatch):
     released = []
     state = SimpleNamespace(tool=cu_tool, released=released, backend=None, releases=True)
     monkeypatch.setattr(cu_tool, "_get_backend", lambda session_id="": state.backend)
+    # upstream acquires through _backend_for_call (cache-validated); hand it the same backend
+    monkeypatch.setattr(cu_tool, "_backend_for_call", lambda session_id="": __import__("contextlib").nullcontext(cu_tool._get_backend(session_id)))
     monkeypatch.setattr(cu_tool, "release_computer_use_session",
                         lambda sid: released.append(sid) or state.releases)
     # a cached backend for session sid that owns its (embedded) daemon, as Moe's does
@@ -560,6 +562,8 @@ class TestComputerUse:
         def boom(session_id=""):
             raise RuntimeError(f"embedded cua-driver exited during startup: {DRV_GATED}")
         monkeypatch.setattr(cu_tool, "_get_backend", boom)
+        # upstream acquires through _backend_for_call (cache-validated); hand it the same backend
+        monkeypatch.setattr(cu_tool, "_backend_for_call", lambda session_id="": __import__("contextlib").nullcontext(cu_tool._get_backend(session_id)))
         out = _contract(cu.run({"action": "capture"}))
         assert out["code"] == "tcc_driver_accessibility" and out["also_pane"] == "Privacy_ScreenCapture"
 

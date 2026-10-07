@@ -294,9 +294,17 @@ def denied_chrome(darwin, tcc, tmp_path, monkeypatch):
     monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override_raw", lambda *a, **k: "")
     monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(cli)])
     bt._real_profile_cdp_cache.clear()
+    # A session another test file left cached (upstream's test_browser_vault does) would skip the
+    # session creation whose failure this suite is about: start from none, put them back after.
+    saved_sessions = dict(bt._active_sessions)
+    bt._active_sessions.clear()
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY  # ...and its CDP supervisors (console fast path)
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "_by_task", {})
     tcc(src)
     yield src
     bt._real_profile_cdp_cache.clear()
+    bt._active_sessions.clear()
+    bt._active_sessions.update(saved_sessions)
 
 
 def _via_registry(name, args):

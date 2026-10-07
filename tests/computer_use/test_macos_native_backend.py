@@ -568,6 +568,8 @@ def test_zoom_and_move_dispatch(monkeypatch, fake_screencapture):
     monkeypatch.setattr(b, "_jxa", lambda script, argv=None: calls.append(list(argv or [])) or "ok")
     tool.reset_backend_for_tests()
     monkeypatch.setattr(tool, "_get_backend", lambda session_id="": b)
+    # upstream acquires through _backend_for_call (cache-validated); hand it the same backend
+    monkeypatch.setattr(tool, "_backend_for_call", lambda session_id="": __import__("contextlib").nullcontext(tool._get_backend(session_id)))
     monkeypatch.setenv("HERMES_MCP_TOOL_PROFILE", "claude-code")
     shot = tool.handle_computer_use({"action": "capture", "mode": "vision"})
     assert isinstance(shot, dict) and shot["_multimodal"]
@@ -680,6 +682,8 @@ def test_force_quit_and_lock_combos_are_hard_blocked(monkeypatch):
     monkeypatch.setattr(b, "_applescript", lambda *a, **k: pytest.fail("must not reach osascript"))
     tool.reset_backend_for_tests()
     monkeypatch.setattr(tool, "_get_backend", lambda session_id="": b)
+    # upstream acquires through _backend_for_call (cache-validated); hand it the same backend
+    monkeypatch.setattr(tool, "_backend_for_call", lambda session_id="": __import__("contextlib").nullcontext(tool._get_backend(session_id)))
     for combo in ("cmd+option+esc", "cmd+alt+escape", "cmd-option-shift-escape", "ctrl+cmd+q", "cmd+shift+q"):
         out = tool.handle_computer_use({"action": "key", "keys": combo})
         assert "blocked key combo" in out, combo
@@ -700,6 +704,8 @@ def _tool_with(monkeypatch, b):
     from tools.computer_use import tool
     tool.reset_backend_for_tests()
     monkeypatch.setattr(tool, "_get_backend", lambda session_id="": b)
+    # upstream acquires through _backend_for_call (cache-validated); hand it the same backend
+    monkeypatch.setattr(tool, "_backend_for_call", lambda session_id="": __import__("contextlib").nullcontext(tool._get_backend(session_id)))
     return tool
 
 
