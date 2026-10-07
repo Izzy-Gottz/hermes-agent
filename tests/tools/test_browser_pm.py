@@ -411,3 +411,16 @@ def test_the_kept_profile_says_the_same_while_the_browser_is_pending(browser_sto
     (store / install.BROWSER_PENDING_MARKER).write_text("")
     cdp, err = rp._launch_kept(str(tmp_path / "kept"))
     assert (cdp, err) == (None, install.browser_pending_message())
+
+
+def test_browser_exec_says_the_same_while_the_browser_is_pending(browser_store, monkeypatch):
+    from tools import browser_use_cli
+
+    _, store, _ = browser_store
+    monkeypatch.setattr("tools.browser_tool_session._run_browser_command",
+                        lambda *a, **k: {"success": False, "error": "Chromium browser is missing."})
+    err = browser_use_cli._resolve_managed_chromium_cdp({}, None)
+    assert err.startswith("The local browser could not be started")
+    store.mkdir(parents=True, exist_ok=True)
+    (store / install.BROWSER_PENDING_MARKER).write_text("")
+    assert browser_use_cli._resolve_managed_chromium_cdp({}, None) == install.browser_pending_message()

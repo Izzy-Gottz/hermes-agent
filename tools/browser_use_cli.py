@@ -445,6 +445,9 @@ def _resolve_managed_chromium_cdp(env: dict, task_id: Optional[str], session_nam
                                timeout=_get_open_command_timeout(first_open=True))
     cdp = str(((res or {}).get("data") or {}).get("cdpUrl") or "") if (res or {}).get("success") else ""
     if not cdp:
+        from tools.browser_tool_install import _browser_pending, browser_pending_message
+        if _browser_pending():  # (fork) the host is still fetching it: say that, and nothing to "reinstall"
+            return browser_pending_message()
         return (f"The local browser could not be started: {(res or {}).get('error') or 'agent-browser returned no CDP endpoint'} "
                 "Run `hermes tools` → Browser Automation to (re)install Chromium, or switch backends.")
     cdp = _reach_sandbox_cdp(cdp)
