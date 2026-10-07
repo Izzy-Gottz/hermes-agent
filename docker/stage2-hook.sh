@@ -654,6 +654,14 @@ fi
 # keeps the extras recorded for the next boot or install. Then collect the
 # generations nothing selects any more: no service holds a lease yet, and
 # collect_generations keeps anything younger than a day.
+#
+# (fork) HERMES_SKIP_DEPENDENCY_REFRESH=1 skips this step: an image whose
+# extras are fixed at build time and whose lazy installs are off (Memoe's away
+# machine) has nothing on the volume to re-resolve, and must not resolve
+# anything from the network at boot.
+if [ "${HERMES_SKIP_DEPENDENCY_REFRESH:-}" = "1" ]; then
+    echo "[stage2] dependency refresh skipped (HERMES_SKIP_DEPENDENCY_REFRESH=1)"
+else
 s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" -c '
 from pathlib import Path
 from hermes_cli.runtime_state import collect_generations
@@ -665,6 +673,7 @@ print("[stage2] dependency environment:", refresh_dependencies(root))
 removed = collect_generations(root) + collect_runtime_generations(install_state_dir(root) / "pm-runtime")
 print("[stage2] collected", len(removed), "unused dependency generations")
 ' || echo "[stage2] Warning: dependency refresh failed; continuing"
+fi
 
 # auth.json: bootstrap from env on first boot only. Same semantics as the
 # pre-s6 entrypoint — the [ ! -f ] guard is critical to avoid clobbering
