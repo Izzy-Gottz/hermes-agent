@@ -37,7 +37,7 @@ def two_profiles(tmp_path, monkeypatch):
     monkeypatch.setattr(_config, "_filter_suspicious_mcp_servers", lambda servers: servers)
     ledgers = ("_servers", "_server_scope_keys", "_server_tool_scopes", "_server_connecting",
                "_server_connect_errors", "_server_connect_retry_after", "_server_connect_failures",
-               "_server_error_counts", "_server_breaker_opened_at", "_lazy_server_configs",
+               "_server_error_counts", "_server_breaker_opened_at", "_lazy_server_configs", "_lazy_server_tool_names",
                "_mcp_tool_server_names", "_orphaned_adopters", "_parallel_safe_servers",
                "_server_trust_levels", "_tool_read_only_hints")
     saved = {n: type(getattr(core, n))(getattr(core, n)) for n in ledgers}
