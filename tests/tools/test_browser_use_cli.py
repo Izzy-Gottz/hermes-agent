@@ -909,6 +909,16 @@ class TestSkillTextDescription:
         assert "Prefer click_at_xy (trusted input" in digest
         assert "ignore synthetic clicks" in digest
 
+    def test_text_only_header_prefers_trusted_clicks(self):
+        # The text-only header once said js("…click()") "for clicks" -- the very synthetic click X ignored
+        # (Moe ticket #19). click_at_xy must be the way to click; js .click() only a named fallback.
+        header = bu_cli._HEADER_TEXT_ONLY
+        assert "click_at_xy(x, y) for clicks" in header
+        assert ".click()\") for clicks" not in header
+        fallback = header.find("click()")
+        assert fallback > header.find("click_at_xy") >= 0
+        assert "only as a fallback" in header[:fallback + 60]
+
     def test_static_fallback_carries_digest_and_install_hint(self):
         desc = bu_cli.BROWSER_EXEC_SCHEMA["description"]
         assert bu_cli._HELPERS_DIGEST in desc

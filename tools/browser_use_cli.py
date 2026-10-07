@@ -922,8 +922,9 @@ _HEADER_VISION = (
 
 _HEADER_TEXT_ONLY = (
     " Your model cannot view images, so work text-first: page_info() for state, js() for "
-    "reading/extracting DOM text, fill_input(selector, text) for inputs, and "
-    "js(\"document.querySelector('…').click()\") for clicks — skip the screenshot-driven workflow described below."
+    "reading/extracting DOM text, fill_input(selector, text) for inputs, and click_at_xy(x, y) for clicks "
+    "(trusted input; take the centre from js(\"…getBoundingClientRect()\")) — use js(\"…click()\") only as a "
+    "fallback for an element with no on-screen box. Skip the screenshot-driven workflow described below."
 )
 
 # Appended when the local engine is Lightpanda: no graphical renderer, and one CDP
