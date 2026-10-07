@@ -1616,6 +1616,12 @@ def run_conversation(
     from gateway.session_context import mark_turn_started
 
     mark_turn_started()  # the in-process runtimes' turn start (browser hand-over's at-the-Mac grace)
+    # The keys this turn's words get filed under (agent/recipient_grounding.py record_turn),
+    # so its reply is filed beside them.
+    try:
+        agent._grounding_turn_keys = []
+    except Exception:
+        pass
     result = _run_conversation_turn(
         agent,
         user_message,
@@ -1631,7 +1637,15 @@ def run_conversation(
         moa_config=moa_config,
         turn_author=turn_author,
     )
-    return export_current_turn_boundary(agent, result, user_message)
+    result = export_current_turn_boundary(agent, result, user_message)
+    # What the assistant said, for the send gate: an address it showed the person, which they
+    # then said yes to, is asked about on the card rather than refused (recipient_grounding).
+    try:
+        from agent.recipient_grounding import record_reply, reply_text
+        record_reply(agent, reply_text(result))
+    except Exception:
+        pass
+    return result
 
 
 __all__ = ["run_conversation"]

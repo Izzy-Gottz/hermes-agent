@@ -417,3 +417,115 @@ def test_an_unchanged_prompt_keeps_the_words_of_who_asked(home, monkeypatch):
     assert store[0]["grounding_words"] == said
     _fresh(jobs.update_job, job["id"], {"prompt": "Text Moshe Finkelman hi"})
     assert store[0]["grounding_words"] == []
+
+
+# ── 2026-10-07: the person's words are what they typed, not the app's whole message ──
+#
+# A live ledger showed it: the Memoe app's user message is a wrapper — a Now line, the
+# background sync's digest (other people's WhatsApp messages, with their numbers), a
+# "# The conversation so far" recap with Moe's own ASSISTANT: lines, the delivery rules — and
+# all of it was filed as the owner's words. So a number somebody ELSE wrote, or Moe wrote,
+# counted as "named by the owner". The app now declares the bare words (X-Hermes-Person-Words).
+
+STRANGER = "19174059316"
+MOES_OWN = "12125550123"
+MOE_WRAPPER = (
+    "Now: Wednesday 7 October 2026, 8:27 AM (morning), New York time (EDT, UTC-4).\n\n"
+    "# What is going on right now (as of 8:22 AM, 5 min before this message)\n\n<brief>\n"
+    "## WhatsApp\n2026-10-06 19:41:54|Project Atlas|" + STRANGER + "|are we able to add Maryann?\n"
+    "</brief>\n\n---\n\n"
+    "# The conversation so far\n\n[...older conversation omitted...]\n"
+    "ASSISTANT: I can text the venue at " + MOES_OWN + " if you want.\n\n---\n\n"
+    "(Typed, not spoken: this answer is read on a screen.)\n\ngood\n\n"
+    "# Before you answer\n\nThe Now line at the top of each message is the only clock.")
+
+
+def _app_turn(key, declared, wrapper=MOE_WRAPPER):
+    from gateway.session_context import (TURN_ORIGIN_PERSON, clear_session_vars, set_session_vars,
+                                         set_turn_origin, set_turn_person_words)
+
+    def turn():
+        tokens = set_session_vars(platform="api_server")
+        set_turn_origin(TURN_ORIGIN_PERSON)
+        set_turn_person_words(declared)
+        try:
+            rg.record_turn(_agent(), [key], wrapper)
+        finally:
+            clear_session_vars(tokens)
+
+    _fresh(turn)
+    return _ledger(key)
+
+
+def _person_text(data):
+    return "\n".join(w["text"] for w in data["words"] if w.get("origin") == "person")
+
+
+def test_an_app_turn_files_only_the_words_the_person_typed(home):
+    data = _app_turn("s-app", "good")
+    assert [w["text"] for w in data["words"] if w["origin"] == "person"] == ["good"]
+    said = _person_text(data)
+    assert STRANGER not in said, "a number from the background digest was filed as the owner's words"
+    assert MOES_OWN not in said, "Moe's own recap line was filed as the owner's words"
+    assert data["current"]["text"] == "good" and data["current"]["origin"] == "person"
+    assert isinstance(data["current"]["at"], float)
+
+
+def test_an_app_turn_that_declares_no_words_names_nobody(home):
+    data = _app_turn("s-undeclared", None)
+    assert _person_text(data) == ""
+    assert data["current"]["origin"] == "other" and data["current"].get("undeclared") is True
+
+
+def test_the_person_words_header_is_base64_and_never_guessed():
+    import base64
+    from gateway.platforms.api_server import _decode_person_words
+    words = "email partnerships@compare.com — שלום"
+    assert _decode_person_words(base64.b64encode(words.encode()).decode()) == words
+    assert _decode_person_words("") is None and _decode_person_words(None) is None
+    assert _decode_person_words("not base64!!") is None
+    assert _decode_person_words(base64.b64encode(b"\xff\xfe").decode()) is None
+
+
+def test_a_finished_turn_files_what_the_assistant_said_after_the_turn_started(home):
+    agent = _agent()
+    from gateway.session_context import (TURN_ORIGIN_PERSON, clear_session_vars, set_session_vars,
+                                         set_turn_origin, set_turn_person_words)
+
+    def turn():
+        tokens = set_session_vars(platform="api_server")
+        set_turn_origin(TURN_ORIGIN_PERSON)
+        set_turn_person_words("look at my screen, can you send for me")
+        try:
+            rg.record_turn(agent, ["s-reply", "cc:reply"], MOE_WRAPPER)
+            rg.record_reply(agent, rg.reply_text({
+                "final_response": "Want me to email partnerships@compare.com?",
+                "current_turn_user_idx": 0,
+                "messages": [{"role": "user", "content": "x"},
+                             {"role": "assistant", "content": "Looking at your screen."},
+                             {"role": "tool", "content": "partnerships@compare.com"},
+                             {"role": "assistant", "content": "Want me to email partnerships@compare.com?"}]}))
+        finally:
+            clear_session_vars(tokens)
+
+    _fresh(turn)
+    for key in ("s-reply", "cc:reply"):
+        data = _ledger(key)
+        (reply,) = data["replies"]
+        assert reply["text"] == "Looking at your screen.\n\nWant me to email partnerships@compare.com?"
+        assert reply["at"] >= data["current"]["at"]
+        assert all(w["origin"] != "person" or "compare.com" not in w["text"] for w in data["words"])
+
+
+def test_run_conversation_files_the_reply_under_the_turns_keys(home, monkeypatch):
+    from agent import conversation_loop as cl
+
+    def fake_turn(agent, user_message, **kw):
+        rg.record_turn(agent, ["s-loop"], user_message)
+        return {"final_response": "Sent nothing yet — shall I write to dan@example.com?",
+                "messages": [], "api_calls": 0}
+
+    monkeypatch.setattr(cl, "_run_conversation_turn", fake_turn)
+    agent = _agent(_current_turn_id="")
+    _fresh(cl.run_conversation, agent, "who is free tonight")
+    assert _ledger("s-loop")["replies"][-1]["text"].endswith("dan@example.com?")

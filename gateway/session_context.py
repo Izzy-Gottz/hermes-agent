@@ -68,6 +68,30 @@ def reset_turn_origin(token) -> None:
     _TURN_ORIGIN.reset(token)
 
 
+# The person's own words for THIS turn, as its client declared them (api_server, from
+# X-Hermes-Person-Words), apart from whatever the client wrapped around them — Moe's user message
+# carries a Now line, a background-sync digest of other people's mail and chats, a recap of the
+# conversation with Moe's own lines in it, delivery rules. Read by the send gate's recipient
+# grounding (agent/recipient_grounding.py), for which only what the person typed or said may name
+# somebody. ``None`` = not declared.
+_TURN_PERSON_WORDS = ContextVar("HERMES_TURN_PERSON_WORDS", default=_UNSET)
+
+
+def set_turn_person_words(words):
+    """Bind this turn's declared person words (``None`` = undeclared); returns the reset token."""
+    return _TURN_PERSON_WORDS.set(words if isinstance(words, str) else _UNSET)
+
+
+def reset_turn_person_words(token) -> None:
+    _TURN_PERSON_WORDS.reset(token)
+
+
+def get_turn_person_words():
+    """The person's own words as declared for this turn, or ``None`` when nobody declared them."""
+    value = _TURN_PERSON_WORDS.get()
+    return None if value is _UNSET else str(value)
+
+
 _TURN_STARTED_AT = ContextVar("HERMES_TURN_STARTED_AT", default=_UNSET)
 
 

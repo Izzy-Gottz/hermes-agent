@@ -32,6 +32,22 @@ person":
 * ``results`` — what tools returned, with the call's arguments, so the gate can
   tell a real lookup (contacts, chats, mail search) from a web page or a grep.
   The memory tools and reads of the memory files are never recorded.
+* ``replies`` — what the assistant said at the end of each turn, stamped with
+  when, and ``current["at"]`` — when the turn now running started. Together
+  they let the gate see Moe's own message *immediately before* the person's
+  latest one: an address Moe found on a page and showed the person, which they
+  then answered "yes" to, is "shown" (Moe's ``tools/recipients.py``) — never
+  grounded silently, always asked about on the card. Moe's words never count as
+  the person's.
+
+**What "the person's words" are.** Only what they typed or said. A client that
+wraps its user message in other text — Moe sends a Now line, a background-sync
+digest of other people's mail and chats, a recap of the conversation with its
+own lines in it, delivery rules — declares the bare words separately
+(api_server's ``X-Hermes-Person-Words``; ``gateway.session_context``
+``get_turn_person_words``). An api_server turn that says it is the person's but
+does not declare their words is filed as ``other``: the wrapper can be context,
+never grounding.
 
 The reader is Moe's ``tools/recipients.py``; the contract is this JSON shape,
 :func:`ledger_path` and the ``.enabled`` marker. With the marker present, a
@@ -72,6 +88,8 @@ MAX_WORD_CHARS = 8000
 MAX_RESULTS = 80
 MAX_RESULT_CHARS = 64 * 1024
 MAX_ARGS_CHARS = 2000
+MAX_REPLIES = 8
+MAX_REPLY_CHARS = 16000
 STALE_SECONDS = 2 * 24 * 3600
 
 #: Tools whose results are memory, not lookups.
@@ -312,7 +330,26 @@ def turn_words(agent: Any, current: Any) -> List[Dict[str, Any]]:
     sender = turn_sender()
     kind = sender.get("kind")
     origin = "person" if kind in ("local", "chat") else ("model" if kind in ("job", "helper") else "other")
+    if kind == "local" and sender.get("platform") == "api_server":
+        # The user message is the client's whole wrapper; the person's words are only what
+        # it declared as theirs. Undeclared, nothing in it is the person's.
+        declared = declared_person_words()
+        if declared is None:
+            return [{"text": text, "origin": "other", "sender": sender, "undeclared": True}]
+        said = clean(declared)
+        if not said:
+            return []
+        return [{"text": said, "origin": "person", "sender": sender}]
     return [{"text": text, "origin": origin, "sender": sender}]
+
+
+def declared_person_words() -> Optional[str]:
+    """The person's own words for this turn, as its client declared them; None = undeclared."""
+    try:
+        from gateway.session_context import get_turn_person_words
+        return get_turn_person_words()
+    except Exception:
+        return None
 
 
 def record_turn(agent: Any, keys: Iterable[str], current: Any) -> None:
@@ -341,7 +378,15 @@ def record_turn(agent: Any, keys: Iterable[str], current: Any) -> None:
             agent._grounding_person_words = persons
         except Exception:
             pass
-        current_entry = new[-1] if new else None
+        current_entry = dict(new[-1]) if new else None
+        if current_entry is not None:
+            # When this turn started: the gate reads Moe's last reply BEFORE it.
+            current_entry["at"] = time.time()
+        try:
+            seen = list(getattr(agent, "_grounding_turn_keys", None) or [])
+            agent._grounding_turn_keys = list(dict.fromkeys(seen + keys))
+        except Exception:
+            pass
         override = getattr(agent, "_grounding_override", None)
         legacy = override.get("legacy_job") if isinstance(override, dict) else None
         # {"prompt": …}: the job's own stored prompt, which says whom it may
@@ -399,6 +444,46 @@ def record_result(key: str, tool_name: str, args: Any, result: Any) -> None:
             data["results"] = rows[-MAX_RESULTS:]
 
         _update(key, _add)
+    except Exception:
+        return
+
+
+def reply_text(result: Any) -> str:
+    """What the assistant said in a finished turn: every assistant text after this turn's
+    user message when the result says where that is, else its final response."""
+    if not isinstance(result, dict):
+        return ""
+    parts: List[str] = []
+    messages = result.get("messages")
+    idx = result.get("current_turn_user_idx")
+    if isinstance(messages, list) and isinstance(idx, int) and 0 <= idx < len(messages):
+        for m in messages[idx + 1:]:
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                t = _text_of(m.get("content")).strip()
+                if t:
+                    parts.append(t)
+    final = str(result.get("final_response") or "").strip()
+    if final and not any(final in p for p in parts):
+        parts.append(final)
+    return "\n\n".join(parts)
+
+
+def record_reply(agent: Any, text: Any) -> None:
+    """File what the assistant said at the end of this turn, under every key the turn's
+    words were filed under (:func:`record_turn`). Never raises."""
+    try:
+        keys = [k for k in (getattr(agent, "_grounding_turn_keys", None) or []) if k]
+        said = _MEMORY_FENCE.sub(" ", _text_of(text)).strip()[:MAX_REPLY_CHARS]
+        if not keys or not said:
+            return
+
+        def _add(data: dict) -> None:
+            rows = data.get("replies") if isinstance(data.get("replies"), list) else []
+            rows.append({"text": said, "at": time.time()})
+            data["replies"] = rows[-MAX_REPLIES:]
+
+        for key in keys:
+            _update(key, _add)
     except Exception:
         return
 

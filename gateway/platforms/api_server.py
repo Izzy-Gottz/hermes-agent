@@ -50,6 +50,25 @@ _api_request_browser_control_principal: ContextVar[str] = ContextVar(
 #: X-Hermes-Turn-Origin for this request ("person" | "background" | ""), bound for the agent's turn.
 _api_request_turn_origin: ContextVar[str] = ContextVar("api_server_turn_origin", default="")
 _TURN_ORIGIN_HEADER = "X-Hermes-Turn-Origin"
+#: X-Hermes-Person-Words: the person's own words for this turn, base64 of their UTF-8 — apart from
+#: everything the client wraps around them (the Now line, a digest of other people's messages, a
+#: recap with the assistant's own lines). Only a "person" turn's are kept; ``None`` = undeclared.
+_api_request_person_words: ContextVar[Optional[str]] = ContextVar("api_server_person_words", default=None)
+_PERSON_WORDS_HEADER = "X-Hermes-Person-Words"
+
+
+def _decode_person_words(raw: Any) -> Optional[str]:
+    """The header's words, or ``None`` when it is absent or does not decode — never a guess."""
+    import base64
+    import binascii
+
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return base64.b64decode(text, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
 _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
     "api_server_browser_control_transport_family", default="")
 
@@ -1672,9 +1691,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     raw_origin = request.headers.get(_TURN_ORIGIN_HEADER, "").strip().lower()
                     origin_token = _api_request_turn_origin.set(
                         raw_origin if raw_origin in ("person", "background") else "")
+                    words_token = _api_request_person_words.set(
+                        _decode_person_words(request.headers.get(_PERSON_WORDS_HEADER))
+                        if raw_origin == "person" else None)
                     try:
                         return await handler(request)
                     finally:
+                        _api_request_person_words.reset(words_token)
                         _api_request_turn_origin.reset(origin_token)
                         _api_request_browser_control_transport_family.reset(family_token)
                         _api_request_browser_control_principal.reset(principal_token)
@@ -3857,16 +3880,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         request_browser_control_principal = _api_request_browser_control_principal.get()
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
         request_turn_origin = _api_request_turn_origin.get()
+        request_person_words = _api_request_person_words.get()
 
         def _run():
-            from gateway.session_context import reset_turn_origin, set_turn_origin
+            from gateway.session_context import (
+                reset_turn_origin, reset_turn_person_words, set_turn_origin, set_turn_person_words,
+            )
             # The client's own declaration of who started this turn (X-Hermes-Turn-Origin): the
             # Chrome-extension browser lane acts on the person's screen only in a "person" turn.
             # Reset after: executor threads are reused, and a stale "person" must never leak.
             origin_token = set_turn_origin(request_turn_origin)
+            # …and of what the person said (X-Hermes-Person-Words), for recipient grounding.
+            words_token = set_turn_person_words(request_person_words)
             try:
                 return _run_bound()
             finally:
+                reset_turn_person_words(words_token)
                 reset_turn_origin(origin_token)
 
         def _run_bound():
