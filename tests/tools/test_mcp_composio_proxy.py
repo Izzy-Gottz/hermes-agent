@@ -252,3 +252,185 @@ class TestRouteHint:
         with patch("tools.registry.registry.get_all_tool_names",
                    return_value=["mcp__composio__COMPOSIO_MULTI_EXECUTE_TOOL"]):
             assert tool_search._composio_route_hint("mcp__github__create_issue") == ""
+
+
+# ── which account: an address resolves to the id Composio can match ─────────
+#
+# 2026-10-07, measured live: three Gmail accounts on one multi-account session,
+# one with no alias. ``account: "yisrael@claimoe.ai"`` came back ``No account
+# found matching``; ``account: "ca_1r8-AuqvZ_oB"`` (that mailbox) answered its
+# profile. Composio matches an id or an alias, and nothing gave that one an
+# alias. The fixtures are the live shapes, trimmed to the fields read.
+
+USER = "moe-0123456789abcdef0123"
+ACCOUNTS = [  # newest first is NOT the order the API returns; sorted by created_at
+    {"id": "ca_S1ES5lxCn2qH", "alias": "sruly@hqpulse.ai", "user_id": USER, "status": "ACTIVE",
+     "toolkit": {"slug": "gmail"}, "created_at": "2026-09-20T10:00:00.000Z"},
+    {"id": "ca_1r8-AuqvZ_oB", "alias": None, "user_id": USER, "status": "ACTIVE",
+     "toolkit": {"slug": "gmail"}, "created_at": "2026-10-07T10:35:58.451Z"},
+    {"id": "ca_7NIHiXGSiOUe", "alias": "srulynj@gmail.com", "user_id": USER, "status": "ACTIVE",
+     "toolkit": {"slug": "gmail"}, "created_at": "2026-09-01T10:00:00.000Z"},
+    # Someone else's, on a project-wide list: never a choice for this person.
+    {"id": "ca_OTHERUSER0001", "alias": "stranger@example.com", "user_id": "moe-someoneelse", "status": "ACTIVE",
+     "toolkit": {"slug": "gmail"}, "created_at": "2026-10-01T10:00:00.000Z"},
+]
+PROFILE = {"ca_1r8-AuqvZ_oB": "yisrael@claimoe.ai", "ca_S1ES5lxCn2qH": "sruly@hqpulse.ai",
+           "ca_7NIHiXGSiOUe": "srulynj@gmail.com"}
+
+
+class _FakeComposio:
+    """Composio's REST API as this module uses it: the session, the accounts
+    list, and the alias PATCH. Records every request."""
+
+    def __init__(self, accounts=ACCOUNTS, readable=True):
+        self.accounts = [dict(a) for a in accounts]
+        self.readable = readable
+        self.requests = []
+
+    async def __call__(self, server, method, path, body=None):
+        self.requests.append((method, path, body))
+        if not self.readable:
+            return None
+        if method == "GET" and path.startswith("/api/v3.1/tool_router/session/"):
+            return {"session_id": "trs_fake", "config": {"user_id": USER}}
+        if method == "GET" and path.startswith("/api/v3/connected_accounts?"):
+            assert "user_ids=" + USER in path and "statuses=ACTIVE" in path
+            return {"items": [dict(a) for a in self.accounts], "next_cursor": None}
+        if method == "PATCH":
+            return {"ok": True}
+        return None
+
+    def lists(self):
+        return sum(1 for m, p, _ in self.requests if p.startswith("/api/v3/connected_accounts?"))
+
+    def patches(self):
+        return [(p, b) for m, p, b in self.requests if m == "PATCH"]
+
+
+def _profile_answer(account):
+    return _Result(json.dumps({"successful": True, "data": {"results": [{"response": {
+        "successful": True, "data": {"emailAddress": PROFILE[account]}},
+        "tool_slug": "GMAIL_GET_PROFILE", "index": 0}]}}))
+
+
+def _composio_session(server):
+    """call_tool that answers GET_TOOL_SCHEMAS and a muxed GMAIL_GET_PROFILE."""
+    async def call_tool(name, arguments=None):
+        if name == "COMPOSIO_GET_TOOL_SCHEMAS":
+            return _Result(LIVE_SCHEMAS)
+        entry = (arguments or {}).get("tools", [{}])[0]
+        if name == "COMPOSIO_MULTI_EXECUTE_TOOL" and entry.get("tool_slug") == "GMAIL_GET_PROFILE":
+            return _profile_answer(entry["account"])
+        return _Result('{"data":{"results":[]},"successful":true}')
+    server.session.call_tool = AsyncMock(side_effect=call_tool)
+    return server
+
+
+@pytest.fixture(autouse=True)
+def _no_real_composio(tmp_path, monkeypatch):
+    """No test reaches the network or the real HERMES_HOME. By default the
+    accounts cannot be read, which is the behaviour the tests above pin."""
+    monkeypatch.setattr(proxy, "_rest", _FakeComposio(readable=False))
+    monkeypatch.setattr(proxy, "_names_path", lambda: tmp_path / "cache" / "composio-account-names.json")
+
+
+def _augment_with_accounts(monkeypatch, fake=None):
+    fake = fake or _FakeComposio()
+    monkeypatch.setattr(proxy, "_rest", fake)
+    s = _composio_session(_server())
+    s._tools = asyncio.new_event_loop().run_until_complete(proxy.augment(s, s._tools))
+    return s, fake
+
+
+def _sent_after(server, n_before):
+    calls = server.session.call_tool.await_args_list[n_before:]
+    assert len(calls) == 1, calls
+    return calls[0].args[0], calls[0].kwargs["arguments"]
+
+
+class TestAccountChoice:
+    def test_the_unnamed_account_is_learned_from_its_profile_and_listed(self, monkeypatch, tmp_path):
+        s, fake = _augment_with_accounts(monkeypatch)
+        asked = [c.kwargs["arguments"]["tools"][0]["account"] for c in s.session.call_tool.await_args_list
+                 if c.args[0] == "COMPOSIO_MULTI_EXECUTE_TOOL"]
+        assert asked == ["ca_1r8-AuqvZ_oB"], "only the account with no alias is asked who it is"
+        send = next(t for t in s._tools if t.name == "GMAIL_SEND_EMAIL")
+        desc = send.inputSchema["properties"]["account"]["description"]
+        for who in ("yisrael@claimoe.ai", "sruly@hqpulse.ai", "srulynj@gmail.com"):
+            assert '"%s"' % who in desc
+        assert "stranger@example.com" not in desc, "another user's account is never a choice"
+        saved = json.loads((tmp_path / "cache" / "composio-account-names.json").read_text())
+        assert saved == {"ca_1r8-AuqvZ_oB": "yisrael@claimoe.ai"}
+        assert fake.patches() == [("/api/v3/connected_accounts/ca_1r8-AuqvZ_oB", {"alias": "yisrael@claimoe.ai"})], \
+            "an alias is given only where there was none"
+
+    def test_naming_the_unnamed_accounts_address_sends_its_id(self, monkeypatch):
+        """The 2026-10-07 call, as it should have gone."""
+        s, _ = _augment_with_accounts(monkeypatch)
+        n = len(s.session.call_tool.await_args_list)
+        out = _call(s, "GMAIL_SEND_EMAIL", {"recipient_email": "a@example.com", "subject": "hi",
+                                            "body": "x", "account": "yisrael@claimoe.ai"})
+        name, args = _sent_after(s, n)
+        assert name == "COMPOSIO_MULTI_EXECUTE_TOOL"
+        assert args["tools"][0]["account"] == "ca_1r8-AuqvZ_oB"
+        assert args["tools"][0]["arguments"] == {"recipient_email": "a@example.com", "subject": "hi", "body": "x"}
+        assert "error" not in json.loads(out)
+
+    @pytest.mark.parametrize("named,expected", [
+        ("SRULY@HQPULSE.AI", "ca_S1ES5lxCn2qH"),     # any case
+        ("ca_7NIHiXGSiOUe", "ca_7NIHiXGSiOUe"),      # the id itself
+        ("claimoe", "ca_1r8-AuqvZ_oB"),              # a name that is part of exactly one address
+    ])
+    def test_an_address_id_or_unique_name_resolves(self, monkeypatch, named, expected):
+        s, _ = _augment_with_accounts(monkeypatch)
+        n = len(s.session.call_tool.await_args_list)
+        _call(s, "GMAIL_FETCH_EMAILS", {"query": "in:inbox", "account": named})
+        _, args = _sent_after(s, n)
+        assert args["tools"][0]["account"] == expected
+
+    @pytest.mark.parametrize("named", ["nobody@example.com", "stranger@example.com", "sruly"])
+    def test_an_unknown_or_ambiguous_account_is_refused_with_the_choices(self, monkeypatch, named):
+        """Never passed on, never the default. ``sruly`` is part of two
+        addresses, so it names neither."""
+        s, fake = _augment_with_accounts(monkeypatch)
+        n = len(s.session.call_tool.await_args_list)
+        out = json.loads(_call(s, "GMAIL_SEND_EMAIL", {"recipient_email": "a@example.com", "account": named}))
+        assert s.session.call_tool.await_args_list[n:] == [], "nothing reaches Composio"
+        msg = out["error"]
+        assert named in msg and "Nothing was sent" in msg
+        for who in ("yisrael@claimoe.ai", "sruly@hqpulse.ai", "srulynj@gmail.com"):
+            assert who in msg
+
+    def test_a_miss_rereads_the_list_once_so_a_new_account_is_found(self, monkeypatch):
+        fake = _FakeComposio()
+        s, _ = _augment_with_accounts(monkeypatch, fake)
+        s._composio_accounts = (s._composio_accounts[0] - 60, s._composio_accounts[1])  # past the throttle
+        fake.accounts.append({"id": "ca_NEWNEWNEW001", "alias": "new@example.com", "user_id": USER,
+                              "status": "ACTIVE", "toolkit": {"slug": "gmail"},
+                              "created_at": "2026-10-07T12:00:00.000Z"})
+        n = len(s.session.call_tool.await_args_list)
+        _call(s, "GMAIL_SEND_EMAIL", {"recipient_email": "a@example.com", "account": "new@example.com"})
+        _, args = _sent_after(s, n)
+        assert args["tools"][0]["account"] == "ca_NEWNEWNEW001"
+
+    def test_a_learned_address_is_never_asked_for_again(self, monkeypatch):
+        _augment_with_accounts(monkeypatch)
+        s2, _ = _augment_with_accounts(monkeypatch)  # a fresh server, same Hermes home
+        assert not [c for c in s2.session.call_tool.await_args_list if c.args[0] == "COMPOSIO_MULTI_EXECUTE_TOOL"]
+        desc = next(t for t in s2._tools if t.name == "GMAIL_SEND_EMAIL").inputSchema["properties"]["account"]
+        assert '"yisrael@claimoe.ai"' in desc["description"]
+
+    def test_the_model_calling_the_multiplexer_itself_is_resolved_too(self, monkeypatch):
+        s, _ = _augment_with_accounts(monkeypatch)
+        n = len(s.session.call_tool.await_args_list)
+        _call(s, "COMPOSIO_MULTI_EXECUTE_TOOL", {"tools": [
+            {"tool_slug": "GMAIL_SEND_EMAIL", "arguments": {}, "account": "yisrael@claimoe.ai"}]})
+        _, args = _sent_after(s, n)
+        assert args["tools"][0]["account"] == "ca_1r8-AuqvZ_oB"
+
+    def test_unreadable_accounts_leave_the_call_as_it_was(self, monkeypatch):
+        """Composio then refuses an unknown name itself; it does not default."""
+        s = _augment(_server())
+        _call(s, "GMAIL_SEND_EMAIL", {"account": "yisrael@claimoe.ai"})
+        _, args = _sent(s)
+        assert args["tools"][0]["account"] == "yisrael@claimoe.ai"
