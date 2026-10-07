@@ -110,14 +110,17 @@ GROUPS = {
          ["tool_error_carries_the_note"]),
 
         (MCP, "rule 4d: a transport failure loses the note",
-         '            f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"\n'
-         '            + (("\\n\\n" + failure_note) if failure_note else "")',
-         '            f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"',
+         '        if failure_note:\n'
+         '            message = _sanitize_error(message + "\\n\\n" + failure_note)',
+         '        if False:\n'
+         '            pass',
          ["transport_exception_carries_the_note"]),
 
         (MCP, "the note is appended to every failure, applied or not",
-         '            + (("\\n\\n" + failure_note) if failure_note else "")))',
-         '            + "\\n\\nHermes filled in something"))',
+         '        if failure_note:\n'
+         '            message = _sanitize_error(message + "\\n\\n" + failure_note)',
+         '        if True:\n'
+         '            message = _sanitize_error(message + "\\n\\nHermes filled in something")',
          ["failure_with_no_defaults_applied_says_nothing"]),
 
         (MCP, "the multiplexer path is skipped",

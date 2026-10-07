@@ -166,12 +166,8 @@ _CALLBACK_GETTERS = {"unlock": lambda: get_unlock_prompt_callback(), "login": la
 def _in_process_prompt_ok(kind: Optional[str] = None) -> bool:
     """A surface in THIS process installed the prompt for ``kind`` (any of them when None), and the
     context is one a human can answer (not cron, webhook, api_server or -q)."""
-    from tools.approval_context import (
-        _is_cron_approval_context,
-        _is_single_query_approval_context,
-        _is_unattended_platform_approval_context,
-    )
-    if _is_cron_approval_context() or _is_unattended_platform_approval_context() or _is_single_query_approval_context():
+    from tools.approval_context import _no_user_can_answer
+    if _no_user_can_answer():
         return False
     kinds = [kind] if kind in _CALLBACK_GETTERS else list(_CALLBACK_GETTERS)
     return any(_CALLBACK_GETTERS[k]() is not None for k in kinds)

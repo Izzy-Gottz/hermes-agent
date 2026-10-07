@@ -22,7 +22,6 @@ import json
 
 import pytest
 
-
 @pytest.fixture
 def hermes_env(tmp_path, monkeypatch):
     """Isolate HERMES_HOME for each test so jobs don't leak."""
@@ -42,7 +41,6 @@ def hermes_env(tmp_path, monkeypatch):
 
     return home
 
-
 def _create_job() -> dict:
     from tools.cronjob_tools import cronjob
 
@@ -55,7 +53,6 @@ def _create_job() -> dict:
             deliver="local",
         )
     )
-
 
 class TestCreateSurfacesGatewayLiveness:
     def test_create_with_gateway_running_has_no_warning(self, hermes_env):
@@ -96,7 +93,6 @@ class TestCreateSurfacesGatewayLiveness:
         assert result["success"] is True
         assert result["gateway_running"] is None
         assert "warning" not in result
-
 
 class TestListSurfacesGatewayLiveness:
     """The `list` action has the same silent-inert-job failure mode as
@@ -145,12 +141,9 @@ class TestListSurfacesGatewayLiveness:
         assert result["gateway_running"] is True
         assert "warning" not in result
 
-
 # ---------------------------------------------------------------------------
 
-
 from contextlib import ExitStack
-
 
 class _LivenessPatches:
     """Context manager patching the provider/gateway-pid probes.
@@ -207,10 +200,8 @@ class _LivenessPatches:
     def __exit__(self, *exc):
         return self._stack.__exit__(*exc)
 
-
 def patch_liveness(*, provider, pids, lock_active=False):
     return _LivenessPatches(provider=provider, pids=pids, lock_active=lock_active)
-
 
 class TestRuntimeLockFirstLiveness:
     """The gateway runtime lock is the primary liveness signal (#95947).
@@ -332,7 +323,7 @@ class TestTickerHeartbeatLiveness:
     way and leaves the existing signals to decide.
     """
 
-    def _liveness(self, *, pids, lock_active, heartbeat_age):
+    def _liveness(self, *, pids, lock_active, heartbeat_age, writer_alive=True):
         from unittest.mock import patch
 
         import hermes_cli.cron as cron_cli
@@ -345,6 +336,8 @@ class TestTickerHeartbeatLiveness:
                 return_value=lock_active,
             ),
             patch("cron.jobs.get_ticker_heartbeat_age", return_value=heartbeat_age),
+            # Upstream (#121881) also requires the heartbeat's writer pid to be alive.
+            patch("cron.jobs.ticker_heartbeat_writer_alive", return_value=writer_alive),
         ):
             return cron_cli._builtin_gateway_liveness()
 
@@ -357,6 +350,9 @@ class TestTickerHeartbeatLiveness:
 
     def test_missing_heartbeat_is_not_evidence(self, hermes_env):
         assert self._liveness(pids=[], lock_active=False, heartbeat_age=None) is False
+
+    def test_fresh_heartbeat_from_a_dead_writer_is_not_evidence(self, hermes_env):
+        assert self._liveness(pids=[], lock_active=False, heartbeat_age=43.0, writer_alive=False) is False
 
     def test_heartbeat_never_overrides_a_positive_pid_scan(self, hermes_env):
         assert self._liveness(pids=[4242], lock_active=False, heartbeat_age=None) is True
@@ -378,6 +374,7 @@ class TestTickerHeartbeatLiveness:
             ),
             patch("gateway.status.get_running_pid", return_value=None),
             patch("cron.jobs.get_ticker_heartbeat_age", return_value=heartbeat_age),
+            patch("cron.jobs.ticker_heartbeat_writer_alive", return_value=True),
             patch(
                 "cron.jobs.get_ticker_success_age",
                 return_value=heartbeat_age if success_age is None else success_age,

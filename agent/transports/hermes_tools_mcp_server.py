@@ -189,49 +189,21 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
 #     does, over the tool bridge (see AGENT_LOOP_TOOLS below); codex has no
 #     bridge wired, so there they are still withheld.
 EXPOSED_TOOLS: tuple[str, ...] = (
-    "web_search",
-    "web_extract",
-    "browser_navigate",
-    "browser_click",
-    "browser_type",
-    "browser_press",
-    "browser_snapshot",
-    "browser_scroll",
-    "browser_back",
-    "browser_get_images",
-    "browser_console",
-    "browser_vision",
-    "vision_analyze",
-    "image_generate",
-    "skill_view",
-    "skills_list",
-    "text_to_speech",
-    # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
-    # (set by the kanban dispatcher when spawning a worker). Without these
-    # in the callback, a worker spawned with openai_runtime=codex_app_server
-    # could do the work but couldn't report completion back to the kernel,
-    # making it hang until timeout. Stateless dispatch — they just read
-    # the env var and write to ~/.hermes/kanban.db.
-    "kanban_complete",
-    "kanban_block",
-    "kanban_request_review",
-    "kanban_request_changes",
-    "kanban_comment",
-    "kanban_heartbeat",
-    "kanban_show",
-    "kanban_list",
-    # NOTE: kanban_create / kanban_unblock / kanban_link are orchestrator-
-    # only — the kanban tool gates them on HERMES_KANBAN_TASK being unset.
-    # They're exposed here for orchestrator agents running on the codex
-    # runtime that need to dispatch new tasks.
-    "kanban_create",
-    "kanban_unblock",
-    "kanban_link",
+    "web_search", "web_extract",
+    "browser_navigate", "browser_click", "browser_type", "browser_press", "browser_snapshot", "browser_scroll",
+    "browser_back", "browser_get_images", "browser_console", "browser_vision",
+    "vision_analyze", "image_generate", "skill_view", "skills_list", "text_to_speech",
+    # Kanban handoff tools: stateless (read HERMES_KANBAN_TASK, write kanban.db).
+    # Without them a codex-runtime worker can't report completion and hangs.
+    "kanban_complete", "kanban_block", "kanban_schedule", "kanban_request_review",
+    "kanban_request_changes", "kanban_comment",
+    "kanban_heartbeat", "kanban_show", "kanban_list",
+    # Orchestrator-only (the kanban tool gates them on HERMES_KANBAN_TASK unset).
+    "kanban_create", "kanban_unblock", "kanban_link",
     # Moe's own clock: "check in on me in five minutes" is a cronjob. Upstream
     # 0.21 defers this tool by default, so it is named here to stay a direct
     # tool of the child rather than a tool_search hop. Both names, one exists.
-    "cronjob",
-    "cronjob_manage",
+    "cronjob", "cronjob_manage",
 )
 
 

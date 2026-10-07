@@ -410,7 +410,12 @@ def lane_enabled_in_config(hermes_home: Optional[str] = None) -> bool:
     """``browser.chrome_extension.enabled`` from the Hermes config, literal True only; unreadable = off."""
     home = Path(hermes_home or os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     try:
-        import yaml
+        # Upstream dropped PyYAML (pyproject: ruamel via hermes_yaml), and Chrome runs this file as a script with
+        # tools/ as sys.path[0] -- so the repo root goes on the path for the shared reader.
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.append(root)
+        import hermes_yaml as yaml
         cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
         return (cfg.get("browser") or {}).get("chrome_extension", {}).get("enabled") is True
     except Exception:

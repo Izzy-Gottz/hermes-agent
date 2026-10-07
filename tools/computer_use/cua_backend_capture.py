@@ -59,7 +59,7 @@ def _linux_x11_active_window_id() -> Optional[int]:
 #    "layer":0,"pid":69038,"title":"","window_id":405,...}
 # and over the MCP transport with a session it is list_windows' index 0. get_window_state on it is
 # refused, so every unqualified capture failed (7 times in 6 sessions, 2026-09-17 to 09-23).
-_DRIVER_APP_NAMES = frozenset({"cua driver", "cuadriver", "cua-driver"})
+_DRIVER_APP_NAMES = frozenset({"cuadriver"})  # normalised: whitespace, "_" and "-" removed
 _DRIVER_BUNDLE_IDS = frozenset({"com.trycua.driver"})
 _DRIVER_SELF_REFUSAL = "refuses operations that target its own authorization process"
 _DRIVER_OWN_WINDOW_MSG = ("that window belongs to the screen-control helper itself ({app}, pid {pid}, window "
@@ -95,8 +95,9 @@ def _driver_pids() -> frozenset:
 
 def _is_driver_window(w: Dict[str, Any], driver_pids: frozenset = frozenset()) -> bool:
     """True for a window the screen-control helper owns: its pid, app name or bundle id."""
+    # Names normalised as upstream #94527 does ("Cua_Driver", "cua-driver", "Cua Driver" alike).
     return (w.get("pid") in driver_pids
-            or str(w.get("app_name") or "").strip().lower() in _DRIVER_APP_NAMES
+            or re.sub(r"[\s_-]+", "", str(w.get("app_name") or "").strip().lower()) in _DRIVER_APP_NAMES
             or str(w.get("bundle_id") or "").strip().lower() in _DRIVER_BUNDLE_IDS)
 
 
@@ -136,6 +137,8 @@ def _capture_candidates(windows: List[Dict[str, Any]], *, app_requested: bool, e
     informative, keep that frontmost contract. See #58026.
     """
     pool = [w for w in windows if not w["off_screen"]]
+    # Exact and app-filtered captures are the caller's choice and stay untouched (the fork's contract;
+    # upstream #94527 skips the helper on app-filtered captures too).
     if exact_target or app_requested:
         return pool or windows[:1]
     pool = [w for w in (pool or windows[:1]) if not _is_driver_window(w, driver_pids)]

@@ -110,7 +110,7 @@ class TestLazyMcpRegistration:
              patch("tools.mcp_tool_loop._ensure_mcp_loop"), \
              patch("tools.mcp_tool_loop._run_on_mcp_loop") as mock_run:
 
-            mcp.register_mcp_servers(config)
+            _mcp_discovery.register_mcp_servers(config)
 
         mock_run.assert_called_once()
 
@@ -139,7 +139,7 @@ class TestLazyMcpRegistration:
              patch("tools.mcp_tool_loop._ensure_mcp_loop"), \
              patch("tools.mcp_tool_loop._run_on_mcp_loop") as mock_run:
 
-            names = mcp.register_mcp_servers(config)
+            names = _mcp_discovery.register_mcp_servers(config)
 
         mock_run.assert_not_called()
         assert any("browser_navigate" in n for n in names), names

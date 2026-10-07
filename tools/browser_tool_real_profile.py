@@ -140,7 +140,7 @@ def _agent_browser_get_cdp(session_name: str) -> Optional[str]:
 def _read_devtools_port(data_dir: str) -> Optional[str]:
     """First line of Chrome's ``DevToolsActivePort`` in ``data_dir`` (None when unreadable)."""
     try:
-        with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8") as fh:
+        with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8-sig") as fh:
             return fh.readline().strip()
     except OSError:
         return None
@@ -186,7 +186,7 @@ def _surviving_chrome_cdp(data_dir: str) -> Optional[str]:
     outlives a crashed browser and its port can be recycled by another local CDP server, so the
     file's browser id (line 2) must match what ``/json/version`` reports before it is trusted."""
     try:
-        with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8") as fh:
+        with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8-sig") as fh:
             port, browser_path = fh.readline().strip(), fh.readline().strip()
     except OSError:
         return None
@@ -329,7 +329,11 @@ def driven_browser_executable() -> Optional[str]:
             for candidate in _driven_browser_candidates(root, entry):
                 if os.path.isfile(candidate):
                     return candidate
-    return None
+    # PM's pinned full Chromium (upstream's only browser source since 5e4a2a3d24) comes after the packaged
+    # builds above: a profile last opened by a newer Chrome for Testing must not be handed to an older build.
+    from hermes_cli.browser_runtime import chromium_executable
+    pm_chromium = chromium_executable(allow_override=False)
+    return pm_chromium if pm_chromium and os.path.isfile(pm_chromium) else None
 
 
 def _terminate_one(proc, what: str) -> None:

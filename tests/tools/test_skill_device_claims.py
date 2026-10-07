@@ -63,9 +63,9 @@ def test_ordinary_sentences_are_not(text):
 
 @contextmanager
 def _review(on=True):
-    """The background review, writing skills it manages (the ownership guards are not under test)."""
+    """The background review, writing skills (the ownership guards are not under test; upstream e3d2e57c9e
+    removed the write guard: the review may improve every skill)."""
     with patch("tools.skill_manager_guards._is_background_review", return_value=on), \
-         patch("tools.skill_manager_tool._background_review_write_guard", return_value=None), \
          patch("tools.skill_manager_tool._background_review_read_before_write_guard", return_value=None):
         yield
 
@@ -88,7 +88,10 @@ def test_a_quoted_page_line_is_not_a_claim():
 
 
 def test_the_mark_has_no_colon_and_the_skill_still_parses():
-    import yaml
+    from ruamel.yaml import YAML  # upstream unified YAML on ruamel; PyYAML is no longer installed
+
+    class yaml:  # noqa: N801 - the safe_load spelling the assertions below use
+        safe_load = staticmethod(lambda text: YAML(typ="safe", pure=True).load(text))
     assert DEVICE_CLAIM_MARK == "[unverified]" and ":" not in DEVICE_CLAIM_MARK
     fm_claim = SKILL.replace("description: Submitting a product to launch directories.",
                              "description: Wait for the user to approve it on their phone first.")

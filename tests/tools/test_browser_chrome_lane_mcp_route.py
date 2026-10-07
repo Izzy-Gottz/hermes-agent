@@ -83,12 +83,15 @@ def route(tmp_path_factory):
         # cdp_url: the own lane points at a dead endpoint instead of launching a real browser here.
         "browser:\n  backend: browser-use\n  allow_private_urls: true\n  cdp_url: http://127.0.0.1:9\n"
         "  chrome_extension:\n    enabled: true\n")
-    (home / "bin").mkdir()
-    cli = home / "bin" / "browser-use"
-    cli.write_text("#!/bin/sh\ncat >/dev/null\n"
-                   "echo \"CDP_WS=${BU_CDP_WS:-none} CDP_URL=${BU_CDP_URL:-none} NAME=${BU_NAME:-none} "
-                   "SINGLE_QUERY=${HERMES_SINGLE_QUERY_SESSION:-unset}\"\n")
-    cli.chmod(0o755)
+    # The Browser Use CLI engine is browser_harness on Hermes's own interpreter (upstream 1d287d5375):
+    # a stand-in package first on the server's path is what browser_exec runs, with the child env it built.
+    fake = home / "fake-harness" / "browser_harness"
+    fake.mkdir(parents=True)
+    (fake / "__init__.py").write_text("")
+    (fake / "run.py").write_text(
+        "import os, sys\nsys.stdin.read()\ne = os.environ.get\n"
+        "print(f\"CDP_WS={e('BU_CDP_WS') or 'none'} CDP_URL={e('BU_CDP_URL') or 'none'} NAME={e('BU_NAME') or 'none'} \"\n"
+        "      f\"SINGLE_QUERY={e('HERMES_SINGLE_QUERY_SESSION', 'unset')}\")\n")
     state = home / "chrome-bridge"
     state.mkdir(mode=0o700)
     bridge_file = state / "bridge.json"
@@ -106,7 +109,7 @@ def route(tmp_path_factory):
     env.update(server.get("env") or {})
     env["HERMES_HOME"] = str(home)
     extra = os.environ.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = str(ROOT) + (os.pathsep + extra if extra else "")
+    env["PYTHONPATH"] = os.pathsep.join([str(home / "fake-harness"), str(ROOT)]) + (os.pathsep + extra if extra else "")
     for k in ("HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION", "HERMES_KANBAN_TASK"):
         env.pop(k, None)  # whatever the server has, it gets from prepare_claude_code_profile()
     proc = subprocess.Popen([server["command"], *server["args"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
