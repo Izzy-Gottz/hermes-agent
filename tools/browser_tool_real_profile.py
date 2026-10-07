@@ -1008,6 +1008,8 @@ def _real_profile_cdp() -> tuple:
         driven = driven_browser_executable()
         if driven is None and _install._maybe_autoinstall_chromium():
             driven = driven_browser_executable()
+        if driven is None and _install._browser_pending():  # (fork) the host is still fetching it
+            return None, _install.browser_pending_message()
         if driven is None:
             return None, (_RP + "the browser engine's own Chrome is not installed, and Hermes never drives your "
                           "installed browser application. Run `agent-browser install`, or turn the toggle off.")
@@ -1048,6 +1050,8 @@ def _launch_kept(copy_dir: str) -> tuple:
     driven = driven_browser_executable()
     if driven is None and _install._maybe_autoinstall_chromium():
         driven = driven_browser_executable()
+    if driven is None and _install._browser_pending():  # (fork) the host is still fetching it
+        return None, _install.browser_pending_message()
     if driven is None:
         return None, _RP + "the browser engine's own Chrome is not installed. Run `agent-browser install`."
     port, err = _launch_driven_browser(driven, copy_dir, None)

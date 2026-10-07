@@ -157,6 +157,33 @@ def _chromium_installed() -> bool:
     return driven_browser_executable() is not None
 
 
+# (fork) The host installs PM's pinned Chromium itself, outside Hermes, while
+# lazy installs stay off (Memoe ships its seed without the 330 MB browser and
+# fetches it on first launch). While that download is outstanding the host
+# leaves this marker in PM's store root, and the browser tools say so in
+# plain words instead of disappearing from the tool list — a model that
+# cannot see browser_* reaches for something else, silently.
+BROWSER_PENDING_MARKER = ".browser-pending"
+
+
+def _browser_pending() -> bool:
+    """The host says its pinned Chromium is still on its way (``<store>/.browser-pending``)."""
+    try:
+        from pm.paths import store_root
+        return (store_root() / BROWSER_PENDING_MARKER).is_file()
+    except Exception:  # an unresolvable store is not a pending browser
+        return False
+
+
+def browser_pending_message() -> str:
+    """What a browser tool answers while the host's browser download is outstanding."""
+    from tools.fix_reasons import host_app_name
+    name = host_app_name()
+    name = name[:1].upper() + name[1:]
+    return (f"{name} is still downloading its browser (about 330 MB). "
+            "Try again in a minute; nothing else is needed.")
+
+
 def _maybe_autoinstall_chromium() -> bool:
     """Install only PM's pinned full Chromium, never the upstream browser pair.
 
@@ -221,7 +248,9 @@ def check_browser_requirements() -> bool:
     if _lp._using_lightpanda_engine():
         return True
     # Local Chrome mode needs Chromium on disk or the CLI hangs until the command timeout.
-    return _chromium_installed()
+    # (fork) A browser the host is still downloading stays advertised: the call answers
+    # browser_pending_message() rather than the model losing the tools without a word.
+    return _chromium_installed() or _browser_pending()
 
 
 def check_browser_vision_requirements() -> bool:

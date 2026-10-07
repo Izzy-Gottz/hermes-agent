@@ -353,3 +353,61 @@ def test_browser_readiness_ignores_ambient_chromium(browser_store, monkeypatch, 
     assert install.check_browser_requirements() is (backend != "local")
     publish("chromium")
     assert install.check_browser_requirements()
+
+# ── (fork) the host is still downloading the browser ────────────────────────
+# Memoe ships its seed without PM's 330 MB Chromium and puts it in the store on
+# first launch, with lazy installs off. Until it lands, the store root carries
+# `.browser-pending`, and the browser tools answer that in words.
+
+def _local_browser_mode(monkeypatch):
+    from tools import browser_tool_cloud, browser_tool_lightpanda_fallback
+
+    monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: False)
+    monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(browser_tool_cloud, "_get_cloud_provider", lambda: None)
+    monkeypatch.setattr(browser_tool_cloud, "_is_local_mode", lambda: True)
+    monkeypatch.setattr(browser_tool_lightpanda_fallback, "_using_lightpanda_engine", lambda: False)
+    monkeypatch.setenv("BROWSER_CDP_URL", "")
+
+
+def test_a_pending_browser_keeps_the_tools_advertised(browser_store, monkeypatch):
+    _, store, publish = browser_store
+    publish("agent-browser")
+    _local_browser_mode(monkeypatch)
+    assert install.check_browser_requirements() is False      # no browser, no word from the host
+    (store / install.BROWSER_PENDING_MARKER).write_text("")
+    assert install.check_browser_requirements() is True       # the host says it is coming
+
+
+def test_a_pending_browser_answers_in_plain_words(browser_store, monkeypatch):
+    _, store, publish = browser_store
+    publish("agent-browser")
+    _local_browser_mode(monkeypatch)
+    monkeypatch.setenv("HERMES_HOST_APP_NAME", "Memoe")
+    monkeypatch.setattr(session, "placement", type("P", (), {"TERMINAL": object()}), raising=False)
+    missing = session._browser_command_preflight()
+    assert missing["success"] is False and "Chromium browser is missing" in missing["error"]
+    (store / install.BROWSER_PENDING_MARKER).write_text("")
+    pending = session._browser_command_preflight()
+    assert pending == {"success": False, "error": install.browser_pending_message()}
+    assert pending["error"].startswith("Memoe is still downloading its browser (about 330 MB)")
+    publish("chromium")                                         # it landed: the marker no longer matters
+    assert "browser_cmd" in session._browser_command_preflight()
+
+
+def test_the_pending_message_names_no_product_it_was_not_given(monkeypatch):
+    monkeypatch.delenv("HERMES_HOST_APP_NAME", raising=False)
+    assert install.browser_pending_message().startswith("The app is still downloading its browser")
+
+
+def test_the_kept_profile_says_the_same_while_the_browser_is_pending(browser_store, monkeypatch, tmp_path):
+    from tools import browser_tool_real_profile as rp
+
+    _, store, _ = browser_store
+    monkeypatch.setattr(rp, "driven_browser_executable", lambda: None)
+    cdp, err = rp._launch_kept(str(tmp_path / "kept"))
+    assert cdp is None and "not installed" in err
+    store.mkdir(parents=True, exist_ok=True)
+    (store / install.BROWSER_PENDING_MARKER).write_text("")
+    cdp, err = rp._launch_kept(str(tmp_path / "kept"))
+    assert (cdp, err) == (None, install.browser_pending_message())

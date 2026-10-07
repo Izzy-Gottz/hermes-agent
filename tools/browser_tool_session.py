@@ -705,6 +705,8 @@ def _browser_command_preflight() -> Dict[str, Any]:
         and _cloud._get_browser_engine() != "lightpanda"
         and not _install._maybe_autoinstall_chromium()
     ):
+        if _install._browser_pending():  # (fork) the host is still fetching it
+            return {"success": False, "error": _install.browser_pending_message()}
         hint = _CHROMIUM_MISSING_DOCKER_HINT if _install._running_in_docker() else _CHROMIUM_MISSING_HINT
         _bt.logger.warning("browser command blocked: %s", hint)
         return {"success": False, "error": hint}
