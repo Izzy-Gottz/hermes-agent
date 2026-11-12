@@ -350,7 +350,7 @@ def test_claudes_init_seals_the_key(tmp_path):
     try:
         env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
         session = types.SimpleNamespace(_tool_bridge=bridge, _session_id=None, _init_info=None,
-                                        _emit=lambda ev: None)
+                                        _emit=lambda ev: None, _end_opening_effort=lambda: None)
         handler = object.__new__(ccs._TurnProjector)
         handler._s = session
         handler._on_system({"type": "system", "subtype": "init", "session_id": "s"},
