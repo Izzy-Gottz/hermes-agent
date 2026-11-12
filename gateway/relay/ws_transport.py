@@ -1105,6 +1105,7 @@ class WebSocketRelayTransport:
     async def _on_inbound(self, frame: dict[str, Any]) -> None:
         if self._inbound is None:
             return
+        from gateway.session_ingress_context import relay_callback
         try:
             event = _event_from_wire(frame.get("event", {}))
         except inbound_seal.SealError as exc:
@@ -1127,7 +1128,14 @@ class WebSocketRelayTransport:
                 "relay inbound: dropping a frame that cannot be "
                 "opened (%s)", exc)
             return
-        await self._inbound(event)
+        try:
+            with relay_callback(self, event):
+                await self._inbound(event)
+        except Exception:
+            # A handler failure is not a socket failure: keep this reader, withhold the
+            # ACK so the connector redelivers the buffered frame later.
+            logger.exception("relay: inbound handler failed; frame left unacknowledged")
+            return
         # A replayed buffered delivery carries a bufferId; ack AFTER the handler
         # has taken it so the connector advances its cursor (no dup).
         buffer_id = frame.get("bufferId")
