@@ -225,6 +225,20 @@ class TestLazyDefaultsToTheCachedManifest:
         assert _resolve_server_lazy("srv", {**cfg, "lazy": False}) is False
         assert _resolve_server_lazy("srv", {"url": "https://cold.test", "lazy": True}) is True
 
+    def test_an_explicit_reconnect_is_never_lazy_by_default(self, tmp_path, monkeypatch):
+        """restart_mcp_servers_with_new_inputs promises a live server on the new inputs; the
+        cached-manifest default would hand it a registration with no session instead. An
+        explicit ``lazy: true`` still wins."""
+        from tools import mcp_tool_discovery as disc
+
+        self._isolate(tmp_path, monkeypatch)
+        cfg = self._cfg()
+        msc.write_cache_entry("srv", msc.config_fingerprint(cfg), tools=[{"name": "t"}])
+        monkeypatch.setattr(disc, "_RECONNECT_EAGER", {"srv"})
+        assert disc._resolve_server_lazy("srv", cfg) is False
+        assert disc._resolve_server_lazy("other", cfg) is False  # not being reconnected, no manifest
+        assert disc._resolve_server_lazy("srv", {**cfg, "lazy": True}) is True
+
     def test_the_env_escape_hatch_restores_the_old_default(self, tmp_path, monkeypatch):
         from tools.mcp_tool_discovery import _resolve_server_lazy
 

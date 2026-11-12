@@ -212,6 +212,11 @@ def _request_lazy_reconnect(server_name: str, server: _core.MCPServerTask) -> bo
 #: pre-2026 behaviour: nothing is lazy unless its config says so.
 LAZY_WHEN_CACHED_ENV = "HERMES_MCP_LAZY_WHEN_CACHED"
 
+#: Server names being reconnected on purpose right now. Written only under
+#: ``_RESTART_LOCK``; the cached-manifest default skips them (an explicit
+#: ``lazy:`` in config still wins).
+_RECONNECT_EAGER: set[str] = set()
+
 
 def _resolve_server_lazy(name: str, config: dict) -> bool:
     """True when this server defers spawn/connect until first tool use.
@@ -247,6 +252,11 @@ def _resolve_server_lazy(name: str, config: dict) -> bool:
     configured = config.get("lazy")
     if configured is not None:
         return _parse_boolish(configured, default=False)
+    if name in _RECONNECT_EAGER:
+        # An explicit reconnect (restart_mcp_servers_with_new_inputs): the caller is told the
+        # server is back on its new inputs, so the cached-manifest default must not turn the
+        # reconnect into a registration that has no session and no recorded identity.
+        return False
     if not _parse_boolish(os.environ.get(LAZY_WHEN_CACHED_ENV, "1"), default=True):
         return False
     try:
@@ -840,7 +850,11 @@ def restart_mcp_servers_with_new_inputs(names: set[str]) -> list[str]:
             _registration._remove_server_scope(key, scope)
         for name in changed:
             _clear_connect_failure(name)
-        discover_mcp_tools()
+        _RECONNECT_EAGER.update(changed)
+        try:
+            discover_mcp_tools()
+        finally:
+            _RECONNECT_EAGER.difference_update(changed)
         return changed
 
 
