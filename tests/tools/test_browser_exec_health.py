@@ -470,7 +470,7 @@ class TestSweep:
         monkeypatch.setattr(bu, "_run_cli_killing_process_group",
                             lambda cmd, code, env, timeout: sp.CompletedProcess(cmd, 0, "ok\n", ""))
         monkeypatch.setattr(bu, "_route_backend",
-                            lambda env, session, task_id, local: env.update(BU_CDP_URL="http://127.0.0.1:9100") or None)
+                            lambda env, session, task_id, local, **_kw: env.update(BU_CDP_URL="http://127.0.0.1:9100") or None)
         monkeypatch.setattr(bu, "_attach_vault_supervisor", lambda env, task_id: None)
         monkeypatch.setattr(bu, "_workspace_dir", lambda task_id: None)
         monkeypatch.setattr(bu, "_read_browser_cfg", lambda: {})
@@ -484,6 +484,6 @@ class TestSweep:
         assert swept == [("http://127.0.0.1:9100", {"MINE", "THEIRS"})]
         swept.clear()
         monkeypatch.setattr(bu, "_route_backend",
-                            lambda env, session, task_id, local: env.update(BU_CDP_URL="http://127.0.0.1:9222") or None)
+                            lambda env, session, task_id, local, **_kw: env.update(BU_CDP_URL="http://127.0.0.1:9222") or None)
         bu.browser_exec("print(1)", task_id="t")
         assert swept == []                                       # not Moe's own browser: never touched

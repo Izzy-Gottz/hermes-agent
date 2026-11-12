@@ -693,7 +693,7 @@ def cli(monkeypatch):
     def fake_run(cmd, code, env, timeout):
         return subprocess.CompletedProcess(cmd, 0, calls["stdout"], "")
 
-    def fake_route(env, session, task_id, local):
+    def fake_route(env, session, task_id, local, **_kw):
         env["BU_CDP_URL"] = calls.get("cdp", "http://127.0.0.1:9333")
         return None
 
@@ -1343,7 +1343,7 @@ def test_live_browser_exec_end_to_end_catches_a_silent_turnstile(chrome, conn, m
     from tools import browser_use_cli as bu
     monkeypatch.setattr(bu, "_find_cli", lambda: [str(_BU_CLI)])
 
-    def route(env, session, task_id, local):
+    def route(env, session, task_id, local, **_kw):
         env["BU_CDP_WS"] = chrome["ws"]
         return None
 

@@ -388,7 +388,7 @@ class TestAtThisMac:
         monkeypatch.setattr(cl, "_run_conversation_turn", lambda *a, **k: {"seen": get_turn_started_at()})
         monkeypatch.setattr("agent.turn_context.export_current_turn_boundary", lambda agent, result, msg: result)
         before = time.time()
-        out = cl.run_conversation(object(), "hi")
+        out = cl.run_conversation(type("A", (), {})(), "hi")
         assert before <= out["seen"] <= time.time()
         assert before <= lane.local_turn_presence()["turn_started_at"] <= time.time()
 
@@ -420,7 +420,7 @@ def cli(monkeypatch):
 
     monkeypatch.setattr(bu, "_find_cli", lambda: ["browser-use"])
     monkeypatch.setattr(bu, "_run_cli_killing_process_group", fake_run)
-    monkeypatch.setattr(bu, "_route_backend", lambda env, session, task_id, local: None)
+    monkeypatch.setattr(bu, "_route_backend", lambda env, session, task_id, local, **_kw: None)
     monkeypatch.setattr(bu, "_attach_vault_supervisor", lambda env, task_id: None)
     monkeypatch.setattr(bu, "_workspace_dir", lambda task_id: None)
     monkeypatch.setattr(bu, "_read_browser_cfg", lambda: {})
@@ -429,7 +429,7 @@ def cli(monkeypatch):
 
 def _probe_returns(monkeypatch, cli, result):
     monkeypatch.setattr(bu, "_route_backend",
-                        lambda env, session, task_id, local: env.update(BU_CDP_URL="http://127.0.0.1:9333") or None)
+                        lambda env, session, task_id, local, **_kw: env.update(BU_CDP_URL="http://127.0.0.1:9333") or None)
     seen = []
     monkeypatch.setattr(ps, "probe_active_page", lambda cdp, **k: seen.append(cdp) or result)
     return seen

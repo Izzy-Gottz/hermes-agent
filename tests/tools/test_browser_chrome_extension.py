@@ -224,7 +224,7 @@ def cli(monkeypatch):
         calls.update(cmd=cmd, code=code, env=dict(env))
         return subprocess.CompletedProcess(cmd, 0, calls.get("stdout", "ok\n"), "")
 
-    def fake_route(env, session, task_id, local):
+    def fake_route(env, session, task_id, local, **_kw):
         calls["route"] += 1
         return None
 
