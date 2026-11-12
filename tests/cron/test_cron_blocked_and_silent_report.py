@@ -114,6 +114,17 @@ def run_env(monkeypatch, tmp_path):
     monkeypatch.setattr(s, "finish_execution", lambda *a, **kw: state["finished"].append((a, kw)))
     monkeypatch.setattr(s, "_upsert_incident_for_failure", lambda *_a, **_kw: (False, None))
     monkeypatch.setattr(s, "load_config", lambda: {})
+    # Since upstream #106742 a run with an execution id QUEUES its notice (cron.delivery_queue) and
+    # a gateway tick sends it. Run that tick right after the job, with the real queue and the real
+    # drain, so "what was sent" still means what reached the sender.
+    real_run_one_job = s.run_one_job
+
+    def run_then_drain(*a, **kw):
+        out = real_run_one_job(*a, **kw)
+        s.drain_delivery_queue(None, None)
+        return out
+
+    monkeypatch.setattr(s, "run_one_job", run_then_drain)
     return state
 
 
@@ -189,7 +200,7 @@ def test_a_real_report_is_untouched(run_env, monkeypatch):
 
     assert "Followed 24 accounts, left 3 comments." in run_env["send"][0]["message"]
     (args, kw), = run_env["marked"]
-    assert args[1] is True and kw.get("status") is None
+    assert args[1] is True and kw.get("status") in (None, "delivery_queued")  # queued: upstream #106742
 
 
 def test_the_preamble_tells_the_model_about_blocked():

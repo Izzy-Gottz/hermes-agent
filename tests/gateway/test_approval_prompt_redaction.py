@@ -151,3 +151,37 @@ def test_a_shell_command_keeps_its_own_prompt():
     from gateway.platforms.base_exec_approval import EA_HEADER_TEXT
     assert msg.startswith(f"⚠️ **{EA_HEADER_TEXT}**")
     assert "`/approve always`" in msg
+
+
+def test_a_plugin_approval_reaches_a_buttonless_chat_through_the_turn_runner():
+    """The formatter above can be right and unreachable. This drives the path a relayed Telegram
+    turn takes — TurnRunner._approval_notify_sync on an adapter with no button card — and requires
+    the plugin wording to be what was actually sent. Written when upstream split gateway/run_turn.py
+    into five modules (#106742): it fails if the runner stops calling the fork's formatter."""
+    import asyncio
+    from types import SimpleNamespace
+    from gateway.run_turn_runner import TurnRunner
+
+    sent = []
+
+    class Buttonless:
+        def pause_typing_for_chat(self, chat_id):
+            pass
+
+        async def send(self, chat_id, text, **kwargs):
+            sent.append(text)
+            return SimpleNamespace(success=True)
+
+    async def exercise():
+        ctx = SimpleNamespace(_status_adapter=Buttonless(), _status_chat_id='fixture',
+                              _status_thread_metadata=None, session_key='plugin-approval-fixture',
+                              _loop_for_step=asyncio.get_running_loop(), stream_consumer_holder=[None])
+        turn = TurnRunner(SimpleNamespace(), ctx)
+        await asyncio.to_thread(turn._approval_notify_sync,
+                                {'command': '<gmail_send> (plugin approval rule)', 'description': _LONG_SEND})
+
+    asyncio.run(exercise())
+    assert len(sent) == 1
+    assert "Approval needed" in sent[0] and "`gmail_send`" in sent[0]
+    assert "THE LAST LINE." in sent[0] and "dad@example.com" in sent[0]
+    assert "Dangerous command" not in sent[0]
