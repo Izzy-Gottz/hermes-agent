@@ -81,7 +81,7 @@ def _claude_code_route(tool_result_text: str, *, is_error: bool):
             tool_complete_callback=kwargs.get("tool_complete_callback"),
             tool_progress_callback=None, show_commentary=False, _stream_needs_break=False)
         on_event = make_claude_code_event_bridge(agent)
-        projector = _TurnProjector(types.SimpleNamespace(_emit=on_event), silent=False)
+        projector = _TurnProjector(types.SimpleNamespace(_emit=on_event, _end_opening_effort=lambda: None), silent=False)
         result = TurnResult()
         projector.handle({"type": "assistant", "message": {"content": [{
             "type": "tool_use", "id": "toolu_chrome_1", "name": "mcp__hermes__browser_navigate",
@@ -211,7 +211,7 @@ def _stream_one(wire_name: str, text: str, *, is_error: bool = False):
             tool_start_callback=kwargs.get("tool_start_callback"),
             tool_complete_callback=kwargs.get("tool_complete_callback"),
             tool_progress_callback=None, show_commentary=False, _stream_needs_break=False)
-        projector = _TurnProjector(types.SimpleNamespace(_emit=make_claude_code_event_bridge(agent)),
+        projector = _TurnProjector(types.SimpleNamespace(_emit=make_claude_code_event_bridge(agent), _end_opening_effort=lambda: None),
                                    silent=False)
         result = TurnResult()
         projector.handle({"type": "assistant", "message": {"content": [{
@@ -350,7 +350,7 @@ def test_claudes_init_seals_the_key(tmp_path):
     try:
         env = {BRIDGE_SOCKET_ENV: bridge.socket_path, BRIDGE_TOKEN_ENV: bridge.token}
         session = types.SimpleNamespace(_tool_bridge=bridge, _session_id=None, _init_info=None,
-                                        _emit=lambda ev: None)
+                                        _emit=lambda ev: None, _end_opening_effort=lambda: None)
         handler = object.__new__(ccs._TurnProjector)
         handler._s = session
         handler._on_system({"type": "system", "subtype": "init", "session_id": "s"},
