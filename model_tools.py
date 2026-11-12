@@ -202,7 +202,40 @@ _tool_defs_cache_lock = threading.Lock()
 # toggles); without a bound the cache grows unboundedly. 8 comfortably covers the warm working set (the
 # handful of distinct platform/toolset combos a gateway actually serves) while keeping the cap small.
 # (#19251)
-_TOOL_DEFS_CACHE_MAX = 8
+#
+# 16, and least-RECENTLY-USED rather than first-in: with 8 and insertion order, the entry evicted was
+# whichever was filled first — on a host that talks to one conversation all day, that is the
+# conversation's, pushed out by eight one-off selections (a scheduled job, a narrowed learning turn,
+# a delegated child, each in two shapes) and rebuilt on the person's next turn. Measured in one
+# gateway's log: 214 full assemblies in steady state against ~800 turns, the same four sizes over
+# and over, 90-300 ms each with a 2,200-tool catalog. A hit now refreshes its entry.
+_TOOL_DEFS_CACHE_MAX = 16
+# The last key seen for each selection, so a miss can say WHY it missed (see _tool_defs_miss_reason).
+_tool_defs_last_key: Dict[tuple, tuple] = {}
+# Key positions (see _tool_defs_cache_key): what moves without the selection changing.
+_KEY_GENERATION, _KEY_CONFIG = 3, 4
+
+
+def _tool_defs_miss_reason(cache_key: tuple) -> str:
+    """Why this key was not in the cache, against the last key for the same selection: never asked
+    for, pushed out, or made stale by the registry or config.yaml moving. One word in the log line
+    that already reports the assembly, so a slow turn can be told from a churning key."""
+    shape = cache_key[:_KEY_GENERATION] + cache_key[_KEY_CONFIG + 1:]
+    with _tool_defs_cache_lock:
+        previous = _tool_defs_last_key.get(shape)
+        _tool_defs_last_key[shape] = cache_key
+        while len(_tool_defs_last_key) > 4 * _TOOL_DEFS_CACHE_MAX:
+            _tool_defs_last_key.pop(next(iter(_tool_defs_last_key)))
+    if previous is None:
+        return "first for this selection"
+    if previous == cache_key:
+        return "evicted"
+    moved = []
+    if previous[_KEY_GENERATION] != cache_key[_KEY_GENERATION]:
+        moved.append(f"registry generation {previous[_KEY_GENERATION]} -> {cache_key[_KEY_GENERATION]}")
+    if previous[_KEY_CONFIG] != cache_key[_KEY_CONFIG]:
+        moved.append("config.yaml changed")
+    return ", ".join(moved) or "unexplained"
 
 
 def _clear_tool_defs_cache() -> None:
@@ -235,6 +268,9 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
     # fingerprints it sees over its lifetime (#19251).
     with _tool_defs_cache_lock:
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
+        if cached is not None:
+            # Most recently used goes last; eviction takes the first.
+            _tool_defs_cache[cache_key] = _tool_defs_cache.pop(cache_key)
     if cached is None:
         _assemble_started = time.perf_counter()
         result = compute()
@@ -245,9 +281,10 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
             # cache is bypassed — the two failure modes that cost ~120 ms per
             # rebuild with a large lazy-MCP catalog (measured 2026-09-06).
             logger.info(
-                "tool definitions assembled in %.0f ms (%d tools, cache %s)",
+                "tool definitions assembled in %.0f ms (%d tools, %scache %s)",
                 (time.perf_counter() - _assemble_started) * 1000.0,
                 len(result),
+                _tool_defs_miss_reason(cache_key) + " — " if cache_key is not None else "",
                 "miss" if cache_key is not None else "bypassed",
             )
         if cache_key is None:

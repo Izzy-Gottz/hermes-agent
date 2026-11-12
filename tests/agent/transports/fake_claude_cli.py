@@ -29,6 +29,21 @@ Protocol facts it reproduces on purpose:
   ``--session-id`` naming an id listed in ``FAKE_CLAUDE_USED_IDS``
   (comma-separated) it exits 1 with "already in use", also like the CLI.
 
+* ``control_request/apply_flag_settings {effortLevel}`` and ``get_settings``
+  are answered the way Claude Code 2.1.322 was MEASURED to answer them (control
+  requests only, no model call): a known level is applied; ``null`` — and a
+  level the CLI does not know — goes back to the CLI default (``medium``), NOT
+  to ``--effort`` from argv, and is acknowledged all the same; ``get_settings``
+  reports the level in force as ``applied.effort``. Every user message, and
+  every effort change, is appended to ``$FAKE_CLAUDE_EFFORT_LOG`` with the
+  effort in force, so a test reads what a turn actually RAN at.
+  ``FAKE_CLAUDE_EFFORT=silent`` never answers either request (an older CLI);
+  ``FAKE_CLAUDE_EFFORT=ack-only`` acknowledges and changes nothing.
+* ``TOOLWAIT`` is ``TOOL`` that holds its tool result until the next effort
+  change arrives — a turn whose work only continues once the opening's effort
+  has been put back, so "restored mid-turn" cannot be mistaken for "restored
+  at the end".
+
 Argv and environment are recorded to ``$FAKE_CLAUDE_RECORD`` (JSON) so the
 tests can assert on the spawn contract; every ``user`` message received is
 appended to ``$FAKE_CLAUDE_INBOX`` (JSON lines) when that is set.
@@ -99,7 +114,7 @@ def _result(text: str, *, is_error: bool = False) -> None:
     )
 
 
-def _tool_turn() -> None:
+def _tool_turn(before_result=None) -> None:
     _emit(
         {
             "type": "assistant",
@@ -117,6 +132,8 @@ def _tool_turn() -> None:
             },
         }
     )
+    if before_result is not None:
+        before_result()
     _emit(
         {
             "type": "user",
@@ -158,6 +175,42 @@ def main() -> int:
             sys.stderr.write(f"Error: Session ID {sid} is already in use.\n")
             return 1
 
+    efforts = ("low", "medium", "high", "xhigh", "max")
+    effort_mode = os.environ.get("FAKE_CLAUDE_EFFORT", "")
+    effort = argv[argv.index("--effort") + 1] if "--effort" in argv else "medium"
+    effort_log = os.environ.get("FAKE_CLAUDE_EFFORT_LOG")
+
+    def _log_effort(what: str) -> None:
+        if effort_log:
+            with open(effort_log, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"what": what, "effort": effort}) + "\n")
+
+    def _effort_request(msg: dict) -> bool:
+        """Answer an effort control request; False when ``msg`` is not one."""
+        nonlocal effort
+        subtype = (msg.get("request") or {}).get("subtype") if msg.get("type") == "control_request" else None
+        if subtype not in ("apply_flag_settings", "get_settings"):
+            return False
+        if effort_mode == "silent":
+            return True
+        if subtype == "apply_flag_settings":
+            wanted = ((msg.get("request") or {}).get("settings") or {}).get("effortLevel")
+            if effort_mode != "ack-only":
+                effort = wanted if wanted in efforts else "medium"
+            _log_effort(f"apply {wanted}")
+            _emit({"type": "control_response", "response": {"subtype": "success", "request_id": msg.get("request_id")}})
+        else:
+            _emit({"type": "control_response", "response": {
+                "subtype": "success", "request_id": msg.get("request_id"),
+                "response": {"applied": {"effort": effort}, "effective": {}}}})
+        return True
+
+    def _hold_for_effort_change() -> None:
+        for held in sys.stdin:
+            if held.strip() and _effort_request(json.loads(held)):
+                _log_effort("tool result")
+                return
+
     inited = False
     hanging = False
     pending_perm = None
@@ -166,6 +219,8 @@ def main() -> int:
         if not line:
             continue
         msg = json.loads(line)
+        if _effort_request(msg):
+            continue
         if msg.get("type") == "control_request":
             if hanging and (msg.get("request") or {}).get("subtype") == "interrupt":
                 hanging = False
@@ -210,6 +265,7 @@ def main() -> int:
             )
         content = msg["message"]["content"]
         text = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+        _log_effort(f"user {text[:40]}")
         if reject_resume:
             sys.stderr.write("No conversation found with session ID\n"); sys.stderr.flush()
             _result("No conversation found with session ID", is_error=True)
@@ -233,7 +289,9 @@ def main() -> int:
         if "HANG" in text:
             hanging = True
             continue
-        if "TOOL" in text:
+        if "TOOLWAIT" in text:
+            _tool_turn(before_result=_hold_for_effort_change)
+        elif "TOOL" in text:
             _tool_turn()
         elif "ready" in text:
             _text_turn("ready")

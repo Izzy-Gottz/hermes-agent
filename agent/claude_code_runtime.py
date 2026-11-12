@@ -174,11 +174,52 @@ class _RegistryEntry:
     ready: threading.Event = field(default_factory=threading.Event)
     respawn_times: list = field(default_factory=list)
     respawn_warned: bool = False
+    # A conversation the host named in ``prewarm_session_keys``: the one a
+    # person is waiting on. Evicted last (see ``_evict_lru_locked``).
+    kept_warm: bool = False
 
 
 _REGISTRY: Dict[str, _RegistryEntry] = {}
 _REGISTRY_LOCK = threading.Lock()
 _SWEEPER_STARTED = False
+
+# Why a session that is no longer in the registry left it, so the spawn that
+# replaces it can say so. A warm child lost between turns is ~6 s on the next
+# one, and until this was kept every such spawn was logged without a cause:
+# on one Mac, 26 of 32 respawns under a spoken turn had none in any log.
+# Bounded; a key is read once, by the spawn it explains.
+_GONE: "OrderedDict[str, tuple]" = OrderedDict()
+_GONE_LOCK = threading.Lock()
+_GONE_MAX = 64
+
+
+def _note_gone(key: Optional[str], why: str) -> None:
+    if not key:
+        return
+    with _GONE_LOCK:
+        _GONE.pop(key, None)
+        _GONE[key] = (why, time.monotonic())
+        while len(_GONE) > _GONE_MAX:
+            _GONE.popitem(last=False)
+
+
+def _spawn_reason_for(agent, key: Optional[str]) -> str:
+    """Why a session is being built for ``key`` now: what took the last one,
+    or that there never was one in this process."""
+    gone = None
+    if key:
+        with _GONE_LOCK:
+            gone = _GONE.pop(key, None)
+    if gone is not None:
+        return f"{gone[0]} {time.monotonic() - gone[1]:.0f}s ago"
+    try:
+        resumes = bool(_claude_code_config().get("resume", True)) and _has_transcript(agent)
+    except Exception:
+        resumes = False
+    # A transcript with no process and no record of one leaving: this process
+    # is younger than the conversation — the gateway restarted under it.
+    return "first-in-this-process (conversation resumes)" if resumes else "first (new conversation)"
+
 
 
 def _registry_key(agent) -> Optional[str]:
@@ -294,6 +335,7 @@ def sweep_idle_sessions(idle_seconds: float, *, now: Optional[float] = None) -> 
                 entry.turn_lock.release()
     for key, entry in victims:
         logger.info("claude-code: evicting idle session %s (pid %s)", key[:12], entry.session.pid)
+        _note_gone(key, "evicted-idle")
         try:
             entry.session.close()
         except Exception:
@@ -329,6 +371,7 @@ def release_lane_session(agent) -> bool:
             if _REGISTRY.get(key) is not entry:
                 return False
             _REGISTRY.pop(key, None)
+            _note_gone(key, "lane-released")
     finally:
         entry.turn_lock.release()
     logger.info("claude-code: closing the %s lane's session (pid %s)",
@@ -341,13 +384,14 @@ def release_lane_session(agent) -> bool:
     return True
 
 
-def evict_session(key: Optional[str]) -> None:
+def evict_session(key: Optional[str], why: str = "retired") -> None:
     """Drop and close the registered session for ``key`` (retire / close)."""
     if not key:
         return
     with _REGISTRY_LOCK:
         entry = _REGISTRY.pop(key, None)
     if entry is not None and entry.session is not None:
+        _note_gone(key, why)
         try:
             entry.session.close()
         except Exception:
@@ -581,6 +625,18 @@ def _may_mint_for(agent) -> bool:
     if allowed is None:
         return True
     return str(getattr(agent, "_gateway_session_key", "") or "").strip() in allowed
+
+
+def _kept_warm(agent) -> bool:
+    """Whether ``agent`` is a conversation the host named in
+    ``prewarm_session_keys`` — and so evicted last. Unset names nobody, which
+    is the plain LRU there was before. Never a lane or a subagent: those
+    borrow a conversation's key without being it."""
+    if _prewarm_session_keys_from_config() is None:
+        return False
+    if not _is_live_turn(agent) or _is_subagent(agent):
+        return False
+    return _may_mint_for(agent)
 
 
 def _is_subagent(agent) -> bool:
@@ -851,6 +907,7 @@ def _reap_closed_locked() -> None:
             continue
         try:
             _REGISTRY.pop(key, None)
+            _note_gone(key, "closed-by-its-agent")
         finally:
             entry.turn_lock.release()
 
@@ -861,7 +918,16 @@ def _evict_lru_locked(max_sessions: int) -> list[tuple[str, _RegistryEntry]]:
     victims: list[tuple[str, _RegistryEntry]] = []
     _reap_closed_locked()
     while len(_REGISTRY) >= max_sessions:
-        candidates = sorted(_REGISTRY.items(), key=lambda kv: kv[1].last_used)
+        # Least recently used — but a conversation the host asked to keep
+        # warm goes after everything else. "Least recently used" is exactly
+        # what a person's conversation is while they are away from it, and
+        # the sessions that crowd it out (a scheduled job, a learning pass, a
+        # capability probe) are each used once and never again: measured on
+        # one Mac, respawns under a spoken turn rose from 3% within a minute
+        # of the last turn to 29% after 15-60 minutes, with ``max_sessions: 4``
+        # and the idle timeout at four hours. The bound itself is unchanged:
+        # with nothing else to evict, the oldest kept-warm one still goes.
+        candidates = sorted(_REGISTRY.items(), key=lambda kv: (kv[1].kept_warm, kv[1].last_used))
         for key, entry in candidates:
             if not entry.ready.is_set():
                 continue
@@ -897,17 +963,21 @@ def _acquire_entry(agent) -> tuple[_RegistryEntry, bool]:
             and (entry.session is None or getattr(entry.session, "_closed", False))
         ):
             _REGISTRY.pop(key, None)
+            _note_gone(key, "closed-by-its-agent")
             entry = None
         if entry is None:
             victims = _evict_lru_locked(_max_sessions_from_config())
-            entry = _RegistryEntry()
+            entry = _RegistryEntry(kept_warm=_kept_warm(agent))
             _REGISTRY[key] = entry
             created = True
     for victim_key, victim in victims:
         logger.info(
-            "claude-code: registry full (max_sessions=%d); evicting LRU session %s (pid %s)",
+            "claude-code: registry full (max_sessions=%d); evicting LRU session %s (pid %s)%s",
             _max_sessions_from_config(), victim_key[:12], getattr(victim.session, "pid", None),
+            " — a conversation the host keeps warm; nothing else was left to evict"
+            if victim.kept_warm else "",
         )
+        _note_gone(victim_key, "evicted-lru")
         try:
             victim.session.close()
         except Exception:
@@ -920,6 +990,7 @@ def _acquire_entry(agent) -> tuple[_RegistryEntry, bool]:
                 refill_spare(agent)
             else:
                 session = _build_session(agent)
+                session.note_spawn_reason(_spawn_reason_for(agent, key))
             entry.session = session
         except BaseException:
             with _REGISTRY_LOCK:
@@ -1693,6 +1764,7 @@ def _run_claude_code_turn_body(
             "without a truthful pre-compaction transcript boundary"
         )
 
+    _t_entered = time.perf_counter()
     cfg = _claude_code_config()
     registry_key = _registry_key(agent)
     # The id a bridged tool call is accounted under: hooks, middleware and
@@ -1741,8 +1813,10 @@ def _run_claude_code_turn_body(
         fresh_child = created
         if not created and session.needs_respawn(wanted_prompt):
             fresh_child = True
-            logger.info("claude-code: system prompt changed; respawning session")
+            changed = _prompt_change(session.system_prompt, agent, wanted_prompt)
+            logger.info("claude-code: system prompt changed (%s); respawning session", changed)
             _note_respawn(entry, registry_key)
+            session.note_spawn_reason(f"prompt-changed ({changed})")
             try:
                 session.restart(system_prompt=wanted_prompt)
             except Exception:
@@ -1753,6 +1827,7 @@ def _run_claude_code_turn_body(
                     pass
                 old_session = session
                 session = _build_session(agent)
+                session.note_spawn_reason(f"prompt-changed ({changed}); restart failed")
                 entry.session = session
                 agent._claude_code_session = session
                 # The turn is still this one: its ledger (token, live flag, its tool calls) moves
@@ -1762,7 +1837,11 @@ def _run_claude_code_turn_body(
         # NOTE: the user message is ALREADY in ``messages`` (appended by
         # run_conversation before dispatch). Do not append it again.
         try:
+            _mark = time.perf_counter
+            _t_dispatch = _mark()
+            _was_alive = session.is_alive()
             session.ensure_started()
+            _t_started = _mark()
             # The person's words for this turn, filed under the key the MCP
             # server's tool calls (and so the send gate) are filed under —
             # they carry no session id of their own. See
@@ -1778,14 +1857,21 @@ def _run_claude_code_turn_body(
             # A turn's first words never carry the break a previous turn
             # may have left armed (a turn that ended on a tool call).
             agent._stream_needs_break = False
+            _opening = _opening_effort_for(agent)
+            _turn_input = _with_helper_preamble(agent, user_message, fresh=fresh_child)
+            logger.info("%s", _turn_timing_line(
+                agent, registry_key, session, spawned=not _was_alive, entered=_t_entered,
+                dispatch=_t_dispatch, started=_t_started, now=_mark(), opening=_opening,
+            ))
             turn = session.run_turn(
-                user_input=_with_helper_preamble(agent, user_message, fresh=fresh_child),
+                user_input=_turn_input,
                 turn_timeout=float(cfg.get("turn_timeout") or 600.0),
                 idle_timeout=float(cfg.get("silence_timeout") or 300.0),
+                opening_effort=_opening,
             )
         except Exception as exc:
             logger.exception("claude-code turn failed")
-            evict_session(registry_key)
+            evict_session(registry_key, "turn-failed")
             try:
                 session.close()
             except Exception:
@@ -1813,7 +1899,7 @@ def _run_claude_code_turn_body(
             # this session must wake to a fresh process, not to one we are
             # about to close underneath it.
             logger.warning("claude-code session retired (turn error: %s)", turn.error)
-            evict_session(registry_key)
+            evict_session(registry_key, "retired-after-turn-error")
             try:
                 session.close()
             except Exception:
@@ -1833,6 +1919,84 @@ def _run_claude_code_turn_body(
         user_message=user_message, original_user_message=original_user_message,
         messages=messages, should_review_memory=should_review_memory,
     )
+
+
+def _prompt_change(old_prompt: str, agent, wanted: str) -> str:
+    """Which half of the baked-in prompt moved, and by how much — sizes only,
+    never text. The two halves have different owners: Hermes builds the first
+    (memory, skills, identity), the host sends the second with each request."""
+    host = (getattr(agent, "ephemeral_system_prompt", None) or "").strip()
+    base = (getattr(agent, "_cached_system_prompt", None) or "").strip()
+    old_prompt = old_prompt or ""
+    if host and old_prompt.endswith(host):
+        which = "hermes's half"       # the host's is byte-for-byte what it was
+    elif base and old_prompt.startswith(base):
+        which = "the host's half"     # hermes's is byte-for-byte what it was
+    else:
+        which = "both halves, or one with nothing to compare"
+    return f"{which}, {len(old_prompt)} -> {len(wanted)} chars"
+
+
+def _turn_timing_line(agent, registry_key, session, *, spawned: bool, entered: float, dispatch: float,
+                      started: float, now: float, opening: Optional[str]) -> str:
+    """One line a turn, no words in it: where the time went between the
+    gateway taking the request and the child being handed the prompt, and
+    whether this turn had to start its child (and why).
+
+    These stages were measured from outside at 0.5-0.6 s + 0.4-0.5 s a turn
+    and could not be split: nothing was logged at request-received, and
+    nothing between turn start and the write to the child. The first two
+    fields exist only when the host stamped the agent (api_server does).
+
+        build_agent   request taken -> AIAgent built (tool definitions, memory checkout)
+        to_runtime    AIAgent built -> this runtime entered (history load, memory
+                      prefetch, pre-turn hooks, system prompt)
+        acquire       this runtime entered -> the session's turn lock held
+        ensure        ensure_started(): ~0 warm, seconds when it spawns
+        pre_send      the turn's words recorded, helper preamble built
+    """
+    ms = lambda a, b: f"{(b - a) * 1000.0:.0f}"  # noqa: E731
+    received = getattr(agent, "_turn_received_at", None)
+    built = getattr(agent, "_turn_agent_built_at", None)
+    parts = [f"session={(registry_key or '-')[:12]}"]
+    if isinstance(received, float) and isinstance(built, float):
+        parts += [f"build_agent_ms={ms(received, built)}", f"to_runtime_ms={ms(built, entered)}"]
+    parts += [
+        f"acquire_ms={ms(entered, dispatch)}", f"ensure_ms={ms(dispatch, started)}",
+        f"pre_send_ms={ms(started, now)}",
+    ]
+    if isinstance(received, float):
+        parts.append(f"total_ms={ms(received, now)}")
+    parts.append("spawned=yes reason=\"%s\"" % (getattr(session, "last_spawn_reason", "") or "unstated")
+                 if spawned else "spawned=no")
+    parts.append(f"opening_effort={opening or '-'}")
+    return "claude-code turn timing: " + " ".join(parts)
+
+
+def _opening_effort_for(agent) -> Optional[str]:
+    """The effort a VOICE turn opens at, on the CLI's own scale, or None.
+
+    ``agent/voice_turn_route`` has already put the turn's reasoning setting on
+    the agent (``auxiliary.voice_chat.reasoning_effort``, default off) and
+    marked it; this runtime owns no model call to apply it to, so it is handed
+    to the session, which applies it to the turn's opening only. "Off" becomes
+    the CLI's lowest level: a warm child cannot be told to stop thinking
+    (measured — see ``ClaudeCodeSession._apply_effort``), and the lowest level
+    is what ``voice_turn_route`` itself falls back to wherever off is refused.
+    Typed turns, lanes and subagents are never marked, so never changed."""
+    if not getattr(agent, "_voice_route_state", None):
+        return None
+    cfg = getattr(agent, "reasoning_config", None)
+    if not isinstance(cfg, dict):
+        return None
+    from agent.transports.claude_code_session import CLI_EFFORTS
+
+    if cfg.get("enabled") is False:
+        return CLI_EFFORTS[0]
+    effort = str(cfg.get("effort") or "").strip().lower()
+    if effort in ("none", "minimal"):
+        return CLI_EFFORTS[0]
+    return effort if effort in CLI_EFFORTS else None
 
 
 def _with_helper_preamble(agent, user_message: Any, *, fresh: bool) -> Any:

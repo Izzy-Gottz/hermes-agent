@@ -290,6 +290,43 @@ _STDERR_KEEP_LINES = 200
 # Queue sentinels emitted by the reader thread. Never valid stream-json.
 _EOF = object()
 
+#: What ``claude --effort`` accepts, lowest first — the CLI's own scale, the
+#: same for every model it serves. There is no "off" on it.
+CLI_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+#: How long a turn waits for the CLI to answer an effort change before its
+#: user message goes anyway. The real CLI answers in 15-25 ms (measured); one
+#: that never answers costs this once per process.
+_EFFORT_CONTROL_WAIT_SECONDS = 0.3
+
+
+def effort_from_args(args: Optional[list[str]]) -> Optional[str]:
+    """The ``--effort`` level in a ``claude`` argument list (``--effort X`` or
+    ``--effort=X``; the last one wins, as on the command line), or None."""
+    found: Optional[str] = None
+    items = [str(a) for a in (args or [])]
+    for index, arg in enumerate(items):
+        if arg == "--effort" and index + 1 < len(items):
+            found = items[index + 1]
+        elif arg.startswith("--effort="):
+            found = arg.split("=", 1)[1]
+    found = (found or "").strip().lower()
+    return found if found in CLI_EFFORTS else None
+
+
+def _callers(depth: int = 4) -> str:
+    """The few function names above the caller, innermost first — enough to
+    say who closed a session without a traceback in the log."""
+    names: list[str] = []
+    try:
+        frame = sys._getframe(2)
+        while frame is not None and len(names) < depth:
+            names.append(frame.f_code.co_name)
+            frame = frame.f_back
+    except Exception:
+        pass
+    return " < ".join(names) or "unknown"
+
 
 @dataclass
 class TurnResult:
@@ -1237,6 +1274,21 @@ class ClaudeCodeSession:
         self._exit_code: Optional[int] = None
         self._pid: Optional[int] = None
         self._reader_thread: Optional[threading.Thread] = None
+        # Why the NEXT spawn happens, in a word, and why the last one did. A
+        # spawn under a turn costs the person about six seconds and was, until
+        # this, logged without a cause (26 of 32 on one Mac had none in any
+        # log). ``note_spawn_reason`` is the caller's account; with none, a
+        # process that was here before and is not now died on its own.
+        self._pending_spawn_reason: Optional[str] = None
+        self.last_spawn_reason: str = ""
+        self._last_turn_ended: Optional[float] = None
+        # The effort the child was spawned with (``--effort`` in extra_args),
+        # which is what an opening's lower effort is put back to; and whether
+        # this CLI takes a mid-session change at all (asked once, see
+        # ``_apply_effort``).
+        self._configured_effort = effort_from_args(self._extra_args)
+        self._effort_adjustable = True
+        self._opening_effort_active = False
 
     # ---------- introspection ----------
 
@@ -1432,6 +1484,17 @@ class ClaudeCodeSession:
             return self._session_id
         if self._closed:
             raise RuntimeError("ClaudeCodeSession is closed")
+        reason, self._pending_spawn_reason = self._pending_spawn_reason, None
+        if not reason:
+            if self._pid is None:
+                reason = "first"
+            else:
+                idle = (
+                    f", {time.monotonic() - self._last_turn_ended:.0f}s after its last turn"
+                    if self._last_turn_ended is not None else ""
+                )
+                reason = f"child-exited (pid {self._pid}, code {self._exit_code}{idle})"
+        self.last_spawn_reason = reason
         token = resolve_oauth_token(self._oauth_token_env)
         _makedirs_or_explain(self._config_dir)
         _makedirs_or_explain(self._cwd)
@@ -1573,10 +1636,11 @@ class ClaudeCodeSession:
         ).start()
         logger.info(
             "claude-code session spawned: pid=%s model=%s permission=%s "
-            "config_dir=%s cwd=%s %s=%s",
+            "config_dir=%s cwd=%s %s=%s reason=%s",
             proc.pid, self._model or "default", self._permission_mode,
             self._config_dir, self._cwd,
             "resume" if resume else "session-id", self._requested_session_id[:8],
+            self.last_spawn_reason or "unstated",
         )
 
     def restart(self, *, system_prompt: Optional[str] = None) -> str:
@@ -1588,8 +1652,17 @@ class ClaudeCodeSession:
         """
         if system_prompt is not None:
             self._system_prompt = system_prompt
+            if not self._pending_spawn_reason:
+                self._pending_spawn_reason = "prompt-changed"
+        elif not self._pending_spawn_reason:
+            self._pending_spawn_reason = "restart"
         self._stop_process()
         return self.ensure_started()
+
+    def note_spawn_reason(self, reason: str) -> None:
+        """The caller's account of why the next spawn happens (first use, an
+        eviction, a changed prompt). Logged with the spawn; never changes it."""
+        self._pending_spawn_reason = str(reason or "") or None
 
     def _stop_process(self) -> None:
         proc, self._proc = self._proc, None
@@ -1617,6 +1690,13 @@ class ClaudeCodeSession:
         if self._closed:
             return
         self._closed = True
+        if self.is_alive():
+            # A warm child closed between turns is the next turn's six-second
+            # spawn, and nothing used to say who did it.
+            logger.info(
+                "claude-code: closing a live session (pid %s, cli session %s) — called from %s",
+                self._pid, self._requested_session_id[:8], _callers(),
+            )
         self._stop_process()
         for attr in ("_system_prompt_path",):
             path = getattr(self, attr)
@@ -1772,6 +1852,12 @@ class ClaudeCodeSession:
             # healthy replacement.
             if proc is self._proc:
                 self._exit_code = proc.poll()
+                if not self._turn_active and not self._closed:
+                    logger.info(
+                        "claude-code: the child exited on its own between turns "
+                        "(pid %s, code %s); the next turn will spawn another",
+                        proc.pid, self._exit_code,
+                    )
                 self._lines.put(_EOF)
 
     def _read_stderr(self, proc: subprocess.Popen) -> None:
@@ -1834,11 +1920,17 @@ class ClaudeCodeSession:
         *,
         turn_timeout: float = 600.0,
         idle_timeout: float = 300.0,
+        opening_effort: Optional[str] = None,
     ) -> TurnResult:
         """Send one user message and block until the CLI's ``result`` event.
 
         ``turn_timeout`` bounds the whole turn; ``idle_timeout`` bounds the
         silence between two events (a wedged CLI emits nothing at all).
+
+        ``opening_effort`` (one of ``CLI_EFFORTS``) runs the turn's OPENING —
+        everything up to its first words or its first tool call — at that
+        effort, then puts the session's own effort back for the rest of the
+        turn. See ``_apply_effort``.
         """
         blocks = _coerce_input_blocks(user_input)
         if not self.is_alive():
@@ -1854,7 +1946,8 @@ class ClaudeCodeSession:
             self._interrupt_event.clear()
             return TurnResult(interrupted=True, session_id=self._session_id)
         return self._run_turn_locked(
-            blocks, silent=False, turn_timeout=turn_timeout, idle_timeout=idle_timeout
+            blocks, silent=False, turn_timeout=turn_timeout, idle_timeout=idle_timeout,
+            opening_effort=opening_effort,
         )
 
     def _emit(self, event: dict) -> None:
@@ -1872,6 +1965,7 @@ class ClaudeCodeSession:
         silent: bool,
         turn_timeout: float,
         idle_timeout: float = 300.0,
+        opening_effort: Optional[str] = None,
     ) -> TurnResult:
         result = TurnResult(session_id=self._session_id)
         proc = self._proc
@@ -1882,6 +1976,8 @@ class ClaudeCodeSession:
 
         self._turn_active = True
         self._interrupt_event.clear()
+        if opening_effort:
+            self._begin_opening_effort(opening_effort)
         if not self._write(self._user_message(content)):
             self._turn_active = False
             result.error = self._format_error("could not write to claude stdin")
@@ -1965,6 +2061,10 @@ class ClaudeCodeSession:
                     saw_result = True
                     break
         finally:
+            # Whatever ended the turn, the next one starts at the session's
+            # own effort: a typed turn after a spoken one thinks as it did.
+            self._end_opening_effort()
+            self._last_turn_ended = time.monotonic()
             self._turn_active = False
 
         if saw_result:
@@ -1982,6 +2082,106 @@ class ClaudeCodeSession:
                 len(result.final_text), bool(result.error),
             )
         return result
+
+    # ---------- effort for a turn's opening ----------
+    #
+    # A warm child's effort is not fixed at spawn. Measured on Claude Code
+    # 2.1.322 with control requests alone (no model call): the stream-json
+    # control channel takes ``apply_flag_settings {effortLevel}`` between
+    # turns, ``get_settings`` then reports it as ``applied.effort``, and the
+    # pair round-trips in 15-25 ms. Three things it does NOT do, also measured:
+    #
+    #   * ``set_max_thinking_tokens: 0`` is acknowledged and changes nothing —
+    #     the next turn still thinks.
+    #   * ``effortLevel: null`` goes back to the CLI's default (medium), not to
+    #     the ``--effort`` the child was spawned with, so putting it back means
+    #     naming the spawn-time level.
+    #   * a level it does not know ("none") is ALSO acknowledged, and resolves
+    #     to the default. So the answer is read back and compared, every time:
+    #     an acknowledgement is not an effect.
+    #
+    # A CLI too old to know the request (or the test fake) never answers; the
+    # wait is bounded, said once in the log, and not tried again on that
+    # process.
+
+    def _control_roundtrip(self, request: dict, *, timeout: float) -> Optional[dict]:
+        """Send one control request and return its ``response`` payload, or
+        None. Only for the gap before a turn's user message: anything else that
+        turns up in the meantime is put back for the turn to read."""
+        request_id = uuid.uuid4().hex
+        if not self._write({"type": "control_request", "request_id": request_id, "request": request}):
+            return None
+        deadline = time.monotonic() + timeout
+        held: list[Any] = []
+        answer: Optional[dict] = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                obj = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if obj is _EOF:
+                held.append(obj)
+                break
+            if obj.get("type") == "control_response":
+                response = obj.get("response") or {}
+                if response.get("request_id") == request_id:
+                    answer = response
+                    break
+                continue  # an earlier request's answer; nobody is waiting on it
+            held.append(obj)
+        for obj in held:
+            self._lines.put(obj)
+        return answer
+
+    def _apply_effort(self, level: Optional[str], *, verify: bool) -> bool:
+        """Set the child's effort (``None`` = the CLI's default). With
+        ``verify``, True only when the CLI then REPORTS that effort."""
+        settings = {"subtype": "apply_flag_settings", "settings": {"effortLevel": level}}
+        if not verify:
+            return self._write({"type": "control_request", "request_id": uuid.uuid4().hex,
+                                "request": settings})
+        applied = self._control_roundtrip(settings, timeout=_EFFORT_CONTROL_WAIT_SECONDS)
+        if applied is None or applied.get("subtype") != "success":
+            return False
+        seen = self._control_roundtrip({"subtype": "get_settings"}, timeout=_EFFORT_CONTROL_WAIT_SECONDS)
+        payload = (seen or {}).get("response") or {}
+        reported = (payload.get("applied") or {}).get("effort") if isinstance(payload, dict) else None
+        return reported == level
+
+    def _begin_opening_effort(self, level: str) -> None:
+        level = str(level or "").strip().lower()
+        if level not in CLI_EFFORTS or not self._effort_adjustable:
+            return
+        if level == (self._configured_effort or ""):
+            return  # already what the session runs at
+        if self._apply_effort(level, verify=True):
+            if not self._opening_effort_active:
+                logger.info(
+                    "claude-code: this turn opens at effort %s (the session's is %s)",
+                    level, self._configured_effort or "the CLI's default",
+                )
+            self._opening_effort_active = True
+            return
+        # Not taken: say so once, stop asking this process, and make sure the
+        # session is not left on a level nobody chose.
+        self._effort_adjustable = False
+        logger.warning(
+            "claude-code: this CLI did not take a per-turn effort (%s); spoken turns "
+            "run at the session's effort", level,
+        )
+        self._apply_effort(self._configured_effort, verify=False)
+
+    def _end_opening_effort(self) -> None:
+        """Put the session's effort back. Called at the opening's end (first
+        words or first tool call) and again when the turn ends; the second
+        call is a no-op."""
+        if not self._opening_effort_active:
+            return
+        self._opening_effort_active = False
+        self._apply_effort(self._configured_effort, verify=False)
 
     # ---------- permission prompts (``--permission-prompt-tool stdio``) ----------
 
@@ -2305,6 +2505,7 @@ class _TurnProjector:
         if dtype == "text_delta":
             text = delta.get("text")
             if isinstance(text, str) and text:
+                self._s._end_opening_effort()
                 self._text_parts.append(text)
                 self._saw_stream_text = True
                 if not self._silent:
@@ -2325,6 +2526,10 @@ class _TurnProjector:
             if not isinstance(block, dict):
                 continue
             btype = block.get("type")
+            if btype in ("text", "tool_use"):
+                # The opening is over: what follows a tool call is the work,
+                # and it runs at the session's own effort.
+                self._s._end_opening_effort()
             if btype == "text":
                 text = block.get("text")
                 if isinstance(text, str) and text.strip():

@@ -56,6 +56,11 @@ _TURN_ORIGIN_HEADER = "X-Hermes-Turn-Origin"
 #: recap with the assistant's own lines). Only a "person" turn's are kept; ``None`` = undeclared.
 _api_request_person_words: ContextVar[Optional[str]] = ContextVar("api_server_person_words", default=None)
 _PERSON_WORDS_HEADER = "X-Hermes-Person-Words"
+#: X-Hermes-Voice-Turn: "1" when the person SPOKE this turn and is waiting to hear the answer. Marks
+#: the turn for ``agent/voice_turn_route`` (``auxiliary.voice_chat``), exactly as the CLI, TUI and
+#: messaging surfaces mark theirs. Only a "person" turn can be one.
+_api_request_voice_turn: ContextVar[bool] = ContextVar("api_server_voice_turn", default=False)
+_VOICE_TURN_HEADER = "X-Hermes-Voice-Turn"
 
 
 def _decode_person_words(raw: Any) -> Optional[str]:
@@ -1907,9 +1912,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     words_token = _api_request_person_words.set(
                         _decode_person_words(request.headers.get(_PERSON_WORDS_HEADER))
                         if raw_origin == "person" else None)
+                    voice_token = _api_request_voice_turn.set(
+                        raw_origin == "person"
+                        and request.headers.get(_VOICE_TURN_HEADER, "").strip().lower() in ("1", "true", "yes"))
                     try:
                         return await handler(request)
                     finally:
+                        _api_request_voice_turn.reset(voice_token)
                         _api_request_person_words.reset(words_token)
                         _api_request_turn_origin.reset(origin_token)
                         _api_request_browser_control_transport_family.reset(family_token)
@@ -4441,6 +4450,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
         request_turn_origin = _api_request_turn_origin.get()
         request_person_words = _api_request_person_words.get()
+        request_voice_turn = _api_request_voice_turn.get()
+        # When this gateway took the turn, for the runtime's one timing line (what happens between
+        # here and the model having the prompt was, until then, not itemised anywhere).
+        request_received_at = time.perf_counter()
 
         def _run():
             from gateway.session_context import (
@@ -4488,6 +4501,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # emitted during setup is not lost.
                     if status_callback is not None:
                         agent.status_callback = status_callback
+                    agent._turn_received_at = request_received_at
+                    agent._turn_agent_built_at = time.perf_counter()
+                    if request_voice_turn:
+                        agent._voice_turn_pending = True  # auxiliary.voice_chat route
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if resume_unanswered_turn:
