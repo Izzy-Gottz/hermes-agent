@@ -235,8 +235,16 @@ _COOKIE_PARAM_KEYS = ("name", "value", "domain", "path", "secure", "httpOnly", "
 _COOKIE_IMPORT_CHUNK = 300
 
 
+def real_profile_fallback_note(err: str) -> str:
+    """Tool-result note when the real profile can't load and a fresh browser serves instead: the
+    browser keeps working (a consented user is never left with no browser), and the model is told
+    it is signed out so it can say so rather than act as if the user's accounts were there."""
+    return (f"{err} Using a fresh browser without the user's logins for this session instead; "
+            "tell the user if the task needs their accounts.")
+
+
 def _real_profile_unsupported_reason(browser) -> Optional[str]:
-    """Fail-closed message when the default browser can't be used, else None.
+    """Why the default browser's profile can't be used (the session falls back to a fresh browser), else None.
 
     A pre-release channel lives in a profile dir we don't resolve; normalizing to the stable
     family would drive a DIFFERENT profile/account (wrong-principal bug), so refuse rather than guess.
@@ -892,7 +900,9 @@ def _real_profile_cdp() -> tuple:
     launch the driven browser on the copy -> load the jar -> return its HTTP CDP endpoint. The copy
     is a non-default dir, so it sidesteps the Chrome >=136 default-profile remote-debugging block
     and never contends with the user's running browser. One shared agent-browser session is reused
-    across calls (cached, re-validated). ``(None, message)`` fail-closed; ``(None, None)`` when consent is off.
+    across calls (cached, re-validated). ``(None, message)`` when it cannot load: browser_exec then returns the message with the
+    question for the person (ask, then continue -- tools.browser_use_cli._route_backend), never a
+    signed-out browser on its own say-so; ``(None, None)`` when consent is off.
     """
     _bt = _origin()
     if not _cloud._use_real_profile():

@@ -102,7 +102,8 @@ class TestResyncUnderALiveCopyBrowser:
         assert _read(os.path.join(dst, "Default", JAR)) == "cookies-v2", "the jar is the person's, fresh"
         for name in AUTH_DBS:
             assert _read(os.path.join(dst, "Default", name)) == f"DRIVEN-{name}"  # untouched
-        assert any("hand-over discards them" in r.getMessage() for r in caplog.records)
+        # Upstream 80f4f989d3a moved the skip (and its log line) into _mirror_profile_auth.
+        assert any("session cookies still copied" in r.getMessage() for r in caplog.records)
         assert not hasattr(bc, "pop_snapshot_note"), "no note may claim stale sign-ins"
 
     def test_an_unreadable_cookie_jar_fails_closed_without_close_chrome(self, handed_over):

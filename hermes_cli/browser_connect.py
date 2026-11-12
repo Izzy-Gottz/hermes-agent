@@ -433,9 +433,15 @@ _SQLITE_AUTH_DBS = frozenset({"Cookies", "Login Data", "Login Data For Account",
 _AUTH_BACKUP_DEADLINE_S = 5.0
 _AUTH_DB_LOCKED = ("SQLite backup made no progress within five seconds — "
                    "a running browser holds a write lock on it")
+# Session cookies keep the copy signed in. Login Data / Web Data are saved passwords and
+# autofill, which a running Chrome on macOS/Linux holds with a write lock even when Cookies
+# copy in milliseconds; failing the snapshot over them forced users to quit Chrome before
+# every browser session. They get a short best-effort budget and are skipped when locked.
+_SESSION_AUTH_DBS = frozenset({"Cookies"})
+_OPTIONAL_AUTH_BACKUP_DEADLINE_S = 0.5
 
 
-def _copy_auth_file(src_file: str, dst_file: str) -> str | None:
+def _copy_auth_file(src_file: str, dst_file: str, *, deadline_s: float | None = None) -> str | None:
     """Copy auth state; returns None on success, else WHY the file could not be snapshotted. A DB
     is backed up into a side file and swapped in only once it is whole, so a failed copy leaves the
     previous one exactly as it was (the snapshot stays usable, just older). Never raw-copied."""
@@ -478,7 +484,7 @@ def _copy_auth_file(src_file: str, dst_file: str) -> str | None:
             # replacing only the destination file can replay its abandoned WAL. Connection busy
             # timeouts do not bound backup's retry loop; its callback does.
             _discard_partial_db(side)
-            deadline = time.monotonic() + _AUTH_BACKUP_DEADLINE_S
+            deadline = time.monotonic() + (_AUTH_BACKUP_DEADLINE_S if deadline_s is None else deadline_s)
             last_remaining: list[int | None] = [None]
 
             def check_deadline(_status: int, remaining: int, total: int) -> None:
@@ -639,23 +645,30 @@ def _discard_partial_db(dst_file: str) -> None:
 
 def _mirror_profile_auth(src: str, dst: str, source_profile: str) -> dict[str, str]:
     """Mirror ``source_profile``'s auth files into the copy's ``Default`` (agent-browser opens it);
-    returns ``{relative name: reason}`` for the DB auth files that could NOT be copied ({} = clean)."""
+    returns ``{relative name: reason}`` for the session-cookie DBs that could NOT be copied ({} =
+    the signed-in state is usable). Locked password/autofill DBs are logged and skipped."""
     failed: dict[str, str] = {}
     for rel in _AUTH_REFRESH_PROFILE_FILES:
         s = os.path.join(src, source_profile, rel)
         if not os.path.isfile(s):
             continue
-        reason = _copy_auth_file(s, os.path.join(dst, "Default", rel))
-        if reason and os.path.basename(rel) in _SQLITE_AUTH_DBS:
+        base = os.path.basename(rel)
+        session_db = base in _SESSION_AUTH_DBS
+        reason = _copy_auth_file(s, os.path.join(dst, "Default", rel),
+                                 deadline_s=None if session_db else _OPTIONAL_AUTH_BACKUP_DEADLINE_S)
+        if not reason or base not in _SQLITE_AUTH_DBS:
+            continue
+        if session_db:
             failed[rel] = reason
+        else:
+            why = "the running browser holds a write lock on it" if reason == _AUTH_DB_LOCKED else reason
+            logger.info("real-profile snapshot: skipped %s (%s); session cookies still copied", rel, why)
     return failed
 
 
 def _unavailable_auth_dbs_error(browser: str, failed: dict[str, str]) -> str:
-    """Fail-closed message naming WHICH auth databases could not be snapshotted and WHY. On
-    macOS/Linux a running browser typically lets Cookies back up but holds Login Data / Login Data
-    For Account / Web Data with a write lock, so the message must not read as "close the browser"
-    when the real cause is an unreadable file (and vice versa)."""
+    """Message naming WHICH session-cookie databases could not be snapshotted and WHY, so it never
+    reads as "close the browser" when the real cause is an unreadable file (and vice versa)."""
     names = ", ".join(failed)
     if all(reason == _AUTH_DB_LOCKED for reason in failed.values()):
         return (f"{browser} is running and holds the profile's {names} with a write lock, so their "
@@ -973,11 +986,39 @@ def _browser_label(browser: str) -> str:
         browser, browser.capitalize())
 
 
+def _drop_singleton_leftovers(dst: str) -> None:
+    """Never carry live-instance leftovers into the copy (they make Chrome think it's open)."""
+    for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        with contextlib.suppress(OSError):
+            os.unlink(os.path.join(dst, leftover))
+
+
+def _snapshot_source(marker: str) -> str | None:
+    """Source profile name a completed snapshot was taken from (the done marker's content)."""
+    try:
+        with open(marker, encoding="utf-8-sig") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _reuse_snapshot(browser: str, dst: str) -> tuple[str, None]:
+    """Serve the last completed snapshot as-is when the live profile is locked. Its logins are as
+    fresh as that copy; the next launch with the browser closed re-syncs them. Refusing instead
+    would drop the session to a signed-out browser although a usable copy is on disk."""
+    _drop_singleton_leftovers(dst)
+    logger.info("real-profile: %s holds its profile lock; reusing the last snapshot in %s "
+                "(logins as of that copy)", browser, dst)
+    return dst, None
+
+
 def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | None, str | None]:
     """Snapshot ``browser``'s real ACTIVE profile into the hermes copy dir; returns ``(dst, err)``.
     Copies ``Local State`` plus the active profile's auth files into the copy's ``Default``. The
     completion marker is written only after full success, so a torn first copy (disk full, Ctrl+C)
-    never looks "already populated" — it is redone from scratch."""
+    never looks "already populated" — it is redone from scratch. A locked live profile (Windows,
+    browser running) reuses a completed snapshot of the same source profile without re-syncing;
+    only a missing or other-profile snapshot fails with the locked error."""
     src = src or real_profile_data_dir(browser)
     if src and not os.path.isdir(src):
         try:  # isdir() swallows EPERM; a protected dir is not a missing one
@@ -1000,15 +1041,25 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     if (denied := _probe_source_access(src, source_profile)) is not None:
         return None, _source_denial_error(browser, src, denied)
     dst = real_profile_copy_dir(browser)
-    # Fast lock probe BEFORE any copy: a blocking file op on a Windows-locked cookie DB can
-    # hang the launch for minutes. Windows only, so copy-while-running still works elsewhere.
-    if _profile_is_locked(src, source_profile):
-        return None, _locked_profile_error(browser)
     marker = os.path.join(dst, _SNAPSHOT_DONE_MARKER)
     # Only a copy that previously COMPLETED counts as populated; a half-written tree is
     # rebuilt — otherwise a torn first copy poisons freshness forever.
     populated = os.path.isfile(marker)
+    same_source = populated and _snapshot_source(marker) == source_profile
+    # Fast lock probe BEFORE any copy: a blocking file op on a Windows-locked cookie DB can
+    # hang the launch for minutes. Never trips on POSIX, where a running browser only locks the
+    # password/autofill DBs, which ``_mirror_profile_auth`` skips.
+    if _profile_is_locked(src, source_profile):
+        # (fork) Never ``_reuse_snapshot``: the hand-over deletes the copy's cookie jar once the driven
+        # browser has it (tools.browser_tool_real_profile), so an old snapshot is a signed-out one, and
+        # serving it would be the silent downgrade the person is asked about instead (ask, then
+        # continue -- tools.browser_use_cli._route_backend).
+        return None, _locked_profile_error(browser)
     try:
+        if populated and not same_source:
+            # Drop another profile's marker BEFORE re-syncing: an interrupted sync must never leave
+            # it vouching for this profile's cookies on a later locked reuse.
+            os.unlink(marker)
         os.makedirs(dst, exist_ok=True)
         # Secure the snapshot dir AND its browser-profile parent on EVERY launch so a failed
         # first attempt or an older-build dir still converges to owner-only perms.
@@ -1033,14 +1084,9 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
             return None, (f"could not read the '{browser}' profile's login data: its cookie jar "
                           f"({details}) was unavailable while {_browser_label(browser)} "
                           "was writing it. Retry in a moment, or turn browser.use_real_profile off.")
-        if failed:
-            logger.info("real-profile: %s of the '%s' profile not re-copied (unread while the browser "
-                        "was writing); the hand-over discards them, so the session is unaffected",
-                        ", ".join(failed), browser)
-        # Never carry live-instance leftovers into the copy.
-        for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-            with contextlib.suppress(OSError):
-                os.unlink(os.path.join(dst, leftover))
+        # (Since upstream 80f4f989d3a ``failed`` holds only the cookie jar: _mirror_profile_auth
+        # skips and logs a password/autofill DB that would not copy.)
+        _drop_singleton_leftovers(dst)
         # Mark complete only after everything above succeeded.
         try:
             with open(marker, "w", encoding="utf-8") as fh:

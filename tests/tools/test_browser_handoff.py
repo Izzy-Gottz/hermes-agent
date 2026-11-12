@@ -1133,7 +1133,7 @@ class TestShowToPerson:
         assert seen == [("back", None)]
         src = open(bu.__file__).read()
         body = src[src.index("def browser_exec("):]
-        assert body.index("_park_check(code, task_id)") < body.index("route_err = _route_backend(")
+        assert body.index("_park_check(code, task_id)") < body.index("_route_exec_current(")
         assert '"keep_out_of_sight"' in body
 
     def test_hiding_and_raising_are_by_pid_and_raising_unhides_first(self):

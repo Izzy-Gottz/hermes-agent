@@ -57,8 +57,10 @@ def test_mirror_profile_auth_reports_reason_by_name(tmp_path, monkeypatch):
     root, dst = tmp_path / "real", tmp_path / "copy"
     _fake_profile(root)
     monkeypatch.setattr(bc, "_copy_auth_file",
-                        lambda src, d: "file is not a database" if os.path.basename(src) == "Web Data" else None)
-    assert bc._mirror_profile_auth(str(root), str(dst), "Default") == {"Web Data": "file is not a database"}
+                        lambda src, d, **_kw: "file is not a database" if os.path.basename(src) in ("Web Data", "Cookies") else None)
+    # Since upstream 80f4f989d3a only the session-cookie DB is reported; a password/autofill DB that
+    # would not copy is logged and skipped. The fork already ignored those (the hand-over discards them).
+    assert bc._mirror_profile_auth(str(root), str(dst), "Default") == {"Cookies": "file is not a database"}
 
 
 @pytest.mark.parametrize("reason", [bc._AUTH_DB_LOCKED, "file is not a database"])
@@ -67,7 +69,7 @@ def test_unreadable_cookie_jar_fails_closed_naming_it_and_why(tmp_path, monkeypa
     _fake_profile(root)
     monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "hh")
     monkeypatch.setattr(bc, "_copy_auth_file",
-                        lambda src, d: reason if os.path.basename(src) == "Cookies" else None)
+                        lambda src, d, **_kw: reason if os.path.basename(src) == "Cookies" else None)
     dst, err = bc.snapshot_real_profile("chrome", src=str(root))
     assert dst is None and err
     assert "cookie jar" in err and "Cookies" in err and reason in err, err
@@ -84,6 +86,6 @@ def test_unreadable_login_dbs_do_not_fail_the_snapshot(tmp_path, monkeypatch):
     _fake_profile(root)
     monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "hh")
     monkeypatch.setattr(bc, "_copy_auth_file",
-                        lambda src, d: bc._AUTH_DB_LOCKED if os.path.basename(src) in _LOCKED else None)
+                        lambda src, d, **_kw: bc._AUTH_DB_LOCKED if os.path.basename(src) in _LOCKED else None)
     dst, err = bc.snapshot_real_profile("chrome", src=str(root))
     assert err is None and dst

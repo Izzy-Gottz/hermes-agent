@@ -5,6 +5,7 @@ instead of default browser tools
 """
 
 import contextlib
+import functools
 import importlib
 import importlib.util
 import json
@@ -19,8 +20,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, hermes_home_key
 from tools import browser_exec_health as exec_health
+from tools.browser_harness_dirs import daemon_env, daemon_identity, namespace_harness_dirs
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,13 @@ _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
 # Internal route provenance: this exec resolved to a browser on the Bot Desktop display and must use
 # the same human-control lease fence as the built-in browser tools. Popped before launching the CLI.
 _BOT_DESKTOP_BROWSER_SENTINEL = "_HERMES_BU_BOT_DESKTOP_BROWSER"
+# The note when the consented real profile could not load (the route fell back). Popped before launch.
+_REAL_PROFILE_FALLBACK_SENTINEL = "_HERMES_BU_REAL_PROFILE_FALLBACK"
+# local=True whose real profile could not load: run on the local sidecar browser. Popped before launch.
+_LOCAL_FALLBACK_SENTINEL = "_HERMES_BU_LOCAL_FALLBACK"
+# Fork (owner decision 2026-11-12): the signed-in profile could not load and nobody has agreed to
+# continue signed out. Marks the route error so browser_exec returns the question, not a browser.
+_REAL_PROFILE_REFUSED_SENTINEL = "_HERMES_BU_REAL_PROFILE_REFUSED"
 
 # Prepended to the model's code for named sessions on SHARED browsers (a /browser connect CDP override): the
 # harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
@@ -208,6 +217,7 @@ def _base_subprocess_env() -> dict:
         env.pop("PYTHONPATH", None)
     env["PATH"] = _floor_subprocess_path(env.get("PATH", ""))
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
+    namespace_harness_dirs(env, _served_profile_tag())  # a served profile's own harness runtime/tmp dirs
     return env
 
 
@@ -410,6 +420,15 @@ def _sidecar_daemon_name(name: str) -> str:
     return f"_local_{name or 'default'}"[:64]
 
 
+def _export_real_profile_note(env: dict, key: str) -> None:
+    """The session layer decides real profile vs fresh browser once per key; carry its note (if it fell
+    back) so the result reports the browser this call actually drives."""
+    from tools.browser_tool_session import real_profile_note
+    note = real_profile_note(key)
+    if note:
+        env.setdefault(_REAL_PROFILE_FALLBACK_SENTINEL, note)
+
+
 def _resolve_lightpanda_cdp(env: dict, task_id: Optional[str], session_name: str = "",
                             sidecar: bool = False) -> Optional[str]:
     """Point the harness at a Hermes-spawned ``lightpanda serve`` (``browser.engine: lightpanda`` and
@@ -432,6 +451,7 @@ def _resolve_lightpanda_cdp(env: dict, task_id: Optional[str], session_name: str
     if err is None:
         env[_PRIVATE_BROWSER_SENTINEL] = "1"
         env[_BOT_DESKTOP_BROWSER_SENTINEL] = "1"
+        _export_real_profile_note(env, _backend_cache_key(task_id, session_name, sidecar))
     return err
 
 
@@ -488,6 +508,7 @@ def _resolve_managed_chromium_cdp(env: dict, task_id: Optional[str], session_nam
     _set_cdp_env(env, cdp)
     env[_PRIVATE_BROWSER_SENTINEL] = "1"  # one Chromium per cache key: nothing to share a tab with
     env[_BOT_DESKTOP_BROWSER_SENTINEL] = "1"
+    _export_real_profile_note(env, _backend_cache_key(task_id, session_name, sidecar))
     return None
 
 
@@ -581,8 +602,8 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     profile, hermes_cli.browser_connect) when consented. Two ways in: the effective backend is already local
     (no provider, CDP override, or legacy BU cloud config) → silent upgrade; or ``force_local`` (consent-gated
     ``local`` arg) → the user's browser even under a cloud backend. Operator overrides (BU_CDP_* env,
-    /browser connect, ``browser.cdp_url``) own the session either way. Fail closed: a launch error is
-    returned so a consented user is never silently downgraded."""
+    /browser connect, ``browser.cdp_url``) own the session either way. A launch error is returned;
+    ``_route_backend`` then falls back to the normal backend and reports it, never silently."""
     if not _real_profile_consented() or _has_cdp_env(env):
         return None
     try:
@@ -627,7 +648,8 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
 
 
 def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool,
-                   force_local_sidecar: bool = False) -> Optional[str]:
+                   force_local_sidecar: bool = False, real_profile: bool = True,
+                   allow_signed_out: bool = False) -> Optional[str]:
     """Resolve where the harness connects; returns an error string or None. Real-profile consent runs
     BEFORE provider resolution so a hit short-circuits the cloud path via the BU_CDP_* env contract. Named
     sessions compose with the backend: BU_NAME namespaces the harness daemon (IPC socket, log, pid) and on
@@ -635,13 +657,33 @@ def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool,
 
     ``force_local_sidecar`` (a call carrying a private URL) declines the cloud provider for the hybrid local
     sidecar; unlike ``local`` (the consent-gated real-profile browser) it never touches the user's profile."""
-    rp_err = _resolve_real_profile_cdp(env, force_local=local)
-    if rp_err:
+    # ``real_profile=False``: this route already fell back, so it stays on its fresh browser instead
+    # of swapping browsers mid-task once the profile frees up.
+    rp_err = _resolve_real_profile_cdp(env, force_local=local) if real_profile else None
+    # ASK, THEN CONTINUE (fork; owner decision 2026-11-12). Upstream falls back to a signed-out browser
+    # here and says so afterwards; the fork used to stop dead. Neither: without the person's yes
+    # (``allow_signed_out`` on this call, or an earlier yes remembered for this route as
+    # ``real_profile=False``) a profile that cannot load returns its reason and NO browser. The
+    # caller turns that into the question. This is the one place that decides it — a signed-out
+    # browser reached from below this line without the opt-in is the bug the tests pin.
+    if rp_err and not allow_signed_out:
+        env[_REAL_PROFILE_REFUSED_SENTINEL] = "1"
         return rp_err
     # local=True is only served by the real-profile route; consent off must not pretend.
     if local and not _has_cdp_env(env) and not _real_profile_consented():
         return ("local=true was requested but browser.use_real_profile is off. Enable it in config.yaml "
                 "(browser.use_real_profile: true) or the desktop Settings → Browser section, then retry.")
+    # local=True promised the user's own machine: a profile that can't load runs on a fresh LOCAL browser
+    # (the sidecar, which never loads the profile), never the cloud one. Without ``local`` the session
+    # layer makes the one real-profile-or-fresh decision and reports it (_resolve_managed_chromium_cdp).
+    # (fork) Not only ``local``: with the person's yes every such route takes the sidecar, which never
+    # loads the profile — the session layer below would try the profile again and refuse.
+    if not _has_cdp_env(env) and (rp_err or not real_profile):
+        if rp_err:
+            from tools.browser_tool_real_profile import real_profile_fallback_note
+            env[_REAL_PROFILE_FALLBACK_SENTINEL] = real_profile_fallback_note(rp_err)
+        env[_LOCAL_FALLBACK_SENTINEL] = "1"
+        force_local_sidecar = True
     return _resolve_backend_cdp(env, task_id, session_name=session,
                                 force_local_sidecar=force_local_sidecar)
 
@@ -823,33 +865,125 @@ def _proxy_failure_note(stdout: str, stderr: str = "") -> str:
             "proxy setting is pointing at something that isn't running; retrying the site will fail the same way.")
 
 
-# BU_NAMEs whose harness daemon this process has driven. The daemon reads BU_CDP_* once, at start, and
-# outlives every call, so a backend swap (/browser connect|disconnect) that only changes the resolved
-# endpoint leaves later browser_exec calls in the old browser until these are stopped.
-_driven_daemons: set = set()
+# Harness daemons this process drove: each latches BU_CDP_* at start and outlives every call, so a backend
+# swap (/browser connect|disconnect) leaves later calls in the old browser until these are stopped.
+_driven_daemons: dict[tuple[str, ...], str] = {}  # daemon identity -> home
 _driven_daemons_lock = threading.Lock()
+_live_generation = functools.partial(_lazy_call, "tools.browser_tool_cdp", "live_cdp_generation", 0,
+                                     "live CDP generation lookup failed")  # this profile's publish count
 # Route cache key -> whether its last browser_exec ran on the hybrid local sidecar.
 _exec_route_is_sidecar: dict[str, bool] = {}
+# Route cache key -> the note from its real-profile fallback; that route stays on the fallback browser.
+_real_profile_fallback: dict[str, str] = {}
+_real_profile_note_delivered: set = set()
 
 
-def stop_harness_daemons() -> None:
-    """Stop every harness daemon this process drove, through the harness's own identity-checked
-    ``--reload``; the next browser_exec respawns one on the endpoint it resolves then."""
+def stop_harness_daemons(home_key: Optional[str] = None) -> None:
+    """Stop every harness daemon this process drove (only ``home_key``'s when given), through the
+    harness's own identity-checked ``--reload``; the next browser_exec respawns one on the endpoint
+    it resolves then."""
     with _driven_daemons_lock:
-        names = sorted(_driven_daemons)
-        _driven_daemons.clear()
-    cmd = _find_cli() if names else None
+        daemons = sorted(key for key, home in _driven_daemons.items() if home_key in (None, home))
+        for key in daemons:
+            _driven_daemons.pop(key, None)
+    _reload_daemons(daemons)
+
+
+def _reload_daemons(daemons) -> None:  # each ``daemon_identity`` daemon, with its own dirs
+    cmd = _find_cli() if daemons else None
     if not cmd:
         return
     env = _base_subprocess_env()
-    for name in names:
+    for daemon in daemons:
         with contextlib.suppress(OSError, subprocess.SubprocessError):
-            _run_cli_killing_process_group([*cmd, "--reload"], "", {**env, "BU_NAME": name}, 15)
+            _run_cli_killing_process_group([*cmd, "--reload"], "", daemon_env(env, daemon), 15)
+
+
+def _route_exec(env: dict, session: str, task_id: Optional[str], local: bool, local_sidecar: bool,
+                route_key: str, allow_signed_out: bool = False) -> tuple[Optional[str], bool]:
+    """``_route_backend`` for one browser_exec call; returns ``(error, runs on the local sidecar)``.
+    A real-profile fallback is remembered per route: the route keeps its fresh browser and the note
+    waits until a result carries it (``_take_real_profile_note``)."""
+    route_err = _route_backend(env, session, task_id, local, force_local_sidecar=local_sidecar,
+                               real_profile=route_key not in _real_profile_fallback,
+                               allow_signed_out=allow_signed_out)
+    note = env.pop(_REAL_PROFILE_FALLBACK_SENTINEL, None)
+    if note:
+        _real_profile_fallback.setdefault(route_key, note)
+    return route_err, local_sidecar or bool(env.pop(_LOCAL_FALLBACK_SENTINEL, None))
+
+
+def _route_exec_current(env: dict, session: str, task_id: Optional[str], local: bool,
+                        local_sidecar: bool, route_key: str,
+                        allow_signed_out: bool = False) -> tuple[dict, Optional[str], bool, int]:
+    """``_route_exec`` on a copy of ``env`` -> ``(routed env, error, sidecar, generation)``, re-routed (at
+    most 3 tries) when /browser connect published meanwhile; ``_reload_if_republished`` covers dispatch."""
+    for _attempt in range(3):
+        routed = dict(env)
+        generation = _live_generation()
+        route_err, sidecar = _route_exec(routed, session, task_id, local, local_sidecar, route_key,
+                                         allow_signed_out=allow_signed_out)
+        if route_err or _live_generation() == generation:
+            break
+    return routed, route_err, sidecar, generation
+
+
+def _reload_if_republished(env: dict, generation: int) -> None:
+    """Stop this call's daemon if the profile published a new endpoint while it spawned on the old one."""
+    if _live_generation() == generation:
+        return
+    daemon = daemon_identity(env)
+    with _driven_daemons_lock:
+        _driven_daemons.pop(daemon, None)
+    _reload_daemons([daemon])
+
+
+def _take_real_profile_note(route_key: str) -> dict:
+    """The fallback note for the first result this route returns after falling back, then nothing."""
+    if route_key not in _real_profile_fallback or route_key in _real_profile_note_delivered:
+        return {}
+    _real_profile_note_delivered.add(route_key)
+    return {"real_profile_unavailable": _real_profile_fallback[route_key]}
+
+
+#: The question, in the owner's words. The model asks it; it never answers it.
+SIGNED_OUT_QUESTION = ("I'm not logged in -- I'm having an issue opening your signed-in browser. "
+                       "Do you want me to still continue, signed out?")
+
+
+def _real_profile_refusal(route_err: Any) -> str:
+    """The result for a signed-in profile that could not load and no yes from the person: not a
+    success, the fixable reason exactly as the fork reports it (code, owner, pane ride along), and
+    the way on -- ask the person, then retry with ``allow_signed_out=true``."""
+    from tools.fix_reasons import as_tool_error
+    return as_tool_error(
+        route_err, signed_in=False, signed_out_available=True, ask_person=SIGNED_OUT_QUESTION,
+        hint=("Nothing ran. The person's signed-in browser could not be opened; the reason is in `error`. "
+              "This is the person's call, not yours: tell them the reason and ask them, in these words or "
+              f"close to them: \"{SIGNED_OUT_QUESTION}\" Only if THEY say yes, call browser_exec again with "
+              "allow_signed_out=true -- that runs in a fresh browser signed in as nobody, for this task "
+              "only. If they say no, or nobody is there to answer (a scheduled job, a turn nobody started "
+              "live), do not pass it: stop and report the reason."))
+
+
+def _signed_out_fields(route_key: str) -> dict:
+    """On EVERY result of a route that is running signed out (not only the first, as upstream's
+    note is): Moe must never report work done there as done "as you"."""
+    if route_key not in _real_profile_fallback:
+        return {}
+    return {"signed_out": True,
+            "signed_out_note": ("This ran in a fresh browser signed in as NOBODY -- the person agreed to continue "
+                                "without their sign-ins. It did not act as the person: never say it did, and "
+                                "nothing behind a login was reached.")}
 
 
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
-                 task_id: Optional[str] = None, local: bool = False, where: str = ""):
+                 task_id: Optional[str] = None, local: bool = False, where: str = "",
+                 allow_signed_out: bool = False):
     """Run Python code through the browser-use CLI, and return its output.
+
+    ``allow_signed_out``: the person said yes to continuing without their sign-ins after the
+    signed-in profile failed to load (``_real_profile_refusal``); remembered for this route only.
 
     ``where`` picks the lane (tools.browser_chrome_extension): "own" = Hermes' own browser
     (default), "chrome" = Moe's tab group in the owner's real Chrome via the Memoe extension."""
@@ -893,6 +1027,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                                                 browser_cfg=browser_cfg, connected=bridge is not None,
                                                 presence=presence)
     bot_desktop_browser = False
+    generation = _live_generation()  # the Chrome lane routes nothing; the own lane replaces this
     if lane == chrome_lane.LANE_CHROME:
         # Fail closed: an explicit (or routed) Chrome call never quietly runs somewhere else.
         if not chrome_lane.lane_enabled(browser_cfg):
@@ -907,8 +1042,11 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         chrome_lane.chrome_lane_env(env, bridge, session)
     else:
         _park_check(code, task_id)
-        route_err = _route_backend(env, session, task_id, bool(local), force_local_sidecar=local_sidecar)
+        env, route_err, local_sidecar, generation = _route_exec_current(
+            env, session, task_id, bool(local), local_sidecar, route_key, allow_signed_out=bool(allow_signed_out))
         if route_err:
+            if env.pop(_REAL_PROFILE_REFUSED_SENTINEL, None):
+                return _real_profile_refusal(route_err)  # the reason, and the question for the person
             from tools.fix_reasons import as_tool_error
             return as_tool_error(route_err)  # keeps a fixable cause's code (tools.fix_reasons)
         if local_sidecar:
@@ -947,7 +1085,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         if lane == chrome_lane.LANE_OWN:  # the vault supervisor serves Hermes' own browser, never the owner's Chrome
             _attach_vault_supervisor(env, task_id)
         with _driven_daemons_lock:
-            _driven_daemons.add(env.get("BU_NAME", "default"))
+            daemon = daemon_identity(env)
+            _driven_daemons[daemon] = hermes_home_key()
         try:
             return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
         except subprocess.TimeoutExpired:
@@ -964,6 +1103,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         dispatched = run_fenced({"features": {"local": True}}, dispatch)
     else:
         dispatched = dispatch()
+    _reload_if_republished(env, generation)
     if "proc" not in dispatched:
         if "error_result" in dispatched:
             return dispatched["error_result"]
@@ -1031,6 +1171,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         result["workspace"] = workspace
     if session:
         result["session"] = session
+    result.update(_take_real_profile_note(route_key))
+    result.update(_signed_out_fields(route_key))
     stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
     if len(stderr) > _STDERR_CAP_CHARS:
         stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
@@ -1140,8 +1282,18 @@ def _dynamic_schema_overrides() -> dict:
     # default -- without one it chose nothing (every call already ran in the signed-in copy) and read as
     # if the default were a cloud browser (ticket #18). The caller memoizes on config.yaml mtime, so
     # toggling consent or the provider applies next session, not mid-chat.
-    if cloud:
+    if consented:
+        # Exists only where a signed-in profile exists to fail. Never a default: see _route_backend.
         props = dict(BROWSER_EXEC_SCHEMA["parameters"]["properties"])
+        props["allow_signed_out"] = {
+            "type": "boolean", "default": False,
+            "description": ("Only after a result said signed_out_available AND the person answered yes to its "
+                            "ask_person question: continue this task in a fresh browser signed in as nobody. "
+                            "Never set it on your own judgment, and never on a first call."),
+        }
+        overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
+    if cloud:
+        props = dict((overrides.get("parameters") or BROWSER_EXEC_SCHEMA["parameters"])["properties"])
         props["local"] = {
             "type": "boolean", "default": False,
             "description": ("Run in Moe's own browser on this Mac -- a copy of the person's own browser "
@@ -1199,6 +1351,7 @@ registry.register(
         code=args.get("code", ""), session=args.get("session", "") or "",
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
         local=bool(args.get("local", False)), where=str(args.get("where", "") or ""),
+        allow_signed_out=args.get("allow_signed_out") is True,
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,
