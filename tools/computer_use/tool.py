@@ -90,7 +90,7 @@ def _canon_key_combo(keys: str) -> frozenset:
     # Split on "+" AND "-": cua-driver accepts hyphenated combos, so "ctrl-alt-delete" would bypass otherwise.
     return frozenset(_KEY_ALIASES.get(p, p) for p in (q.strip().lower() for q in re.split(r"\s*[+\-]\s*", keys)) if p)
 
-def _reject_unsafe(action: str, args: Dict[str, Any]) -> Optional[str]:
+def _reject_unsafe(action: str, args: dict[str, Any]) -> Optional[str]:
     """JSON error for hard-blocked input, else None. Runs BEFORE the approval prompt."""
     if action == "type" and (pat := next((p.pattern for p in _BLOCKED_TYPE_PATTERNS if p.search(args.get("text", ""))), None)):
         return json.dumps({"error": f"blocked pattern in type text: {pat!r}",
@@ -138,10 +138,10 @@ def _input_target_mismatch(backend, requested_app: str) -> Optional[str]:
 # Per-Hermes-session cached backends (own cua-driver session, native target, refs, grant namespace).
 _backend_lock = threading.Lock()
 _backend: Optional[ComputerUseBackend] = None  # backward-compatible empty-session injection hook (older tests)
-_backends: Dict[str, ComputerUseBackend] = {}
-_backend_call_locks: Dict[str, threading.RLock] = {}
-_backend_permission_modes: Dict[str, str] = {}
-_backend_displays: Dict[str, str] = {}  # DISPLAY the cached backend was spawned against (Bot Desktop rebind)
+_backends: dict[str, ComputerUseBackend] = {}
+_backend_call_locks: dict[str, threading.RLock] = {}
+_backend_permission_modes: dict[str, str] = {}
+_backend_displays: dict[str, str] = {}  # DISPLAY the cached backend was spawned against (Bot Desktop rebind)
 # Per-session stall history. Keyed the same way as _backend_call_locks so a
 # second tenant can never inherit another session's streak — this module is
 # imported once per process and serves every session on it.
@@ -173,10 +173,10 @@ def _stall_detector(session_id: str) -> StallDetector:
 # cap: full pixels are re-delivered before compaction (which keeps only the newest image-bearing tool results)
 # could evict the image the note refers to. State is per session; sessionless calls never dedup.
 _screenshot_dedup_lock = threading.Lock()
-_last_screenshot_state: Dict[str, Dict[str, Any]] = {}  # session_id -> {"digest", "target": (app, window), "streak"}
+_last_screenshot_state: dict[str, dict[str, Any]] = {}  # session_id -> {"digest", "target": (app, window), "streak"}
 _SCREENSHOT_DEDUP_MAX_STREAK = 2
 
-def _screenshot_dedup_check(session_id: str, digest: str, target: Tuple[str, str]) -> bool:
+def _screenshot_dedup_check(session_id: str, digest: str, target: tuple[str, str]) -> bool:
     """True when this capture should be delivered WITHOUT its image: the previous frame for this session had identical
     bytes for the same target and the omission streak is below _SCREENSHOT_DEDUP_MAX_STREAK. Any miss (new pixels,
     new target, streak exhausted, first capture) resets the stored state to this digest so the image goes out."""
@@ -298,7 +298,7 @@ def _install_backend(sid: str, backend: ComputerUseBackend, permission_mode: str
     _backend = backend if sid == "" else _backend
     return backend
 
-def _detach_locked(sid: str) -> Tuple[Optional[ComputerUseBackend], Optional[threading.RLock]]:
+def _detach_locked(sid: str) -> tuple[Optional[ComputerUseBackend], Optional[threading.RLock]]:
     """Remove one session's cache entries, plus the ``_backend`` injection hook when it aliases the empty session
     (older callers/tests may populate only the hook). Caller holds ``_backend_lock``."""
     global _backend
@@ -434,7 +434,7 @@ def _noop_stub(name: str, *params: str, result: Any = None):
 class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     """Test stub (tests patch ``_new_backend`` to return it). Records ``(name, kwargs)`` calls; returns trivial results."""
 
-    def __init__(self) -> None: self.calls: List[Tuple[str, Dict[str, Any]]] = []
+    def __init__(self) -> None: self.calls: list[tuple[str, dict[str, Any]]] = []
     start = stop = lambda self: None
     def is_available(self) -> bool: return True
 
@@ -685,7 +685,7 @@ def _handle_steps(args: Dict[str, Any], kwargs: Dict[str, Any]) -> str:
     })
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
-def handle_computer_use(args: Dict[str, Any], _nested: bool = False, **kwargs) -> Any:
+def handle_computer_use(args: dict[str, Any], _nested: bool = False, **kwargs) -> Any:
     """Main entry point (tools.registry): a JSON string (text-only) or a dict marked `_multimodal`. Order: steps
     (re-entered per step) -> hard blocks + argument validation (_reject_unsafe) -> stall detector (budget, repeats,
     looking without acting) -> approval scopes (destructive action, then 'bring_to_front' — persistent focus is a
@@ -962,7 +962,7 @@ def _attach_stall_advisory(detector: StallDetector, action: str, args: Dict[str,
         return f"{banner}\n\n{result}"
     return result
 
-def _request_approval(action: str, args: Dict[str, Any]) -> Optional[str]:
+def _request_approval(action: str, args: dict[str, Any]) -> Optional[str]:
     """None if approved, else a JSON error string. With no callback wired at all, allow (Moe fork, below).
     Otherwise the decision (yolo bypass, session/permanent grants, CLI prompt,
     gateway pending, cron/unattended policy, fail-closed with nobody to ask) is ``tools.approval``'s shared gate,
@@ -1006,7 +1006,7 @@ def _request_approval(action: str, args: Dict[str, Any]) -> Optional[str]:
         return None
     return json.dumps({"error": result.get("message") or "denied by user", "action": action})
 
-def _summarize_action(action: str, args: Dict[str, Any]) -> str:
+def _summarize_action(action: str, args: dict[str, Any]) -> str:
     fg = " [FOREGROUND — briefly raises the window / changes focus]" if args.get("delivery_mode") == "foreground" else ""
     return _ACTIONS.get(action, _ActionSpec(None)).summarize(action, args, fg)
 
@@ -1027,11 +1027,11 @@ def _force_kw(fn, args: Dict[str, Any]) -> Dict[str, Any]:
 # --- handlers: (backend, action, args, **delivery) -> ActionResult (_dispatch applies the follow-up capture) or a
 #     final str/dict result. `delivery` = delivery_mode + bring_to_front; only input actions use it.
 
-def _xy(args: Dict[str, Any]) -> Dict[str, Any]:
+def _xy(args: dict[str, Any]) -> dict[str, Any]:
     """Click semantics: a coordinate only counts when its x is set (a bare y is not a point)."""
     return dict(x=coord[0], y=coord[1]) if (coord := args.get("coordinate")) and coord[0] is not None else dict(x=None, y=None)
 
-def _scroll_xy(args: Dict[str, Any]) -> Dict[str, Any]:
+def _scroll_xy(args: dict[str, Any]) -> dict[str, Any]:
     """Scroll semantics: axes are independent — ``coordinate=[null, 100]`` scrolls at y=100 with x unset."""
     coord = args.get("coordinate") or (None, None)
     return dict(x=coord[0] if coord and coord[0] is not None else None,
@@ -1124,7 +1124,7 @@ def _do_listing(backend, action, args, key, **_):
         out["note"] = note
     return json.dumps(out)
 
-def _summarize_click(action: str, args: Dict[str, Any], fg: str) -> str:
+def _summarize_click(action: str, args: dict[str, Any], fg: str) -> str:
     where = (f" element #{args['element']}" if args.get("element") is not None
              else f" at {tuple(args['coordinate'])}" if args.get("coordinate") else "")
     return f"{action}{where}{fg}"
@@ -1142,7 +1142,7 @@ _ActionSpec = namedtuple("_ActionSpec", "handler input destructive summarize",
                          defaults=(False, False, lambda a, args, fg: a + fg))
 _input = partial(_ActionSpec, input=True, destructive=True)
 
-_ACTIONS: Dict[str, _ActionSpec] = {
+_ACTIONS: dict[str, _ActionSpec] = {
     "click": _input(_do_click, summarize=_summarize_click),
     "double_click": _input(partial(_do_click, count=2), summarize=_summarize_click),
     "right_click": _input(partial(_do_click, button="right"), summarize=_summarize_click),
@@ -1179,7 +1179,7 @@ _ACTION_SUGGESTIONS = {
     "input_text": "type", "screenshot": "capture", "get_window_state": "capture", "left_click": "click", "mouse_click": "click",
 }
 
-def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any], fence: Callable[[], None] = lambda: None,
+def _dispatch(backend: ComputerUseBackend, action: str, args: dict[str, Any], fence: Callable[[], None] = lambda: None,
               session_id: Optional[str] = None) -> Any:
     """``fence`` raises when the screen lease moved since admission; capture paths call it as soon as the
     frame is in hand, before anything derived from it leaves the process (including the screenshot dedup
@@ -1205,7 +1205,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any], fe
                                                                          session_id=session_id)
 
 # ── Response shaping ────────────────────────────────────────────────────────
-def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
+def _classify_action_result(res: ActionResult) -> dict[str, Any]:
     """Next ladder step from semantic evidence, in precedence order. Escalation is advisory: it never overrides
     a confirmed effect nor licenses repeating input."""
     if res.effect == "confirmed" or res.verified is True:
@@ -1294,14 +1294,14 @@ def _verify_payload(res: ActionResult) -> Dict[str, Any]:
         payload["code"] = res.code
     return payload
 
-def _present(**fields: Any) -> Dict[str, Any]:
+def _present(**fields: Any) -> dict[str, Any]:
     return {k: v for k, v in fields.items() if v}  # only the truthy optional fields, in the given order
 
 # Landing info is hoisted to the top level so it is impossible to miss: where the input went matters more than that
 # it was sent.
 _LANDING_KEYS = ("front_app", "focused", "front_app_changed", "front_app_before", "target")
 
-def _action_payload(res: ActionResult) -> Dict[str, Any]:
+def _action_payload(res: ActionResult) -> dict[str, Any]:
     # cua-driver's structured verdict fields only when returned (None = old driver). ok is transport success;
     # effect/escalation are the semantic verdict.
     meta = res.meta if isinstance(res.meta, dict) else {}
@@ -1390,7 +1390,7 @@ def _degraded_note(reason: Optional[str], total_elements: int, mode: Optional[st
 def _is_claude_code_profile() -> bool:
     return (os.environ.get("HERMES_MCP_TOOL_PROFILE") or "").strip().lower() == "claude-code"
 
-def _capture_image_format(cap: CaptureResult) -> Tuple[str, str]:
+def _capture_image_format(cap: CaptureResult) -> tuple[str, str]:
     # (MIME, file extension): cua-driver's explicit MIME type, else sniff the base64 prefix (JPEG starts with /9j/,
     # PNG with iVBOR). The extension matches the on-disk bytes for MIME sniffing.
     mime = cap.image_mime_type or ("image/jpeg" if (cap.png_b64 or "").startswith("/9j/") else "image/png")
@@ -1403,19 +1403,19 @@ def _bounds_unknown(bounds) -> bool:
         return all(int(v) == 0 for v in bounds)
     return False
 
-def _element_to_dict(e: UIElement) -> Dict[str, Any]:
+def _element_to_dict(e: UIElement) -> dict[str, Any]:
     # A zero rect is "geometry unknown", not a position — null it so no coordinate= is ever derived from it (the index still works).
     return {"index": e.index, "role": e.role, "label": e.label[:_MAX_ELEMENT_LABEL_CHARS],
             "bounds": None if _bounds_unknown(e.bounds) else list(e.bounds), "app": e.app,
             **({"label_truncated": True} if len(e.label) > _MAX_ELEMENT_LABEL_CHARS else {})}
 
-def _format_elements(elements: List[UIElement], max_lines: int = 40) -> List[str]:
+def _format_elements(elements: list[UIElement], max_lines: int = 40) -> list[str]:
     out = [f"  #{e.index} {e.role} {e.label.replace(chr(10), ' ')[:60]!r} "
            + ("@ bounds-unknown (click by element index)" if _bounds_unknown(e.bounds) else f"@ {e.bounds}")
            + (f" [{e.app}]" if e.app else "") for e in elements[:max_lines]]
     return out + ([f"  ... +{len(elements) - max_lines} more (call capture with app= to narrow)"] if len(elements) > max_lines else [])
 
-def _bounds_hints(elements: List[UIElement], image_width: int, image_height: int) -> Tuple[Optional[float], Optional[str]]:
+def _bounds_hints(elements: list[UIElement], image_width: int, image_height: int) -> tuple[Optional[float], Optional[str]]:
     """(scale, note) when element bounds live in a different coordinate space than the screenshot, else (None, None).
     On HiDPI displays AX bounds are native while the screenshot is downscaled, so coordinate= clicks read off the
     screenshot miss by the scale factor. 5% slack: window chrome can hang a few px past the captured frame without
@@ -1436,8 +1436,8 @@ def _bounds_hints(elements: List[UIElement], image_width: int, image_height: int
             "space — derive click points from element bounds, or scale screenshot positions up accordingly")
     return round(max(max_x / image_width, max_y / image_height), 2), note
 
-_bounds_scale = lambda elements, image_width, image_height: _bounds_hints(elements, image_width, image_height)[0]  # noqa: E731
-_bounds_space_note = lambda elements, image_width, image_height: _bounds_hints(elements, image_width, image_height)[1]  # noqa: E731
+_bounds_scale = lambda elements, image_width, image_height: _bounds_hints(elements, image_width, image_height)[0]
+_bounds_space_note = lambda elements, image_width, image_height: _bounds_hints(elements, image_width, image_height)[1]
 
 def _capture_lost_detail(cap: CaptureResult, visible_elements: List[UIElement], truncated_elements: int) -> bool:
     """True when the in-context response drops information the full tree has."""
@@ -1467,7 +1467,7 @@ def _capture_view(cap: CaptureResult, max_elements: int) -> SimpleNamespace:
                            screenshot_path=_persist_capture_image(cap) if has_image and not _is_claude_code_profile() else None,
                            dims_omitted=dims if too_small else None, has_image=has_image)
 
-def _capture_summary_lines(v: SimpleNamespace) -> List[str]:
+def _capture_summary_lines(v: SimpleNamespace) -> list[str]:
     """Human-readable capture summary; line ORDER is contract. Lists only what `elements` surfaces, otherwise the
     summary names indices the model can't find."""
     notes = (
@@ -1494,7 +1494,7 @@ def _capture_summary_lines(v: SimpleNamespace) -> List[str]:
            f"{_MIN_PROVIDER_IMAGE_DIMENSION}x{_MIN_PROVIDER_IMAGE_DIMENSION} provider minimum)"] if v.dims_omitted else []),
     ]
 
-def _text_capture_payload(v: SimpleNamespace, summary: str, extra: Optional[Dict[str, Any]] = None) -> str:
+def _text_capture_payload(v: SimpleNamespace, summary: str, extra: Optional[dict[str, Any]] = None) -> str:
     """JSON text payload shared by the AX, vision-unavailable and aux-vision branches. Key order is contract:
     fixed fields, ``extra`` branch markers, then set optionals."""
     return json.dumps({
@@ -1741,7 +1741,7 @@ _VISION_PROMPT = ("Describe what is visible in this desktop application screensh
                   "and any prominent text content the user would need to know about. Do not invent details that are not "
                   "actually visible.\n\nAX/SOM index for cross-reference:\n")
 
-def _route_capture_through_aux_vision(cap: CaptureResult, summary: str, *, visible_elements: Optional[List[UIElement]] = None,
+def _route_capture_through_aux_vision(cap: CaptureResult, summary: str, *, visible_elements: Optional[list[UIElement]] = None,
                                       truncated_elements: int = 0, elements_file: Optional[str] = None,
                                       screenshot_path: Optional[str] = None) -> Optional[str]:
     """Pre-analyse the capture via ``vision_analyze_tool`` (temp file under ``$HERMES_HOME/cache/vision/``) and merge
@@ -1818,6 +1818,6 @@ def check_computer_use_requirements() -> bool:
         return placement.resolve().where == placement.TERMINAL
     return False
 
-def get_computer_use_schema() -> Dict[str, Any]:
+def get_computer_use_schema() -> dict[str, Any]:
     from tools.computer_use.schema import COMPUTER_USE_SCHEMA
     return COMPUTER_USE_SCHEMA

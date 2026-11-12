@@ -852,7 +852,7 @@ def release_if_idle(now: Optional[float] = None) -> bool:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _attach_agent_browser_to_real_profile(port: int, copy_dir: str) -> Tuple[Optional[str], Optional[str]]:
+def _attach_agent_browser_to_real_profile(port: int, copy_dir: str) -> tuple[Optional[str], Optional[str]]:
     """Make agent-browser ATTACH to the running browser (never launch its own); returns ``(http_cdp, error)``.
 
     The daemon may answer with the endpoint of a browser IT spawned (throwaway temp profile);

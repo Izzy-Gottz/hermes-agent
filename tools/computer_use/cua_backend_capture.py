@@ -169,23 +169,23 @@ def _select_capture_target(windows: List[Dict[str, Any]], *, app_requested: bool
     pool = [w for w in windows if not w["off_screen"]]
     return pool[0] if pool else windows[0]
 
-def _sorted_windows(out: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _sorted_windows(out: dict[str, Any]) -> list[dict[str, Any]]:
     """Normalised list_windows rows, ``z_index`` DESCENDING (frontmost first = default capture/focus target)."""
     return sorted(_ingest_windows(_windows_from_tool_result(out)), key=lambda w: w["z_index"], reverse=True)
 
-def _tree_and_title(out: Dict[str, Any]) -> Tuple[str, str]:
+def _tree_and_title(out: dict[str, Any]) -> tuple[str, str]:
     """``(tree_markdown, window_title)`` from a get_window_state result."""
     tree = _split_tree_text(data if isinstance((data := out.get("data")), str) else "")[1]
     return tree, (match.group(1) if (match := re.search(r'AXWindow\s+"([^"]+)"', tree)) else "")
 
-def _gws_is_empty(out: Dict[str, Any]) -> bool:
+def _gws_is_empty(out: dict[str, Any]) -> bool:
     """True when a get_window_state result carries neither a screenshot nor a parseable tree. Modern
     drivers put the payload in structuredContent with no markdown tree — that is NOT empty."""
     sc_ = out.get("structuredContent") or {}
     return not (out.get("images") or sc_.get("elements") or sc_.get("screenshot_png_b64")
                 or _tree_and_title(out)[0].strip())
 
-def _png_metrics(png_b64: str, width: int, height: int) -> Tuple[int, int, int]:
+def _png_metrics(png_b64: str, width: int, height: int) -> tuple[int, int, int]:
     """``(png_bytes_len, width, height)``; the sniffed size wins when the bytes carry a readable PNG/JPEG header."""
     try:
         raw = base64.b64decode(png_b64, validate=False)
@@ -194,7 +194,7 @@ def _png_metrics(png_b64: str, width: int, height: int) -> Tuple[int, int, int]:
     detected_width, detected_height = _image_dimensions_from_bytes(raw)
     return len(raw), *((detected_width, detected_height) if detected_width and detected_height else (width, height))
 
-def _is_desktop_window(w: Dict[str, Any], names: Tuple[str, ...] = _DESKTOP_WINDOW_NAMES) -> bool:
+def _is_desktop_window(w: dict[str, Any], names: tuple[str, ...] = _DESKTOP_WINDOW_NAMES) -> bool:
     return any(name in f"{w.get('app_name', '')} {w.get('title', '')}".lower() for name in names)
 
 
@@ -228,7 +228,7 @@ class _CaptureMixin:
         self._clear_active_target()
         return CaptureResult(mode=mode, width=0, height=0, window_title=message, fix=fix)
 
-    def _call_capture_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def _call_capture_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Call a capture-stage tool and disarm state on transport or logical failure."""
         with self._disarming():
             out = self._session.call_tool(name, args)
@@ -238,8 +238,8 @@ class _CaptureMixin:
                                    + (f": {message}" if isinstance(message, str) and message else ""))
         return out
 
-    def _cli_refetch(self, name: str, args: Dict[str, Any], timeout: float, what: str,
-                     warning: str, *warning_args: Any) -> Optional[Dict[str, Any]]:
+    def _cli_refetch(self, name: str, args: dict[str, Any], timeout: float, what: str,
+                     warning: str, *warning_args: Any) -> Optional[dict[str, Any]]:
         """MCP came back empty/imageless without raising: log *warning*, then a one-shot call over the CLI
         transport (different daemon socket). None on failure."""
         logger.warning(warning, *warning_args)
@@ -255,8 +255,8 @@ class _CaptureMixin:
         self._clear_active_target()
         return None
 
-    def _fetch_or_refetch(self, name: str, args: Dict[str, Any], timeout: float, what: str,
-                          empty: Callable[[Dict[str, Any]], bool], warning: str, *warning_args: Any) -> Dict[str, Any]:
+    def _fetch_or_refetch(self, name: str, args: dict[str, Any], timeout: float, what: str,
+                          empty: Callable[[dict[str, Any]], bool], warning: str, *warning_args: Any) -> dict[str, Any]:
         """``_call_capture_tool`` whose result, when *empty*, is replaced by a non-empty CLI re-fetch (the
         MCP result stands when the CLI fails too)."""
         out = self._call_capture_tool(name, args)
@@ -420,12 +420,12 @@ class _CaptureMixin:
             f"first.>"
         ), None)
 
-    def _match_windows_for_app(self, windows: List[Dict[str, Any]], app: str) -> List[Dict[str, Any]]:
+    def _match_windows_for_app(self, windows: list[dict[str, Any]], app: str) -> list[dict[str, Any]]:
         """Resolve ``app=``: exact window names, then exact list_apps aliases (Linux ``list_windows`` can
         omit the app name that ``list_apps`` keeps), then substrings — querying ``Code`` must not silently
         select ``Visual Studio Code`` because it is frontmost."""
         app_lower = app.strip().lower()
-        _name = lambda w: str(w.get("app_name", "")).lower()  # noqa: E731
+        _name = lambda w: str(w.get("app_name", "")).lower()
         direct_exact = [w for w in windows if app_lower and app_lower == _name(w).strip()]
         if not app_lower or direct_exact:
             return direct_exact
@@ -455,7 +455,7 @@ class _CaptureMixin:
         return next((matched for matched in tiers if matched), [])
 
     def _resolve_capture_windows(self, mode: str, app: Optional[str], pid: Optional[int],
-                                 window_id: Optional[int]) -> "List[Dict[str, Any]] | CaptureResult":
+                                 window_id: Optional[int]) -> list[dict[str, Any]] | CaptureResult:
         """Candidate windows for capture(), or a failed CaptureResult."""
         if pid is not None or window_id is not None:
             # An exact pid/window pair is both the stable capture_after target and the escape hatch when
@@ -485,7 +485,7 @@ class _CaptureMixin:
         # macOS list_windows returns the localized app name (e.g. "計算機"), so `app="Calculator"` legitimately misses.
         return self._match_windows_for_app(windows, app) or self._failed_capture(mode, *self._no_match(app))
 
-    def _gws_args(self) -> Dict[str, Any]:
+    def _gws_args(self) -> dict[str, Any]:
         """``get_window_state`` args.
 
         ``max_elements`` bounds the DRIVER's accessibility walk, not just its response: tool.py caps the
@@ -494,7 +494,7 @@ class _CaptureMixin:
         latency and nothing else. The bounded tree is a prefix of the unbounded one, so the elements the
         model sees are unchanged. ``computer_use.ax_max_elements`` tunes it; 0 disables.
         """
-        args: Dict[str, Any] = {"pid": self._active_pid, "window_id": self._active_window_id,
+        args: dict[str, Any] = {"pid": self._active_pid, "window_id": self._active_window_id,
                                 "session": self._session_id}
         from tools.computer_use import cua_backend as _cb  # lazy: cua_backend imports this module at import time
         if capped := _cb._cua_configured_ax_max_elements():
@@ -622,7 +622,7 @@ class _CaptureMixin:
             previous_scope = sc["capture_scope"] if isinstance(sc, dict) and isinstance(sc.get("capture_scope"), str) else None
         except Exception as e:
             logger.debug("cua-driver get_config before full-screen capture failed: %s", e)
-        _set_scope = lambda value: self._session.call_tool(  # noqa: E731
+        _set_scope = lambda value: self._session.call_tool(
             "set_config", {"key": "capture_scope", "value": value, "session": self._session_id}, timeout=10.0)
         try:
             if previous_scope != "desktop":
@@ -644,7 +644,7 @@ class _CaptureMixin:
                              window_title="Full screen (composited)", png_bytes_len=png_bytes_len,
                              image_mime_type=image_mime_type, note=_FULL_SCREEN_NOTE)
 
-    def list_apps(self) -> List[Dict[str, Any]]:
+    def list_apps(self) -> list[dict[str, Any]]:
         out = self._session.call_tool("list_apps", {"session": self._session_id})
         structured, data = out.get("structuredContent"), out.get("data")
         # structuredContent is canonical; empty lists fall through so a populated compatibility envelope

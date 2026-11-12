@@ -47,7 +47,7 @@ class ApiErrorVerdict:
     max_retries: Any
     compression_attempts: Any
     _provider_overflow_recovery_pending: Any
-    result: Optional[Dict[str, Any]] = None
+    result: Optional[dict[str, Any]] = None
 
 
 def handle_api_error(
@@ -63,7 +63,7 @@ def handle_api_error(
     preflight re-runs against the fallback's context window (#84733)."""
     _provider_overflow_recovery_pending = False
 
-    def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ApiErrorVerdict:
+    def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ApiErrorVerdict:
         return ApiErrorVerdict(
             action=action, thinking_spinner=thinking_spinner, messages=messages,
             active_system_prompt=active_system_prompt, conversation_history=conversation_history,
@@ -253,7 +253,7 @@ class UnrecoveredErrorVerdict:
     active_system_prompt: Any
     retry_count: Any
     compression_attempts: Any
-    result: Optional[Dict[str, Any]] = None
+    result: Optional[dict[str, Any]] = None
 
 
 def settle_unrecovered_error(
@@ -273,7 +273,7 @@ def settle_unrecovered_error(
         _arm_fallback_restart, _is_copilot_provider, _is_stale_copilot_credential_error
     )
 
-    def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> UnrecoveredErrorVerdict:
+    def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> UnrecoveredErrorVerdict:
         return UnrecoveredErrorVerdict(
             action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
             compression_attempts=compression_attempts, result=result,

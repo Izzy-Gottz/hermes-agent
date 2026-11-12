@@ -16,7 +16,7 @@ from typing import Any, Dict
 # pid, window_id) / zoom (region) / targeting (element, coordinate, button,
 # modifiers) / drag / scroll / set_value / type-key-wait / focus_app / delivery
 # ladder / force / return shape.
-_PROPERTIES: Dict[str, Any] = {
+_PROPERTIES: dict[str, Any] = {
     "steps": {
         "type": "array",
         "items": {"type": "object"},
@@ -293,7 +293,7 @@ _PROPERTIES: Dict[str, Any] = {
     },
 }
 
-COMPUTER_USE_SCHEMA: Dict[str, Any] = {
+COMPUTER_USE_SCHEMA: dict[str, Any] = {
     "name": "computer_use",
     "description": (
         "Drive the desktop via cua-driver — screenshots, mouse, keyboard, "
@@ -334,6 +334,6 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
     "parameters": {"type": "object", "properties": _PROPERTIES, "required": ["action"]},
 }
 
-def get_computer_use_schema() -> Dict[str, Any]:
+def get_computer_use_schema() -> dict[str, Any]:
     """Return the generic OpenAI function-calling schema."""
     return COMPUTER_USE_SCHEMA
