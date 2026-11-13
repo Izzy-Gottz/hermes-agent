@@ -57,7 +57,7 @@ def _cause(message, **extra):
 def test_turn_interrupted_by_the_owner_stop_carries_a_named_notice(cause, notice):
     frame = _publish('interrupted', _cause(cause))
     assert frame['status'] == 'interrupted' and frame['warning'] == notice
-    assert 'will not be run again' in notice
+    assert 'had to stop before I could answer' in notice
     EVENTS['message.complete'].payload.model_validate({k: frame[k] for k in ('text', 'status', 'warning')})
 
 

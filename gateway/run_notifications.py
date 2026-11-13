@@ -576,6 +576,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     platform.value,
                 )
                 continue
+            # Memoe: "I'm back" is a lifecycle diagnostic like the shutdown notice, so it honours the
+            # same gate (display.suppress_warning_notifications). The per-platform switch above is a
+            # table keyed by name, and a name nobody listed (`relay`) walked past it.
+            from gateway.warning_notifications import warning_notifications_enabled
+            from gateway.run import _async_profile_runtime_scope
+            profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
+            async with (_async_profile_runtime_scope(profile_home) if profile_home else contextlib.nullcontext()):
+                shown = warning_notifications_enabled(platform)
+            if not shown:
+                logger.info("Home-channel startup notification suppressed: %s hides diagnostics", platform.value)
+                continue
             target = _served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id)
             if target in skipped or target in delivered:
                 continue

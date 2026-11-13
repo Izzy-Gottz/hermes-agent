@@ -117,10 +117,10 @@ def _publish_completion(authority, live, ref, row, settled, response, captured):
     live.event_stream.publish(ref.session_id, complete)
 
 
-RESTART_INTERRUPT_NOTICE = ('Gateway restarting: this turn was interrupted and will not be run again. '
-                            'Send your message again once Hermes reconnects.')
-SHUTDOWN_INTERRUPT_NOTICE = ('Gateway shutting down: this turn was interrupted and will not be run again. '
-                             'Send your message again once Hermes is back.')
+RESTART_INTERRUPT_NOTICE = ("Sorry — I had to stop before I could answer that. "
+                            "Please send it again in a moment.")
+SHUTDOWN_INTERRUPT_NOTICE = ("Sorry — I had to stop before I could answer that. "
+                             "Please send it again in a moment.")
 
 
 def owner_stop_notice(captured, outcome, row=None):

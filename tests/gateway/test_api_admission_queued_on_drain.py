@@ -59,7 +59,7 @@ async def test_retirement_tells_a_queued_api_observer_its_input_is_saved(tmp_pat
 
     outcome, row = await _observe_queued_then(tmp_path, monkeypatch, retire)
     assert isinstance(outcome, AdmissionQueued), outcome
-    assert outcome.reason == 'admission_queued' and 'do not resend' in str(outcome)
+    assert outcome.reason == 'admission_queued' and 'No need to send it again' in str(outcome)
     assert row['status'] == 'queued'  # durable: the next owner runs it once
 
 

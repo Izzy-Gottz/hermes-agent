@@ -56,7 +56,7 @@ async def test_paused_fifo_releases_the_messaging_waiter_with_one_notice_per_epi
         from gateway.session_ingress import pause_notice
         authority.sessions['s'].pause_notified = False
         draining = pause_notice(authority, ref, 'runtime_draining')
-        assert 'restarting' in draining and '/reset' not in draining, draining
+        assert 'got your message' in draining and '/reset' not in draining, draining
         authority.sessions['s'].pause_notified = False
         # The operator resumes the FIFO; the saved followers run, no new notice was owed.
         viewer = AuthorityConnection(authority, Peer(), {'user_id': 'human'})

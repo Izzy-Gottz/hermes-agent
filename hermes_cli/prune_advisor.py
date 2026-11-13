@@ -53,7 +53,11 @@ class DiskSnapshot:
         if self.total_bytes <= 0:
             return False
         free_pct = self.free_bytes * 100.0 / self.total_bytes
-        return self.free_bytes < LOW_FREE_FLOOR or (
+        # The absolute floor is for a big disk nearly full. On a small volume (a 2 GB cloud
+        # machine) 2 GiB is more than the whole disk, so "1.7 GB free of 1.9 GB" read as low
+        # every time (Memoe, 2026-11-13): the floor never exceeds a quarter of the volume.
+        floor = min(LOW_FREE_FLOOR, self.total_bytes // 4)
+        return self.free_bytes < floor or (
             free_pct < LOW_FREE_PERCENT and self.free_bytes < LOW_FREE_HEADROOM)
 
 

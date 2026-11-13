@@ -193,7 +193,7 @@ def pause_notice(authority, ref, reason):
     live.pause_notified = True
     if reason == 'runtime_draining':
         # Transient: the row runs when the restarted owner drains it, so /reset would be wrong advice.
-        return '⏳ Hermes is restarting — your message is saved and will be answered when it is back.'
+        return '⏳ One moment — I got your message and will answer it shortly.'
     if reason == 'session_busy':
         # Transient: queued behind work already running on this conversation (a worker execution).
         return '⏳ Your message is saved and will be answered when the work running in this conversation finishes.'
