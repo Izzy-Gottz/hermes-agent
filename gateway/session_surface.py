@@ -107,6 +107,7 @@ def arm_surface_turn(agent, notes=(), voice_turn=False):
     process and in a managed worker: the ``auxiliary.voice_chat`` marker and the must-deliver notes
     that ride the current user message (never the system prompt). Assigned unconditionally so a
     reused agent never replays a stale note or route."""
-    agent._voice_turn_pending = bool(voice_turn) or surface_voice_turn()
+    from gateway.session_api_turn import api_voice_turn
+    agent._voice_turn_pending = bool(voice_turn) or surface_voice_turn() or api_voice_turn()
     agent._gateway_turn_context_notes = '\n\n'.join(
         note for note in (*notes, surface_turn_note(agent)) if note)

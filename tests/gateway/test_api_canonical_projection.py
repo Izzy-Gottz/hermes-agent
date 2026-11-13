@@ -453,3 +453,43 @@ async def test_api_turn_selects_the_requests_registered_browser_controller(api, 
     finally:
         broker.reset()
     assert selected == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_turn_keeps_its_origin_words_and_voice_under_the_authority(api, owner):
+    """X-Hermes-Turn-Origin / -Person-Words / -Voice-Turn reach the turn the authority runs, as
+    the legacy executor's ``_run_agent`` binds them: the admission carries them, execution binds
+    them, and nothing is left bound for the next turn. Before this, every API turn under the
+    authority was nobody's — the claimstore learned nothing, recipient grounding found no person
+    words, the extension lane was never live and a spoken turn opened at full effort."""
+    from gateway.platforms.api_server import (
+        _api_request_person_words, _api_request_turn_origin, _api_request_voice_turn)
+    from gateway.session_api_turn import api_voice_turn
+    from gateway.session_context import get_turn_origin, get_turn_person_words
+    from gateway.session_surface import arm_surface_turn
+    seen = []
+
+    async def handle(event):
+        from gateway.session_results import execution_result
+        agent = SimpleNamespace(valid_tool_names=set())
+        arm_surface_turn(agent)
+        seen.append((get_turn_origin(), get_turn_person_words(), api_voice_turn(), agent._voice_turn_pending))
+        execution_result.get()['result'] = {'final_response': 'ok', 'messages': []}
+        return 'ok'
+    owner.runner._handle_message = handle
+    cases = [('person', 'call mum', True), ('background', 'not theirs', True), ('', None, False),
+             ('person', None, False)]
+    for i, (origin, words, voice) in enumerate(cases):
+        tokens = (_api_request_turn_origin.set(origin), _api_request_person_words.set(words),
+                  _api_request_voice_turn.set(voice))
+        try:
+            _, ref, row = admit_api_turn(api, session_id='signals-%d' % i, user_message='hello',
+                                         conversation_history=[])
+        finally:
+            _api_request_voice_turn.reset(tokens[2])
+            _api_request_person_words.reset(tokens[1])
+            _api_request_turn_origin.reset(tokens[0])
+        await execute_admission(owner, ref, row)
+    assert seen == [('person', 'call mum', True, True), ('background', None, False, False),
+                    ('', None, False, False), ('person', None, False, False)]
+    assert (get_turn_origin(), get_turn_person_words()) == ('', None)

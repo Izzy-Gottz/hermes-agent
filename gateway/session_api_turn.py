@@ -55,13 +55,14 @@ def check_api_turn(authority, ref, payload):
     if 'api_turn_v1' in payload:
         data = payload['api_turn_v1']
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered'}
+                         'relay_metadata', 'resume_unanswered', 'turn_signals'}
                 or data.get('resume_unanswered', True) is not True
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
                 or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))
-                or ('browser_control' in data and not _valid_browser_control(data['browser_control']))):
+                or ('browser_control' in data and not _valid_browser_control(data['browser_control']))
+                or ('turn_signals' in data and not _valid_turn_signals(data['turn_signals']))):
             raise RuntimeStoreError('invalid_params')
         if set(data['settings']) - set(_SETTING_KEYS):
             raise RuntimeStoreError('invalid_params')
@@ -88,6 +89,59 @@ def _request_browser_control():
     bound = {'principal': _api_request_browser_control_principal.get(),
              'transport_family': _api_request_browser_control_transport_family.get()}
     return bound if _valid_browser_control(bound) else None
+
+
+def _valid_turn_signals(value):
+    if not isinstance(value, dict) or not value or set(value) - {'origin', 'person_words', 'voice'}:
+        return False
+    if value.get('origin') not in ('person', 'background'):
+        return False
+    if 'person_words' in value and (value['origin'] != 'person' or not isinstance(value['person_words'], str)):
+        return False
+    return 'voice' not in value or (value['origin'] == 'person' and value['voice'] is True)
+
+
+def _request_turn_signals():
+    """What the client declared about THIS turn (X-Hermes-Turn-Origin, X-Hermes-Person-Words,
+    X-Hermes-Voice-Turn), as the api_server middleware bound it for the request; ``None`` when it
+    declared nothing. The legacy executor binds these inside ``_run_agent``; an admission has to
+    carry them, or a turn the authority runs is nobody's: the Chrome-extension lane treats it as
+    not live, recipient grounding finds no person words, the claimstore learns nothing from it and
+    a spoken turn opens at the chat's full effort. Words and voice only ride a person's turn."""
+    from gateway.platforms.api_server import (
+        _api_request_person_words, _api_request_turn_origin, _api_request_voice_turn)
+    origin = _api_request_turn_origin.get()
+    if origin not in ('person', 'background'):
+        return None
+    signals = {'origin': origin}
+    words = _api_request_person_words.get()
+    if origin == 'person' and isinstance(words, str):
+        signals['person_words'] = words
+    if origin == 'person' and _api_request_voice_turn.get() is True:
+        signals['voice'] = True
+    return signals
+
+
+def bind_api_turn_signals(prepared):
+    """Bind an executing API admission's declared origin and person words for the turn; returns
+    the tokens for ``reset_api_turn_signals``. Bound for every API turn (``""``/``None`` when
+    nothing was declared) so an executor never inherits an earlier turn's "person"."""
+    from gateway.session_context import set_turn_origin, set_turn_person_words
+    signals = (prepared or {}).get('turn_signals') or {}
+    return (set_turn_origin(signals.get('origin') or ''), set_turn_person_words(signals.get('person_words')))
+
+
+def reset_api_turn_signals(tokens):
+    from gateway.session_context import reset_turn_origin, reset_turn_person_words
+    if tokens:
+        reset_turn_person_words(tokens[1])
+        reset_turn_origin(tokens[0])
+
+
+def api_voice_turn():
+    """Whether the executing API admission was declared a spoken turn (X-Hermes-Voice-Turn)."""
+    current = api_execution.get()
+    return bool(((current or {}).get('turn_signals') or {}).get('voice'))
 
 
 def _rebind_browser_control(adapter, data):
@@ -209,6 +263,11 @@ def admit_api_steps(adapter, **kwargs):
         # Server-derived like the owner scope: the admission keeps the identity the legacy
         # path bound for its executor, so execution and recovery can rebind it.
         payload['api_turn_v1']['browser_control'] = browser_control
+    turn_signals = _request_turn_signals()
+    if turn_signals is not None:
+        # Header-derived like browser_control, and part of the exact-retry identity: a retry that
+        # declares a different origin is a different turn.
+        payload['api_turn_v1']['turn_signals'] = turn_signals
     # Refuse a foreign-surface target before committing any media for it (a refused
     # admission otherwise retains its image bytes under native-inputs/ forever).
     existing = authority.db.get_session(sid)
@@ -483,7 +542,8 @@ def prepare_api_execution(authority, ref, payload):
             'content': content, 'turn_author': data.get('turn_author') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
             'resume_unanswered': bool(data and data.get('resume_unanswered')),
-            'browser_control': _rebind_browser_control(adapter, data)}
+            'browser_control': _rebind_browser_control(adapter, data),
+            'turn_signals': data.get('turn_signals') if data else None}
 
 
 def _api_observers(authority, session_id):
