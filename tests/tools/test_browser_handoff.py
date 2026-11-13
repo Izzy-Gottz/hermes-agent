@@ -773,10 +773,10 @@ class TestHandoff:
     @staticmethod
     def _host(monkeypatch, platform, kept, real=True):
         from tools import browser_handoff_tool as bh
-        from tools import browser_tool_cloud as cloud
+        from tools import browser_session_cloud as cloud
         monkeypatch.setattr(bh.sys, "platform", platform)
-        monkeypatch.setattr(cloud, "_use_real_profile", lambda: real)
-        monkeypatch.setattr(cloud, "_use_kept_profile", lambda: kept)
+        monkeypatch.setattr(cloud, "use_real_profile", lambda: real)
+        monkeypatch.setattr(cloud, "use_kept_profile", lambda: kept)
 
     @pytest.mark.parametrize("platform", ["telegram", "api_server"])
     def test_on_the_cloud_computer_it_points_at_the_sign_in_link(self, handoff, monkeypatch, platform):
@@ -938,7 +938,6 @@ class TestShowToPerson:
                             lambda: "/x/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
         monkeypatch.setattr(rp, "_cdp_on_data_dir", lambda cdp, d: True)
         monkeypatch.setattr(rp, "_persons_identity", lambda b: None)
-        monkeypatch.setattr(rp, "_agent_browser_close_session", lambda name: None)
         monkeypatch.setattr(rp, "_await_holders_gone", lambda d, wait=10.0: None)
         monkeypatch.setattr(rp, "_other_work", lambda task: [])
         monkeypatch.setattr(rp, "_main_browser_pid", lambda d: 4242)
@@ -963,7 +962,7 @@ class TestShowToPerson:
         monkeypatch.setattr(rp, "_launch_driven_browser", fake_launch)
         monkeypatch.setattr(rp, "_import_cookies_into_driven_browser",
                             lambda port, cookies: calls.__setitem__("cookies_in", (port, cookies)))
-        monkeypatch.setattr(rp, "_attach_agent_browser_to_real_profile", lambda port, d: (f"http://127.0.0.1:{port}", None))
+        monkeypatch.setattr(rp, "_attach_to_driven_browser", lambda port, d: (f"http://127.0.0.1:{port}", None))
         monkeypatch.setattr(rp, "_bring_to_front", lambda port, tid, pid: calls["front"].append((port, tid, pid)) or True)
         monkeypatch.setitem(rp._shown_to_person, "on", False)
         monkeypatch.setitem(rp._launched_headless, "headless", True)
@@ -1006,7 +1005,7 @@ class TestShowToPerson:
         from tools import browser_tool_real_profile as rp
         d = tmp_path / "claims"
         monkeypatch.setattr(rp, "_claims_dir", lambda: str(d))
-        window = rp._origin().BROWSER_SESSION_INACTIVITY_TIMEOUT
+        window = rp._session_inactivity_timeout()
         rp.claim_driven_browser()
         assert rp.other_live_claims(window) == []                     # our own claim is never "other work"
         other = subprocess.Popen(["/bin/sleep", "30"])
@@ -1223,7 +1222,7 @@ class TestShowToPerson:
         other = subprocess.Popen(["/bin/sleep", "30"])
         try:
             self._claim_by(tmp_path, other.pid, "cc:another-conversation",
-                           age=rp._origin().BROWSER_SESSION_INACTIVITY_TIMEOUT + 30)
+                           age=rp._session_inactivity_timeout() + 30)
             out = rp.show_to_person()
         finally:
             other.kill()
@@ -1354,7 +1353,7 @@ class TestShowToPerson:
 
     def test_while_shown_a_relaunch_stays_headed_and_hand_back_restores_headless(self, rp, monkeypatch):
         rp, _ = rp
-        monkeypatch.setattr(rp._cloud, "_is_headed_mode", lambda: False)
+        monkeypatch.setattr("tools.browser_session_cloud.is_headed_mode", lambda: False)
         rp.show_to_person()
         assert rp._driven_browser_headless() is False
         rp.hand_back()
@@ -1365,12 +1364,12 @@ class TestShowToPerson:
         _bt = rp._origin()
         monkeypatch.setattr(rp, "_real_profile_in_use", lambda: False)
         rp.show_to_person()
-        long_after = time.time() + _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT + 60
+        long_after = time.time() + rp._session_inactivity_timeout() + 60
         before = calls["terminated"]
         assert rp.release_if_idle(now=long_after) is False and calls["terminated"] == before
         rp.hand_back()                                   # done: the idle clock starts from now
         assert rp.release_if_idle(now=time.time() + 5) is False
-        assert rp.release_if_idle(now=time.time() + _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT + 60) is True
+        assert rp.release_if_idle(now=time.time() + rp._session_inactivity_timeout() + 60) is True
 
     def test_a_window_nobody_hands_back_is_released_after_the_two_hour_ceiling(self, rp, monkeypatch):
         rp, _ = rp

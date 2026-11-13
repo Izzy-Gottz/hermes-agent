@@ -250,9 +250,10 @@ class TestExecEnv:
 
     def test_browser_exec_prepends_the_patch_and_sets_the_env(self, tmp_path, monkeypatch):
         import tools.browser_use_cli as bu_cli
-        from tools import browser_tool_session as bt_session, browser_supervisor
-        monkeypatch.setattr(bt_session, "_run_browser_command",
-                            lambda *a, **k: {"success": True, "data": {"cdpUrl": "ws://127.0.0.1:47000/x"}})
+        from tools import browser_session, browser_supervisor
+        monkeypatch.setattr(bu_cli, "_real_profile_consented", lambda: False)
+        monkeypatch.setattr(browser_session, "get_session_info",
+                            lambda key: {"cdp_url": "ws://127.0.0.1:47000/x", "features": {"local": True}})
         monkeypatch.setattr(browser_supervisor, "SUPERVISOR_REGISTRY",
                             type("R", (), {"get_or_start": lambda self, **k: None, "get": lambda self, t: None})())
         cli = tmp_path / "browser-use"
@@ -274,14 +275,14 @@ class TestDialogs:
         monkeypatch.setattr(health, "_dialog_tool_available", lambda: True)
         assert health.exec_dialog_policy("must_respond") == "must_respond"
 
-    def test_browser_use_mode_really_has_no_dialog_tool(self, monkeypatch):
-        """The premise: in Browser Use mode browser_dialog's check_fn is False."""
-        # a static CDP URL is what normally offers browser_dialog; Browser Use mode takes it away
-        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override_raw", lambda: "http://127.0.0.1:9222")
-        monkeypatch.setattr("tools.browser_tool._is_camofox_mode", lambda: False)
-        monkeypatch.setattr("tools.browser_tool._is_browser_use_cli_mode", lambda: False)
+    def test_without_a_static_cdp_url_there_is_no_dialog_tool(self, monkeypatch):
+        """The premise, on upstream's gate since the rewire: browser_dialog rides with browser_cdp, offered
+        only beside browser_exec with a static CDP URL (``/browser connect``). Every other browser_exec
+        browser has no tool that could answer a held dialog."""
+        monkeypatch.setattr("tools.browser_use_cli.browser_exec_available", lambda: True)
+        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override_raw", lambda: "http://127.0.0.1:9222")
         assert health._dialog_tool_available() is True
-        monkeypatch.setattr("tools.browser_tool._is_browser_use_cli_mode", lambda: True)
+        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override_raw", lambda: "")
         assert health._dialog_tool_available() is False
 
     def _supervisor(self, policy):
@@ -290,7 +291,7 @@ class TestDialogs:
 
     def test_attach_passes_the_exec_policy_and_corrects_a_running_supervisor(self, monkeypatch):
         import tools.browser_use_cli as bu_cli
-        from tools import browser_supervisor, browser_tool_cdp
+        from tools import browser_supervisor, browser_session_cdp
         running = self._supervisor("must_respond")
         seen = {}
 
@@ -299,8 +300,8 @@ class TestDialogs:
                 seen.update(kw)
                 return running
         monkeypatch.setattr(browser_supervisor, "SUPERVISOR_REGISTRY", _Reg())
-        monkeypatch.setattr(browser_tool_cdp, "_get_dialog_policy_config", lambda: ("must_respond", 300.0))
-        monkeypatch.setattr(browser_tool_cdp, "_resolve_cdp_override", lambda u: u)
+        monkeypatch.setattr(browser_session_cdp, "get_dialog_policy_config", lambda: ("must_respond", 300.0))
+        monkeypatch.setattr(browser_session_cdp, "resolve_cdp_override", lambda u: u)
         monkeypatch.setattr(health, "_dialog_tool_available", lambda: False)
         bu_cli._attach_vault_supervisor({"BU_CDP_URL": "http://127.0.0.1:9222"}, "t16")
         assert seen["dialog_policy"] == "auto_dismiss"

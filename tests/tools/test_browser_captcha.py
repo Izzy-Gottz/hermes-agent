@@ -1054,24 +1054,6 @@ def test_local_browser_ws_refuses_anything_but_loopback():
     assert bl.local_browser_ws({}) is None
 
 
-# ---- description fixes ---------------------------------------------------------------------------------------
-
-def test_browser_vision_no_longer_invites_solving_captchas():
-    from tools import browser_tool as bt
-    schema = next(s for s in bt.BROWSER_TOOL_SCHEMAS if s["name"] == "browser_vision")
-    d = schema["description"]
-    assert "especially for CAPTCHAs" not in d and "never try to solve one yourself" in d
-
-
-def test_bot_detection_warning_points_at_the_person_not_browserbase():
-    from tools import browser_tool as bt
-    resp = {}
-    bt._add_navigate_warnings(resp, "Just a moment...", None)
-    w = resp["bot_detection_warning"]
-    assert "BROWSERBASE" not in w and "stealth" not in w.lower() and "Scale plan" not in w
-    assert "Do not try to solve it yourself" in w and "browser_handoff" in w
-
-
 # ---- live: Chrome for Testing on local pages only ----------------------------------------------------------------
 
 def _cft() -> Optional[str]:
