@@ -46,8 +46,8 @@ OOM_SCORE_ADJ = 1000
 
 
 def _cfg(key: str, default, parse):
-    from tools.browser_tool_origin import origin_module
-    return origin_module()._browser_cfg(key, default, parse, key + " from config")
+    from tools.browser_session_cloud import browser_cfg
+    return browser_cfg(key, default, parse)
 
 
 def active() -> bool:
@@ -55,8 +55,8 @@ def active() -> bool:
     if not sys.platform.startswith("linux"):
         return False
     try:
-        from tools import browser_tool_cloud as cloud
-        return bool(cloud._use_real_profile() and cloud._use_kept_profile())
+        from tools import browser_session_cloud as cloud
+        return bool(cloud.use_real_profile() and cloud.use_kept_profile())
     except Exception:  # noqa: BLE001 - a config we cannot read is not the cloud lane
         return False
 

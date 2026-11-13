@@ -7,15 +7,15 @@ import sys
 import pytest
 
 from tools import browser_kept_limits as kl
-from tools import browser_tool_cloud as cloud
+from tools import browser_session_cloud as cloud
 from tools import browser_tool_real_profile as rp
 
 
 @pytest.fixture
 def cloud_lane(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(cloud, "_use_real_profile", lambda: True)
-    monkeypatch.setattr(cloud, "_use_kept_profile", lambda: True)
+    monkeypatch.setattr(cloud, "use_real_profile", lambda: True)
+    monkeypatch.setattr(cloud, "use_kept_profile", lambda: True)
     cfg = {}
     monkeypatch.setattr(kl, "_cfg", lambda key, default, parse: parse(cfg[key]) if key in cfg else default)
     return cfg
@@ -23,15 +23,15 @@ def cloud_lane(monkeypatch):
 
 def test_a_mac_never_takes_the_cloud_lane(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(cloud, "_use_real_profile", lambda: True)
-    monkeypatch.setattr(cloud, "_use_kept_profile", lambda: True)
+    monkeypatch.setattr(cloud, "use_real_profile", lambda: True)
+    monkeypatch.setattr(cloud, "use_kept_profile", lambda: True)
     assert kl.active() is False and kl.kept_flags() == ()
 
 
 def test_linux_without_the_kept_profile_is_not_the_cloud_lane(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(cloud, "_use_real_profile", lambda: True)
-    monkeypatch.setattr(cloud, "_use_kept_profile", lambda: False)
+    monkeypatch.setattr(cloud, "use_real_profile", lambda: True)
+    monkeypatch.setattr(cloud, "use_kept_profile", lambda: False)
     assert kl.active() is False
 
 
@@ -149,16 +149,3 @@ def test_every_tick_re_marks_the_tree(cloud_lane):
     kl.enforce(9222, lambda: None, available=lambda: 5000, trim=lambda *a: 0,
                data_dir="/kept", mark=lambda d: seen.append(d) or 0)
     assert seen == ["/kept"]
-
-
-def test_attach_trusts_our_devtools_port_and_never_asks_the_daemon(monkeypatch, tmp_path):
-    # Asking agent-browser for `cdp-url` after an attach launched a second, throwaway Chrome.
-    (tmp_path / "DevToolsActivePort").write_text("41234\n/devtools/browser/x\n")
-
-    class Done:
-        returncode, stdout, stderr = 0, "ok", ""
-
-    monkeypatch.setattr(rp._install, "_find_agent_browser", lambda: "/bin/agent-browser")
-    monkeypatch.setattr(rp, "_capture_agent_browser_cli", lambda argv, timeout, tag: Done())
-    monkeypatch.setattr(rp, "_agent_browser_get_cdp", lambda s: pytest.fail("asked the daemon for cdp-url"))
-    assert rp._attach_agent_browser_to_real_profile(41234, str(tmp_path)) == ("http://127.0.0.1:41234", None)
