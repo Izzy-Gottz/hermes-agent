@@ -1478,3 +1478,33 @@ def test_live_a_parked_challenge_frame_is_not_an_image_challenge(chrome, conn):
     found = bl.find_challenge(conn, ["127.0.0.1"])
     assert found is not None and found[1].kind == bc.HCAPTCHA
     assert found[1].stage == "checkbox"          # the -9999 frame is parked, not shown
+
+
+# ---- (fork) hands off: a cloud computer never works a check ---------------------------------------------
+
+def test_hands_off_is_explicit_or_follows_the_kept_profile():
+    assert bc.hands_off({"captcha": {"hands_off": True}}) is True
+    assert bc.hands_off({"captcha": {"hands_off": False}, "kept_profile": True}) is False
+    assert bc.hands_off({"kept_profile": True}) is True                  # a cloud computer, unset
+    assert bc.hands_off({}) is False and bc.hands_off(None) is False     # a Mac, unset
+    assert bc.hands_off({"captcha": {"hands_off": "yes"}}) is True       # unreadable fails safe
+
+
+def test_hands_off_never_clicks_and_hands_the_check_to_the_person():
+    # The same Turnstile the ladder passes in two clicks above, on a cloud computer.
+    out, s, _ = run(lambda st, dt: ts(solved=st["inputs"] >= 1), cfg={"kept_profile": True})
+    assert out.outcome == bl.NEEDS_PERSON
+    assert s.fd.clicks == [] and s.fd.holds == 0 and s.state["inputs"] == 0 and s.locates == 0
+    assert any("hands off" in step for step in out.steps)
+
+
+def test_hands_off_still_lets_a_managed_challenge_clear_on_its_own():
+    # Waiting is the site's own flow, not working the check: it passes with no input.
+    out, s, _ = run(lambda st, dt: cf_managed(cleared=dt >= 6), cfg={"kept_profile": True})
+    assert out.outcome == bl.PASSED and s.state["inputs"] == 0
+
+
+def test_hands_off_never_reaches_a_solver_on_an_image_grid():
+    calls = []
+    out, s, _ = run(lambda st, dt: ts(), cfg={"captcha": {"hands_off": True, "solver": "x"}})
+    assert out.outcome == bl.NEEDS_PERSON and s.state["inputs"] == 0 and calls == []

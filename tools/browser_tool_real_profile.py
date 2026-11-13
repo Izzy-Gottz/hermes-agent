@@ -37,6 +37,7 @@ from tools.browser_tool_origin import origin_module as _origin
 from tools import browser_tool_cloud as _cloud
 from tools import browser_tool_fidelity as _fidelity
 from tools import browser_tool_install as _install
+from tools import browser_kept_limits as _limits
 from tools import browser_tool_lightpanda_fallback as _lp
 from tools import browser_tool_session as _session
 
@@ -381,6 +382,7 @@ def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str
     except (subprocess.SubprocessError, OSError) as e:
         return None, None, f"{_RP}the {what} launch failed: {e}"
     _bt._real_profile_chrome_procs.append(proc)
+    _limits.mark_expendable(proc.pid)  # (fork) kept lane only: the OOM killer takes it, not the gateway
 
     deadline = time.monotonic() + startup_wait
     while time.monotonic() < deadline:
@@ -433,6 +435,7 @@ def _driven_browser_flags(identity: Optional[Dict[str, Any]], headless: bool) ->
     flags = list(_mock_keychain_flags())
     if _fidelity.fidelity_enabled():
         flags += _fidelity.launch_flags(identity, headless, _fidelity.main_display() if headless else None)
+    flags += _limits.kept_flags()  # (fork) a cloud computer's kept lane launches small; () elsewhere
     return tuple(flags)
 
 
@@ -843,6 +846,15 @@ def release_if_idle(now: Optional[float] = None) -> bool:
         # The person is working in this window (browser_handoff) and has not said "done": closing it
         # would take the page out from under them.
         return False
+    release_now()
+    _bt.logger.info("real-profile: driven browser released after %ds idle", _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT)
+    return True
+
+
+def release_now() -> None:
+    """Close the driven browser now, whoever is using it (the idle release above, and the kept
+    lane's memory floor in :mod:`tools.browser_kept_limits`). The next call relaunches it."""
+    _bt = _origin()
     with _bt._real_profile_cdp_lock:
         if window_state().get("pid") in _own_browser_pids():
             _set_window_state(None)
@@ -852,8 +864,16 @@ def release_if_idle(now: Optional[float] = None) -> bool:
         _shown_to_person["on"] = False  # the next launch is out of sight again
         _launched_headless["headless"] = None
         _parked["on"] = False
-    _bt.logger.info("real-profile: driven browser released after %ds idle", _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT)
-    return True
+
+
+def enforce_kept_limits() -> str:
+    """(fork) The kept lane's tab cap and memory floor, from the cleanup thread. "" elsewhere."""
+    cdp = _origin()._real_profile_cdp_cache.get("cdp")
+    try:
+        port = int(str(cdp).rsplit(":", 1)[1]) if cdp else None
+    except (ValueError, IndexError):
+        port = None
+    return _limits.enforce(port, release_now)
 
 
 # ---------------------------------------------------------------------------

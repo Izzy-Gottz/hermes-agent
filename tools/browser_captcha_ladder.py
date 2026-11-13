@@ -304,6 +304,13 @@ class Ladder:
             if state == "changed" and now is not None and now.hard_stop:
                 return self._run(surface, now, task_id, start, call_deadline)
 
+        # 3b. (fork) Hands off: a cloud computer never works a check itself -- no click, no hold, no
+        # solver. Waiting above is the site's own flow; anything past it is the person's (Memoe Away).
+        if bc.hands_off(self.cfg):
+            steps.append("hands off: this browser never works a check itself")
+            return self._out(ch, NEEDS_PERSON, f"the {ch.kind} check on {ch.host} is the person's to pass: "
+                             "this browser never clicks, holds or solves one", steps=steps)
+
         # 4. Image / puzzle stages: tier C, or the person.
         if budget is None or budget.attempts == 0 or ch.stage in ("image", "slider"):
             return self._tier_c(surface, ch, steps, task_id)

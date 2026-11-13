@@ -437,6 +437,7 @@ def _browser_cleanup_thread_worker():
         # The shared real-profile browser has no session of its own to go idle; release it once
         # every task session that used it is gone and the same inactivity timeout has passed.
         _best_effort("Real-profile idle release", _real_profile.release_if_idle)
+        _best_effort("Kept-browser limits", _real_profile.enforce_kept_limits)  # (fork) cloud lane only
 
         for _ in range(30):  # 1s granularity so stop is quick
             if not _bt._cleanup_running:

@@ -119,6 +119,18 @@ def ladder_enabled(browser_cfg: Optional[dict]) -> bool:
     return captcha_config(browser_cfg).get("enabled", True) is not False
 
 
+def hands_off(browser_cfg: Optional[dict]) -> bool:
+    """(fork) ``browser.captcha.hands_off`` -- detect and report a check, never work it: no click,
+    no press-and-hold, no solver; the outcome is always the person's. Explicit true/false wins;
+    absent, it follows ``browser.kept_profile`` (a cloud computer: someone else's machine and IP,
+    and the owner's rule there is "hand it back, never bypass"). A non-bool value is ON: an
+    unreadable safety switch fails safe."""
+    cfg = captcha_config(browser_cfg)
+    if "hands_off" in cfg:
+        return cfg.get("hands_off") is not False
+    return isinstance(browser_cfg, dict) and browser_cfg.get("kept_profile") is True
+
+
 # ---- text signatures (what browser_exec printed) -----------------------------------------------------
 
 #: Page-text hints of a bot wall, most specific first: (vendor label, pattern). They only label a
