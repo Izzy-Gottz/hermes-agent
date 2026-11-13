@@ -20,18 +20,28 @@ const on = (name) => ({ addListener: (fn) => { (listeners[name] = listeners[name
 let hookOnSend = null;
 
 const store = {};
+// The toolbar button, as the person sees it: badge, its colour, the hover title; and how often
+// the extension asked Chrome for its native host.
+const toolbar = { badge: undefined, color: undefined, title: undefined, connects: 0 };
 const chrome = {
   runtime: {
     id: "ljblhmlmgflmbffbfelamefleikodmjh",
     getManifest: () => ({ version: "test" }),
-    connectNative: () => port,
+    connectNative: () => { toolbar.connects++; return port; },
+    lastError: undefined,
     onStartup: on("onStartup"), onInstalled: on("onInstalled"),
   },
   extension: { isAllowedFileSchemeAccess: (cb) => cb(false) },
-  action: { onClicked: on("action") },
+  action: {
+    onClicked: on("action"),
+    setBadgeText: async ({ text }) => { toolbar.badge = text; },
+    setBadgeBackgroundColor: async ({ color }) => { toolbar.color = color; },
+    setTitle: async ({ title }) => { toolbar.title = title; },
+  },
   storage: { session: {
     get: async (k) => (k in store ? { [k]: store[k] } : {}),
     set: async (o) => { Object.assign(store, o); },
+    remove: async (k) => { delete store[k]; },
   } },
   tabGroups: {
     TAB_GROUP_ID_NONE: NONE,
@@ -91,11 +101,11 @@ const chrome = {
 const replies = new Map();
 const port = {
   onMessage: { addListener: (fn) => { port._deliver = fn; } },
-  onDisconnect: { addListener: () => {} },
+  onDisconnect: { addListener: (fn) => { port._disconnect = fn; } },
   postMessage: (m) => { if ("id" in m) replies.set(m.id, m); },
 };
 
-const ctx = vm.createContext({ chrome, navigator: { userAgent: "Chrome/153 test" }, URL, setTimeout, console });
+const ctx = vm.createContext({ chrome, navigator: { userAgent: "Chrome/153 test" }, URL, setTimeout, clearTimeout, console });
 vm.runInContext(fs.readFileSync(SRC, "utf8"), ctx, { filename: SRC });
 
 let n = 0;
@@ -179,6 +189,25 @@ const sentTo = (tabId) => calls.send.filter((c) => c.tabId === tabId);
   const second = (await op("create", { url: "https://example.org/" })).result.tabId;
   report.targets = (await op("targets", {})).result.map((t) => t.tabId);
   report.secondSameWindow = tabs.get(second).windowId === tabs.get(moe).windowId;
+
+  // When Memoe can't be reached: Chrome says why only in lastError, at onDisconnect. The person
+  // must see it on the toolbar button, and it must clear when the host answers again.
+  report.toolbarAfterHello = { ...toolbar };
+  const shot = () => ({ badge: toolbar.badge, color: toolbar.color, title: toolbar.title });
+  report.unreachable = {};
+  for (const [name, message] of [["missing", "Specified native messaging host not found."],
+                                 ["forbidden", "Access to the specified native messaging host is forbidden."],
+                                 ["exited", "Native host has exited."]]) {
+    chrome.runtime.lastError = { message };
+    port._disconnect();
+    chrome.runtime.lastError = undefined;
+    report.unreachable[name] = { ...shot(), stored: (store.lastHostError || {}).message || null };
+    const before = toolbar.connects;
+    for (const fn of listeners.action || []) fn();       // the person clicks the button: try now
+    report.unreachable[name].retriedOnClick = toolbar.connects - before;
+    await op("hello", {});                                 // the host answers
+    report.unreachable[name].after = { ...shot(), stored: (store.lastHostError || {}).message || null };
+  }
 
   process.stdout.write(JSON.stringify(report));
 })().catch((e) => { process.stdout.write(JSON.stringify({ crashed: String(e && e.stack || e) })); });

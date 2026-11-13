@@ -392,6 +392,24 @@ def write_bridge_state(state_dir: Path, state: dict) -> Path:
     return path
 
 
+def write_seen(state_dir: Path, extension_origin: str, info: dict) -> Optional[Path]:
+    """Record that the extension reached this host (lane on or off): ``seen.json``, private, by rename.
+    It is how Moe and the app tell "installed, Chrome closed / other profile" from "never added"."""
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(state_dir, 0o700)
+        path = state_dir / "seen.json"
+        tmp = state_dir / f".seen.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"extension_origin": extension_origin, "extension_id": (info or {}).get("extensionId"),
+                       "version": (info or {}).get("version"), "at": time.time(), "pid": os.getpid()}, fh)
+        os.replace(tmp, path)
+        return path
+    except OSError:
+        return None
+
+
 def make_request_check(token: str):
     """websockets ``process_request`` hook: exact secret path, and no browser Origin."""
     expected_path = f"/devtools/browser/{token}"
@@ -425,6 +443,7 @@ def lane_enabled_in_config(hermes_home: Optional[str] = None) -> bool:
 async def serve_bridge(link: ExtensionLink, extension_origin: str, state_dir: Path) -> None:
     """Serve the socket only while the lane is enabled; with it off, no socket and no bridge.json exist."""
     info = await link.request("hello")
+    write_seen(state_dir, extension_origin, info if isinstance(info, dict) else {})
     while not link.closed.is_set():
         if lane_enabled_in_config(str(state_dir.parent)):
             await _serve_socket(link, info, extension_origin, state_dir)
