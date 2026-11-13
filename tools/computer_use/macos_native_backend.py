@@ -264,7 +264,8 @@ class MacNativeBackend(ComputerUseBackend):
     # ── subprocess plumbing ──────────────────────────────────────────
     @staticmethod
     def _run(cmd: List[str], timeout: float = 20.0) -> subprocess.CompletedProcess:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False,
+                              stdin=subprocess.DEVNULL)
 
     def _applescript(self, script: str, argv: Optional[List[str]] = None) -> str:
         """Run AppleScript with ``argv`` delivered out-of-band (``on run argv``)."""

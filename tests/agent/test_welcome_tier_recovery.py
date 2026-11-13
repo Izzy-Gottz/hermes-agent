@@ -29,6 +29,10 @@ class MockAPIError(Exception):
         self.body = body
 
 
+# (fork) these pin upstream's "a long wait stays buffered"; Memoe speaks it (68b96c57bd).
+_FORK_SPEAKS = pytest.mark.skip(reason="fork 68b96c57bd: a wait past SPEAK_UP_AFTER_S is said to the person in their provider's name, not buffered")
+
+
 def _gateway_error(status: int, body: dict) -> MockAPIError:
     return MockAPIError(f"Error code: {status} - {body}", status_code=status, body=body)
 
@@ -313,6 +317,7 @@ class TestFreeTierCooldownCutoff:
             assert free_tier_cooldown_ends_turn(_agent(platform="cli"), _plain_429(90), WELCOME) is False
         assert free_tier_cooldown_ends_turn(_agent(platform="cli"), _plain_429(90), WELCOME) is True
 
+    @_FORK_SPEAKS
     @pytest.mark.parametrize("platform", ["cron", None])
     def test_an_unattended_run_keeps_waiting_and_is_told_the_reset(self, platform):
         from agent.turn_recovery import compute_error_backoff, free_tier_cooldown_ends_turn
@@ -323,6 +328,7 @@ class TestFreeTierCooldownCutoff:
                               is_zai_coding_overload=False, base_url=WELCOME, model="nous/welcome")
         assert "Resets in ~" in agent.buffered[0]
 
+    @_FORK_SPEAKS
     def test_a_paid_long_wait_stays_buffered_with_mains_attempt_numbers(self):
         """A paid 300 s Retry-After: the status line is buffered (replayed only if every retry
         fails) and the live wait line names the attempt that just failed, as on main."""

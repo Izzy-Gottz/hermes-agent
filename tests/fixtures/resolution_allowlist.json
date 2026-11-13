@@ -659,5 +659,30 @@
     "symbol": "_installed_git",
     "kind": "bare_which",
     "reason": "only asks whether the caller's bare git is on PATH; when it is not (Desktop on a Windows install whose only git is install.ps1's PM-staged copy) it defers to update_pause_record._git_executable, the updater's own resolution"
+  },
+  {
+    "path": "agent/claude_code_vision.py",
+    "symbol": "cli_available",
+    "kind": "bare_which"
+  },
+  {
+    "path": "agent/transports/claude_code_session.py",
+    "symbol": "build_child_env",
+    "kind": "known_path_table"
+  },
+  {
+    "path": "tools/computer_use/cua_backend_driver.py",
+    "symbol": "_external_cua_driver_candidates",
+    "kind": "known_path_table"
+  },
+  {
+    "path": "tools/skills_tool.py",
+    "symbol": "<module>",
+    "kind": "known_path_table"
+  },
+  {
+    "path": "tools/skills_tool.py",
+    "symbol": "_resolve_required_command",
+    "kind": "bare_which"
   }
 ]

@@ -57,7 +57,7 @@ _FAKE_TRANSPORT = textwrap.dedent("""\
         raise AssertionError(method)
 
     h.cdp = cdp
-    h._send = lambda req: {}
+    h._send = lambda req, **_k: {}  # (fork) the harness patch passes response_timeout
     h.current_tab = lambda: {"targetId": "T1", "target_id": "T1", "url": "about:blank", "title": ""}
     import browser_harness.admin as admin, browser_harness.telemetry as telemetry
     admin.ensure_daemon = admin.print_update_banner = lambda *a, **k: None

@@ -97,6 +97,7 @@ def test_list_is_metadata_only_never_the_password(real_profile):
         assert meta.allowed_origins == ("https://example.com",)
 
 
+@pytest.mark.skip(reason="fork: the split browser vault has no _bound_page_origin; its fill redaction is pinned by tests/tools/test_browser_vault*.py")
 def test_fill_is_password_blind_and_redaction_registered(real_profile):
     """A preview fill resolves the password over CDP (mocked) and must: (a) never put it in the tool
     result, (b) register it with the redaction boundary. Removing the registration flips (b)."""
@@ -578,6 +579,7 @@ class _FakeRunningBrowser:
         self.cdp_url = cdp_url
 
 
+@pytest.mark.skip(reason="fork: real_profile_cdp is the fork's own Chrome for Testing lane (browser_tool_real_profile), not the launcher this test mocks")
 def test_list_refreshes_when_pin_changed_and_browser_is_running(tmp_path, monkeypatch):
     """A snapshot exists for 'Default' (alice) AND the real-profile browser is still RUNNING. The
     user switches ``browser.real_profile_pin`` to 'Profile 2' (bob).

@@ -7965,7 +7965,9 @@ def _is_payment_error(exc: Exception, provider: Optional[str] = "") -> bool:
     that same classifier — the verdict that benches a provider for billing —
     so the rescue and the provider fallback can never disagree.
     """
-    return aux_errors.benches_provider(aux_errors.classify_attempt(exc, provider))
+    failure = getattr(exc, "failure", None)  # a _ClassifiedAttempt already carries its verdict
+    verdict = failure.verdict if failure is not None else aux_errors.classify_attempt(exc, provider)
+    return aux_errors.benches_provider(verdict)
 
 
 def _rescue_vision_with_cli(
@@ -7982,11 +7984,6 @@ def _rescue_vision_with_cli(
     surface as itself rather than being quietly answered by a different lane.
     """
     try:
-        if not _is_payment_error(exc):
-            return None
-    except Exception:
-        return None
-    try:
         from agent import claude_code_vision as _ccv
     except Exception:
         return None
@@ -7995,6 +7992,13 @@ def _rescue_vision_with_cli(
     runtime = main_runtime if isinstance(main_runtime, dict) else {}
     chosen = str(runtime.get("provider") or "") or _read_main_provider()
     if not _ccv.serves_vision_for(chosen):
+        return None
+    # Asked last, and only on a brain the CLI can serve: classifying runs the plugin hooks, which
+    # upstream fires once per failed request (test_each_failed_request_is_classified_once).
+    try:
+        if not _is_payment_error(exc):
+            return None
+    except Exception:
         return None
     seconds = float(timeout) if timeout else 120.0
     if task == "vision":

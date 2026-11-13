@@ -792,7 +792,7 @@ def _parent_pid(pid: int) -> Optional[int]:
         pass
     try:
         out = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(pid)], capture_output=True,
-                             text=True, timeout=5)
+                             text=True, timeout=5, stdin=subprocess.DEVNULL)
         return int(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None

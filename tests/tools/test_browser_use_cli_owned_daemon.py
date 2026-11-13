@@ -228,7 +228,7 @@ def test_a_long_first_browser_exec_owns_its_daemon_before_the_call_returns(monke
     monkeypatch.setattr(browser_use_cli, "_find_cli", lambda: ["browser-use"])
     monkeypatch.setattr(browser_use_cli, "_base_subprocess_env", dict)
     monkeypatch.setattr(browser_use_cli, "_route_exec_current",
-                        lambda env, *_a: ({**env, "BU_CDP_URL": "http://127.0.0.1:9222"}, None, False, 0))
+                        lambda env, *_a, **_k: ({**env, "BU_CDP_URL": "http://127.0.0.1:9222"}, None, False, 0))
     monkeypatch.setattr(browser_use_cli, "_run_cli_killing_process_group", run_cli)
     monkeypatch.setattr(browser_use_cli, "_driven_daemons", {})
 
