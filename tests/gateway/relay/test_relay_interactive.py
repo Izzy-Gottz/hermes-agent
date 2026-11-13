@@ -337,11 +337,13 @@ async def test_free_form_reaction_platforms_keep_the_check_mark():
 
 @pytest.mark.asyncio
 async def test_ack_platform_falls_back_through_the_real_wire_decode():
-    """`_event_from_wire` maps an absent OR unknown wire platform to
+    """`_event_from_wire` maps an absent OR malformed wire platform to
     `Platform.RELAY` — never to "" — so the fallback must treat the "relay"
     placeholder as unresolved. Built through the real decoder, because an
-    event with no platform at all is a state the wire cannot produce."""
-    for wire_platform in ({}, {"platform": "relay"}, {"platform": "not_a_platform"}):
+    event with no platform at all is a state the wire cannot produce. (A
+    well-formed name this build has no adapter for, such as Memoe's
+    `moemail`, keeps its own name: test_relay_channel_name_kept.py.)"""
+    for wire_platform in ({}, {"platform": "relay"}, {"platform": "Not a platform!"}):
         adapter, stub = _adapter()  # make_desc default platform is telegram
         event = _event_from_wire(
             {

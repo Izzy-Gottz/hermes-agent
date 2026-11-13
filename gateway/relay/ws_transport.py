@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -238,16 +239,39 @@ def _media_filenames_from_wire(raw: dict[str, Any]) -> list[str]:
     return [clean_attachment_filename(n) for n in _per_url_from_wire(raw, "filename")]
 
 
+_WIRE_PLATFORM_NAME = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
+
+
+def _platform_from_wire(value: Any) -> Any:
+    """The chat app the connector says a message came from.
+
+    A name this build has no adapter for (Memoe's ``moemail``: email to Moe's
+    own address, which only the connector speaks) used to become ``RELAY``,
+    so the session, its memory and its turns were filed under "relay" and no
+    longer read as the person talking (Memoe docs/CHANNEL-SYNC-AUDIT-2026-11-13
+    F7). It now keeps its own name as a pseudo-member — the same mechanism
+    plugin platforms use — so replies still go back through this transport
+    (the adapter that received it answers it) and the connector is told the
+    real channel. Only a plain lowercase name is kept; anything else is
+    ``RELAY`` as before."""
+    from gateway.config import Platform
+
+    try:
+        return Platform(value)
+    except ValueError:
+        pass
+    if isinstance(value, str) and _WIRE_PLATFORM_NAME.match(value):
+        return Platform._value2member_map_.get(value) or Platform._add_pseudo_member(value)
+    return Platform.RELAY
+
+
 def _event_from_wire(raw: dict[str, Any]) -> MessageEvent:
     """Rebuild a MessageEvent from the connector's normalized inbound payload (§3).
     Unknown platforms fall back to RELAY, unknown message types to TEXT."""
     src = raw.get("source", {}) or {}
     from gateway.config import Platform
 
-    try:
-        platform_enum = Platform(src.get("platform", "relay"))
-    except ValueError:
-        platform_enum = Platform.RELAY
+    platform_enum = _platform_from_wire(src.get("platform", "relay"))
 
     source = SessionSource(
         platform=platform_enum,
