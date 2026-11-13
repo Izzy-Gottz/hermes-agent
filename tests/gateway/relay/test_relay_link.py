@@ -1,215 +1,111 @@
-"""`link_request` / `link_result` (Moe slice E3) — gateway side.
+"""Team Gateway account links minted from the instance (#141546).
 
-The connector asks this gateway to become a second device of the person's
-own Telegram or WhatsApp; the registered handler answers, and the answer
-goes back on the same socket as a `link_result`. Against a real in-process
-websockets server, in the shape of test_relay_going_idle.py.
+A relay-exclusive instance reaches Telegram only through the shared bot, so the Channels surfaces
+mint ``/link <code>`` through the gateway's ``relay-link`` verb, which alone holds the per-gateway
+secret. The stand-in connector below checks the bearer the way the connector does (gatewayId
+peeked from the token, HMAC over ``payload:exp`` with the stored secret).
 """
-
-from __future__ import annotations
-
-import asyncio
+import base64
+import hashlib
+import hmac
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
-import pytest_asyncio
 
-from gateway import relay as relay_module
-from gateway.relay.ws_transport import WebSocketRelayTransport, WEBSOCKETS_AVAILABLE
-
-pytestmark = pytest.mark.skipif(not WEBSOCKETS_AVAILABLE, reason="websockets not installed")
-
-if WEBSOCKETS_AVAILABLE:
-    import websockets
+_SECRET = "per-gateway-secret"
+_GATEWAY_ID = "gw-test"
 
 
-DESCRIPTOR = {
-    "contract_version": 1,
-    "platform": "telegram",
-    "label": "Telegram",
-    "max_message_length": 4096,
-    "supports_draft_streaming": False,
-    "supports_edit": True,
-    "supports_threads": False,
-    "markdown_dialect": "plain",
-    "len_unit": "chars",
-}
+class _Connector(BaseHTTPRequestHandler):
+    seen: list = []
+    managed_by = None  # None: a connector without the access route (404)
+
+    def log_message(self, format, *args):
+        pass
+
+    def _reply(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _bearer_valid(self) -> bool:
+        token = self.headers.get("Authorization", "").removeprefix("Bearer ")
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+        signed, _, sig = raw.rpartition(":")
+        return hmac.compare_digest(sig, hmac.new(_SECRET.encode(), signed.encode(), hashlib.sha256).hexdigest())
+
+    def do_GET(self):  # /manage/access/list: who governs this agent's access
+        if not self._bearer_valid():
+            return self._reply(401, {"error": "bad bearer"})
+        if _Connector.managed_by is None:
+            return self._reply(404, {"error": "not found"})
+        self._reply(200, {"agent": "inst-1", "managedBy": _Connector.managed_by, "grants": []})
+
+    def do_POST(self):
+        token = self.headers.get("Authorization", "").removeprefix("Bearer ")
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+        signed, _, sig = raw.rpartition(":")
+        valid = hmac.compare_digest(sig, hmac.new(_SECRET.encode(), signed.encode(), hashlib.sha256).hexdigest())
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        _Connector.seen.append((self.path, signed.split(":")[0], body))
+        self._reply(*((401, {"error": "bad bearer"}) if not valid else (
+            200, {"code": "AB12CD", "expiresAt": "2026-11-03T00:10:00.000Z"})))
 
 
-class _AskingServer:
-    """Connector stub: descriptor on hello, then pushes the link_requests it
-    was given and records every link_result that comes back."""
-
-    def __init__(self, to_push=None):
-        self.results: list[dict] = []
-        self.received: list[dict] = []
-        self._to_push = list(to_push or [])
-        self._server = None
-        self.url = ""
-        self.got_result = asyncio.Event()
-
-    async def start(self):
-        self._server = await websockets.serve(self._handle, "127.0.0.1", 0)
-        sock = next(iter(self._server.sockets))
-        self.url = f"ws://127.0.0.1:{sock.getsockname()[1]}"
-
-    async def stop(self):
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-
-    async def _handle(self, ws):
-        try:
-            async for raw in ws:
-                for line in str(raw).split("\n"):
-                    if not line.strip():
-                        continue
-                    frame = json.loads(line)
-                    self.received.append(frame)
-                    if frame.get("type") == "hello":
-                        await ws.send(json.dumps({"type": "descriptor", "descriptor": DESCRIPTOR}) + "\n")
-                        for f in self._to_push:
-                            await ws.send(json.dumps(f) + "\n")
-                    elif frame.get("type") == "link_result":
-                        self.results.append(frame)
-                        self.got_result.set()
-        except Exception:
-            pass
+@pytest.fixture
+def connector(monkeypatch):
+    server = HTTPServer(("127.0.0.1", 0), _Connector)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _Connector.seen = []
+    _Connector.managed_by = None
+    monkeypatch.setenv("GATEWAY_RELAY_URL", f"ws://127.0.0.1:{server.server_port}/relay")
+    monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "telegram")
+    monkeypatch.setenv("GATEWAY_RELAY_BOT_IDS", json.dumps({"telegram": {"botId": "42", "username": "@NousHermesBot"}}))
+    monkeypatch.setenv("GATEWAY_RELAY_ID", _GATEWAY_ID)
+    yield _Connector
+    server.shutdown()
 
 
-async def _wait_for_result(server: _AskingServer, timeout: float = 3.0) -> dict:
-    await asyncio.wait_for(server.got_result.wait(), timeout)
-    return server.results[-1]
+def test_link_code_is_minted_with_the_gateway_bearer_and_points_at_the_shared_bot(connector, monkeypatch):
+    from gateway.relay.link import relay_link_verb
+
+    monkeypatch.delenv("GATEWAY_RELAY_SECRET", raising=False)
+    not_ready = relay_link_verb({"action": "request", "platform": "telegram"})
+    assert not_ready["ok"] is False and not_ready["error"] == "relay_not_provisioned"
+    assert connector.seen == []
+
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", _SECRET)
+    result = relay_link_verb({"action": "request", "platform": "telegram"})
+
+    assert result["ok"] is True
+    assert result["command"] == "/link AB12CD"
+    assert result["bot_url"] == "https://t.me/NousHermesBot"
+    assert connector.seen == [("/manage/link", _GATEWAY_ID, {"platform": "telegram"})]
+    # A platform the shared bot does not carry never reaches the connector.
+    assert relay_link_verb({"action": "request", "platform": "slack"})["error"] == "platform_not_fronted"
+    assert len(connector.seen) == 1
+    # A bearer the connector rejects is named as such, never shown as the connector's raw text.
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", "rotated-elsewhere")
+    refused = relay_link_verb({"action": "request", "platform": "telegram"})
+    assert refused["error"] == "relay_not_authorized" and refused["status"] == 401
 
 
-@pytest_asyncio.fixture
-async def server():
-    srv = _AskingServer()
-    await srv.start()
-    yield srv
-    await srv.stop()
+def test_portal_managed_agent_is_sent_to_the_portal_instead_of_a_code_that_binds_nothing(connector, monkeypatch):
+    """On a Portal-managed agent a gateway-bearer code carries no owner, so its redeem binds no
+    account (connector scopeService: managed agents take only the Portal setting)."""
+    from gateway.relay.link import relay_link_verb
 
+    monkeypatch.setenv("GATEWAY_RELAY_SECRET", _SECRET)
+    connector.managed_by = "portal"
 
-@pytest.fixture(autouse=True)
-def _no_module_handler():
-    relay_module.set_link_handler(None)
-    yield
-    relay_module.set_link_handler(None)
+    refused = relay_link_verb({"action": "request", "platform": "telegram"})
+    status = relay_link_verb({"action": "status"})
 
-
-@pytest.mark.asyncio
-async def test_a_plain_handler_answers_and_the_result_carries_its_body(server):
-    server._to_push = [{"type": "link_request", "requestId": "r-1", "link": "telegram", "body": {}}]
-    asked = []
-
-    def handler(link, body):
-        asked.append((link, body))
-        return {"key": "QUJD"}
-
-    t = WebSocketRelayTransport(server.url, "telegram", "appShared")
-    t.set_link_handler(handler)
-    await t.connect()
-    try:
-        await t.handshake()
-        result = await _wait_for_result(server)
-        assert asked == [("telegram", {})]
-        assert result == {"type": "link_result", "requestId": "r-1", "ok": True, "body": {"key": "QUJD"}}
-    finally:
-        await t.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_a_coroutine_handler_is_awaited_and_the_body_is_passed_through(server):
-    server._to_push = [{"type": "link_request", "requestId": "r-2", "link": "whatsapp",
-                        "body": {"phone": "447700900000"}}]
-    seen = {}
-
-    async def handler(link, body):
-        seen["link"], seen["body"] = link, body
-        return {"code": "ABCD1234"}
-
-    t = WebSocketRelayTransport(server.url, "telegram", "appShared")
-    t.set_link_handler(handler)
-    await t.connect()
-    try:
-        await t.handshake()
-        result = await _wait_for_result(server)
-        assert seen == {"link": "whatsapp", "body": {"phone": "447700900000"}}
-        assert result["ok"] is True and result["body"] == {"code": "ABCD1234"}
-    finally:
-        await t.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_no_handler_is_an_honest_refusal_not_silence(server):
-    server._to_push = [{"type": "link_request", "requestId": "r-3", "link": "telegram", "body": {}}]
-    t = WebSocketRelayTransport(server.url, "telegram", "appShared")
-    await t.connect()
-    try:
-        await t.handshake()
-        result = await _wait_for_result(server)
-        assert result["ok"] is False
-        assert "no link handler" in result["body"]["error"]
-    finally:
-        await t.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_the_module_level_handler_is_consulted_when_the_transport_has_none(server):
-    """The transport is built before any plugin loads, so a plugin registers
-    with `gateway.relay.set_link_handler` and the transport finds it at
-    frame time rather than at construction."""
-    server._to_push = [{"type": "link_request", "requestId": "r-4", "link": "telegram", "body": {}}]
-    relay_module.set_link_handler(lambda link, body: {"already": True})
-    t = WebSocketRelayTransport(server.url, "telegram", "appShared")
-    await t.connect()
-    try:
-        await t.handshake()
-        result = await _wait_for_result(server)
-        assert result == {"type": "link_result", "requestId": "r-4", "ok": True, "body": {"already": True}}
-    finally:
-        await t.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_a_handler_that_raises_or_answers_with_error_is_ok_false(server):
-    server._to_push = [
-        {"type": "link_request", "requestId": "r-5", "link": "telegram", "body": {}},
-        {"type": "link_request", "requestId": "r-6", "link": "whatsapp", "body": {}},
-    ]
-
-    def handler(link, body):
-        if link == "telegram":
-            raise RuntimeError("boom")
-        return {"error": "no number was given"}
-
-    t = WebSocketRelayTransport(server.url, "telegram", "appShared")
-    t.set_link_handler(handler)
-    await t.connect()
-    try:
-        await t.handshake()
-        deadline = asyncio.get_running_loop().time() + 3
-        while len(server.results) < 2 and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.02)
-        by_id = {r["requestId"]: r for r in server.results}
-        assert by_id["r-5"]["ok"] is False and "failed" in by_id["r-5"]["body"]["error"]
-        assert by_id["r-6"] == {"type": "link_result", "requestId": "r-6", "ok": False,
-                                "body": {"error": "no number was given"}}
-        # The socket survived both: a bad handler is a bad answer, not a dead link.
-        assert t._ws is not None
-    finally:
-        await t.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_a_link_request_without_an_id_is_dropped_and_nothing_is_sent(server):
-    server._to_push = [{"type": "link_request", "link": "telegram", "body": {}}]
-    t = WebSocketRelayTransport(server.url, "telegram", "appShared")
-    t.set_link_handler(lambda link, body: {"key": "x"})
-    await t.connect()
-    try:
-        await t.handshake()
-        await asyncio.sleep(0.2)
-        assert server.results == []
-    finally:
-        await t.disconnect()
+    assert refused["ok"] is False and refused["error"] == "managed_by_portal"
+    assert [path for path, *_ in connector.seen] == ["/manage/link-status"]
+    assert status["managed_by"] == "portal" and status["portal_url"].endswith("/agents")

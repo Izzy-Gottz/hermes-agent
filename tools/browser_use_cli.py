@@ -23,9 +23,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
+from hermes_cli.process_identity import (
+    own_process_groups, register_child, release_process_group_once_empty, spawn_env, spawned_by_this_process)
 from hermes_constants import get_hermes_home, hermes_home_key
 from tools import browser_exec_health as exec_health
-from tools.browser_harness_dirs import daemon_env, daemon_identity, namespace_harness_dirs
+from tools.browser_harness_dirs import (daemon_env, daemon_identity, fit_default_socket_dir, harness_pid_file,
+                                        namespace_harness_dirs)
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -50,6 +53,8 @@ _LOCAL_FALLBACK_SENTINEL = "_HERMES_BU_LOCAL_FALLBACK"
 # Fork (owner decision 2026-11-12): the signed-in profile could not load and nobody has agreed to
 # continue signed out. Marks the route error so browser_exec returns the question, not a browser.
 _REAL_PROFILE_REFUSED_SENTINEL = "_HERMES_BU_REAL_PROFILE_REFUSED"
+# Where new/hidden tabs may be brought to the front: a browser_use_shot.ACTIVATE_* mode. Popped before launch.
+_CLOUD_BROWSER_SENTINEL = "_HERMES_BU_CLOUD_BROWSER"
 
 # Prepended to the model's code for named sessions on SHARED browsers (a /browser connect CDP override): the
 # harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
@@ -230,6 +235,8 @@ def _base_subprocess_env() -> dict:
     env["PATH"] = _floor_subprocess_path(env.get("PATH", ""))
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
     namespace_harness_dirs(env, _served_profile_tag())  # a served profile's own harness runtime/tmp dirs
+    # A daemon the CLI starts inherits this tag; _own_harness_daemon owns only one that names us.
+    env.update(spawn_env("browser-harness-daemon"))
     return env
 
 
@@ -496,6 +503,10 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     provider_key = str(getattr(provider, "name", "") or "").strip().lower()
     if provider_key == _BROWSER_USE_PROVIDER and not _use_gateway(_read_browser_cfg()) and _browser_use_api_key_set():
         env[_PRIVATE_BROWSER_SENTINEL] = "1"  # named BU cloud browsers are exclusive to their daemon
+        # Only intent: the harness attaches to a local Chrome already listening instead of autospawning, so
+        # the live daemon's own report decides.
+        from tools.browser_use_shot import ACTIVATE_IF_CLOUD
+        env[_CLOUD_BROWSER_SENTINEL] = ACTIVATE_IF_CLOUD
         return None
 
     provider_name = type(provider).__name__
@@ -521,6 +532,9 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
         if err is None:
             _mark_local_browser(env, session, key)
         return err
+    if err is None:
+        from tools.browser_use_shot import ACTIVATE_ALWAYS
+        env[_CLOUD_BROWSER_SENTINEL] = ACTIVATE_ALWAYS  # the provider's own session: the harness connects only there
     # A provider browser keyed bu-named-<name> is exclusive to this session — the
     # own-tab preamble would just leak a blank tab into it.
     if err is None and session_name:
@@ -625,6 +639,7 @@ def _group_popen_kwargs() -> dict:
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         return {"creationflags": windows_hide_flags() | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
                 "startupinfo": si}
+    # detached-spawn: ok — awaited CLI; a timeout kills its whole group (_run_cli_killing_process_group)
     return _quiet(_flags, {}, "Windows hide-flags unavailable") if os.name == "nt" else {"start_new_session": True}
 
 
@@ -792,6 +807,8 @@ def _proxy_failure_note(stdout: str, stderr: str = "") -> str:
             "proxy setting is pointing at something that isn't running; retrying the site will fail the same way.")
 
 
+# How often a running browser_exec re-checks for the daemon its first call starts.
+_OWN_DURING_CALL_S = 0.5
 # Harness daemons this process drove: each latches BU_CDP_* at start and outlives every call, so a backend
 # swap (/browser connect|disconnect) leaves later calls in the old browser until these are stopped.
 _driven_daemons: dict[tuple[str, ...], str] = {}  # daemon identity -> home
@@ -816,6 +833,23 @@ def stop_harness_daemons(home_key: Optional[str] = None) -> None:
     _reload_daemons(daemons)
 
 
+def _published_daemon_pid(env: dict) -> Optional[int]:
+    """The pid the harness published for the daemon ``env`` drives (``harness_pid_file``: JSON
+    ``{"pid", "started"}`` or a bare pid), or None when there is none."""
+    try:
+        raw = harness_pid_file(env).read_text(encoding="utf-8-sig").strip()
+        return int(json.loads(raw)["pid"]) if raw.startswith("{") else int(raw.split()[0])
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
+
+
+def _own_harness_daemon_until_owned(env: dict) -> Optional[bool]:
+    """Periodic check while browser_exec runs: own the daemon as soon as it publishes its pid, then
+    stop (False). It also stops once the daemon can never be ours (Windows, a managed worker, a daemon
+    another Hermes started), instead of re-checking every tick for the whole call."""
+    return None if _own_harness_daemon(env) is None else False
+
+
 def _reload_daemons(daemons) -> None:  # each ``daemon_identity`` daemon, with its own dirs
     cmd = _find_cli() if daemons else None
     if not cmd:
@@ -824,6 +858,69 @@ def _reload_daemons(daemons) -> None:  # each ``daemon_identity`` daemon, with i
     for daemon in daemons:
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             _run_cli_killing_process_group([*cmd, "--reload"], "", daemon_env(env, daemon), 15)
+        with _owned_daemon_groups_lock:
+            pgid = _owned_daemon_groups.pop(daemon, None)
+        if pgid is not None:
+            release_process_group_once_empty(pgid)  # a daemon --reload failed to stop stays covered
+
+
+# Daemon identity (``daemon_identity``: its dirs + BU_NAME) -> process group of the harness daemon this
+# process owns. The harness starts its daemon with start_new_session so it outlives each CLI call (that
+# is how a session persists across browser_exec calls), which also means it outlives a SIGKILLed or
+# OOM-killed Hermes forever (#121095). Its group goes to this process's owner-death supervisor, so it
+# dies with us however we die.
+_owned_daemon_groups: dict[tuple[str, ...], int] = {}
+_owned_daemon_groups_lock = threading.Lock()
+
+
+def _own_harness_daemon(env: dict) -> Optional[bool]:
+    """Hand the daemon behind ``env``'s BU_NAME to the owner-death supervisor.
+
+    The harness publishes its daemon pid in its runtime dir (``harness_pid_file``: JSON
+    ``{"pid", "started"}`` or a bare pid). The daemon is accepted only while it is this user's live
+    ``browser_harness.daemon`` leading its own session and its spawn tag names this process, so a
+    stale or planted pid file, or a daemon another Hermes started, never reaches the supervisor.
+    Runs after every browser_exec (and while a long one runs, until the daemon is owned): a pid
+    already owned for this daemon costs one file read.
+
+    Returns True once the daemon is owned, False when it can never be (Windows, a managed worker, a
+    daemon another Hermes started), None when there is nothing to own yet."""
+    if os.name != "posix":
+        return False  # Windows: the harness daemon is outside this process's job; nothing to register.
+    from agent.runtime_session_store import is_worker_process
+    if is_worker_process():
+        # A managed per-turn worker never owns it, so a killed worker does not take the browser the
+        # next turn's worker drives along (its clean exit still runs the atexit browser cleanup).
+        return False
+    import psutil
+
+    daemon = daemon_identity(env)
+    pid = _published_daemon_pid(env)
+    if pid is None:
+        logger.debug("browser_exec: no harness daemon pid published for %s", daemon[-1])
+        return None
+    try:
+        with _owned_daemon_groups_lock:
+            if _owned_daemon_groups.get(daemon) == pid:
+                return True
+        proc = psutil.Process(pid)
+        argv = proc.cmdline()
+        if (os.getsid(pid) != pid or proc.uids().real != os.getuid()  # windows-footgun: ok — posix-only, returned above
+                or argv[argv.index("-m") + 1] != "browser_harness.daemon"):
+            return None
+        if not spawned_by_this_process(pid):
+            return False  # another Hermes on the same BU_NAME started it: that Hermes owns it
+    except (OSError, ValueError, IndexError, psutil.Error) as exc:
+        logger.debug("browser_exec: no harness daemon to supervise for %s: %s", daemon[-1], exc)
+        return None
+    with _owned_daemon_groups_lock:
+        replaced = _owned_daemon_groups.get(daemon)
+        _owned_daemon_groups[daemon] = pid
+    own_process_groups([pid])
+    register_child(pid, "browser-harness-daemon")
+    if replaced is not None:
+        release_process_group_once_empty(replaced, timeout=0)  # the daemon it replaced; a survivor stays covered
+    return True
 
 
 def _route_exec(env: dict, session: str, task_id: Optional[str], local: bool, local_sidecar: bool,
@@ -982,6 +1079,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         local_engine = env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
         bot_desktop_browser = bool(local_engine)
         _exec_local_engine.set(local_engine)  # only local browsers carry the sentinel
+    fit_default_socket_dir(env)  # BU_NAME is final: a deep HOME's socket would overflow sun_path
     chrome_lane.record_lane(task_id, session, lane)
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
@@ -994,6 +1092,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         code = _captcha_prepare(code, env, browser_cfg, task_id, session)
     # Every lane: a page that does not answer gets 30 s (not 5) and an honest error (ticket #16).
     code = exec_health.harness_patch_preamble() + code
+    # Every backend: capture_screenshot() falls back to jpeg instead of hanging on a png a hidden tab never
+    # renders; only on a cloud browser does it (and new_tab) bring the tab to the front (tools/browser_use_shot.py).
+    from tools.browser_use_shot import ACTIVATE_NEVER, harness_command
+    cmd = harness_command(cmd, activate=env.pop(_CLOUD_BROWSER_SENTINEL, None) or ACTIVATE_NEVER)
 
     workspace = _workspace_dir(task_id)
     if workspace:
@@ -1016,6 +1118,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         with _driven_daemons_lock:
             daemon = daemon_identity(env)
             _driven_daemons[daemon] = hermes_home_key()
+        # The first call starts the daemon and may run long (navigation, user code): own it as soon as
+        # it publishes its pid, so a Hermes killed mid-call takes it along (the call's end owns it too).
+        from agent.periodic_scheduler import schedule
+        owning = schedule(lambda: _own_harness_daemon_until_owned(env), _OWN_DURING_CALL_S)
         try:
             return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
         except subprocess.TimeoutExpired:
@@ -1026,6 +1132,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             )}
         except OSError as e:
             return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
+        finally:
+            owning.cancel(wait=5)  # an in-flight check finishes before the post-call one runs
 
     if bot_desktop_browser:
         from tools.browser_session import run_fenced
@@ -1033,6 +1141,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     else:
         dispatched = dispatch()
     _reload_if_republished(env, generation)
+    _own_harness_daemon(env)
     if "proc" not in dispatched:
         if "error_result" in dispatched:
             return dispatched["error_result"]
@@ -1120,8 +1229,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
 
 _HEADER_BASE = (
-    "Drive a real web browser via the Browser Use CLI: `code` runs as full Python (stdlib available) "
-    "with pre-imported browser helpers; stdout comes back in the result. Start `code` with a one-line "
+    "Drive a real browser for JS pages, logins, forms and clicks (Browser Use CLI). `code` runs as full "
+    "Python (stdlib available) with pre-imported browser helpers; stdout comes back in the result. Start `code` with a one-line "
     "comment describing the step for the user in plain language, max 60 chars "
     "(e.g. `# Searching Amazon for paper towels`) — the UI shows it as the step label.\n\n"
     "STATE: the browser session and workspace persist across calls; Python variables do NOT (fresh "
@@ -1141,20 +1250,29 @@ _HEADER_VISION = (
     "with your own vision — never send browser screenshots to a separate vision tool."
 )
 
-_HEADER_TEXT_ONLY = (
-    " Your model cannot view images, so work text-first: page_info() for state, js() for "
-    "reading/extracting DOM text, fill_input(selector, text) for inputs, and click_at_xy(x, y) for clicks "
-    "(trusted input; take the centre from js(\"…getBoundingClientRect()\")) — use js(\"…click()\") only as a "
-    "fallback for an element with no on-screen box. Skip the screenshot-driven workflow described below."
+_TEXT_FIRST = (
+    "page_info() for state, js() for reading/extracting DOM text, fill_input(selector, text) for inputs, and "
+    "click_at_xy(x, y) for clicks (trusted input; take the centre from js(\"…getBoundingClientRect()\")) — use "
+    "js(\"document.querySelector('…').click()\") only as a fallback for an element with no on-screen box."
 )
 
-# Appended when the local engine is Lightpanda: no graphical renderer, and one CDP
-# connection holds one page — a second Target.createTarget fails with
-# TargetAlreadyLoaded (drop the new_tab() sentence once lightpanda-io/browser#1962 lands).
+# The non-native header states a transport fact (screenshots do not ride back inside THIS
+# tool's results: routing is not ``native`` — e.g. an explicit ``auxiliary.vision`` pin — or
+# the route rejects tool-result media), never a verdict on the model's own vision: models
+# quote "your model cannot view images" against themselves and skip user images (#131568).
+# model_tools.get_tool_definitions() appends the vision_analyze pointer after
+# SCREENSHOTS_DETACHED when the session actually has that tool.
+SCREENSHOTS_DETACHED = " Screenshots are not attached to this tool's results."
+
+_HEADER_TEXT_ONLY = SCREENSHOTS_DETACHED + " Work text-first: " + _TEXT_FIRST
+
+# Lightpanda: no graphical renderer, and one CDP connection holds one page — a second
+# Target.createTarget fails with TargetAlreadyLoaded (drop the new_tab() sentence once
+# lightpanda-io/browser#1962 lands).
 _HEADER_LIGHTPANDA = (
     " The local engine is Lightpanda (no graphical renderer, one page per session): capture_screenshot() "
-    "is unavailable, so work text-first; navigate with new_tab(url) exactly once, then goto_url(url) for "
-    "every later navigation — a second new_tab() fails with TargetAlreadyLoaded."
+    "is unavailable, so work text-first: " + _TEXT_FIRST + " Navigate with new_tab(url) exactly once, then "
+    "goto_url(url) for every later navigation — a second new_tab() fails with TargetAlreadyLoaded."
 )
 
 # Pinned quick-reference for the CLI's pre-imported helpers, replacing the live
@@ -1182,12 +1300,13 @@ _HELPERS_DIGEST = (
 
 
 def _description_header() -> str:
-    """Header tailored to whether the active model can see images natively"""
+    """Header tailored to whether screenshots ride back natively in this tool's results."""
     if _lazy_call("tools.browser_lightpanda", "lightpanda_engine_status", (False, ""),
                   "lightpanda engine status unavailable")[0]:  # no screenshots, whatever the model sees
-        return _HEADER_BASE + _HEADER_TEXT_ONLY + _HEADER_LIGHTPANDA
-    vision = _lazy_call("tools.vision_tools", "_should_use_native_vision_fast_path", False, "")
-    return _HEADER_BASE + (_HEADER_VISION if vision else _HEADER_TEXT_ONLY)
+        return _HEADER_BASE + _HEADER_LIGHTPANDA
+    if _lazy_call("tools.vision_tools", "_should_use_native_vision_fast_path", False, ""):
+        return _HEADER_BASE + _HEADER_VISION
+    return _HEADER_BASE + _HEADER_TEXT_ONLY
 
 
 def _real_profile_description(cloud: bool) -> str:

@@ -975,8 +975,23 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, co
     source = "person" if stated else "user"
     backend = backend_for_handle(handle) if handle and not code else None
     if backend is not None:
+        # Upstream 6a8b466263, ported: a saved login's authenticator code is minted only on a page that is
+        # one of that login's saved origins (exact match), checked BEFORE the backend resolves anything.
+        # Before, a code for the handle was minted and written into whatever page the session was on.
         try:
-            code = backend.resolve_otp(handle)
+            meta = backend.get_meta(handle)
+        except Exception:
+            meta = None
+        allowed = (list(getattr(meta, "allowed_origins", None) or [])
+                   or ([str(meta.origin)] if meta is not None and getattr(meta, "origin", None) else []))
+        if meta is not None and origin not in allowed:
+            return json.dumps({"success": False, "error_type": "origin_mismatch",
+                               "error": (f"Refused: current page origin ({origin}) does not match the saved login's "
+                                         f"origin(s) ({', '.join(allowed) or 'none'}), so no code was generated. If this "
+                                         "page asks for the code of a different account, call again without a handle "
+                                         "so the person is asked.")})
+        try:
+            code = backend.resolve_otp(handle) if meta is not None else None
         except Exception:
             code = None
         if code:

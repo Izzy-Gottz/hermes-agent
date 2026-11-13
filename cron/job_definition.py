@@ -15,6 +15,7 @@ JOB_DEFINITION_FIELDS = frozenset({
     "script", "no_agent", "monitor_script", "monitor_url", "context_from",
     "schedule", "schedule_display", "deliver", "origin", "enabled_toolsets",
     "workdir", "attach_to_session", "reasoning_effort", "failure_deliver",
+    "timezone", "grace_minutes", "catch_up",
     # Moe fork (99683fa0f3): authored like the rest. ``grounding_words`` is deliberately NOT here:
     # who asked for a job is never taken from a foreign store (agent/recipient_grounding.py).
     "light_context",
@@ -35,7 +36,10 @@ def merge_job_definition(local: dict[str, Any], authored: dict[str, Any]) -> dic
     if isinstance(merged.get("schedule"), str):
         merged["schedule"] = parse_schedule(merged["schedule"])
 
-    if local.get("schedule") != merged.get("schedule"):
+    # A zone change moves every wall-clock occurrence exactly like an expr change: the instant on
+    # file belongs to the old zone and the next scan would re-anchor past it without firing.
+    if (local.get("schedule") != merged.get("schedule")
+            or local.get("timezone") != merged.get("timezone")):
         merged.pop("pending_slot", None)
         _clear_quota_hold(merged)
         if is_job_runnable(merged):
