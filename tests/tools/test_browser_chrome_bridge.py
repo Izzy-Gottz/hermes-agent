@@ -139,6 +139,11 @@ def test_state_file_is_private_and_names_the_calling_extension(host):
     data = json.loads(state.read_text())
     assert data["pid"] == proc.pid and data["extension_origin"] == ORIGIN
     assert data["ws_url"].startswith("ws://127.0.0.1:") and len(data["ws_url"].rsplit("/", 1)[1]) >= 40
+    # seen.json: the proof the extension reached its host, kept after bridge.json goes (lane off, Chrome closed)
+    seen = state.parent / "seen.json"
+    assert stat.S_IMODE(seen.stat().st_mode) == 0o600
+    sdata = json.loads(seen.read_text())
+    assert sdata["extension_origin"] == ORIGIN and sdata["pid"] == proc.pid and sdata["at"] > 0
 
 
 def test_socket_refuses_browser_pages_and_guessed_paths(host):

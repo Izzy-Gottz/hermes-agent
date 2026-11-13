@@ -44,6 +44,8 @@ def _unbind(bound):
 def _home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_MCP_TOOL_PROFILE", raising=False)
+    # lane_status reads Chrome's NativeMessagingHosts: a scratch one, never this Mac's.
+    monkeypatch.setitem(lane.MAC_BROWSER_DIRS, "chrome", str(tmp_path / "Chrome"))
     lane.reset_sticky_lanes()
     bound = _bind()  # by default: the person's own live turn in the Memoe app
     yield
@@ -178,10 +180,64 @@ def test_read_bridge_accepts_only_a_private_live_loopback_bridge_from_our_extens
     assert lane.read_bridge() is None                                  # not loopback
     _write_bridge(tmp_path, extension_origin="chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/")
     assert lane.read_bridge() is None                                  # some other extension's host
+    _write_bridge(tmp_path, extension_origin="chrome-extension://nmdhnfjfpipnjbfbiligpbdnpfdkojjn/")
+    assert lane.read_bridge() is not None                              # the Web Store build
+    _write_bridge(tmp_path, extension_origin="chrome-extension://nmdhnfjfpipnjbfbiligpbdnpfdkojjn")
+    assert lane.read_bridge() is not None                              # with or without the slash
     dead = subprocess.Popen(["true"])
     dead.wait()
     _write_bridge(tmp_path, pid=dead.pid)
     assert lane.read_bridge() is None                                  # host exited
+
+
+# ---- lane_status: why the lane is or is not usable, for Moe to say -------------------------------
+
+def _host(browser_dir, origins, launcher=None):
+    d = browser_dir / "NativeMessagingHosts"
+    d.mkdir(parents=True, exist_ok=True)
+    if launcher is None:
+        launcher = browser_dir / "launcher"
+        launcher.write_text("#!/bin/sh\n")
+        os.chmod(launcher, 0o700)
+    (d / "app.memoe.chrome_bridge.json").write_text(json.dumps(
+        {"name": "app.memoe.chrome_bridge", "path": str(launcher), "type": "stdio", "allowed_origins": origins}))
+
+
+def _seen(tmp_path, origin="chrome-extension://nmdhnfjfpipnjbfbiligpbdnpfdkojjn/"):
+    from tools.browser_chrome_bridge import write_seen
+    return write_seen(tmp_path / "chrome-bridge", origin, {"extensionId": origin[19:51], "version": "0.2.2"})
+
+
+def test_lane_status_names_each_way_the_lane_can_be_unreachable(tmp_path):
+    chrome = tmp_path / "Chrome"
+    on = {"chrome_extension": {"enabled": True}}
+    st = lambda cfg=on: lane.lane_status(str(tmp_path), cfg, browser_dir=str(chrome))
+    assert st({"chrome_extension": {"enabled": False}})["state"] == "off"
+    assert st()["state"] == "host_missing"
+    _host(chrome, ["chrome-extension://ljblhmlmgflmbffbfelamefleikodmjh/"])   # what every install before this wrote
+    s = st()
+    assert s["state"] == "host_outdated" and s["missing_ids"] == ["nmdhnfjfpipnjbfbiligpbdnpfdkojjn"]
+    _host(chrome, list(lane.ALLOWED_ORIGINS), launcher=tmp_path / "gone")
+    assert st()["state"] == "host_broken"
+    _host(chrome, list(lane.ALLOWED_ORIGINS))
+    assert st()["state"] == "not_installed"
+    p = _seen(tmp_path)
+    assert oct(p.stat().st_mode & 0o777) == "0o600"
+    s = st()
+    assert s["state"] == "installed_not_connected" and "different Chrome profile" in s["text"]
+    assert s["last_seen"]["extension_id"] == "nmdhnfjfpipnjbfbiligpbdnpfdkojjn" and s["last_seen"]["version"] == "0.2.2"
+    _write_bridge(tmp_path)
+    assert st()["state"] == "connected"
+    assert set(lane.LANE_STATES) >= {"off", "host_missing", "host_outdated", "host_broken", "not_installed",
+                                     "installed_not_connected", "connected"}
+
+
+def test_seen_from_some_other_extension_is_not_proof_ours_is_installed(tmp_path):
+    chrome = tmp_path / "Chrome"
+    _host(chrome, list(lane.ALLOWED_ORIGINS))
+    _seen(tmp_path, origin="chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/")
+    assert lane.lane_status(str(tmp_path), {"chrome_extension": {"enabled": True}},
+                            browser_dir=str(chrome))["state"] == "not_installed"
 
 
 # ---- install --------------------------------------------------------------------------------
@@ -206,7 +262,9 @@ def test_install_writes_one_manifest_beside_the_profiles_and_nothing_inside_them
     manifest, launcher = lane.install_native_host(str(browser_dir), hermes_home=str(tmp_path / "hh"), python="/usr/bin/python3")
     assert manifest == browser_dir / "NativeMessagingHosts" / "app.memoe.chrome_bridge.json"
     data = json.loads(manifest.read_text())
-    assert data["allowed_origins"] == [f"chrome-extension://{lane.EXTENSION_ID}/"] and data["type"] == "stdio"
+    # Both: the store build is what people install, the unpacked build is what a developer loads.
+    assert data["allowed_origins"] == ["chrome-extension://nmdhnfjfpipnjbfbiligpbdnpfdkojjn/",
+                                       "chrome-extension://ljblhmlmgflmbffbfelamefleikodmjh/"] and data["type"] == "stdio"
     assert data["path"] == str(launcher) and os.access(launcher, os.X_OK)
     assert oct(launcher.stat().st_mode & 0o777) == "0o700"
     assert sorted(p.name for p in browser_dir.iterdir()) == ["Default", "NativeMessagingHosts"]
@@ -254,7 +312,10 @@ def test_where_chrome_without_the_extension_fails_closed_with_a_fix_code(cli):
     out = json.loads(bu.browser_exec('print(page_info())', task_id="t", where="chrome"))
     assert out["code"] == "browser_extension_missing" and out["owner"] == "app" and out["pane"] is None
     assert out["subject"] == "Memoe extension for Google Chrome" and out["retry"] is True
-    assert out["extension_id"] == lane.EXTENSION_ID and out["native_host"] == "app.memoe.chrome_bridge"
+    assert out["extension_id"] == "nmdhnfjfpipnjbfbiligpbdnpfdkojjn" and out["native_host"] == "app.memoe.chrome_bridge"
+    assert out["extension_ids"] == ["nmdhnfjfpipnjbfbiligpbdnpfdkojjn", "ljblhmlmgflmbffbfelamefleikodmjh"]
+    assert out["lane_status"]["state"] == "host_missing"  # the scratch Chrome has no host manifest
+    assert out["lane_status"]["text"] in out["error"]     # the why is in the words Moe reads, too
     assert "cmd" not in cli and cli["route"] == 0         # nothing ran anywhere
 
 

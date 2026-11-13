@@ -85,11 +85,27 @@ def test_nothing_focuses_and_moes_window_is_behind_the_persons(report):
     assert report["hello"]["result"]["fileAccess"] is False
 
 
+def test_a_host_that_cannot_be_reached_is_shown_on_the_button_and_clears_when_it_answers(report):
+    assert report["toolbarAfterHello"]["badge"] == ""                 # connected: nothing to see
+    words = {"missing": "isn't set up for Chrome", "forbidden": "doesn't recognise this copy",
+             "exited": "link for Chrome stopped"}
+    for name, r in report["unreachable"].items():
+        assert r["badge"] == "!" and r["color"] == "#C62828", name
+        assert r["title"].startswith("Moe can't reach Memoe") and words[name] in r["title"], (name, r["title"])
+        assert "Connections" in r["title"] or "reopen Memoe" in r["title"], name
+        assert r["stored"], name                                     # the reason is kept, not swallowed
+        assert r["retriedOnClick"] == 1, name                        # the button tries again at once
+        assert r["after"] == {"badge": "", "color": "#C62828", "title": "Moe works in the Moe tab group",
+                              "stored": None}, name
+
+
 @pytest.mark.parametrize("anchor,gutted,expect", [
     ("async function requireOwned(tabId) {\n", "async function requireOwned(tabId) {\n  return;\n",
      lambda r: r["foreign"]["cdp"].get("error") is None and r["foreignDebuggerCalls"]["send"] > 0),
     ("function urlAllowed(url) {\n", "function urlAllowed(url) {\n  return true;\n",
      lambda r: r["createRefused"]["file:///etc/hosts"]["error"] is None),
+    ("function showUnreachable(message) {\n", "function showUnreachable(message) {\n  return;\n",
+     lambda r: r["unreachable"]["missing"]["badge"] != "!"),
 ])
 def test_the_harness_goes_red_when_a_guard_is_gutted(tmp_path, anchor, gutted, expect):
     src = BACKGROUND.read_text()
