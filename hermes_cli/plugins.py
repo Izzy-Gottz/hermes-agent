@@ -198,6 +198,13 @@ VALID_HOOKS: set[str] = {
     # hooks.md). Other event types and hook names land here only together with real fire-sites and payload
     # contracts; no inert VALID_HOOKS surface is registered ahead of implementation.
     "gateway_platform_event",
+    # pre_cron_run: once per cron fire, before any gate, agent or script runs (cron/scheduler.py
+    # ``_prepare_job_prompt``). Kwargs: job (a copy of the stored job dict), job_id, job_name.
+    # Return {"action": "skip", "reason": str} to say this occurrence is not this host's to run
+    # (another host already claimed it): the fire ends silent, delivers nothing and counts as
+    # skipped. Anything else — None, another shape, an exception, a timeout — runs the job: a
+    # claim that cannot be answered must never lose a reminder. Bounded and fail-open.
+    "pre_cron_run",
     # pre_command: BEFORE a recognized slash command's handler on CLI and gateway canonical dispatch;
     # returns IGNORED in v1. Deliberately NOT fired for the gateway's running-agent intercept path
     # (/stop, /approve, busy_policy) — a slow/hostile plugin must not touch the operator's escape
