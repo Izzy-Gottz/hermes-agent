@@ -1038,7 +1038,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                               "turn, so Moe does not open tabs in the person's Chrome. Nothing ran; use where=\"own\" "
                               "and report the block instead.")
         if bridge is None:
-            return chrome_lane.not_connected_error()  # fixable: code browser_extension_missing
+            return chrome_lane.not_connected_error(browser_cfg)  # fixable: code browser_extension_missing
         chrome_lane.chrome_lane_env(env, bridge, session)
     else:
         _park_check(code, task_id)

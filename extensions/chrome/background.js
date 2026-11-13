@@ -261,7 +261,58 @@ function post(msg) {
   try { port && port.postMessage(msg); } catch { /* port died; onDisconnect reconnects */ }
 }
 
+// ---- what the person sees when Memoe can't be reached ------------------------------
+// Chrome hands a failed connectNative only to onDisconnect, as chrome.runtime.lastError, and shows
+// the person nothing — so for weeks "not connected" was silent on both ends. The toolbar button
+// says it instead: a red "!" and a title naming what is wrong and where to fix it. It clears the
+// moment the host speaks, and clicking the button tries again at once.
+const DEFAULT_TITLE = "Moe works in the Moe tab group";
+const ROW = "Memoe › Settings › Connections › Moe in your Chrome";
+
+function unreachableText(message) {
+  const m = String(message || "");
+  if (/native messaging host not found/i.test(m)) {
+    return `Moe can't reach Memoe: Memoe isn't set up for Chrome on this Mac. Install or open Memoe and go to ${ROW}. Click here to try again.`;
+  }
+  if (/forbidden/i.test(m)) {
+    return "Moe can't reach Memoe: Memoe on this Mac doesn't recognise this copy of the extension yet. Quit and reopen Memoe, then click here to try again.";
+  }
+  if (/exited|communicating/i.test(m)) {
+    return `Moe can't reach Memoe: its link for Chrome stopped. Make sure Memoe is open (${ROW}), then click here to try again.`;
+  }
+  return `Moe can't reach Memoe on this Mac${m ? ` (${m})` : ""}. Open ${ROW}, then click here to try again.`;
+}
+
+function quietly(p) {
+  try { if (p && typeof p.catch === "function") p.catch(() => {}); } catch { /* best effort */ }
+}
+
+function showUnreachable(message) {
+  const title = unreachableText(message);
+  try {
+    quietly(chrome.action.setBadgeBackgroundColor({ color: "#C62828" }));
+    quietly(chrome.action.setBadgeText({ text: "!" }));
+    quietly(chrome.action.setTitle({ title }));
+  } catch { /* no toolbar button: nothing to show it on */ }
+  quietly(chrome.storage.session.set({ lastHostError: { message: String(message || ""), at: Date.now() } }));
+}
+
+function showReachable() {
+  try {
+    quietly(chrome.action.setBadgeText({ text: "" }));
+    quietly(chrome.action.setTitle({ title: DEFAULT_TITLE }));
+  } catch { /* as above */ }
+  quietly(chrome.storage.session.remove ? chrome.storage.session.remove("lastHostError") : null);
+}
+
+let reached = false;
+
 async function onHostMessage(msg) {
+  if (!reached) {
+    reached = true;
+    retryMs = 1000; // only an answer proves the host is there; a connectNative that returns does not
+    showReachable();
+  }
   const { id, op } = msg || {};
   log("op", id, op, JSON.stringify(msg.args || {}).slice(0, 160));
   const fn = OPS[op];
@@ -276,22 +327,35 @@ async function onHostMessage(msg) {
   }
 }
 
+let retryTimer = null;
+
+function retryLater() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => { retryTimer = null; connect(); }, retryMs);
+  retryMs = Math.min(retryMs * 2, 60000);
+}
+
 function connect() {
   if (port) return;
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   try {
     port = chrome.runtime.connectNative(HOST);
   } catch (e) {
     port = null;
-    setTimeout(connect, (retryMs = Math.min(retryMs * 2, 60000)));
+    showUnreachable(e && e.message);
+    retryLater();
     return;
   }
   port.onMessage.addListener(onHostMessage);
   port.onDisconnect.addListener(() => {
+    // Read lastError here or Chrome logs "Unchecked runtime.lastError" and the reason is lost.
+    const err = chrome.runtime.lastError;
     port = null;
+    reached = false;
     for (const tabId of [...attached]) detach({ tabId });
-    setTimeout(connect, (retryMs = Math.min(retryMs * 2, 60000)));
+    showUnreachable(err && err.message);
+    retryLater();
   });
-  retryMs = 1000;
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {

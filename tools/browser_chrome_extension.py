@@ -47,6 +47,13 @@ from tools.browser_chrome_bridge import NATIVE_HOST_NAME, bridge_state_dir
 
 #: Stable id of the unpacked extension (derived from the public ``key`` in its manifest).
 EXTENSION_ID = "ljblhmlmgflmbffbfelamefleikodmjh"
+#: The Chrome Web Store item (unlisted), which is how people install it: the store assigns its own
+#: id, because the packager strips ``key``. Listing: https://chromewebstore.google.com/detail/<this>
+STORE_EXTENSION_ID = "nmdhnfjfpipnjbfbiligpbdnpfdkojjn"
+#: Every id the native host answers and the relay trusts: the store build first (what people have),
+#: then the unpacked dev build (what this repo's tests and a developer's Load unpacked run).
+EXTENSION_IDS: Tuple[str, ...] = (STORE_EXTENSION_ID, EXTENSION_ID)
+ALLOWED_ORIGINS: Tuple[str, ...] = tuple(f"chrome-extension://{i}/" for i in EXTENSION_IDS)
 EXTENSION_DIR = Path(__file__).resolve().parent.parent / "extensions" / "chrome"
 
 logger = logging.getLogger(__name__)
@@ -123,9 +130,92 @@ def read_bridge(hermes_home: Optional[str] = None) -> Optional[dict]:
     if type(pid) is not int or not _pid_alive(pid):
         return None
     origin = str(data.get("extension_origin") or "")
-    if origin and origin.rstrip("/") != f"chrome-extension://{EXTENSION_ID}":
+    if origin and origin.rstrip("/") + "/" not in ALLOWED_ORIGINS:
         return None
     return data
+
+
+def read_seen(hermes_home: Optional[str] = None) -> Optional[dict]:
+    """The last time the extension reached its native host (written by the host on every hello,
+    lane on or off), or None: never, or not a file of ours. Proof the extension is installed
+    somewhere in this Chrome even while it is not connected."""
+    path = bridge_state_dir(hermes_home) / "seen.json"
+    try:
+        st = path.stat()
+        if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or str(data.get("extension_origin") or "") not in ALLOWED_ORIGINS:
+        return None
+    return data
+
+
+def host_manifest_status(browser_dir: Optional[str] = None) -> dict:
+    """What Google Chrome will find when the extension asks for ``app.memoe.chrome_bridge``: is the
+    host manifest there, does it list every id, does its launcher exist. Reads, never writes."""
+    path = Path(os.path.expanduser(browser_dir or MAC_BROWSER_DIRS["chrome"])) / "NativeMessagingHosts" / f"{NATIVE_HOST_NAME}.json"
+    out = {"path": str(path), "present": False, "missing_ids": list(EXTENSION_IDS), "launcher_ok": False}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    out["present"] = isinstance(data, dict)
+    if not out["present"]:
+        return out
+    origins = data.get("allowed_origins") if isinstance(data.get("allowed_origins"), list) else []
+    out["missing_ids"] = [i for i in EXTENSION_IDS if f"chrome-extension://{i}/" not in origins]
+    launcher = data.get("path")
+    out["launcher_ok"] = isinstance(launcher, str) and os.access(launcher, os.X_OK)
+    return out
+
+
+#: lane_status() states, in the order they are decided. Each has words Moe can say as they are.
+LANE_STATES = ("connected", "off", "host_missing", "host_outdated", "host_broken",
+               "installed_not_connected", "not_installed")
+
+
+def lane_status(hermes_home: Optional[str] = None, browser_cfg: Optional[dict] = None, *,
+                browser_dir: Optional[str] = None) -> dict:
+    """Why the Chrome lane is or is not usable, in one word and in the words to tell the person.
+
+    The field Moe reads (``lane_status`` on the not-connected error, and ``status``): the person
+    asks "why can't you use my Chrome" and Moe can answer instead of guessing. Reads only."""
+    from tools.fix_reasons import host_app_name
+    app = host_app_name()
+    row = f"{app} › Settings › Connections › Moe in your Chrome"
+    bridge = read_bridge(hermes_home)
+    host = host_manifest_status(browser_dir)
+    seen = read_seen(hermes_home)
+    enabled = None if browser_cfg is None else lane_enabled(browser_cfg)
+    if bridge:
+        state, text = "connected", "Moe's extension is connected to your Chrome."
+    elif enabled is False:
+        state, text = "off", f"Moe in your Chrome is turned off. Turn it on in {row}."
+    elif not host["present"]:
+        state, text = "host_missing", (f"{app} hasn't set up its link for Chrome on this Mac, so the extension "
+                                       f"can't reach {app}. Open {row} and click Add to Chrome (or Set up).")
+    elif host["missing_ids"]:
+        state, text = "host_outdated", (f"{app}'s link for Chrome is out of date and doesn't let the extension in. "
+                                        f"Quit and reopen {app}, which rewrites it, then reopen Chrome.")
+    elif not host["launcher_ok"]:
+        state, text = "host_broken", (f"{app}'s link for Chrome points at a file that is gone. Open {row} and "
+                                      "click Set up again.")
+    elif seen:
+        state, text = "installed_not_connected", (
+            "Moe's extension is installed in Chrome but isn't connected right now. Chrome may be closed, or the "
+            "extension is in a different Chrome profile from the one that is open: open Chrome in the profile "
+            "where you added Memoe, or add it to this one.")
+    else:
+        state, text = "not_installed", (f"Moe's extension isn't in your Chrome yet. Open {row} and click Add to "
+                                        "Chrome, then reopen Chrome.")
+    out = {"state": state, "text": text, "host_manifest": host["path"]}
+    if host["missing_ids"] and host["present"]:
+        out["missing_ids"] = host["missing_ids"]
+    if seen:
+        out["last_seen"] = {k: seen.get(k) for k in ("at", "extension_id", "version") if k in seen}
+    return out
 
 
 def bridge_warnings(bridge: Optional[dict]) -> list:
@@ -152,13 +242,27 @@ def not_connected_message() -> str:
             "(Moe can use where=\"own\" to work in its own browser instead.)")
 
 
-def not_connected_error() -> str:
+def not_connected_error(browser_cfg: Optional[dict] = None) -> str:
     """The fixable tool error (tools.fix_reasons contract) for an absent or unpaired extension.
-    ``owner`` is the app (its install flow is the fix), ``pane`` stays null (no System Settings pane)."""
+    ``owner`` is the app (its install flow is the fix), ``pane`` stays null (no System Settings pane).
+    ``lane_status`` says which of the ways it can be unreachable this is, in words Moe can repeat."""
     from tools.fix_reasons import BROWSER_EXTENSION_MISSING, OWNER_APP, fix_error
-    return fix_error(not_connected_message(), BROWSER_EXTENSION_MISSING, owner=OWNER_APP,
+    status = _quiet_status(browser_cfg)
+    msg = not_connected_message()
+    if status and status.get("state") not in (None, "connected"):
+        msg = f"{msg} Why: {status['text']}"
+    return fix_error(msg, BROWSER_EXTENSION_MISSING, owner=OWNER_APP,
                      subject="Memoe extension for Google Chrome", retry=True,
-                     extension_id=EXTENSION_ID, native_host=NATIVE_HOST_NAME)
+                     extension_id=STORE_EXTENSION_ID, extension_ids=list(EXTENSION_IDS),
+                     native_host=NATIVE_HOST_NAME, lane_status=status)
+
+
+def _quiet_status(browser_cfg: Optional[dict] = None) -> Optional[dict]:
+    try:
+        return lane_status(browser_cfg=browser_cfg)
+    except Exception:  # a diagnosis never turns a fixable error into a crash
+        logger.debug("chrome lane_status failed", exc_info=True)
+        return None
 
 
 # ---- who is here ------------------------------------------------------------------
@@ -580,18 +684,20 @@ MAC_BROWSER_DIRS = {
 }
 
 
-def host_manifest(host_path: str, extension_id: str = EXTENSION_ID) -> dict:
+def host_manifest(host_path: str, extension_ids: Iterable[str] = EXTENSION_IDS) -> dict:
+    """The host manifest Chrome reads. ``allowed_origins`` lists the store id AND the dev id: Chrome
+    refuses connectNative from any extension not listed, with nothing shown to the person."""
     return {
         "name": NATIVE_HOST_NAME,
         "description": "Memoe: lets Moe work in its own tab group in this browser",
         "path": host_path,
         "type": "stdio",
-        "allowed_origins": [f"chrome-extension://{extension_id}/"],
+        "allowed_origins": [f"chrome-extension://{i}/" for i in extension_ids],
     }
 
 
 def install_native_host(browser_dir: str, *, hermes_home: Optional[str] = None, python: Optional[str] = None,
-                        extension_id: str = EXTENSION_ID) -> Tuple[Path, Path]:
+                        extension_ids: Iterable[str] = EXTENSION_IDS) -> Tuple[Path, Path]:
     """Write the host launcher (in the Hermes home) and its manifest (in ``<browser_dir>/NativeMessagingHosts``).
 
     Writes one JSON file beside the browser's profiles and nothing inside any profile —
@@ -615,7 +721,7 @@ def install_native_host(browser_dir: str, *, hermes_home: Optional[str] = None, 
     target = Path(os.path.expanduser(browser_dir)) / "NativeMessagingHosts"
     target.mkdir(parents=True, exist_ok=True)
     manifest = target / f"{NATIVE_HOST_NAME}.json"
-    manifest.write_text(json.dumps(host_manifest(str(launcher), extension_id), indent=2) + "\n", encoding="utf-8")
+    manifest.write_text(json.dumps(host_manifest(str(launcher), extension_ids), indent=2) + "\n", encoding="utf-8")
     return manifest, launcher
 
 
@@ -631,12 +737,12 @@ def main(argv: Optional[list] = None) -> int:
     args = ap.parse_args(argv)
     if args.cmd == "install-host":
         manifest, launcher = install_native_host(args.browser_dir or MAC_BROWSER_DIRS[args.browser])
-        print(json.dumps({"manifest": str(manifest), "launcher": str(launcher), "extension_id": EXTENSION_ID,
-                          "extension_dir": str(EXTENSION_DIR)}))
+        print(json.dumps({"manifest": str(manifest), "launcher": str(launcher), "extension_id": STORE_EXTENSION_ID,
+                          "extension_ids": list(EXTENSION_IDS), "extension_dir": str(EXTENSION_DIR)}))
         return 0
     bridge = read_bridge()
     print(json.dumps({"connected": bool(bridge), "extension": (bridge or {}).get("extension"),
-                      "warnings": bridge_warnings(bridge)}))
+                      "warnings": bridge_warnings(bridge), "lane_status": _quiet_status()}))
     return 0 if bridge else 1
 
 
