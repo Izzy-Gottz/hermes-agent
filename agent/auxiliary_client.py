@@ -7957,6 +7957,17 @@ def _try_claude_code_cli(
         model=model if model else None, timeout=seconds)
 
 
+def _is_payment_error(exc: Exception, provider: Optional[str] = "") -> bool:
+    """(fork) Payment/credit/quota exhaustion, for the Claude Code CLI rescue below.
+
+    Upstream 49165bcaff removed the private substring predicate of this name in
+    favour of classify_api_error; this keeps the rescue's question answered by
+    that same classifier — the verdict that benches a provider for billing —
+    so the rescue and the provider fallback can never disagree.
+    """
+    return aux_errors.benches_provider(aux_errors.classify_attempt(exc, provider))
+
+
 def _rescue_vision_with_cli(
     exc, task, provider, model, messages, timeout, main_runtime,
 ):

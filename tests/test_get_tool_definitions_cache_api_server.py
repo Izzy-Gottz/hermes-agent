@@ -43,7 +43,7 @@ _FAKE_DEFS = [
 @pytest.fixture(autouse=True)
 def _isolated_cache(monkeypatch, tmp_path):
     """Empty cache, a private config file for the mtime fingerprint, a
-    counting assembly stub, and browser control OFF (the shipped default)."""
+    counting assembly stub."""
     model_tools._tool_defs_cache.clear()
 
     cfg = tmp_path / "config.yaml"
@@ -58,9 +58,6 @@ def _isolated_cache(monkeypatch, tmp_path):
         return [dict(d) for d in _FAKE_DEFS]
 
     monkeypatch.setattr(model_tools, "_compute_tool_definitions", _fake_compute)
-    monkeypatch.setattr(
-        "gateway.browser_control_broker.browser_control_enabled", lambda: False
-    )
     yield calls, cfg
     model_tools._tool_defs_cache.clear()
 
@@ -74,8 +71,6 @@ def api_server_identity():
         return set_session_vars(
             platform="api_server",
             session_id=session_id,
-            browser_control_principal="principal:default:0123456789abcdef",
-            browser_control_transport_family="local-api",
             async_delivery=False,
             cron_session="",
         )
@@ -118,7 +113,7 @@ def test_agent_init_and_between_turns_refresh_share_one_assembly(_isolated_cache
     assert len(calls) == 1
 
 
-def test_different_sessions_share_when_browser_control_off(_isolated_cache, api_server_identity):
+def test_different_sessions_share(_isolated_cache, api_server_identity):
     """Session identity is not part of the key: with the feature off it cannot
     influence which tools exist, so request N+1 hits request N's entry."""
     calls, _ = _isolated_cache
@@ -129,24 +124,7 @@ def test_different_sessions_share_when_browser_control_off(_isolated_cache, api_
     assert len(calls) == 1
 
 
-def test_bypass_still_holds_when_browser_control_enabled(_isolated_cache, api_server_identity, monkeypatch):
-    """The safety property the bypass exists for is untouched: a real
-    browser-control deployment keeps per-request evaluation and caches nothing."""
-    calls, _ = _isolated_cache
-    monkeypatch.setattr(
-        "gateway.browser_control_broker.browser_control_enabled", lambda: True
-    )
-    api_server_identity("sess-1")
-    assert check_fn_cache_scope() == CHECK_FN_CACHE_BYPASS
-
-    _call()
-    _call()
-
-    assert len(calls) == 2
-    assert model_tools._tool_defs_cache == {}
-
-
-def test_miss_and_bypass_are_logged_once_per_assembly(_isolated_cache, api_server_identity, monkeypatch, caplog):
+def test_a_miss_is_logged_once_per_assembly(_isolated_cache, api_server_identity, monkeypatch, caplog):
     calls, _ = _isolated_cache
     api_server_identity("sess-1")
     with caplog.at_level(logging.INFO, logger="model_tools"):
@@ -154,15 +132,8 @@ def test_miss_and_bypass_are_logged_once_per_assembly(_isolated_cache, api_serve
         _call()
     lines = [r.getMessage() for r in caplog.records if "tool definitions assembled" in r.getMessage()]
     assert len(lines) == 1 and lines[0].endswith("cache miss)"), lines
-
-    caplog.clear()
-    monkeypatch.setattr(
-        "gateway.browser_control_broker.browser_control_enabled", lambda: True
-    )
-    with caplog.at_level(logging.INFO, logger="model_tools"):
-        _call()
-    lines = [r.getMessage() for r in caplog.records if "tool definitions assembled" in r.getMessage()]
-    assert len(lines) == 1 and lines[0].endswith("cache bypassed)"), lines
+    # (upstream b87977cadd removed browser-extension control, and with it the
+    # per-request bypass this test and test_bypass_still_holds_... once pinned.)
 
 
 # ── (b) every invalidation input forces exactly one rebuild ─────────────────

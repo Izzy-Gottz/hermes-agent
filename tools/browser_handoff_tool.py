@@ -471,6 +471,7 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
 BROWSER_HANDOFF_SCHEMA = {
     "name": "browser_handoff",
     "description": (
+        "Hand the person the page for a step only they can do. "
         "Show the person the page Moe is working on (pass its url), so they can do a step only they can do -- a passkey or "
         "security key, a CAPTCHA, an identity check, an approval -- or whenever they ask to see it ('open that so "
         "I can approve it'). Moe's own browser runs out of sight; this brings it up in a window in front of them "

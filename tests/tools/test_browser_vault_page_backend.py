@@ -7,6 +7,12 @@ from unittest.mock import patch
 
 import pytest
 
+# (fork) The fork's browser vault is nine split tools (browser_vault_login, _fill, _enter_code, ...),
+# kept whole across the v0.23.1 merge; it does not carry upstream's plugin page backends (Camofox; deleted by the browser rewire), so these upstream
+# tests have nothing to drive. Nothing reaches that path: the fork never registers it. Re-enable if
+# the split vault ever adopts the feature.
+pytestmark = pytest.mark.skip(reason="fork: split browser vault has no plugin page backends (Camofox; deleted by the browser rewire)")
+
 from agent.browser_page_backend import BrowserPageBackend
 from agent.vault_store import VaultStore
 

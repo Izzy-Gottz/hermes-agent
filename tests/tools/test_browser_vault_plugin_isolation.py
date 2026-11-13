@@ -21,6 +21,12 @@ from textwrap import dedent
 
 import pytest
 
+# (fork) The fork's browser vault is nine split tools (browser_vault_login, _fill, _enter_code, ...),
+# kept whole across the v0.23.1 merge; it does not carry upstream's plugin-registered login backends (ctx.register_login_backend), so these upstream
+# tests have nothing to drive. Nothing reaches that path: the fork never registers it. Re-enable if
+# the split vault ever adopts the feature.
+pytestmark = pytest.mark.skip(reason="fork: split browser vault has no plugin-registered login backends (ctx.register_login_backend)")
+
 SECRET = "plugin-dummy-pw-81"
 LEAK = "plugin-leak-canary-93"
 ORIGIN = "https://example.com"

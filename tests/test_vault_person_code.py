@@ -38,7 +38,7 @@ def _enter(controls, *, live=True, code="", source="", prompt=None, probe=None, 
     unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or (prompt or ""))
 
     def fake_eval(t, e):
-        if "querySelectorAll(\"input, select\")" in e:
+        if "data-hermes-vault-slot\", nonce" in e:
             return {"success": True, "result": json.dumps(controls)}
         if "innerText" in e and "page_says" in e:
             return {"success": True, "result": json.dumps(probe) if probe else None}

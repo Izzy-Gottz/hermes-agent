@@ -1274,10 +1274,6 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     if meta.kind != "login" and not meta.origin:
         return json.dumps({"success": False, "error_type": "no_origin",
                            "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
-    if meta.kind == "payment" and not _confirm_payment_fill(meta.label, str(meta.origin)):
-        return json.dumps({"success": False, "error_type": "payment_declined",
-                           "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
-
     # ── Origin binding pre-check (cheap early exit; the authoritative check
     # runs synchronously inside the fill script itself) ──────────────────────
     # Manager items can bind several websites (e.g. amazon.co.uk + www.amazon.co.uk);
@@ -1309,6 +1305,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+
+    # (upstream origin guard) Asked only once the page is on a saved origin: a person asked to
+    # approve a card for a page it would be refused on is asked for nothing.
+    if meta.kind == "payment" and not _confirm_payment_fill(meta.label, str(meta.origin)):
+        return json.dumps({"success": False, "error_type": "payment_declined",
+                           "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
@@ -1438,7 +1440,7 @@ BROWSER_VAULT_LIST_SCHEMA = {
 BROWSER_VAULT_UNLOCK_SCHEMA = {
     "name": "browser_vault_unlock",
     "description": (
-        "Ask the user to unlock a password manager (1Password or Bitwarden) for this session. The master "
+        "Ask the user to unlock 1Password or Bitwarden for this session. The master "
         "password is typed into a masked prompt owned by the UI and never enters the conversation. "
         "Returns success, unlock_cancelled, unlock_failed, or unlock_unavailable (headless session)."
     ),
@@ -1453,6 +1455,7 @@ BROWSER_VAULT_UNLOCK_SCHEMA = {
 BROWSER_VAULT_FILL_SCHEMA = {
     "name": "browser_vault_fill",
     "description": (
+        "Fill the current page from a saved vault item. "
         "Fill the CURRENT browser page from a vault handle (see browser_vault_list): a login item fills ONLY "
         "the password field (type the identifier/username yourself first with the browser's input tool); a "
         "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
@@ -1488,6 +1491,7 @@ _POLICY_PARAM = {"type": "object", "description": (
 BROWSER_VAULT_LOGIN_SCHEMA = {
     "name": "browser_vault_login",
     "description": (
+        "Sign in or sign up with a saved or generated password. "
         "Call this whenever a page asks for a password: a sign-in form (mode='login') or a sign-up form "
         "(mode='signup'). It first looks for a login already saved for exactly this site (the local vault and "
         "any password manager) and fills it: outcome used_existing. Only when there is none: for mode='login' "
@@ -1544,7 +1548,8 @@ BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
 
 BROWSER_VAULT_CONFIRM_SCHEMA = {
     "name": "browser_vault_confirm",
-    "description": ("The site accepted the new account made with a generated password (it says the account exists, "
+    "description": ("Keep a pending generated-password login for good. "
+                    "The site accepted the new account made with a generated password (it says the account exists, "
                     "or asks to verify the email): keep that login for good. Until confirmed it is pending, and a "
                     "pending login nobody confirms is dropped after a day."),
     "parameters": {"type": "object", "properties": {"handle": {"type": "string", "description": "The handle from the created result."}},
@@ -1553,7 +1558,8 @@ BROWSER_VAULT_CONFIRM_SCHEMA = {
 
 BROWSER_VAULT_DISCARD_SCHEMA = {
     "name": "browser_vault_discard",
-    "description": ("The site refused the new account made with a generated password for a reason other than the "
+    "description": ("Drop a pending login for an account the site refused. "
+                    "The site refused the new account made with a generated password for a reason other than the "
                     "password (\"email has already been taken\", the sign-up failed): drop that pending login so no "
                     "login is kept for an account that does not exist. Works only while the login is pending; a "
                     "confirmed login is never removed here."),
@@ -1563,7 +1569,8 @@ BROWSER_VAULT_DISCARD_SCHEMA = {
 
 BROWSER_VAULT_REGENERATE_SCHEMA = {
     "name": "browser_vault_regenerate",
-    "description": ("The site rejected the generated password (too long, no symbols allowed, ...): make a new one that "
+    "description": ("Make a new generated password the site will accept. "
+                    "The site rejected the generated password (too long, no symbols allowed, ...): make a new one that "
                     "follows the site's stated rules, replace the pending login and fill the form again. Pass only the "
                     "rules as policy, read from the site's error text. Works only while the login is pending."),
     "parameters": {"type": "object", "properties": {"handle": {"type": "string"}, "policy": _POLICY_PARAM},
@@ -1574,6 +1581,7 @@ BROWSER_VAULT_REGENERATE_SCHEMA = {
 BROWSER_VAULT_ENTER_CODE_SCHEMA = {
     "name": "browser_vault_enter_code",
     "description": (
+        "Type a one-time sign-in code into the page. "
         "The page asks for a one-time / verification / 2FA / sign-in code (after a password, or instead of one: "
         "'we emailed you a code'): call this, right after the site says it sent the code. If the saved login has an "
         "authenticator key the code is generated; otherwise Hermes reads the person's connected email itself, finds "

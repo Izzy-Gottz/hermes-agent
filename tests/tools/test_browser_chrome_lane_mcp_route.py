@@ -88,6 +88,11 @@ def route(tmp_path_factory):
     fake = home / "fake-harness" / "browser_harness"
     fake.mkdir(parents=True)
     (fake / "__init__.py").write_text("")
+    # Upstream's launcher (tools/browser_use_shot.harness_command) imports browser_harness.helpers and
+    # installs its shot helpers before running browser_harness.run, so the stand-in carries that module too.
+    (fake / "helpers.py").write_text(
+        "def cdp(*a, **k): pass\ndef current_tab(*a, **k): pass\n"
+        "def capture_screenshot(*a, **k): pass\ndef new_tab(*a, **k): pass\n")
     (fake / "run.py").write_text(
         "import os, sys\nsys.stdin.read()\ne = os.environ.get\n"
         "print(f\"CDP_WS={e('BU_CDP_WS') or 'none'} CDP_URL={e('BU_CDP_URL') or 'none'} NAME={e('BU_NAME') or 'none'} \"\n"

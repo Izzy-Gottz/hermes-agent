@@ -91,7 +91,7 @@ class Page:
         self.plain_exprs.append(expr)
         if "location.href" in expr:
             return {"success": True, "result": self.url}
-        if 'querySelectorAll("input, select")' in expr:
+        if 'data-hermes-vault-slot", nonce' in expr:
             return {"success": True, "result": json.dumps(self.controls)}
         return {"success": True, "result": None}
 

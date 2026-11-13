@@ -9,6 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 
+# (fork) The fork's browser vault is nine split tools (browser_vault_login, _fill, _enter_code, ...),
+# kept whole across the v0.23.1 merge; it does not carry upstream's the Desktop in-app browser target ('preview'), so these upstream
+# tests have nothing to drive. Nothing reaches that path: the fork never registers it. Re-enable if
+# the split vault ever adopts the feature.
+pytestmark = pytest.mark.skip(reason="fork: split browser vault has no the Desktop in-app browser target ('preview')")
+
 from agent.redact import clear_vault_redaction_values
 from agent.vault_store import get_vault_store
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
