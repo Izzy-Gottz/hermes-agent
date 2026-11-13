@@ -1,6 +1,6 @@
 """Fidelity for the real-profile browser: it tells sites the truth about what it is.
 
-The browser Hermes drives for real-profile browsing is agent-browser's Chrome for Testing,
+The browser Hermes drives for real-profile browsing is a managed Chrome for Testing,
 headless, on a copy of the person's profile. Left alone it announces itself as a robot on
 every request — measured on macOS 27 / Chrome for Testing 153 (2026-09-23):
 
@@ -30,8 +30,8 @@ own Mac, from their own home. This module makes the driven browser report exactl
   released by the client that set it), checked and restarted on every acquire, with a watchdog
   that drops a stalled keeper's connection so Chrome lets its targets run.
 
-The signed-out lane (and the cloud machine) gets the same, from :func:`signed_out_launch`: the
-browser agent-browser launches for itself when real-profile browsing is off or the default browser
+The signed-out lane (and the cloud machine) gets the same, from :func:`signed_out_launch_args`: the
+browser upstream's launcher (``tools.browser_launcher``) starts when real-profile browsing is off or the default browser
 is not Chromium (Safari, Firefox, Arc). It claims the ENGINE's own identity, never a brand it is
 not: Chrome for Testing reports ``Chromium`` and GREASE only, and so does the claim. What changes is
 only what headless mode adds on top of the engine: the ``HeadlessChrome`` token, ``navigator.webdriver``,
@@ -44,7 +44,7 @@ declared in ``browser.virtual_display``). ``browser.stealth_fidelity: false`` tu
 
 Why headless and not a hidden window (measured 2026-09-23, macOS 27, see the test notes in the
 commit): a headed Chrome for Testing takes focus from the person's app whenever a tab opens in
-the foreground (agent-browser's ``open``, a site's popup, ``Page.bringToFront``). Hiding the app
+the foreground (a new tab, a site's popup, ``Page.bringToFront``). Hiding the app
 does not help, because Chrome unhides and re-activates itself. macOS keeps 40 px of an
 off-screen window on screen. ``lsappinfo`` refuses to retype another app. A copy of the bundle
 patched with ``LSBackgroundOnly`` stops the Dock icon and the focus steal, but its popups still
@@ -62,7 +62,7 @@ import plistlib
 import re
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +84,10 @@ _BRAND_BY_BROWSER = {
 
 def fidelity_enabled() -> bool:
     """``browser.stealth_fidelity`` (default True). Any of false/0/no/off turns it off."""
-    from tools.browser_tool_origin import origin_module
-    return bool(origin_module()._browser_cfg(
+    from tools.browser_session_cloud import browser_cfg
+    return bool(browser_cfg(
         "stealth_fidelity", True,
-        lambda v: True if v is None else str(v).strip().lower() not in ("false", "0", "no", "off"),
-        "browser.stealth_fidelity from config"))
+        lambda v: True if v is None else str(v).strip().lower() not in ("false", "0", "no", "off")))
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +296,7 @@ def default_window_size(width: int, height: int) -> Tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# The signed-out lane: the browser agent-browser launches for itself
+# The signed-out lane: the browser upstream's launcher starts
 # ---------------------------------------------------------------------------
 
 _engine_versions: Dict[Tuple[str, float], Optional[str]] = {}
@@ -346,8 +345,8 @@ def virtual_display() -> Optional[Dict[str, float]]:
             return None
         return {"width": float(m.group(1)), "height": float(m.group(2)), "scale": float(m.group(3) or 1),
                 "top": 0.0, "bottom": 0.0, "depth": 24}
-    from tools.browser_tool_origin import origin_module
-    return origin_module()._browser_cfg("virtual_display", None, parse, "browser.virtual_display from config")
+    from tools.browser_session_cloud import browser_cfg
+    return browser_cfg("virtual_display", None, parse)
 
 
 def launch_display() -> Optional[Dict[str, float]]:
@@ -355,92 +354,27 @@ def launch_display() -> Optional[Dict[str, float]]:
     return main_display() if sys.platform == "darwin" else virtual_display()
 
 
-def launch_wrapper(binary: str, ua: str) -> Optional[str]:
-    """Path of a two-line ``sh`` script that runs ``binary`` with every argument agent-browser passes,
-    plus ``--user-agent=<ua>``. None off POSIX or when it cannot be written.
+def signed_out_launch_args(binary: Optional[str], headless: bool,
+                           operator_args: Iterable[str] = ()) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+    """``(extra launch switches, identity)`` for a browser the launcher (``tools.browser_launcher``) starts
+    on the signed-out lane -- the packaged Chromium when real-profile browsing is off or the default
+    browser is Safari / Firefox / Arc, the hybrid local sidecar, a cloud computer's own browser.
+    ``([], None)`` when ``browser.stealth_fidelity`` is off.
 
-    Why a script (measured 2026-09-25, agent-browser 0.37.1): agent-browser splits
-    ``AGENT_BROWSER_ARGS``, and its config file's ``args``, on commas, and every Chrome UA contains
-    one ("KHTML, like Gecko"). The UA arrived as two argv entries and Chrome exited with "Multiple
-    targets are not supported in headless mode". ``AGENT_BROWSER_USER_AGENT`` is no substitute: it
-    is a per-tab DevTools override WITHOUT ``userAgentMetadata``, and it blanked
-    ``navigator.userAgentData.brands`` (``""`` instead of ``Chromium;154``). The switch is also the
-    only thing that reaches shared and service workers (:func:`launch_flags`). ``exec`` keeps the
-    pid, so agent-browser still owns, watches and closes the browser exactly as before."""
-    if os.name != "posix" or not binary:
-        return None
-    import hashlib
-    import shlex
-    body = ("#!/bin/sh\n# Written by tools.browser_tool_fidelity: the driven browser, plus the UA switch "
-            "agent-browser cannot pass.\n"
-            f"exec {shlex.quote(binary)} \"$@\" {shlex.quote('--user-agent=' + ua)}\n")
-    import tempfile
-    from pathlib import Path
-    from hermes_constants import get_hermes_home
-    name = f"launch-{hashlib.sha256(body.encode()).hexdigest()[:16]}.sh"
-    # A home on a volume mounted noexec would make the browser fail to start at all, so such a
-    # folder is passed over: the next one, else no wrapper (the keeper still covers every page).
-    for folder in (get_hermes_home() / "browser-fidelity",
-                   Path(tempfile.gettempdir()) / f"hermes-browser-fidelity-{os.getuid()}"):
-        try:
-            folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if os.statvfs(folder).f_flag & getattr(os, "ST_NOEXEC", 0):
-                continue
-            path = folder / name
-            if not path.is_file() or path.read_text(encoding="utf-8") != body or not os.access(path, os.X_OK):
-                tmp = folder / f".{name}.{os.getpid()}.tmp"
-                tmp.write_text(body, encoding="utf-8")
-                os.chmod(tmp, 0o755)
-                os.replace(tmp, path)
-            return str(path)
-        except Exception as e:
-            logger.debug("fidelity: launch wrapper not written in %s: %s", folder, e)
-    return None
-
-
-def signed_out_launch(env: Dict[str, str], headless: bool) -> Dict[str, Any]:
-    """What an agent-browser launch on the signed-out lane needs, computed once per session:
-    ``{"args": [...], "executable": wrapper or None, "identity": dict or None}``; ``{}`` when
-    ``browser.stealth_fidelity`` is off.
-
-    * ``args``: ``AutomationControlled`` off, and headless, the display's ``--screen-info``. NOT
-      ``--window-size``: agent-browser drops its own 1280x720 window whenever the args carry one, and
-      the value cannot get through (a comma; ``1440x853`` is not parsed). Measured: either form read
-      back as a 756x556 window. So the window stays agent-browser's own.
-    * ``identity``: the ENGINE's (:func:`engine_identity`), for the UA switch and the keeper.
-      None when an operator set a UA of their own (``AGENT_BROWSER_USER_AGENT``, or ``--user-agent``
-      in the args): theirs is left alone, and the keeper would only fight it."""
+    * switches: :func:`launch_flags` -- ``AutomationControlled`` off; headless, the display's real
+      geometry; and the ENGINE's own UA (:func:`engine_identity`, nothing borrowed). The launcher passes
+      argv as a list, so the UA's comma ("KHTML, like Gecko") goes through whole; the agent-browser era
+      needed a wrapper script for it.
+    * identity: for the keeper (:func:`ensure_keeper`, ``lane=SIGNED_OUT_LANE``). None when the operator
+      set a UA of their own in ``browser.chromium_args``: theirs is left alone, and the keeper would
+      only fight it."""
     if not fidelity_enabled():
-        return {}
+        return [], None
     display = launch_display() if headless else None
-    args = [f for f in launch_flags(None, headless, display) if not f.startswith("--window-size=")]
-    operator_args = f"{env.get('AGENT_BROWSER_ARGS', '')},{env.get('AGENT_BROWSER_CHROME_FLAGS', '')}"
-    if env.get("AGENT_BROWSER_USER_AGENT", "").strip() or "--user-agent" in operator_args:
-        return {"args": args, "executable": None, "identity": None}
-    binary = env.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()
-    if not os.path.isfile(binary):
-        from tools.browser_tool_real_profile import driven_browser_executable
-        binary = driven_browser_executable() or ""
-    identity = engine_identity(binary)
-    wrapper = launch_wrapper(binary, user_agent(identity)) if identity else None
-    return {"args": args, "executable": wrapper, "identity": identity}
-
-
-def apply_launch_env(env: Dict[str, str], launch: Dict[str, Any]) -> None:
-    """Merge :func:`signed_out_launch`'s result into one agent-browser command's environment. The
-    operator's own args (and the sandbox bypass) are kept and come first; a switch they already set
-    is not repeated. Every command gets it, because any command may be the one that (re)launches."""
-    if not launch:
-        return
-    key = "AGENT_BROWSER_CHROME_FLAGS" if ("AGENT_BROWSER_CHROME_FLAGS" in env and "AGENT_BROWSER_ARGS" not in env) \
-        else "AGENT_BROWSER_ARGS"
-    have = [a.strip() for a in env.get(key, "").split(",") if a.strip()]
-    names = {a.split("=", 1)[0] for a in have}
-    add = [a for a in launch.get("args") or [] if a.split("=", 1)[0] not in names]
-    if add:
-        env[key] = ",".join(have + add)
-    if launch.get("executable"):
-        env["AGENT_BROWSER_EXECUTABLE_PATH"] = launch["executable"]
+    if any(str(a).startswith("--user-agent") for a in operator_args):
+        return launch_flags(None, headless, display), None
+    identity = engine_identity(binary) if binary else None
+    return launch_flags(identity, headless, display), identity
 
 
 # ---------------------------------------------------------------------------
@@ -926,8 +860,8 @@ def _keeper_main(argv: List[str]) -> int:
 
 
 # Which browser a keeper serves. The real-profile browser is one per home and is stopped with
-# :func:`stop_keepers`; a signed-out browser is one per agent-browser session, launched and closed
-# by agent-browser, so its keeper is stopped with the session (:func:`stop_keeper`) or, once its
+# :func:`stop_keepers`; a signed-out browser is one per browser session, launched and closed
+# by the session layer, so its keeper is stopped with the session (:func:`stop_keeper`) or, once its
 # browser is gone, forgotten by the monitor.
 REAL_PROFILE_LANE = "real_profile"
 SIGNED_OUT_LANE = "signed_out"
@@ -1090,7 +1024,7 @@ def _monitor_once() -> None:
         items = list(_keepers.items())
     for port, keeper in items:
         if getattr(keeper, "lane", REAL_PROFILE_LANE) != REAL_PROFILE_LANE and not keeper.is_alive():
-            # A signed-out browser is closed by agent-browser (session close, idle timeout), and its
+            # A signed-out browser is closed by the session layer (session close, idle timeout), and its
             # keeper ends with it. That is the normal end of the session, not a failure to report.
             with _keepers_lock:
                 if _keepers.get(port) is keeper:

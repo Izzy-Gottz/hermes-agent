@@ -378,8 +378,8 @@ def _looks_like_test_tempdir(path: str) -> bool:
 
 
 def _build_hermes_tools_mcp_entry() -> dict:
-    """Codex stdio entry launching Hermes' own tool surface as an MCP server (browser/web/
-    vision/skills call-backs). NOT delegate_task or memory: those need the running AIAgent,
+    """Codex stdio entry launching Hermes' own tool surface as an MCP server (web/vision/
+    image/skills/kanban call-backs; never browser_exec). NOT delegate_task or memory: those need the running AIAgent,
     and the claude_code runtime's tool bridge (agent/transports/hermes_tool_bridge.py) — which
     forwards them home — has no address to write here, because this file is written once and a
     bridge is minted per session.
@@ -412,7 +412,7 @@ def _build_hermes_tools_mcp_entry() -> dict:
         "command": sys.executable,
         "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
         "env": env,
-        # Generous timeouts — browser_navigate or delegate_task can take a while.
+        # Generous timeouts — image_generate or delegate_task can take a while.
         "startup_timeout_sec": 30.0,
         "tool_timeout_sec": 600.0}
 

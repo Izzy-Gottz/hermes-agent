@@ -54,6 +54,8 @@ def check_api_turn(authority, ref, payload):
         raise RuntimeStoreError('runtime_draining')
     if 'api_turn_v1' in payload:
         data = payload['api_turn_v1']
+        # 'browser_control' is accepted and ignored: admissions persisted while the removed
+        # browser-extension control existed may carry it and must still recover.
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
                          'relay_metadata', 'resume_unanswered', 'turn_signals'}
                 or data.get('resume_unanswered', True) is not True
@@ -61,7 +63,6 @@ def check_api_turn(authority, ref, payload):
                 or not isinstance(data.get('relay_metadata', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
                 or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))
-                or ('browser_control' in data and not _valid_browser_control(data['browser_control']))
                 or ('turn_signals' in data and not _valid_turn_signals(data['turn_signals']))):
             raise RuntimeStoreError('invalid_params')
         if set(data['settings']) - set(_SETTING_KEYS):
@@ -73,22 +74,6 @@ def check_api_turn(authority, ref, payload):
 
 def _valid_owner_scope(value):
     return isinstance(value, str) and _OWNER_SCOPE_RE.fullmatch(value) is not None
-
-
-def _valid_browser_control(value):
-    return (isinstance(value, dict) and set(value) == {'principal', 'transport_family'}
-            and isinstance(value['principal'], str) and value['principal'].startswith('principal:')
-            and value['transport_family'] in ('local-api', 'remote-api'))
-
-
-def _request_browser_control():
-    """The authenticated request's browser-controller identity, as the profile-prefix
-    middleware derived it from the served profile and its API key; never client JSON."""
-    from gateway.platforms.api_server import (
-        _api_request_browser_control_principal, _api_request_browser_control_transport_family)
-    bound = {'principal': _api_request_browser_control_principal.get(),
-             'transport_family': _api_request_browser_control_transport_family.get()}
-    return bound if _valid_browser_control(bound) else None
 
 
 def _valid_turn_signals(value):
@@ -144,34 +129,13 @@ def api_voice_turn():
     return bool(((current or {}).get('turn_signals') or {}).get('voice'))
 
 
-def _rebind_browser_control(adapter, data):
-    """Re-derive the admitted principal from the profile's current API key before it is bound
-    for execution (also after recovery). A rotated key no longer authorizes the old principal,
-    so that turn runs unbound, like a request the middleware stamped nothing for."""
-    bound = (data or {}).get('browser_control')
-    if bound is None:
-        return None
-    from gateway.platforms.api_server import _api_request_profile
-    profile = bound['principal'][len('principal:'):].rpartition(':')[0]
-    token = _api_request_profile.set(None if profile == 'default' else profile)
-    try:
-        expected = adapter._derive_browser_control_principal(profile)
-    finally:
-        _api_request_profile.reset(token)
-    return bound if hmac.compare_digest(bound['principal'], expected) else None
-
-
 def api_session_vars():
     """Session-context fields an executing API admission binds beyond the shared source:
-    #98619 history-delivery provenance and the rebound browser-controller identity. ``{}``
-    when no API admission is executing."""
+    #98619 history-delivery provenance. ``{}`` when no API admission is executing."""
     current = api_execution.get()
     if current is None:
         return {}
-    bound = current.get('browser_control') or {}
-    return {'session_history_delivery': current['settings'].get('session_history_delivery') or '',
-            'browser_control_principal': bound.get('principal', ''),
-            'browser_control_transport_family': bound.get('transport_family', '')}
+    return {'session_history_delivery': current['settings'].get('session_history_delivery') or ''}
 
 
 def check_api_settings(adapter, settings):
@@ -258,14 +222,9 @@ def admit_api_steps(adapter, **kwargs):
         # This opaque namespace is persisted in the same row/transaction as
         # admission. It is never a bearer credential or execution input.
         payload['api_turn_v1']['run_owner_scope'] = run_owner_scope
-    browser_control = _request_browser_control()
-    if browser_control is not None:
-        # Server-derived like the owner scope: the admission keeps the identity the legacy
-        # path bound for its executor, so execution and recovery can rebind it.
-        payload['api_turn_v1']['browser_control'] = browser_control
     turn_signals = _request_turn_signals()
     if turn_signals is not None:
-        # Header-derived like browser_control, and part of the exact-retry identity: a retry that
+        # Header-derived like the owner scope, and part of the exact-retry identity: a retry that
         # declares a different origin is a different turn.
         payload['api_turn_v1']['turn_signals'] = turn_signals
     # Refuse a foreign-surface target before committing any media for it (a refused
@@ -542,7 +501,6 @@ def prepare_api_execution(authority, ref, payload):
             'content': content, 'turn_author': data.get('turn_author') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
             'resume_unanswered': bool(data and data.get('resume_unanswered')),
-            'browser_control': _rebind_browser_control(adapter, data),
             'turn_signals': data.get('turn_signals') if data else None}
 
 

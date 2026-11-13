@@ -14,13 +14,10 @@ _HERMES_CORE_TOOLS = [
     "read_file", "write_file", "patch", "search_files",
     "vision_analyze", "image_generate",
     "skills_list", "skill_view", "skill_manage",
-    "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_back",
-    "browser_press", "browser_get_images",
-    "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+    "browser_exec",  # THE browser: Python over CDP (browser-harness)
+    "browser_cdp", "browser_dialog",
     "browser_vault_list", "browser_vault_unlock", "browser_vault_fill", "browser_vault_save_login", "browser_vault_enter_code",  # ride with the browser
     "browser_vault_login", "browser_vault_confirm", "browser_vault_regenerate", "browser_vault_discard",
-    "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
     "browser_handoff",  # shows the out-of-sight page to the person (passkey, CAPTCHA, "let me see it")
     "text_to_speech",
     "todo_list", "memory",
@@ -112,8 +109,8 @@ TOOLSETS = {
     # web_search from every session, because disabled toolsets are a strict
     # end-of-pipeline subtraction (#17309, #64503).
     "browser": _ts(
-        "Browser automation for web interaction (navigate, click, type, scroll, "
-        "iframes, hold-click)",
+        "Browser automation: drive a real browser with Python over CDP (navigate, "
+        "click, type, extract, screenshots), raw CDP, dialogs and vault logins",
         [t for t in _HERMES_CORE_TOOLS if t.startswith("browser_")],
     ),
     "cronjob": _ts(

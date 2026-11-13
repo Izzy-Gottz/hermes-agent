@@ -15,10 +15,8 @@ import pytest
 
 import hermes_cli.browser_connect as bc
 from tests.tools.test_browser_real_profile import TestRealProfileCdpLaunch as _Launch, _FakeChrome
-from tools import browser_tool_cloud as bt_cloud
-from tools import browser_tool_install as bt_install
+from tools import browser_session_cloud as bt_cloud
 from tools import browser_tool_real_profile as bt_real_profile
-from tools import browser_tool_session as bt_session
 
 DRIVEN = "/opt/data/.agent-browser/browsers/chrome-153.0.8010.47/chrome-linux64/chrome"
 
@@ -32,7 +30,7 @@ def home(tmp_path, monkeypatch):
 
 def _cold_start(home, *, launches, cdp_calls, detect=None, snapshot=None):
     """``_real_profile_cdp`` cold, with ``kept_profile`` on and only process launch and CDP faked."""
-    import tools.browser_tool as bt
+    import tools.browser_tool_real_profile as bt
     kept = home / "browser-profile" / "kept"
 
     def fake_popen(argv, **kw):
@@ -43,33 +41,30 @@ def _cold_start(home, *, launches, cdp_calls, detect=None, snapshot=None):
 
     def fake_cdp(port, method, params=None, timeout=20.0):
         cdp_calls.append(method)
-        return {}
+        return {"targetInfos": []} if method == "Target.getTargets" else {}
 
     ok = type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
     patches = [
-        patch.object(bt_cloud, "_use_real_profile", return_value=True),
-        patch.object(bt_cloud, "_use_kept_profile", return_value=True),
-        patch.object(bt_cloud, "_is_headed_mode", return_value=False),
+        patch.object(bt_cloud, "use_real_profile", return_value=True),
+        patch.object(bt_cloud, "use_kept_profile", return_value=True),
+        patch.object(bt_cloud, "is_headed_mode", return_value=False),
         patch("hermes_cli.browser_connect.detect_default_chromium", side_effect=detect or (lambda *a: None)),
         patch("hermes_cli.browser_connect.snapshot_real_profile", side_effect=snapshot or (lambda *a, **k: (None, "snapshot ran"))),
         patch.object(bt_real_profile, "driven_browser_executable", return_value=DRIVEN),
         patch.object(bt_real_profile, "_cdp_call", side_effect=fake_cdp),
         patch.object(bt_real_profile, "_browsers_on_data_dir", return_value=[]),
         patch.object(bt.subprocess, "Popen", side_effect=fake_popen),
-        patch.object(bt_real_profile, "_agent_browser_get_cdp", side_effect=[None, "http://127.0.0.1:41000"]),
-        patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"),
+        patch.object(bt_real_profile, "_cdp_http_ready", return_value=True),
+        patch.object(bt_real_profile, "_cdp_on_data_dir", return_value=True),
+        patch.object(bt_real_profile, "_surviving_chrome_cdp", return_value=None),
+        patch.object(bt_real_profile._fidelity, "ensure_keeper", return_value=None),
         patch.object(bt.subprocess, "run", side_effect=lambda *a, **k: ok),
-        # agent-browser's CLI output comes back through temp files (upstream 15485e0c8d), not pipes.
-        patch.object(bt_session, "_popen_agent_browser",
-                     side_effect=lambda *a, **k: type("W", (), {"returncode": 0, "wait": lambda self, timeout=None: 0})()),
     ]
-    for p in patches:
-        p.start()
-    try:
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
         return bt_real_profile._real_profile_cdp()
-    finally:
-        for p in reversed(patches):
-            p.stop()
 
 
 @pytest.fixture(autouse=True)
@@ -126,16 +121,15 @@ def test_the_persons_default_browser_is_never_consulted(home):
 
 def test_kept_profile_off_keeps_the_persons_lane(home):
     """Without ``kept_profile`` a host with no Chromium default fails closed, as before."""
-    with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
-         patch.object(bt_cloud, "_use_kept_profile", return_value=False), \
+    with patch.object(bt_cloud, "use_real_profile", return_value=True), \
+         patch.object(bt_cloud, "use_kept_profile", return_value=False), \
          patch("hermes_cli.browser_connect.detect_default_chromium", return_value=None):
         cdp, err = bt_real_profile._real_profile_cdp()
     assert cdp is None and "not a supported Chromium" in err
 
 
 def test_kept_profile_reads_its_config_key():
-    import tools.browser_tool as bt
-    with patch.object(bt, "_browser_cfg", side_effect=lambda key, default, *a: key == "kept_profile"):
-        assert bt_cloud._use_kept_profile() is True
-    with patch.object(bt, "_browser_cfg", side_effect=lambda key, default, *a: default):
-        assert bt_cloud._use_kept_profile() is False
+    with patch.object(bt_cloud, "browser_section", return_value={"kept_profile": True}):
+        assert bt_cloud.use_kept_profile() is True
+    with patch.object(bt_cloud, "browser_section", return_value={}):
+        assert bt_cloud.use_kept_profile() is False

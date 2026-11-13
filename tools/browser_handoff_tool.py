@@ -67,9 +67,8 @@ _GROUNDED = ("Say only what the page shows: never that a code or a prompt was se
 
 def _check_available() -> bool:
     try:
-        from tools.browser_tool_install import check_browser_requirements
-        from tools.browser_use_cli import is_browser_use_cli_mode
-        return bool(is_browser_use_cli_mode() or check_browser_requirements())
+        from tools.browser_use_cli import browser_exec_available
+        return bool(browser_exec_available())
     except Exception:
         return False
 
@@ -79,7 +78,7 @@ def _safe_url(url: str) -> Optional[str]:
     if not url.startswith(("http://", "https://")):
         return "Only an http(s) page can be handed to the person."
     try:
-        from tools.browser_tool import evaluate_url_safety
+        from tools.browser_url_policy import evaluate_url_safety
         err = evaluate_url_safety(url)
     except Exception:
         err = None
@@ -146,8 +145,8 @@ def _on_cloud_computer() -> bool:
     if sys.platform == "darwin" or not sys.platform.startswith("linux"):
         return False
     try:
-        from tools import browser_tool_cloud as cloud
-        return bool(cloud._use_real_profile() and cloud._use_kept_profile())
+        from tools import browser_session_cloud as cloud
+        return bool(cloud.use_real_profile() and cloud.use_kept_profile())
     except Exception:
         return False
 

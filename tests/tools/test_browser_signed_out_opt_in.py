@@ -41,8 +41,8 @@ def world(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
 
     monkeypatch.setattr(bu, "_real_profile_consented", lambda: True)
-    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override_raw", lambda: "")
-    monkeypatch.setattr("tools.browser_tool_cloud._get_cloud_provider", lambda: None)
+    monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override_raw", lambda: "")
+    monkeypatch.setattr("tools.browser_session_cloud.get_cloud_provider", lambda: None)
     monkeypatch.setattr("tools.browser_tool_real_profile._real_profile_cdp", real_profile_cdp)
     monkeypatch.setattr(bu, "_resolve_backend_cdp", backend)
     monkeypatch.setattr(bu, "_find_cli", lambda: ["browser-use"])

@@ -188,10 +188,11 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
 #     claude_code they are offered anyway and forwarded to the process that
 #     does, over the tool bridge (see AGENT_LOOP_TOOLS below); codex has no
 #     bridge wired, so there they are still withheld.
+#   - browser_exec on codex — it runs model-written Python on the Hermes host,
+#     outside codex's sandbox and approval UI (upstream e5710273103). Under
+#     claude_code it is Moe's browser and stays offered.
 EXPOSED_TOOLS: tuple[str, ...] = (
     "web_search", "web_extract",
-    "browser_navigate", "browser_click", "browser_type", "browser_press", "browser_snapshot", "browser_scroll",
-    "browser_back", "browser_get_images", "browser_console", "browser_vision",
     "vision_analyze", "image_generate", "skill_view", "skills_list", "text_to_speech",
     # Kanban handoff tools: stateless (read HERMES_KANBAN_TASK, write kanban.db).
     # Without them a codex-runtime worker can't report completion and hangs.
@@ -202,8 +203,10 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_create", "kanban_unblock", "kanban_link",
     # Moe's own clock: "check in on me in five minutes" is a cronjob. Upstream
     # 0.21 defers this tool by default, so it is named here to stay a direct
-    # tool of the child rather than a tool_search hop. Both names, one exists.
-    "cronjob", "cronjob_manage",
+    # tool of the child rather than a tool_search hop. Only ``cronjob_manage``
+    # registers (``cronjob`` is a dispatch alias, never offered), and upstream's
+    # test_every_exposed_tool_is_a_core_registered_tool refuses a dead name.
+    "cronjob_manage",
 )
 
 
@@ -225,6 +228,9 @@ CLAUDE_CODE_OS_TOOLS: tuple[str, ...] = (
     # the macOS-native backend).
     "computer_use",
 )
+#: Withheld from codex only: browser_exec runs model-written Python on the Hermes host, outside codex's
+#: sandbox and approval UI (upstream e5710273103). Under claude_code it is Moe's browser.
+CODEX_WITHHELD_TOOLS: tuple[str, ...] = ("browser_exec",)
 PROFILE_ENV = "HERMES_MCP_TOOL_PROFILE"
 SCRUB_ENV = "HERMES_MCP_SCRUB_ENV"
 CLAUDE_CODE_PROFILE = "claude-code"
@@ -359,7 +365,7 @@ def tools_to_offer(
     if key != CLAUDE_CODE_PROFILE:
         # codex brings its own shell and file tools; two of each confuses the
         # model and routes approval through the wrong UI.
-        blocked |= set(CLAUDE_CODE_OS_TOOLS)
+        blocked |= set(CLAUDE_CODE_OS_TOOLS) | set(CODEX_WITHHELD_TOOLS)
     lookup = toolset_of or _registry_toolset
     offered = []
     for n in sorted(available):

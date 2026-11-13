@@ -273,42 +273,38 @@ EXPECTED = {"code": "tcc_app_data", "owner": "app", "pane": "Privacy_AllFiles",
 def denied_chrome(darwin, tcc, tmp_path, monkeypatch):
     """Consented real-profile browsing whose Chrome dir is EPERM; nothing running, no cloud, no
     CDP override, and a browser-use CLI that must never run."""
-    import tools.browser_tool as bt
-    from tools import browser_tool_cloud as bt_cloud
+    from tools import browser_session as bs
+    from tools import browser_session_cloud as bt_cloud
     from tools import browser_tool_real_profile as bt_rp
-    from tools import browser_tool_session as bt_session
     from tools import browser_use_cli as bu_cli
     src = _profile(darwin / "Chrome")
     cli = tmp_path / "browser-use"
     cli.write_text("#!/bin/sh\necho SHOULD-NOT-RUN\n")
     cli.chmod(0o755)
-    monkeypatch.setattr(bt_cloud, "_use_real_profile", lambda: True)
-    monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+    monkeypatch.setattr(bt_cloud, "use_real_profile", lambda: True)
+    monkeypatch.setattr(bt_cloud, "get_cloud_provider", lambda: None)
     monkeypatch.setattr("hermes_cli.browser_connect.detect_default_chromium", lambda *a, **k: "chrome")
     monkeypatch.setattr("hermes_cli.browser_connect.real_profile_data_dir", lambda *a, **k: str(src))
-    monkeypatch.setattr(bt_rp, "_agent_browser_get_cdp", lambda *a, **k: None)
     monkeypatch.setattr(bt_rp, "_terminate_orphaned_browsers_on_dir", lambda *a, **k: None)
     monkeypatch.setattr(bt_rp, "_surviving_chrome_cdp", lambda *a, **k: None)
-    monkeypatch.setattr(bt_session, "_browser_command_preflight", lambda: {"browser_cmd": "agent-browser"})
-    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda *a, **k: "")
-    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override_raw", lambda *a, **k: "")
+    monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda *a, **k: "")
+    monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override_raw", lambda *a, **k: "")
     monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(cli)])
-    bt._real_profile_cdp_cache.clear()
+    bt_rp._real_profile_cdp_cache.clear()
     # A session another test file left cached (upstream's test_browser_vault does) would skip the
     # session creation whose failure this suite is about: start from none, put them back after.
-    saved_sessions = dict(bt._active_sessions)
-    bt._active_sessions.clear()
+    saved_sessions = dict(bs._active_sessions)
+    bs._active_sessions.clear()
     from tools.browser_supervisor import SUPERVISOR_REGISTRY  # ...and its CDP supervisors (console fast path)
     monkeypatch.setattr(SUPERVISOR_REGISTRY, "_by_task", {})
     tcc(src)
     yield src
-    bt._real_profile_cdp_cache.clear()
-    bt._active_sessions.clear()
-    bt._active_sessions.update(saved_sessions)
+    bt_rp._real_profile_cdp_cache.clear()
+    bs._active_sessions.clear()
+    bs._active_sessions.update(saved_sessions)
 
 
 def _via_registry(name, args):
-    import tools.browser_tool  # noqa: F401 — registers the browser tools
     import tools.browser_use_cli  # noqa: F401 — registers browser_exec
     from tools.registry import registry
     return registry.dispatch(name, args)
@@ -341,9 +337,16 @@ def _via_claude_code_bridge(name, args, monkeypatch):
     return out
 
 
-def _session_runner(mp):
-    from tools import browser_tool_session as bt_session
-    return json.dumps(bt_session._run_browser_command("t-route", "snapshot"))
+def _session_layer(mp):
+    """Upstream's session layer, which every local browser comes through (vault, handoff, a sidecar):
+    it refuses with the fix code, never a signed-out browser of its own accord (ask, then continue)."""
+    from tools import browser_session
+    from tools.fix_reasons import as_tool_error
+    try:
+        info = browser_session.get_session_info("t-route")
+    except Exception as e:  # the refusal is the result
+        return as_tool_error(e)
+    return json.dumps({"error": f"a session was created: {info}"})
 
 
 def _browser_exec(mp):
@@ -354,19 +357,8 @@ def _browser_exec(mp):
 ROUTES = {
     "browser_use_cli/browser_exec": _browser_exec,
     "registry/browser_exec": lambda mp: _via_registry("browser_exec", {"code": "print(1)"}),
-    "registry/browser_navigate": lambda mp: _via_registry("browser_navigate", {"url": "https://example.com/"}),
-    "registry/browser_console(expression)": lambda mp: _via_registry("browser_console", {"expression": "1+1"}),
-    "registry/browser_console": lambda mp: _via_registry("browser_console", {}),
-    "registry/browser_vision": lambda mp: _via_registry("browser_vision", {"question": "what is on it?"}),
-    "registry/browser_snapshot": lambda mp: _via_registry("browser_snapshot", {}),
-    "session/_run_browser_command": _session_runner,
+    "session/get_session_info": _session_layer,
     "claude-code-bridge/browser_exec": lambda mp: _via_claude_code_bridge("browser_exec", {"code": "print(1)"}, mp),
-    "claude-code-bridge/browser_navigate": lambda mp: _via_claude_code_bridge(
-        "browser_navigate", {"url": "https://example.com/"}, mp),
-    "claude-code-bridge/browser_console": lambda mp: _via_claude_code_bridge(
-        "browser_console", {"expression": "1+1"}, mp),
-    "claude-code-bridge/browser_vision": lambda mp: _via_claude_code_bridge(
-        "browser_vision", {"question": "what is on it?"}, mp),
 }
 
 

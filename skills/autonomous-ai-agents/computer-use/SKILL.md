@@ -158,9 +158,9 @@ Clicking is the LAST rung, not the first. In order:
    is five steps that can each go wrong: capture, find it, click to open,
    capture again because the menu did not exist a moment ago, click again.
 4. **A keyboard shortcut**, when the menu shows one.
-5. **The `browser_*` tools**, when the target is a web page. They drive a
-   browser of your own with exact refs and no screenshot, and they are the
-   same tools in the cloud. See the browser section below.
+5. **`browser_exec`**, when the target is a web page. It drives a browser of
+   your own over CDP with no screenshot needed, and it is the same tool in
+   the cloud. See the browser section below.
 6. **`click`**, by `element` index.
 7. **`click` by coordinate** — only for canvas/video/WebGL surfaces with no
    AX tree.
@@ -345,26 +345,18 @@ inferring support from the executable's reported version.
 
 ## A web page is not a screen task — use the browser tools
 
-`computer_use` drives the person's Mac. For a PAGE, Hermes has a separate set
-of tools — `browser_navigate`, `browser_snapshot`, `browser_click`,
-`browser_type`, `browser_press`, `browser_scroll`, `browser_back`,
-`browser_get_images`, `browser_vision`, `browser_console` — and they are the
-right rung for anything on the web.
+`computer_use` drives the person's Mac. For a PAGE, Hermes has a separate
+tool — `browser_exec` (Python CDP helpers) — and it is the right rung for
+anything on the web.
 
-They drive **a browser of your own**, not the person's: a headless Chromium
-the agent controls. So nothing appears on their screen, nothing takes focus,
-and their tabs, logins and session are untouched. `browser_snapshot` returns
-the page as a text outline with typed refs (`[ref=e1]`), and you click a ref —
-there is nothing to locate in a picture.
+It drives **a browser of your own**, not the person's: a Chromium the agent
+controls, out of sight. So nothing appears on their screen, nothing takes
+focus, and their tabs, logins and session are untouched. Its own schema
+documents the current contract.
 
 The other half of why this is the lane: **it is the same tool in the cloud**.
 Moe away from the Mac has this and not `computer_use`, so a habit built here
 keeps working there. One vocabulary, both runtimes.
-
-Measured on this Mac, a real article: `browser_snapshot` is ~3,956 tokens in
-3.8 s, against ~1,568 image tokens and ~2.2 s for a screenshot you then have
-to interpret. So it is not free — snapshot the page when you intend to ACT on
-it, not to browse.
 
 Use `computer_use` for the browser instead only when the target is not a page:
 the browser's own chrome and menus, a native download or permission dialog, an
@@ -560,7 +552,7 @@ before it.
 
 ## When NOT to use `computer_use`
 
-- **Web automation you can do via separate headless `browser_*` tools** — those use a
+- **Web automation you can do via the separate headless `browser_exec` tool** — it drives a
   real headless Chromium and are more reliable than driving the user's
   GUI browser. Reach for `computer_use` specifically when the task
   needs the user's actual native apps (Finder/Explorer/Files, Mail/

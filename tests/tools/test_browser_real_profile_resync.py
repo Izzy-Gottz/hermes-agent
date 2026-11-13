@@ -330,7 +330,7 @@ class TestAcquireNeverOverlaysALiveBrowser:
         cdp, err = self._run(tmp_path, extra_patches=[
             patch.object(bt_real_profile, "_browsers_on_data_dir", return_value=[self._live()]),
             patch.object(bt_real_profile, "_surviving_chrome_cdp", side_effect=lambda d: next(answers)),
-            patch.object(bt_real_profile, "_attach_agent_browser_to_real_profile", attach),
+            patch.object(bt_real_profile, "_attach_to_driven_browser", attach),
             patch("tools.browser_tool_fidelity.ensure_keeper", return_value=None),
             patch("hermes_cli.browser_connect.snapshot_real_profile", snapshot)])
         assert err is None and cdp == "http://127.0.0.1:41000"

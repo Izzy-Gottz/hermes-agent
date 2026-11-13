@@ -122,12 +122,12 @@ class TestWhatItSends:
 
 class TestConfig:
     def test_default_on(self):
-        with patch("tools.browser_tool._browser_cfg", side_effect=lambda key, default, parse, label: default):
+        with patch("tools.browser_session_cloud.browser_section", return_value={}):
             assert fid.fidelity_enabled() is True
 
     @pytest.mark.parametrize("raw", [False, "false", "off", 0, "no"])
     def test_off(self, raw):
-        with patch("tools.browser_tool._browser_cfg", side_effect=lambda key, default, parse, label: parse(raw)):
+        with patch("tools.browser_session_cloud.browser_section", return_value={"stealth_fidelity": raw}):
             assert fid.fidelity_enabled() is False
 
     def test_reads_the_real_config_file(self):
@@ -544,20 +544,27 @@ class TestDrivenBrowserLaunch:
         captured, _, _, _ = self._launch(tmp_path, enabled=False)
         assert captured["flags"] == list(rp._mock_keychain_flags())
 
-    def test_terminate_stops_the_keeper(self):
-        with patch.object(fid, "stop_keepers") as stop:
+    def test_terminate_stops_the_keeper(self, monkeypatch):
+        """Only this profile home's keeper: another profile's driven browser keeps its brands."""
+        from types import SimpleNamespace
+        mine = SimpleNamespace(pid=1, _hermes_home=rp._home(), _hermes_port=41000, poll=lambda: None)
+        theirs = SimpleNamespace(pid=2, _hermes_home="another-home", _hermes_port=42000, poll=lambda: None)
+        monkeypatch.setattr(rp, "_real_profile_chrome_procs", [mine, theirs])
+        monkeypatch.setattr("tools.browser_lightpanda._terminate", lambda proc, what="": None)
+        with patch.object(fid, "stop_keeper") as stop:
             rp._terminate_real_profile_chrome()
-        stop.assert_called_once()
+        stop.assert_called_once_with(41000)
+        assert rp._real_profile_chrome_procs == [theirs]
 
     def test_a_cache_hit_still_checks_the_keeper(self):
-        import tools.browser_tool as bt
-        from tools import browser_tool_cloud as bt_cloud
+        import tools.browser_tool_real_profile as bt
+        from tools import browser_session_cloud as bt_cloud
         bt._real_profile_cdp_cache["cdp"] = "http://127.0.0.1:41000"
         try:
-            with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
-                 patch.object(rp._lp, "_using_lightpanda_engine", return_value=False), \
+            with patch.object(bt_cloud, "use_real_profile", return_value=True), \
+                 patch.object(rp, "_using_lightpanda_engine", return_value=False), \
                  patch.object(rp, "_cdp_http_ready", return_value=True), \
-                 patch.object(rp._session, "_prepare_session_socket_dir"), \
+                 patch.object(rp, "_refresh_jar_if_due", return_value=None), \
                  patch.object(fid, "ensure_keeper") as keeper:
                 assert rp._real_profile_cdp() == ("http://127.0.0.1:41000", None)
             assert keeper.call_args[0][0] == 41000 and callable(keeper.call_args[0][1])
@@ -567,9 +574,16 @@ class TestDrivenBrowserLaunch:
     def test_every_tab_hermes_opens_starts_blank(self):
         """The pause holds the renderer, not a navigation already under way, so a tab created at a
         URL sends its first request before the brands are set. The attach opens about:blank."""
-        import inspect
-        src = inspect.getsource(rp._attach_agent_browser_to_real_profile)
-        assert '"open", "about:blank"' in src
+        calls = []
+
+        def cdp(port, method, params=None, timeout=20.0):
+            calls.append((method, params))
+            return {"targetInfos": []} if method == "Target.getTargets" else {}
+        with patch.object(rp, "_cdp_http_ready", return_value=True), \
+             patch.object(rp, "_cdp_on_data_dir", return_value=True), \
+             patch.object(rp, "_cdp_call", side_effect=cdp):
+            assert rp._attach_to_driven_browser(41000, "/copy") == ("http://127.0.0.1:41000", None)
+        assert ("Target.createTarget", {"url": "about:blank"}) in calls
 
 
 # ---------------------------------------------------------------------------
