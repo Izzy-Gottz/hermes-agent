@@ -873,7 +873,15 @@ def enforce_kept_limits() -> str:
         port = int(str(cdp).rsplit(":", 1)[1]) if cdp else None
     except (ValueError, IndexError):
         port = None
-    return _limits.enforce(port, release_now)
+    return _limits.enforce(port, release_now, data_dir=_kept_dir())
+
+
+def _kept_dir() -> Optional[str]:
+    try:
+        from hermes_cli.browser_connect import real_profile_copy_dir
+        return real_profile_copy_dir(KEPT)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -904,10 +912,14 @@ def _attach_agent_browser_to_real_profile(port: int, copy_dir: str) -> tuple[Opt
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()
         return None, f"{_RP}the real-profile browser failed to start: {tail[-1] if tail else f'exit {proc.returncode}'}"
-    cdp = _agent_browser_get_cdp(_bt._REAL_PROFILE_SESSION)
     our_port = _read_devtools_port(copy_dir)
-    if our_port is not None and (m := re.search(r":(\d+)", cdp or "")) and m.group(1) != our_port:
-        cdp = f"http://127.0.0.1:{our_port}"
+    if our_port is not None:
+        # (fork) OUR browser's DevToolsActivePort is authoritative, so the daemon is not asked. Asking
+        # it (`get cdp-url`) after an attach made agent-browser 0.26 launch a SECOND, throwaway Chrome
+        # beside ours and keep it for the life of the daemon -- measured in the away image: two
+        # browser trees for one lane, the second signed in as nobody and driven by nothing.
+        return f"http://127.0.0.1:{our_port}", None
+    cdp = _agent_browser_get_cdp(_bt._REAL_PROFILE_SESSION)
     if not cdp:
         return None, _RP + "the real-profile browser started without exposing a devtools endpoint. Retry, or turn the toggle off."
     return cdp, None
@@ -1092,6 +1104,7 @@ def _launch_kept(copy_dir: str) -> tuple:
         _terminate_real_profile_chrome()
         return None, err
     _bt._real_profile_cdp_cache["cdp"] = cdp
+    _limits.mark_tree(copy_dir)  # (fork) again: Chromium resets its main process after start-up
     _bt.logger.info("real-profile: kept browser profile ready at %s (%s)", cdp, copy_dir)
     return cdp, None
 

@@ -120,3 +120,45 @@ def test_every_launch_of_the_kept_browser_is_marked(cloud_lane, monkeypatch, tmp
     proc, port, err = rp._spawn_browser_on_copy("/bin/chrome", str(tmp_path), (), "browser", headless=True)
     assert (port, err) == (9222, None) and marked == [31337]
     rp._origin()._real_profile_chrome_procs.remove(proc)
+
+
+def _fake_proc(root, pid, ppid, argv, adj="0"):
+    d = root / str(pid)
+    d.mkdir()
+    (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+    (d / "stat").write_text(f"{pid} (chrome) S {ppid} 1 1 0")
+    (d / "oom_score_adj").write_text(adj)
+
+
+def test_the_whole_browser_tree_is_raised_and_nothing_else(cloud_lane, tmp_path):
+    kept = "/data/browser-profile/kept"
+    _fake_proc(tmp_path, 10, 1, ["/chrome", f"--user-data-dir={kept}"])          # main, reset to 0
+    _fake_proc(tmp_path, 11, 10, ["/chrome", "--type=zygote"])                    # no data dir on its line
+    _fake_proc(tmp_path, 12, 11, ["/chrome", "--type=renderer"], adj="300")
+    _fake_proc(tmp_path, 13, 10, ["/chrome", "--type=utility"], adj="1000")       # already there
+    _fake_proc(tmp_path, 20, 1, ["/usr/bin/python", "hermes", "gateway"])          # the gateway
+    _fake_proc(tmp_path, 30, 1, ["/chrome", "--user-data-dir=/tmp/other"])         # not ours
+    assert kl.mark_tree(kept, proc_root=str(tmp_path)) == 3
+    assert [(tmp_path / p / "oom_score_adj").read_text() for p in ("10", "11", "12", "13")] == ["1000"] * 4
+    assert (tmp_path / "20" / "oom_score_adj").read_text() == "0"
+    assert (tmp_path / "30" / "oom_score_adj").read_text() == "0"
+
+
+def test_every_tick_re_marks_the_tree(cloud_lane):
+    seen = []
+    kl.enforce(9222, lambda: None, available=lambda: 5000, trim=lambda *a: 0,
+               data_dir="/kept", mark=lambda d: seen.append(d) or 0)
+    assert seen == ["/kept"]
+
+
+def test_attach_trusts_our_devtools_port_and_never_asks_the_daemon(monkeypatch, tmp_path):
+    # Asking agent-browser for `cdp-url` after an attach launched a second, throwaway Chrome.
+    (tmp_path / "DevToolsActivePort").write_text("41234\n/devtools/browser/x\n")
+
+    class Done:
+        returncode, stdout, stderr = 0, "ok", ""
+
+    monkeypatch.setattr(rp._install, "_find_agent_browser", lambda: "/bin/agent-browser")
+    monkeypatch.setattr(rp, "_capture_agent_browser_cli", lambda argv, timeout, tag: Done())
+    monkeypatch.setattr(rp, "_agent_browser_get_cdp", lambda s: pytest.fail("asked the daemon for cdp-url"))
+    assert rp._attach_agent_browser_to_real_profile(41234, str(tmp_path)) == ("http://127.0.0.1:41234", None)

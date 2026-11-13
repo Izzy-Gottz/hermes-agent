@@ -95,6 +95,57 @@ def mark_expendable(pid: int, proc_root: str = "/proc") -> bool:
         return False
 
 
+def _tree(data_dir: str, proc_root: str) -> List[int]:
+    """Every process of the browser bound to ``data_dir``: the ones whose command line names it,
+    and everything descended from them (Chromium's zygotes and renderers do not repeat it)."""
+    want = f"--user-data-dir={data_dir}".encode()
+    parent = {}
+    roots = []
+    for entry in os.listdir(proc_root):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_root, entry, "cmdline"), "rb") as fh:
+                argv = fh.read().split(b"\0")
+            with open(os.path.join(proc_root, entry, "stat"), "rb") as fh:
+                stat = fh.read()
+            parent[int(entry)] = int(stat[stat.rindex(b")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        if want in argv:
+            roots.append(int(entry))
+    found, frontier = set(roots), list(roots)
+    while frontier:
+        pid = frontier.pop()
+        for child, ppid in parent.items():
+            if ppid == pid and child not in found:
+                found.add(child)
+                frontier.append(child)
+    return sorted(found)
+
+
+def mark_tree(data_dir: Optional[str], proc_root: str = "/proc") -> int:
+    """Raise every process of the kept browser to :data:`OOM_SCORE_ADJ`. Chromium resets its main
+    process after start-up (measured: written 1000 at spawn, read back 0 once the browser was
+    attached), so this runs again after the attach and on every cleanup tick. Returns how many
+    were raised."""
+    if not active() or not data_dir:
+        return 0
+    raised = 0
+    for pid in _tree(data_dir, proc_root):
+        path = os.path.join(proc_root, str(pid), "oom_score_adj")
+        try:
+            with open(path) as fh:
+                if int(fh.read().strip() or 0) >= OOM_SCORE_ADJ:
+                    continue
+            with open(path, "w") as fh:
+                fh.write(str(OOM_SCORE_ADJ))
+            raised += 1
+        except (OSError, ValueError):
+            continue
+    return raised
+
+
 def mem_available_mb(meminfo: str = "/proc/meminfo") -> Optional[int]:
     try:
         with open(meminfo, encoding="ascii") as fh:
@@ -141,11 +192,14 @@ def trim_tabs(port: int, keep: int, *, pages: Callable[[int], List[dict]] = _pag
 
 def enforce(port: Optional[int], release: Callable[[], None], *,
             available: Callable[[], Optional[int]] = mem_available_mb,
-            trim: Callable[[int, int], int] = trim_tabs) -> str:
-    """One cleanup tick on the kept lane: cap the tabs, then hold the memory floor.
-    Returns what it did (``""``, ``"trimmed"``, ``"released"``) for the log and the tests."""
+            trim: Callable[[int, int], int] = trim_tabs, data_dir: Optional[str] = None,
+            mark: Callable[[Optional[str]], int] = mark_tree) -> str:
+    """One cleanup tick on the kept lane: keep the browser the OOM killer's first choice, cap the
+    tabs, then hold the memory floor. Returns what it did (``""``, ``"trimmed"``, ``"released"``)
+    for the log and the tests."""
     if not active() or port is None:
         return ""
+    mark(data_dir)
     did = ""
     cap = max_tabs()
     if cap and trim(port, cap):
