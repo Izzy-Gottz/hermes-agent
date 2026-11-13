@@ -2288,12 +2288,50 @@ def _run_doc_header(job: dict, title: str, job_id: str, prompt: str, *, prompt_s
 _RunResult = tuple[bool, str, str, Optional[str]]
 
 
+def _pre_cron_run_skip(job: dict, job_id: str, job_name: str) -> Optional[_RunResult]:
+    """The ``pre_cron_run`` plugin hook: may another host already have this occurrence?
+
+    Two hosts can hold the same job — a laptop and an always-on machine — and a file lock on one
+    volume cannot arbitrate between them, so a plugin may ask its own arbiter and answer
+    ``{"action": "skip", "reason": ...}``. Fail-open by construction: no plugin, no answer, an
+    exception or a timeout all run the job, because a lost reminder is worse than a repeated one.
+    A skip ends the fire silent (nothing delivered) and is counted as skipped, like the wake gate.
+    """
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+
+        if not has_hook("pre_cron_run"):
+            return None
+        answers = invoke_hook("pre_cron_run", job=dict(job), job_id=job_id, job_name=job_name)
+    except Exception:  # noqa: BLE001 — a broken plugin never stops a job
+        logger.warning("Job '%s': pre_cron_run hook failed; running it", job_id, exc_info=True)
+        return None
+    for answer in answers or ():
+        if isinstance(answer, dict) and answer.get("action") == "skip":
+            reason = str(answer.get("reason") or "another host has this run").strip()[:300]
+            logger.info("Job '%s' (ID: %s): skipped by pre_cron_run — %s", job_name, job_id, reason)
+            note_cron_skipped(job)
+            doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"Not run here: {reason}\n"
+            )
+            return True, doc, SILENT_MARKER, None
+    return None
+
+
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
-    result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
-    injection block, empty prompt); otherwise ``prompt`` is set."""
+    result short-circuits ``run_job`` (pre_cron_run skip, no_agent job, empty payload, monitor gate,
+    wake gate, injection block, empty prompt); otherwise ``prompt`` is set."""
+    # First of all: is this occurrence even this host's? Asked before the config check, the
+    # no_agent branch and every script, so a skipped run costs nothing and touches nothing.
+    _skipped = _pre_cron_run_skip(job, job_id, job_name)
+    if _skipped is not None:
+        return _skipped, None
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):

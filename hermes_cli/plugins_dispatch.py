@@ -49,6 +49,9 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "pre_command",
     # Fires inside the compression commit window (lease held): a hung plugin must not wedge the session.
     "post_compaction",
+    # Asked before every cron fire (cron/scheduler.py): a hung claim must not stall the scheduler,
+    # and a timeout runs the job (fail-open), never loses it.
+    "pre_cron_run",
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.
