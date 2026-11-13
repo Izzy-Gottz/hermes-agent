@@ -50,6 +50,9 @@ _api_request_browser_control_principal: ContextVar[str] = ContextVar(
 #: X-Hermes-Turn-Origin for this request ("person" | "background" | ""), bound for the agent's turn.
 _api_request_turn_origin: ContextVar[str] = ContextVar("api_server_turn_origin", default="")
 _TURN_ORIGIN_HEADER = "X-Hermes-Turn-Origin"
+#: X-Hermes-No-Memory: "1" when nothing of this turn may be remembered (see session_context).
+_api_request_no_memory: ContextVar[bool] = ContextVar("api_server_no_memory", default=False)
+_NO_MEMORY_HEADER = "X-Hermes-No-Memory"
 #: X-Hermes-Person-Words: the person's own words for this turn, base64 of their UTF-8 — apart from
 #: everything the client wraps around them (the Now line, a digest of other people's messages, a
 #: recap with the assistant's own lines). Only a "person" turn's are kept; ``None`` = undeclared.
@@ -1843,9 +1846,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     voice_token = _api_request_voice_turn.set(
                         raw_origin == "person"
                         and request.headers.get(_VOICE_TURN_HEADER, "").strip().lower() in ("1", "true", "yes"))
+                    no_memory_token = _api_request_no_memory.set(
+                        request.headers.get(_NO_MEMORY_HEADER, "").strip().lower() in ("1", "true", "yes"))
                     try:
                         return await handler(request)
                     finally:
+                        _api_request_no_memory.reset(no_memory_token)
                         _api_request_voice_turn.reset(voice_token)
                         _api_request_person_words.reset(words_token)
                         _api_request_turn_origin.reset(origin_token)
@@ -4435,13 +4441,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         request_turn_origin = _api_request_turn_origin.get()
         request_person_words = _api_request_person_words.get()
         request_voice_turn = _api_request_voice_turn.get()
+        request_no_memory = _api_request_no_memory.get()
         # When this gateway took the turn, for the runtime's one timing line (what happens between
         # here and the model having the prompt was, until then, not itemised anywhere).
         request_received_at = time.perf_counter()
 
         def _run():
             from gateway.session_context import (
-                reset_turn_origin, reset_turn_person_words, set_turn_origin, set_turn_person_words,
+                reset_turn_no_memory, reset_turn_origin, reset_turn_person_words, set_turn_no_memory,
+                set_turn_origin, set_turn_person_words,
             )
             # The client's own declaration of who started this turn (X-Hermes-Turn-Origin): the
             # Chrome-extension browser lane acts on the person's screen only in a "person" turn.
@@ -4449,9 +4457,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             origin_token = set_turn_origin(request_turn_origin)
             # …and of what the person said (X-Hermes-Person-Words), for recipient grounding.
             words_token = set_turn_person_words(request_person_words)
+            # …and whether any of it may be remembered (X-Hermes-No-Memory).
+            no_memory_token = set_turn_no_memory(request_no_memory)
             try:
                 return _run_bound()
             finally:
+                reset_turn_no_memory(no_memory_token)
                 reset_turn_person_words(words_token)
                 reset_turn_origin(origin_token)
 

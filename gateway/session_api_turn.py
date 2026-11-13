@@ -92,7 +92,9 @@ def _request_browser_control():
 
 
 def _valid_turn_signals(value):
-    if not isinstance(value, dict) or not value or set(value) - {'origin', 'person_words', 'voice'}:
+    if not isinstance(value, dict) or not value or set(value) - {'origin', 'person_words', 'voice', 'no_memory'}:
+        return False
+    if 'no_memory' in value and value['no_memory'] is not True:
         return False
     if value.get('origin') not in ('person', 'background'):
         return False
@@ -109,11 +111,14 @@ def _request_turn_signals():
     not live, recipient grounding finds no person words, the claimstore learns nothing from it and
     a spoken turn opens at the chat's full effort. Words and voice only ride a person's turn."""
     from gateway.platforms.api_server import (
-        _api_request_person_words, _api_request_turn_origin, _api_request_voice_turn)
+        _api_request_no_memory, _api_request_person_words, _api_request_turn_origin, _api_request_voice_turn)
     origin = _api_request_turn_origin.get()
+    no_memory = _api_request_no_memory.get() is True
     if origin not in ('person', 'background'):
         return None
     signals = {'origin': origin}
+    if no_memory:
+        signals['no_memory'] = True
     words = _api_request_person_words.get()
     if origin == 'person' and isinstance(words, str):
         signals['person_words'] = words
@@ -126,14 +131,17 @@ def bind_api_turn_signals(prepared):
     """Bind an executing API admission's declared origin and person words for the turn; returns
     the tokens for ``reset_api_turn_signals``. Bound for every API turn (``""``/``None`` when
     nothing was declared) so an executor never inherits an earlier turn's "person"."""
-    from gateway.session_context import set_turn_origin, set_turn_person_words
+    from gateway.session_context import set_turn_no_memory, set_turn_origin, set_turn_person_words
     signals = (prepared or {}).get('turn_signals') or {}
-    return (set_turn_origin(signals.get('origin') or ''), set_turn_person_words(signals.get('person_words')))
+    return (set_turn_origin(signals.get('origin') or ''), set_turn_person_words(signals.get('person_words')),
+            set_turn_no_memory(signals.get('no_memory') is True))
 
 
 def reset_api_turn_signals(tokens):
-    from gateway.session_context import reset_turn_origin, reset_turn_person_words
+    from gateway.session_context import reset_turn_no_memory, reset_turn_origin, reset_turn_person_words
     if tokens:
+        if len(tokens) > 2:
+            reset_turn_no_memory(tokens[2])
         reset_turn_person_words(tokens[1])
         reset_turn_origin(tokens[0])
 

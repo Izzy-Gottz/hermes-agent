@@ -227,6 +227,9 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
     aliases ``content``."""
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+    refusal = _no_memory_refusal(action, operations)
+    if refusal is not None:
+        return refusal
     token = FAILURE_CLASS.set("other")
     try:
         outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, store)
@@ -236,6 +239,24 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
     from hermes_cli.observability.shared_metrics_loop import record_builtin_memory_call
     record_builtin_memory_call(action, operations, outcome=outcome, failure_class=failure_class)
     return result
+
+
+#: The memory tool's words when the turn may not be remembered (X-Hermes-No-Memory).
+NO_MEMORY_REFUSAL = ("The person asked for this chat not to be remembered, so nothing from it can be "
+                     "saved to memory. Carry on without saving; do not say you saved anything.")
+
+
+def _no_memory_refusal(action, operations) -> Optional[str]:
+    """A refusal when this turn may not be remembered and the call would write; ``None`` otherwise.
+    Every action of this tool writes (add/replace/remove, or a batch of them), so any call is
+    refused — reading memory is the prompt's, not this tool's."""
+    try:
+        from gateway.session_context import get_turn_no_memory
+    except Exception:  # noqa: BLE001 — no gateway (a CLI run): nothing declared
+        return None
+    if not get_turn_no_memory():
+        return None
+    return tool_error(NO_MEMORY_REFUSAL, success=False)
 
 
 def _applied(result: dict[str, Any]) -> tuple[str, str]:

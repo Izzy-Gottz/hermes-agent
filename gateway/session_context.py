@@ -92,6 +92,28 @@ def get_turn_person_words():
     return None if value is _UNSET else str(value)
 
 
+# Whether THIS turn may be remembered, as its client declared it (api_server, from
+# X-Hermes-No-Memory): a chat the person asked not to be remembered (Memoe's "Don't remember this
+# chat"). Read by the built-in memory tool (it refuses to write), by the post-turn background review
+# (not spawned), and by memory providers' turn learning (claimstore and moe-ledger skip it). Recall
+# is untouched: the person asked for nothing to be kept, not for Moe to forget what it knows.
+_TURN_NO_MEMORY = ContextVar("HERMES_TURN_NO_MEMORY", default=False)
+
+
+def set_turn_no_memory(no_memory: bool):
+    """Bind whether this turn may be remembered; returns the token for ``reset_turn_no_memory``."""
+    return _TURN_NO_MEMORY.set(no_memory is True)
+
+
+def reset_turn_no_memory(token) -> None:
+    _TURN_NO_MEMORY.reset(token)
+
+
+def get_turn_no_memory() -> bool:
+    """True when the client declared this turn not to be remembered."""
+    return _TURN_NO_MEMORY.get() is True
+
+
 _TURN_STARTED_AT = ContextVar("HERMES_TURN_STARTED_AT", default=_UNSET)
 
 

@@ -771,6 +771,12 @@ class AIAgent(
         # marketing job, retired after 120 s of silence or failed, ~2 min each).
         if focus is None and not explicit and getattr(self, "skip_background_review", False) is True:
             return
+        # A turn the person asked not to be remembered (X-Hermes-No-Memory) gets no review: the
+        # review's whole point is to keep something of it, in memory or as a skill.
+        if focus is None and not explicit:
+            from gateway.session_context import get_turn_no_memory
+            if get_turn_no_memory():
+                return
         task_cfg = None
         if focus is None:
             from agent.background_review import load_background_review_settings
