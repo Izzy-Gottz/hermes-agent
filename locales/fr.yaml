@@ -1009,7 +1009,7 @@ gateway:
   shutdown:
     action_shutting_down: "en cours d'arrêt"
     action_restarting: "en cours de redémarrage"
-    cron_interrupted: "⚠️ La tâche planifiée '{job}' a été interrompue car Hermes est {action} ; aucun résultat pour cette exécution. Elle se relancera selon son planning, ou lancez-la maintenant avec `hermes cron run {job}` une fois Hermes de retour."
+    cron_interrupted: "« {job} » a été interrompue cette fois, il n'y a donc pas de résultat. Elle se relancera à sa prochaine heure prévue."
     notice_shutdown: "⚠️ Hermes s'arrête — votre tâche en cours va être interrompue. Une fois de retour en ligne, envoyez n'importe quel message et j'essaierai de reprendre là où nous en étions."
     notice_restart: "⚠️ Hermes redémarre — votre tâche en cours va être interrompue. Envoyez n'importe quel message après le redémarrage et j'essaierai de reprendre là où vous en étiez."
   startup:

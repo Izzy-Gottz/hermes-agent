@@ -853,7 +853,7 @@ gateway:
   shutdown:
     action_shutting_down: "正在关闭"
     action_restarting: "正在重启"
-    cron_interrupted: "⚠️ 定时任务 '{job}' 因 Hermes {action}而被中断；本次运行没有结果。它会按计划再次运行，或在 Hermes 恢复后用 `hermes cron run {job}` 立即运行。"
+    cron_interrupted: "“{job}”这次被中断了，所以没有结果。它会在下一个计划时间再次运行。"
     notice_shutdown: "⚠️ Hermes 正在关闭——你当前的任务将被中断。恢复上线后，发送任意消息，我会尝试从中断处继续。"
     notice_restart: "⚠️ Hermes 正在重启——你当前的任务将被中断。重启后发送任意消息，我会尝试从你离开的地方继续。"
   startup:

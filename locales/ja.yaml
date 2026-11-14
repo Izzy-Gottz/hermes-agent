@@ -853,7 +853,7 @@ gateway:
   shutdown:
     action_shutting_down: "シャットダウン中"
     action_restarting: "再起動中"
-    cron_interrupted: "⚠️ Hermes が{action}のため、スケジュールジョブ '{job}' は途中で打ち切られました。今回の実行結果はありません。次回のスケジュールで再実行されます。Hermes の復帰後に `hermes cron run {job}` で今すぐ実行することもできます。"
+    cron_interrupted: "今回「{job}」は途中で中断されたため、結果はありません。次の予定時刻にもう一度実行されます。"
     notice_shutdown: "⚠️ Hermes はシャットダウン中です — 現在のタスクは中断されます。オンラインに戻ったら何かメッセージを送ってください。中断したところから再開を試みます。"
     notice_restart: "⚠️ Hermes は再起動中です — 現在のタスクは中断されます。再起動後に何かメッセージを送ってください。中断したところから再開を試みます。"
   startup:
