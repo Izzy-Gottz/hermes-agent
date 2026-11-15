@@ -39,11 +39,22 @@ def relay_passthrough_event(transport, forward, event):
 def _relay_connector(adapter, source):
     from gateway.relay.ws_transport import WebSocketRelayTransport
     transport = getattr(adapter, '_transport', None)
-    if (not isinstance(transport, WebSocketRelayTransport)
-            or not transport._gateway_id or not transport._upgrade_secret
+    if not isinstance(transport, WebSocketRelayTransport):
+        raise RuntimeStoreError('permission_denied')
+    # A "raw" upgrade presents the secret itself, so the secret alone authenticates the socket;
+    # a signed token is minted from (gateway_id, secret) and authenticates nothing without both.
+    authenticated = bool(transport._upgrade_secret) and (
+        bool(transport._gateway_id) or transport._upgrade_auth_mode == 'raw')
+    # The catch-all connector (Memoe: one generic ``relay`` hello, no GATEWAY_RELAY_PLATFORMS)
+    # delivers every channel over that one socket; its generic identity fronts them all. A socket
+    # that hello'd named platforms still fronts only those.
+    platform = source.platform.value
+    if transport._bot_id_for(platform) is None and [p for p, _ in transport._identities] == ['relay']:
+        platform = 'relay'
+    if (not authenticated
             or transport.auth_revoked or transport._closing or transport._ws is None
-            or transport.descriptor_for_platform(source.platform.value) is None
-            or transport._bot_id_for(source.platform.value) is None):
+            or transport.descriptor_for_platform(platform) is None
+            or transport._bot_id_for(platform) is None):
         raise RuntimeStoreError('permission_denied')
     identity = json.dumps([transport._url, transport._gateway_id, transport._identities],
                           sort_keys=True, separators=(',', ':'))
