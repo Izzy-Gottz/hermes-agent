@@ -1186,11 +1186,20 @@ def _launch_kept(copy_dir: str) -> tuple:
     """Cold start of the kept profile: the driven browser on ``copy_dir`` as it was left -- no
     snapshot, no hand-over, no cookie import. Created owner-only on first use. ``(cdp, error)``."""
     _bt = _origin()
-    try:
-        os.makedirs(copy_dir, mode=0o700, exist_ok=True)
-        os.chmod(copy_dir, 0o700)
-    except OSError as e:
-        return None, f"{_RP}the kept browser profile {copy_dir} could not be created: {e}"
+    from tools.environments import run_as
+    if run_as.browser_user():
+        # (fork) terminal.browser_run_as_user: the profile belongs to the browser's uid, laid down by
+        # the host (Memoe's boot.sh: browser:hermes 2770), and Chromium sets its own modes inside it.
+        # This uid may not chmod it, and one it created here would be its own, unwritable to the browser.
+        if not os.path.isdir(copy_dir):
+            return None, (f"{_RP}the kept browser profile {copy_dir} does not exist, and under a "
+                          "separate browser uid the host must create it")
+    else:
+        try:
+            os.makedirs(copy_dir, mode=0o700, exist_ok=True)
+            os.chmod(copy_dir, 0o700)
+        except OSError as e:
+            return None, f"{_RP}the kept browser profile {copy_dir} could not be created: {e}"
     driven = driven_browser_executable()
     if driven is None and _maybe_autoinstall_chromium():
         driven = driven_browser_executable()

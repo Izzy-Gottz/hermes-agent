@@ -440,3 +440,32 @@ def test_no_port_hook_when_the_browser_is_the_gateways(tmp_path, monkeypatch):
     assert ran == []
     monkeypatch.delenv("TERMINAL_BROWSER_PORT_HOOK")
     assert ra.allow_browser_port(9333) is False
+
+
+def test_the_kept_profile_is_not_chmodded_when_it_is_the_browser_uids(tmp_path, monkeypatch):
+    """Under browser_run_as_user the kept profile belongs to the browser's uid; the gateway may not
+    chmod it (EPERM on the live machine), and must not need to. Red on revert: the chmod raises."""
+    from tools import browser_tool_real_profile as rp
+
+    monkeypatch.setenv("TERMINAL_BROWSER_RUN_AS_USER", "browser")
+    kept = tmp_path / "kept"
+    kept.mkdir()
+
+    def refused(*_a, **_k):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(rp.os, "chmod", refused)
+    monkeypatch.setattr(rp, "driven_browser_executable", lambda: None)
+    monkeypatch.setattr(rp, "_maybe_autoinstall_chromium", lambda: False)
+    monkeypatch.setattr(rp, "_browser_pending", lambda: False)
+    cdp, err = rp._launch_kept(str(kept))
+    assert cdp is None and "could not be created" not in err and "not installed" in err
+
+
+def test_a_missing_kept_profile_is_not_made_by_the_gateway_under_a_browser_uid(tmp_path, monkeypatch):
+    from tools import browser_tool_real_profile as rp
+
+    monkeypatch.setenv("TERMINAL_BROWSER_RUN_AS_USER", "browser")
+    kept = tmp_path / "kept"
+    cdp, err = rp._launch_kept(str(kept))
+    assert cdp is None and "host must create it" in err and not kept.exists()
