@@ -181,3 +181,90 @@ def within(path: str, root: str) -> bool:
     except OSError:
         return False
     return real == base or real.startswith(base.rstrip("/") + "/")
+
+
+# ---------------------------------------------------------------------------
+# The driven browser as its own uid: ``terminal.browser_run_as_user``
+# ---------------------------------------------------------------------------
+# Off by default. When set (Memoe's cloud machine sets ``browser``), Chromium is launched as that uid,
+# which owns only the browser profile: the shell's uid reaches it only through the CDP port, and a
+# page, a download or a CDP file upload it is steered into cannot read the gateway's files, because
+# the browser's uid cannot either. Chromium chmods its profile to 0600/0700 itself (measured), so the
+# profile is the browser uid's alone; the gateway reads only what Chromium leaves group-readable
+# (DevToolsActivePort, 0660) and signals the browser AS that uid.
+
+def browser_user() -> str:
+    from tools.terminal_scope import terminal_env
+    return (terminal_env("TERMINAL_BROWSER_RUN_AS_USER", "") or "").strip()
+
+
+def resolve_browser() -> Optional[Target]:
+    """The browser's target, or None when off. Raises :class:`RunAsUnavailable` when set and unusable."""
+    name = browser_user()
+    return resolve(name) if name else None
+
+
+def allow_browser_port(port: int) -> bool:
+    """Run ``terminal.browser_port_hook`` (argv; the port appended) once the browser's debug port is
+    known. Memoe's cloud machine points it at a root-owned helper that opens that one loopback port
+    to the shell's uid, after checking the listener is the browser's uid; everything else the shell
+    sends is dropped (deploy/away/boot.sh). Unset: nothing runs. A failing hook leaves the port
+    closed, so browser_exec then fails, which is the closed side to fail on. Never raises."""
+    import shlex
+    from tools.terminal_scope import terminal_env
+    hook = (terminal_env("TERMINAL_BROWSER_PORT_HOOK", "") or "").strip()
+    if not hook:
+        return False
+    try:
+        r = subprocess.run([*shlex.split(hook), str(int(port))], capture_output=True, text=True,
+                           timeout=15, stdin=subprocess.DEVNULL, cwd="/")
+    except Exception as exc:
+        logger.warning("browser port hook could not run: %s", exc)
+        return False
+    if r.returncode != 0:
+        logger.warning("browser port hook refused port %s (exit %s): %s", port, r.returncode,
+                       (r.stderr or "").strip()[:200])
+    return r.returncode == 0
+
+
+_BROWSER_SHIM = 'umask 007; [ -n "$MOE_OOM" ] && echo "$MOE_OOM" > /proc/self/oom_score_adj 2>/dev/null; exec "$@"'
+
+
+def browser_argv(target: Target, chromium: Sequence[str], env: Mapping[str, str], oom: Optional[int] = None) -> list:
+    """``sudo -n -u <browser> -- env -i … sh -c <shim> sh <chromium argv>``. The shim sets umask 007
+    (DevToolsActivePort stays readable to the gateway's group) and, for the kept lane, raises its OWN
+    oom_score_adj before exec, which the gateway can no longer write for another uid; every process
+    Chromium forks inherits it."""
+    child = clean_env(target, base=env)
+    for k in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"):
+        if env.get(k):
+            child[k] = env[k]
+    if oom is not None:
+        child["MOE_OOM"] = str(int(oom))
+    return argv(target, ["/bin/sh", "-c", _BROWSER_SHIM, "sh", *chromium], child)
+
+
+def signal_pids(target: Target, pids: Iterable[int], sig: int = signal.SIGTERM) -> bool:
+    """Signal each pid AS the target (``kill -s SIG -- pid…``). Never raises."""
+    pids = [int(p) for p in pids if p and int(p) > 1]
+    if not pids:
+        return False
+    try:
+        name = signal.Signals(sig).name.removeprefix("SIG")
+        return run(target, [KILL_BIN, "-s", name, "--", *map(str, pids)], timeout=5).returncode == 0
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug("run_as signal_pids(%s) failed: %s", pids, exc)
+        return False
+
+
+def raise_oom(target: Target, pids: Iterable[int], value: int) -> int:
+    """Write ``value`` to each pid's oom_score_adj AS the target (its own processes). Returns how many."""
+    pids = [int(p) for p in pids if p and int(p) > 1]
+    if not pids:
+        return 0
+    script = 'v=$1; shift; n=0; for p; do echo "$v" > /proc/$p/oom_score_adj 2>/dev/null && n=$((n+1)); done; echo $n'
+    try:
+        r = run(target, ["/bin/sh", "-c", script, "sh", str(int(value)), *map(str, pids)], timeout=5)
+        return int((r.stdout or "0").strip() or 0)
+    except Exception:  # pragma: no cover - best effort
+        return 0

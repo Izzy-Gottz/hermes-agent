@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -185,7 +186,7 @@ def _terminate_real_profile_chrome() -> None:
             _bt._real_profile_chrome_procs.remove(proc)
         except ValueError:
             continue
-        _terminate(proc, what="real-profile chrome")
+        _stop(proc, "real-profile chrome")
 
 
 def terminate_all_real_profile_chrome() -> None:
@@ -194,7 +195,7 @@ def terminate_all_real_profile_chrome() -> None:
     _bt = _origin()
     _fidelity.stop_keepers()
     while _bt._real_profile_chrome_procs:
-        _terminate(_bt._real_profile_chrome_procs.pop(), what="real-profile chrome")
+        _stop(_bt._real_profile_chrome_procs.pop(), "real-profile chrome")
     dict.clear(_bt._real_profile_cdp_cache)
 
 
@@ -406,15 +407,26 @@ def driven_browser_executable() -> Optional[str]:
     return pm_chromium if pm_chromium and os.path.isfile(pm_chromium) else None
 
 
+def _stop(proc, what: str) -> None:
+    """Terminate one launched browser. Under ``terminal.browser_run_as_user`` ``proc`` is sudo, which
+    relays SIGTERM to Chromium but not SIGKILL; the group (sudo's session: Chromium and its children)
+    is then killed AS the browser uid, so nothing outlives the stop."""
+    from tools.browser_lightpanda import _terminate
+    _terminate(proc, what=what)
+    target = getattr(proc, "_hermes_run_as", None)
+    if target is not None:
+        from tools.environments import run_as
+        run_as.kill_group(target, proc.pid, signal.SIGKILL)
+
+
 def _terminate_one(proc, what: str) -> None:
     """Terminate ``proc`` alone and forget it -- never the other browsers this process runs (a sign-in
     refresh starts the person's browser while the driven one is live, and must not take it down)."""
-    from tools.browser_lightpanda import _terminate
     try:
         _origin()._real_profile_chrome_procs.remove(proc)
     except ValueError:
         pass
-    _terminate(proc, what=what)
+    _stop(proc, what)
 
 
 def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str], what: str,
@@ -437,17 +449,31 @@ def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str
     else:
         _ensure_screen_for_headed_chromium()
     browser_env = _build_browser_env()  # carries the Bot Desktop DISPLAY when one is running
+    # (fork) terminal.browser_run_as_user: Chromium runs as its own uid (tools/environments/run_as.py).
+    # Fails closed: a configured user that cannot be honoured launches nothing.
+    from tools.environments import run_as
+    try:
+        target = run_as.resolve_browser()
+    except run_as.RunAsUnavailable as e:
+        return None, None, f"{_RP}the {what} was not launched: {e}"
+    if target is not None:
+        argv = run_as.browser_argv(target, argv, browser_env,
+                                   oom=_limits.OOM_SCORE_ADJ if _limits.active() else None)
+        browser_env = {"PATH": "/usr/bin:/bin"}  # sudo's own; the browser's is inside argv
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                stdin=subprocess.DEVNULL, start_new_session=True, env=browser_env)
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=browser_env,
+                                cwd="/" if target is not None else None)
     except (subprocess.SubprocessError, OSError) as e:
         return None, None, f"{_RP}the {what} launch failed: {e}"
     try:
         proc._hermes_home = _home()  # the profile home it serves: only that home stops it
+        proc._hermes_run_as = target
     except AttributeError:
         pass
     _bt._real_profile_chrome_procs.append(proc)
-    _limits.mark_expendable(proc.pid)  # (fork) kept lane only: the OOM killer takes it, not the gateway
+    if target is None:
+        _limits.mark_expendable(proc.pid)  # (fork) kept lane only: the OOM killer takes it, not the gateway
 
     deadline = time.monotonic() + startup_wait
     while time.monotonic() < deadline:
@@ -457,6 +483,8 @@ def _spawn_browser_on_copy(binary: str, copy_dir: str, extra_flags: Iterable[str
                 proc._hermes_port = int(line)  # whose keeper to stop with it
             except AttributeError:
                 pass
+            if target is not None:
+                run_as.allow_browser_port(int(line))  # (fork) the one port the shell may reach
             return proc, int(line), None
         if proc.poll() is not None:
             _terminate_one(proc, what)
@@ -813,10 +841,19 @@ def _browsers_on_data_dir(data_dir: str):
 
 def _is_orphan(proc) -> bool:
     """True when the process that launched ``proc`` is gone (re-parented to pid 1, or parent absent).
-    The driven browser starts in its own session, so a dead owner is visible only this way."""
+    The driven browser starts in its own session, so a dead owner is visible only this way. Under
+    ``terminal.browser_run_as_user`` the parent is sudo, which outlives a dead gateway; its parent is
+    then the launcher that counts."""
     try:
         import psutil
         ppid = proc.ppid()
+        if ppid > 1 and psutil.pid_exists(ppid):
+            try:
+                parent = psutil.Process(ppid)
+                if parent.name() == "sudo":
+                    ppid = parent.ppid()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
         return ppid <= 1 or not psutil.pid_exists(ppid)
     except Exception:
         return False
@@ -835,16 +872,30 @@ def _terminate_processes(procs, what: str) -> int:
             targets.extend(p.children(recursive=True))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+    denied = []
     for p in targets:
         try:
             p.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except psutil.AccessDenied:
+            denied.append(p.pid)
+        except psutil.NoSuchProcess:
             pass
+    # (fork) another uid's browser (terminal.browser_run_as_user): signalled as that uid instead.
+    from tools.environments import run_as
+    try:
+        btarget = run_as.resolve_browser() if denied else None
+    except run_as.RunAsUnavailable:
+        btarget = None
+    if btarget is not None:
+        run_as.signal_pids(btarget, denied, signal.SIGTERM)
     _, alive = psutil.wait_procs(targets, timeout=5.0)
     for p in alive:
         try:
             p.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except psutil.AccessDenied:
+            if btarget is not None:
+                run_as.signal_pids(btarget, [p.pid], signal.SIGKILL)
+        except psutil.NoSuchProcess:
             pass
     if alive:
         psutil.wait_procs(alive, timeout=3.0)
@@ -855,7 +906,16 @@ def _terminate_processes(procs, what: str) -> int:
 
 def _own_browser_pids() -> set:
     _bt = _origin()
-    return {p.pid for p in _bt._real_profile_chrome_procs if p.poll() is None and _ours_here(p)}
+    own = {p.pid for p in _bt._real_profile_chrome_procs if p.poll() is None and _ours_here(p)}
+    # (fork) under terminal.browser_run_as_user the handle is sudo's; Chromium is its child.
+    for p in _bt._real_profile_chrome_procs:
+        if getattr(p, "_hermes_run_as", None) is not None and p.pid in own:
+            try:
+                import psutil
+                own.update(c.pid for c in psutil.Process(p.pid).children(recursive=True))
+            except Exception:
+                pass
+    return own
 
 
 def _live_holders(copy_dir: str) -> list:

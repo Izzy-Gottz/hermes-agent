@@ -275,3 +275,168 @@ def test_screenshot_path_from_output_still_works_off(off, tmp_path, monkeypatch)
     shot.write_bytes(b"\x89PNG\r\n\x1a\n")
     monkeypatch.setattr(cli, "_run_as_target", lambda: None)
     assert cli._find_screenshot(f"saved {shot}", 0) == str(shot)
+
+
+# --- terminal.browser_run_as_user: Chromium as its own uid ---------------------------------------
+
+def _browser_target(tmp_path):
+    return run_as.Target(user="browser", uid=10002, gid=10002, home=str(tmp_path / "brw"), sudo="/usr/bin/sudo")
+
+
+def _spawn(monkeypatch, tmp_path, target, kept=False):
+    import tools.browser_tool_real_profile as rp
+    seen = {}
+
+    class P:
+        pid = 5151
+
+        def poll(self):
+            return None
+
+    def fake_popen(args, **kw):
+        seen["args"], seen["kw"] = args, kw
+        return P()
+    monkeypatch.setattr(rp.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(rp, "_read_devtools_port", lambda d: "9333")
+    monkeypatch.setattr(rp, "_build_browser_env", lambda: {**SECRETS, "PATH": "/usr/bin", "DISPLAY": ":99"})
+    monkeypatch.setattr(rp._limits, "active", lambda: kept)
+    marked = []
+    monkeypatch.setattr(rp._limits, "mark_expendable", lambda pid: marked.append(pid))
+    if isinstance(target, Exception):
+        def boom():
+            raise target
+        monkeypatch.setattr(run_as, "resolve_browser", boom)
+    else:
+        monkeypatch.setattr(run_as, "resolve_browser", lambda: target)
+    procs = []
+    monkeypatch.setattr(rp, "_origin", lambda: types.SimpleNamespace(_real_profile_chrome_procs=procs))
+    out = rp._spawn_browser_on_copy("/opt/chrome", str(tmp_path / "kept"), (), "browser", headless=True)
+    return out, seen, marked, procs
+
+
+def test_browser_off_launches_chromium_directly(tmp_path, monkeypatch):
+    (proc, port, err), seen, marked, _ = _spawn(monkeypatch, tmp_path, None, kept=True)
+    assert err is None and port == 9333
+    assert seen["args"][0] == "/opt/chrome" and marked == [5151]
+
+
+def test_browser_on_launches_chromium_as_the_browser_uid(tmp_path, monkeypatch):
+    t = _browser_target(tmp_path)
+    (proc, port, err), seen, marked, procs = _spawn(monkeypatch, tmp_path, t, kept=True)
+    args = seen["args"]
+    assert err is None and port == 9333
+    assert args[:5] == ["/usr/bin/sudo", "-n", "-u", "browser", "--"]
+    assert "/opt/chrome" in args and "MOE_OOM=1000" in args and "DISPLAY=:99" in args
+    assert not any(v in " ".join(args) for v in SECRETS.values() if len(v) > 3)
+    assert set(seen["kw"]["env"]) == {"PATH"} and seen["kw"]["cwd"] == "/"
+    assert marked == []                 # the gateway cannot write another uid's oom_score_adj
+    assert procs[0]._hermes_run_as is t
+
+
+def test_browser_on_with_an_unusable_user_launches_nothing(tmp_path, monkeypatch):
+    (proc, port, err), seen, _, procs = _spawn(monkeypatch, tmp_path, run_as.RunAsUnavailable("no browser user"))
+    assert proc is None and port is None and "no browser user" in err
+    assert seen == {} and procs == []
+
+
+def test_stopping_the_browser_kills_its_group_as_the_browser_uid(tmp_path, monkeypatch):
+    import tools.browser_tool_real_profile as rp
+    import tools.browser_lightpanda as lp
+    t = _browser_target(tmp_path)
+    monkeypatch.setattr(lp, "_terminate", lambda proc, what="": None)
+    calls = []
+    monkeypatch.setattr(run_as, "kill_group", lambda target, pgid, sig=signal.SIGKILL: calls.append((target.user, pgid, sig)))
+    rp._stop(types.SimpleNamespace(pid=777, _hermes_run_as=t), "browser")
+    rp._stop(types.SimpleNamespace(pid=778), "browser")           # off: the plain terminate only
+    assert calls == [("browser", 777, signal.SIGKILL)]
+
+
+def test_a_sudo_parent_does_not_hide_a_dead_launcher(monkeypatch):
+    import psutil
+    import tools.browser_tool_real_profile as rp
+
+    class Sudo:
+        def __init__(self, pid):
+            pass
+
+        def name(self):
+            return "sudo"
+
+        def ppid(self):
+            return 1                       # its launcher (the gateway) is gone
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: True)
+    monkeypatch.setattr(psutil, "Process", Sudo)
+    assert rp._is_orphan(types.SimpleNamespace(ppid=lambda: 4040)) is True
+
+
+def test_mark_tree_raises_the_browser_as_the_browser_uid(tmp_path, monkeypatch):
+    import tools.browser_kept_limits as kl
+    t = _browser_target(tmp_path)
+    monkeypatch.setattr(kl, "active", lambda: True)
+    monkeypatch.setattr(kl, "_tree", lambda d, root: [11, 12])
+    real_open = open
+
+    def fake_open(path, mode="r", *a, **k):
+        if str(path).endswith("oom_score_adj"):
+            if "w" in mode:
+                raise AssertionError("the gateway wrote another uid's oom_score_adj")
+            import io
+            return io.StringIO("1000" if "/11/" in str(path) else "0")
+        return real_open(path, mode, *a, **k)
+    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(run_as, "resolve_browser", lambda: t)
+    seen = []
+    monkeypatch.setattr(run_as, "raise_oom", lambda target, pids, v: (seen.append((target.user, list(pids), v)), len(pids))[1])
+    assert kl.mark_tree("/opt/data/browser-profile/kept") == 1
+    assert seen == [("browser", [12], kl.OOM_SCORE_ADJ)]
+
+
+def test_an_orphan_of_another_uid_is_signalled_as_that_uid(tmp_path, monkeypatch):
+    import psutil
+    import tools.browser_tool_real_profile as rp
+    t = _browser_target(tmp_path)
+
+    class Denied:
+        pid = 9191
+
+        def children(self, recursive=True):
+            return []
+
+        def terminate(self):
+            raise psutil.AccessDenied(self.pid)
+
+        def kill(self):
+            raise psutil.AccessDenied(self.pid)
+    monkeypatch.setattr(run_as, "resolve_browser", lambda: t)
+    sent = []
+    monkeypatch.setattr(run_as, "signal_pids", lambda target, pids, sig: sent.append((target.user, list(pids), sig)))
+    monkeypatch.setattr(psutil, "wait_procs", lambda procs, timeout=0: ([], []))
+    rp._terminate_processes([Denied()], "orphaned driven-browser")
+    assert sent == [("browser", [9191], signal.SIGTERM)]
+
+
+def test_bridge_maps_the_browser_key():
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+    assert TERMINAL_CONFIG_ENV_MAP["browser_run_as_user"] == "TERMINAL_BROWSER_RUN_AS_USER"
+
+
+def test_the_port_hook_runs_with_the_port_once_the_browser_is_up(tmp_path, monkeypatch):
+    import tools.environments.run_as as ra
+    ran = []
+    monkeypatch.setenv("TERMINAL_BROWSER_PORT_HOOK", "/usr/bin/sudo -n /usr/local/sbin/moe-cdp-allow")
+    monkeypatch.setattr(ra.subprocess, "run", lambda cmd, **kw: (ran.append(cmd), types.SimpleNamespace(returncode=0, stderr=""))[1])
+    t = _browser_target(tmp_path)
+    (proc, port, err), seen, _, _ = _spawn(monkeypatch, tmp_path, t)
+    assert err is None
+    assert ran == [["/usr/bin/sudo", "-n", "/usr/local/sbin/moe-cdp-allow", "9333"]]
+
+
+def test_no_port_hook_when_the_browser_is_the_gateways(tmp_path, monkeypatch):
+    import tools.environments.run_as as ra
+    ran = []
+    monkeypatch.setenv("TERMINAL_BROWSER_PORT_HOOK", "/bin/true")
+    monkeypatch.setattr(ra.subprocess, "run", lambda cmd, **kw: ran.append(cmd))
+    _spawn(monkeypatch, tmp_path, None)
+    assert ran == []
+    monkeypatch.delenv("TERMINAL_BROWSER_PORT_HOOK")
+    assert ra.allow_browser_port(9333) is False

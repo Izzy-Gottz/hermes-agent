@@ -131,6 +131,23 @@ def mark_tree(data_dir: Optional[str], proc_root: str = "/proc") -> int:
     were raised."""
     if not active() or not data_dir:
         return 0
+    from tools.environments import run_as
+    try:
+        target = run_as.resolve_browser() if proc_root == "/proc" else None
+    except run_as.RunAsUnavailable:
+        target = None
+    if target is not None:
+        # (fork) terminal.browser_run_as_user: another uid's /proc/<pid>/oom_score_adj is not the
+        # gateway's to write; the browser uid raises its own processes.
+        low = []
+        for pid in _tree(data_dir, proc_root):
+            try:
+                with open(os.path.join(proc_root, str(pid), "oom_score_adj")) as fh:
+                    if int(fh.read().strip() or 0) < OOM_SCORE_ADJ:
+                        low.append(pid)
+            except (OSError, ValueError):
+                continue
+        return run_as.raise_oom(target, low, OOM_SCORE_ADJ) if low else 0
     raised = 0
     for pid in _tree(data_dir, proc_root):
         path = os.path.join(proc_root, str(pid), "oom_score_adj")
