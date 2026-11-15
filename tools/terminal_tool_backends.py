@@ -131,6 +131,14 @@ def _modal_unavailable_reason(modal_state: dict[str, Any]) -> tuple[str, str]:
 # --- Environment builders. Signature: (*, image, cwd, timeout, cc, task_id, ssh_config, local_config, host_cwd)
 # (env_type is only forwarded to the plugin-registry fallback, not to the built-in builders.)
 def _build_local_env(*, cwd, timeout, local_config=None, **_):
+    # (fork) terminal.run_as_user: every command (and every file-tool operation) runs as that uid.
+    # Resolved here, failing closed: a configured user that cannot be honoured raises, never runs local.
+    from tools.environments import run_as
+    target = run_as.resolve()
+    if target is not None:
+        from tools.environments.local import SandboxedLocalEnvironment
+        return SandboxedLocalEnvironment(cwd=cwd, timeout=timeout,
+                                         persistent=(local_config or {}).get("persistent", True), target=target)
     return _LocalEnvironment(cwd=cwd, timeout=timeout, persistent=(local_config or {}).get("persistent", True))
 
 

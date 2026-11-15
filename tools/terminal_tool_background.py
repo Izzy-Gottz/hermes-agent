@@ -97,7 +97,11 @@ def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, 
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
                   persist_on_release=persist_on_release)
-    if env_type == "local":
+    # (fork) A sandboxed local backend (terminal.run_as_user) declares uses_host_filesystem False: its
+    # background processes go through env.execute like any confining backend, so they run as that uid.
+    # spawn_local is its own Popen as the GATEWAY's uid, and would walk straight past the sandbox.
+    from tools.environments.base import env_uses_host_filesystem
+    if env_type == "local" and env_uses_host_filesystem(env):
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty,
             restore_login_path=True, **common)
@@ -259,6 +263,11 @@ def yield_to_background_handler(
     partial output is returned to the model right away. Other backends return None (no
     adoptable host process) and the foreground wait continues."""
     if env_type != "local":
+        return None
+    # (fork) Adopting the live Popen of a sandboxed command would hand the registry a sudo handle it
+    # cannot signal the command through; it keeps waiting in the foreground instead.
+    from tools.environments import run_as
+    if run_as.configured_user():
         return None
 
     def _handler(proc, output_so_far: str) -> dict:

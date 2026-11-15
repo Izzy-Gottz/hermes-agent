@@ -218,10 +218,31 @@ def _harness_credentials() -> dict:
     return {key: value for key, value in values.items() if value is not None}
 
 
+def _run_as_target():
+    """(fork) The terminal.run_as_user target the browser_exec CLI runs as, or None (off).
+    browser_exec runs model-written Python, so under a sandboxed terminal it is sandboxed too; a target
+    that is configured and unusable raises (tools.environments.run_as.RunAsUnavailable): nothing runs."""
+    from tools.environments import run_as
+    return run_as.resolve()
+
+
+def _sandbox_screenshot_dir(target) -> str:
+    """The ONE place a screenshot is attached from under run_as: the harness's tmp dir, pinned."""
+    return os.path.join(target.home, ".config", "browser-harness", "tmp")
+
+
 def _base_subprocess_env() -> dict:
     from tools.browser_session import build_browser_env
     env = build_browser_env()
-    env.update(_harness_credentials())
+    target = _run_as_target()
+    if target is None:
+        env.update(_harness_credentials())
+    else:
+        # (fork) No harness credential reaches a uid that runs model-written code, and every dir the
+        # harness makes (runtime sockets, screenshots, logs) is the target's own.
+        env.update({"HOME": target.home, "TMPDIR": target.tmp,
+                    "BH_HOME": os.path.join(target.home, ".config", "browser-harness"),
+                    "BH_TMP_DIR": _sandbox_screenshot_dir(target)})
     # The harness runs on Hermes's own interpreter, but a bundled Desktop install boots that
     # interpreter with its site dir on PYTHONPATH (no venv to activate), and the harness's daemon
     # re-runs sys.executable. Point PYTHONPATH at the harness's site dir, replacing whatever the
@@ -324,6 +345,17 @@ def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
     """Stable per-task scratch dir that persists across browser_exec calls"""
     if os.environ.get("BH_AGENT_WORKSPACE"):
         return os.environ["BH_AGENT_WORKSPACE"]
+    target = _run_as_target()
+    if target is not None:  # (fork) the target's own dir, made as the target
+        safe = _TASK_ID_SAFE_RE.sub("_", str(task_id or "default"))[:80] or "default"
+        path = os.path.join(target.home, "browser-workspace", safe)
+        try:
+            from tools.environments import run_as
+            run_as.ensure_dirs(target, [path])
+            return path
+        except Exception as e:
+            logger.debug("browser_exec sandbox workspace unavailable: %s", e)
+            return None
     try:
         safe = _TASK_ID_SAFE_RE.sub("_", str(task_id or "default"))[:80] or "default"
         path = Path(get_hermes_home()) / "cache" / "browser-use" / "workspace" / safe
@@ -334,9 +366,44 @@ def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
         return None
 
 
+def _fetch_sandbox_screenshot(target, since: float) -> Optional[str]:
+    """(fork) Under run_as, the newest image the harness wrote in its pinned tmp dir during this call,
+    copied out BY THE TARGET UID (``cat`` run as it) into a gateway-private file. Never a path taken from
+    the browser's output, and never opened as the gateway: a symlink planted there can only reach what
+    the target could already read."""
+    import tempfile
+    from tools.environments import run_as
+    shots = _sandbox_screenshot_dir(target)
+    script = ('cd "$1" 2>/dev/null || exit 3; f=$(find . -maxdepth 1 -type f -newermt "@$2" '
+              '\\( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" \\) '
+              '-printf "%T@ %f\\n" 2>/dev/null | sort -rn | head -1 | cut -d" " -f2-); '
+              '[ -n "$f" ] || exit 4; head -c 20000000 -- "$f"')
+    try:
+        r = subprocess.run(run_as.argv(target, ["/bin/sh", "-c", script, "sh", shots, str(int(since) - 1)],
+                                       run_as.clean_env(target)),
+                           capture_output=True, timeout=20, cwd="/", stdin=subprocess.DEVNULL)
+    except Exception as e:
+        logger.debug("sandbox screenshot fetch failed: %s", e)
+        return None
+    if r.returncode != 0 or not r.stdout:
+        return None
+    head = r.stdout[:12]
+    ext = ".png" if head.startswith(b"\x89PNG") else ".jpg" if head.startswith(b"\xff\xd8") else \
+        ".webp" if head[8:12] == b"WEBP" else None
+    if ext is None:
+        return None  # not an image: never attached
+    fd, out = tempfile.mkstemp(prefix="sandbox-shot-", suffix=ext)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(r.stdout)
+    return out
+
+
 def _find_screenshot(stdout: str, since: float) -> Optional[str]:
     """Last screenshot path printed during this exec that exists and was written after
     the exec started, or None."""
+    target = _run_as_target() if os.name == "posix" else None
+    if target is not None:
+        return _fetch_sandbox_screenshot(target, since)
     for path in reversed(_IMAGE_PATH_RE.findall(stdout or "")):
         try:
             if os.path.isfile(path) and os.path.getmtime(path) >= since - 1:
@@ -705,6 +772,10 @@ def _kill_cli_process_group(proc) -> None:
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
                            check=False, creationflags=windows_hide_flags())
         return
+    target = getattr(proc, "_hermes_run_as", None)
+    if target is not None:  # (fork) the group's members are the target's: the gateway's killpg reaches only sudo
+        from tools.environments import run_as
+        run_as.kill_group(target, proc.pid, signal.SIGKILL)
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX only, the nt branch returned above
 
@@ -717,10 +788,20 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
     still holding them, and on Windows ``run()``'s unbounded post-kill ``communicate()`` then
     blocks on pipe EOF forever — so the tool call, plus its activity heartbeat, wedges (#106244).
     """
+    target = _run_as_target() if os.name == "posix" else None
+    popen_env, popen_cwd = env, None
+    if target is not None:
+        # (fork) The CLI (and the daemon it starts, which inherits this) runs as the target uid with an
+        # allowlisted env. The gateway keeps only sudo's handle.
+        from tools.environments import run_as
+        child_env = run_as.clean_env(target, extra=env, base={})
+        cmd = run_as.argv(target, list(cmd), child_env)
+        popen_env, popen_cwd = {"PATH": "/usr/bin:/bin"}, "/"
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace", env=env, **_group_popen_kwargs(),
+        text=True, encoding="utf-8", errors="replace", env=popen_env, cwd=popen_cwd, **_group_popen_kwargs(),
     )
+    proc._hermes_run_as = target
     try:
         stdout, stderr = proc.communicate(input=code, timeout=timeout)
     except subprocess.TimeoutExpired:

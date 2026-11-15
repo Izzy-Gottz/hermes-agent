@@ -1248,3 +1248,94 @@ class LocalEnvironment(BaseEnvironment):
         for f in (self._snapshot_path, self._cwd_file, *stale):
             with contextlib.suppress(OSError):
                 os.unlink(f)
+
+
+class SandboxedLocalEnvironment(LocalEnvironment):
+    """(fork) The local backend with every command run as ``terminal.run_as_user`` (tools.environments.run_as).
+
+    Same host, different uid: the gateway's secrets (``.env``, auth, tokens, its ``/proc/<pid>/environ``)
+    are another user's files to these commands. ``uses_host_filesystem = False`` routes read_file /
+    write_file / patch / search through :meth:`execute`, so the file tools see exactly what a command sees
+    and never read the host as the gateway. The cwd is confined to the target's home; Popen starts in "/"
+    (the gateway may not be able to enter that home) and the wrapper's own ``cd`` moves there."""
+
+    uses_host_filesystem = False
+
+    def __init__(self, cwd: str = "", timeout: int = 60, env: dict | None = None, persistent: bool = True,
+                 target=None):
+        from tools.environments import run_as
+        self._run_as = target or run_as.resolve()
+        if self._run_as is None:
+            raise run_as.RunAsUnavailable("SandboxedLocalEnvironment needs terminal.run_as_user")
+        run_as.ensure_dirs(self._run_as, [self._run_as.tmp])
+        BaseEnvironment.__init__(self, cwd=self._confine(cwd), timeout=timeout, env=env, persist_env=persistent)
+        self.init_session()
+
+    def _confine(self, cwd: str) -> str:
+        from tools.environments import run_as
+        home = self._run_as.home
+        if cwd and os.path.isabs(cwd) and run_as.within(cwd, home):
+            return cwd
+        return home
+
+    def get_temp_dir(self) -> str:
+        return self._run_as.tmp
+
+    def _recover_cwd(self) -> None:
+        self.cwd = self._confine(self.cwd)
+
+    def _extract_cwd_from_output(self, result: dict):
+        BaseEnvironment._extract_cwd_from_output(self, result)
+
+    def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
+                  stdin_data: str | None = None) -> subprocess.Popen:
+        from tools.environments import run_as
+        bash = _find_bash()
+        base_env = _make_run_env(self.env)
+        child_env = run_as.clean_env(self._run_as, extra=self.env, base=base_env)
+        if login:
+            cmd_string = _append_dropped_path_entries(cmd_string, child_env.get("PATH", ""))
+            cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
+        args = run_as.argv(self._run_as, [bash, *(["-l"] if login else []), "-c", cmd_string], child_env)
+        self._recover_cwd()
+        proc = subprocess.Popen(
+            args, text=True, env={"PATH": "/usr/bin:/bin"}, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            # detached-spawn: ok — owned via own_process_groups right below
+            start_new_session=True, cwd="/")
+        own_process_groups([proc.pid])
+        proc._hermes_owned_pgid = proc.pid
+        with contextlib.suppress(ProcessLookupError):
+            proc._hermes_pgid = os.getpgid(proc.pid)
+            from gateway.status import get_process_start_time
+            proc._hermes_pgid_start = get_process_start_time(proc.pid)
+        if stdin_data is not None:
+            _pipe_stdin(proc, stdin_data)
+        return proc
+
+    def _pgid(self, proc):
+        return getattr(proc, "_hermes_pgid", None) or getattr(proc, "pid", None)
+
+    def _kill_process(self, proc):
+        """TERM the target's members of the group, then the base teardown (sudo relays TERM and is
+        KILLed after the grace), then KILL whatever of the target's is left: the gateway's own
+        killpg reaches only sudo (measured)."""
+        from tools.environments import run_as
+        pgid = self._pgid(proc)
+        run_as.kill_group(self._run_as, pgid, signal.SIGTERM)
+        try:
+            super()._kill_process(proc)
+        finally:
+            run_as.kill_group(self._run_as, pgid, signal.SIGKILL)
+
+    def _force_kill_process(self, proc):
+        from tools.environments import run_as
+        run_as.kill_group(self._run_as, self._pgid(proc), signal.SIGKILL)
+        super()._force_kill_process(proc)
+
+    def cleanup(self):
+        from tools.environments import run_as
+        with contextlib.suppress(Exception):
+            run_as.run(self._run_as, ["/bin/sh", "-c", 'rm -f -- "$1" "$2" "$1".tmp.*', "sh",
+                                      self._snapshot_path, self._cwd_file], timeout=5)
