@@ -156,6 +156,40 @@ def test_every_command_is_launched_as_the_target(tmp_path, monkeypatch):
     assert seen["kw"]["cwd"] == "/" and set(seen["kw"]["env"]) == {"PATH"}
 
 
+def test_the_claude_code_token_hermes_lets_through_never_reaches_the_sandbox(tmp_path, monkeypatch):
+    """Measured on Memoe's cloud machine: CLAUDE_CODE_OAUTH_TOKEN reaches every plain terminal child,
+    because local_env_policy deliberately does not block it (#55878). The control shows that route is
+    real; the sandboxed launch must still carry no credential of any name."""
+    import re
+    import tools.environments.local as local
+    token = "sk-ant-oat01-" + "q" * 40
+    creds = {"CLAUDE_CODE_OAUTH_TOKEN": token, "MOE_MACHINE_SECRET": "m" * 40,
+             "ANTHROPIC_API_KEY": "a" * 40, "COMPOSIO_API_KEY": "ak_" + "c" * 40}
+    monkeypatch.setattr(local.os, "environ", {**creds, "PATH": "/usr/bin"})
+    # Control: the plain run env Hermes builds DOES carry the token (so this test can fail).
+    assert local._make_run_env({}).get("CLAUDE_CODE_OAUTH_TOKEN") == token
+    seen = {}
+
+    class P:
+        pid = 4243
+
+    monkeypatch.setattr(local.subprocess, "Popen", lambda args, **kw: (seen.update(args=args, kw=kw), P())[1])
+    monkeypatch.setattr(local, "own_process_groups", lambda pids: None)
+    monkeypatch.setattr(local.os, "getpgid", lambda pid: pid)
+    env = _bare_env(tmp_path)
+    env.env = dict(creds)          # and handed to the backend directly, as a config env would be
+    env._run_bash("env")
+    args = seen["args"]
+    joined = " ".join(args)
+    assert not any(v in joined for v in creds.values())
+    start = args.index("-i") + 1
+    names = [a.split("=", 1)[0] for a in args[start:] if "=" in a and not a.startswith("-")
+             and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", a.split("=", 1)[0])]
+    credential_like = [n for n in names if re.search(r"KEY|TOKEN|SECRET|PASS|AUTH|CREDENTIAL|COOKIE", n, re.I)]
+    assert credential_like == [], credential_like
+    assert set(seen["kw"]["env"]) == {"PATH"}
+
+
 def test_kill_signals_the_group_as_the_target(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(run_as, "kill_group", lambda t, pgid, sig=signal.SIGKILL: calls.append((pgid, sig)))
