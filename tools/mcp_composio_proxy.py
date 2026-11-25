@@ -32,6 +32,8 @@ import urllib.parse
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+from tools.tool_pins import ALWAYS_LOAD_META_KEY
+
 logger = logging.getLogger(__name__)
 
 MULTIPLEXER = "COMPOSIO_MULTI_EXECUTE_TOOL"
@@ -113,6 +115,12 @@ def proxied_tools(listed: List[Any], schemas_text: str, slugs: List[str],
         if not isinstance(props, dict):
             props = schema["properties"] = {}
         props["account"] = account_param(slug, accounts)
+        # Pinned out of tool_search (tools/tool_pins.py) when the person has
+        # this service connected -- or when the accounts could not be read,
+        # because hidden is the failure that matters: behind a lexical search
+        # the model reports a connected Gmail "not connected". A service with
+        # no account stays deferred and costs nothing in the prompt.
+        connected = accounts is None or bool(toolkit_of(slug, accounts))
         out.append(SimpleNamespace(
             name=slug,
             description=str(entry.get("description") or ""),
@@ -120,6 +128,7 @@ def proxied_tools(listed: List[Any], schemas_text: str, slugs: List[str],
             input_schema=schema,
             # Declared in config or write-capable: unknown fails closed.
             annotations={"readOnlyHint": slug in set(read_only or ())},
+            meta={ALWAYS_LOAD_META_KEY: True} if connected else None,
             composio_proxy=True,
         ))
     return out

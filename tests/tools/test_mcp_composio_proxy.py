@@ -434,3 +434,28 @@ class TestAccountChoice:
         _call(s, "GMAIL_SEND_EMAIL", {"account": "yisrael@claimoe.ai"})
         _, args = _sent(s)
         assert args["tools"][0]["account"] == "yisrael@claimoe.ai"
+
+
+class TestPinnedWhenConnected:
+    """A named tool for a service the person HAS connected is pinned out of
+    tool_search (tools/tool_pins.py): behind a lexical search the model said a
+    connected Gmail "isn't connected". An unconnected service stays deferred,
+    so it costs nothing in the prompt."""
+
+    def _by(self, accounts):
+        listed = [SimpleNamespace(name=n) for n in META]
+        tools = proxy.proxied_tools(listed, LIVE_SCHEMAS, ["GMAIL_SEND_EMAIL", "GMAIL_FETCH_EMAILS"],
+                                    (), accounts)
+        from tools.mcp_tool_registration import _tool_marks_always_load
+        return {t.name: _tool_marks_always_load(t) for t in tools}
+
+    def test_a_connected_service_is_pinned(self):
+        assert self._by({"gmail": [{"id": "ca_1", "who": "a@example.com"}]}) == {
+            "GMAIL_SEND_EMAIL": True, "GMAIL_FETCH_EMAILS": True}
+
+    def test_an_unconnected_service_is_not(self):
+        assert self._by({"googlecalendar": [{"id": "ca_2", "who": ""}]}) == {
+            "GMAIL_SEND_EMAIL": False, "GMAIL_FETCH_EMAILS": False}
+
+    def test_unknown_accounts_fail_toward_visible(self):
+        assert set(self._by(None).values()) == {True}

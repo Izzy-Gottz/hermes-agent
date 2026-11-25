@@ -28,6 +28,7 @@ from tools.tool_search_validation import (
     local_batch_error, normalize_tool_call_entries, not_deferrable_error, session_unavailable_error,
     unavailable_in_session_reason, validate_deferred_call_args)
 from tools.connectors import CONNECTOR_BATCH_SENTINEL, is_connector_name
+from tools import tool_pins
 from tools.connectors.search import (
     connections_in_scope, connector_entries_by_group, connectors_unavailable, remote_schemas_for)
 
@@ -165,12 +166,17 @@ _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defe
 def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
-    plugin tool). Bridge names never defer."""
+    plugin tool). Bridge names never defer, and neither does a tool its server pinned
+    (``mcp_servers.<name>.always_load`` or the tool's own alwaysLoad mark; tools/tool_pins.py)
+    -- the lexical search cannot be trusted to find "check my email" in a server's tools, and a
+    pinned tool left behind it is reported "not connected" while the row says Connected."""
     if name in BRIDGE_TOOL_NAMES:
         return False
     if defer_tools is not None and name in defer_tools:
         return True
     if name in _core_tool_names():
+        return False
+    if tool_pins.is_pinned(name):
         return False
     toolset = _registry_toolset(name)  # None (unregistered/malformed) never defers
     return toolset is not None and (

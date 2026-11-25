@@ -21,6 +21,7 @@ from tools.mcp_tool_handlers import (
 from tools.mcp_tool_schema import (
     _UTILITY_CAPABILITY_ATTRS, _build_utility_schemas, _normalize_name_filter, matches_name_filter)
 from tools.mcp_tool_scope import _key_name, _key_scope, _resolve_server_key, _server_key
+from tools import tool_pins as _tool_pins
 
 if TYPE_CHECKING:  # pragma: no cover
     from tools.mcp_tool import MCPServerTask
@@ -114,9 +115,10 @@ def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
-    """Forget MCP server provenance for a deregistered tool."""
+    """Forget MCP server provenance (and any always-load pin) for a deregistered tool."""
     with _core._lock:
         _core._mcp_tool_server_names.pop(tool_name, None)
+    _tool_pins.unpin(tool_name)
 
 
 def _server_key_for_task(server) -> object:
@@ -267,8 +269,77 @@ def _cached_tools(raws: Iterable[Any]) -> list[SimpleNamespace]:
     are dropped. Missing or non-dict ``annotations`` (older cache files) fail closed to write-capable."""
     return [SimpleNamespace(name=raw["name"], description=raw.get("description") or "",
                             inputSchema=raw["inputSchema"] if isinstance(raw.get("inputSchema"), dict) else {},
-                            annotations=raw["annotations"] if isinstance(raw.get("annotations"), dict) else None)
+                            annotations=raw["annotations"] if isinstance(raw.get("annotations"), dict) else None,
+                            meta=raw["_meta"] if isinstance(raw.get("_meta"), dict) else None)
             for raw in raws if isinstance(raw, dict) and raw.get("name")]
+
+
+def _tool_marks_always_load(tool: Any) -> bool:
+    """True when the server marked this tool ``_meta: {"anthropic/alwaysLoad": true}``."""
+    meta = mcp_field(tool, "meta", "_meta")
+    return isinstance(meta, dict) and meta.get(_tool_pins.ALWAYS_LOAD_META_KEY) is True
+
+
+def _make_always_load(name: str, config: dict) -> Callable[[Any], bool]:
+    """Which of a server's tools stay out of ``tool_search`` (see ``tools/tool_pins.py``).
+
+    ``always_load: true`` pins every tool, a list pins the names (or globs) it
+    holds, ``false`` pins none; absent, a tool the server itself marks
+    alwaysLoad is pinned and nothing else is."""
+    raw = (config or {}).get("always_load")
+    if isinstance(raw, bool) or (isinstance(raw, str) and raw.strip().lower() in ("true", "false", "yes", "no")):
+        on = raw if isinstance(raw, bool) else raw.strip().lower() in ("true", "yes")
+        return lambda tool: on
+    if isinstance(raw, (list, tuple, set)):
+        names = _normalize_name_filter(list(raw), f"mcp_servers.{name}.always_load")
+        return lambda tool: matches_name_filter(tool.name, names) or _tool_marks_always_load(tool)
+    if raw is not None:
+        logger.warning("mcp_servers.%s.always_load is %r, expected true, false or a list of tool names; "
+                       "honouring only the server's own alwaysLoad marks", name, raw)
+    return _tool_marks_always_load
+
+
+def _pin_budget_tokens(config: dict) -> int:
+    raw = (config or {}).get("always_load_max_tokens")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _tool_pins.DEFAULT_MAX_PINNED_TOKENS_PER_SERVER
+    return max(0, value)
+
+
+def _schema_tokens(schema: dict) -> int:
+    """chars/4 of the tool-def the model is sent -- tool_search's own estimate."""
+    try:
+        chars = len(json.dumps({"type": "function", "function": schema}, ensure_ascii=False,
+                               separators=(",", ":")))
+    except (TypeError, ValueError):
+        chars = len(str(schema))
+    return -(-chars // 4)
+
+
+def _select_pins(name: str, candidates: list["_Candidate"], config: dict) -> set[str]:
+    """Registry names to pin: the candidates marked always-load, in listing order, until the
+    server's token ceiling. The rest stay deferred, and the log names them."""
+    budget = _pin_budget_tokens(config)
+    chosen: set[str] = set()
+    spent = 0
+    over: list[str] = []
+    for c in candidates:
+        if not c.always_load:
+            continue
+        cost = _schema_tokens(c.schema)
+        if spent + cost > budget:
+            over.append(c.registry_name)
+            continue
+        spent += cost
+        chosen.add(c.registry_name)
+    if over:
+        logger.warning("MCP server '%s': %d always-load tool(s) exceed the %d-token pin ceiling and stay behind "
+                       "tool_search: %s", name, len(over), budget, ", ".join(over))
+    if chosen:
+        logger.info("MCP server '%s': %d tool(s) pinned out of tool_search (~%d tokens)", name, len(chosen), spent)
+    return chosen
 
 
 @dataclass
@@ -279,6 +350,7 @@ class _Candidate:
     origin: str
     schema: dict
     handler: Callable
+    always_load: bool = False
 
     @property
     def is_utility(self) -> bool:
@@ -286,7 +358,7 @@ class _Candidate:
 
 
 def _tool_candidates(name: str, tools: Iterable[Any], should_register: Callable[[str], bool],
-                     tool_timeout) -> list[_Candidate]:
+                     tool_timeout, always_load: Optional[Callable[[Any], bool]] = None) -> list[_Candidate]:
     """Native tools (live SDK objects or cache stand-ins) -> candidates. The injection scan runs on
     BOTH paths: the cache file is user-writable JSON."""
     out: list[_Candidate] = []
@@ -297,7 +369,8 @@ def _tool_candidates(name: str, tools: Iterable[Any], should_register: Callable[
         _schema._scan_mcp_description(name, t.name, t.description or "")
         schema = _schema._convert_mcp_schema(name, t)
         handler = _handlers._make_tool_handler(name, t.name, tool_timeout, native_images=True)
-        out.append(_Candidate(schema["name"], f"tool {t.name!r}", schema, handler))
+        pinned = bool(always_load(t)) if always_load is not None else _tool_marks_always_load(t)
+        out.append(_Candidate(schema["name"], f"tool {t.name!r}", schema, handler, always_load=pinned))
     return out
 
 
@@ -356,7 +429,8 @@ def _resolve_name_collisions(name: str, candidates: list[_Candidate]) -> list[_C
 
 
 def _register_candidates(name: str, candidates: list[_Candidate], *, check_fn: Callable,
-                         scope: Callable[[], Optional[str]], lazy: bool, key=None, execution_timeout=None) -> list[str]:
+                         scope: Callable[[], Optional[str]], lazy: bool, key=None, execution_timeout=None,
+                         config: Optional[dict] = None) -> list[str]:
     """Register candidates under toolset ``mcp-{name}``; returns the names that landed. The
     ownership pre-check is advisory (servers connect in parallel): ``registry.register()`` is
     the atomic gate and its verdict is re-read after every call. *key* is the connection whose
@@ -367,6 +441,7 @@ def _register_candidates(name: str, candidates: list[_Candidate], *, check_fn: C
     scope_value = scope()
     if key is None:
         key = _server_key(name, scope_value, current=False)
+    pins = _select_pins(name, candidates, config or {})
     for c in candidates:
         existing_toolset = registry.get_toolset_for_tool(c.registry_name)
         if existing_toolset and existing_toolset != toolset_name:  # foreign owner: skip, preserve it
@@ -387,6 +462,8 @@ def _register_candidates(name: str, candidates: list[_Candidate], *, check_fn: C
             execution_timeout=execution_timeout)
         if registry.get_toolset_for_tool(c.registry_name) == toolset_name:
             _track_mcp_tool_server(c.registry_name, name)
+            # Re-registration (list_changed, a config edit) must also UNPIN.
+            (_tool_pins.pin if c.registry_name in pins else _tool_pins.unpin)(c.registry_name)
             if scope_value is not None:
                 with _core._lock:
                     _core._server_tool_scopes.setdefault(key, set()).add(scope_value)
@@ -419,6 +496,8 @@ def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should
                 "name": t.name, "description": t.description or "",
                 "inputSchema": schema_obj if isinstance(schema_obj, dict) else {},
                 "annotations": {"readOnlyHint": _annotation_read_only_hint(t)},  # lazy path trust-gates identically
+                # the server's own alwaysLoad mark, so a lazy start pins what a live one did
+                **({"_meta": {_tool_pins.ALWAYS_LOAD_META_KEY: True}} if _tool_marks_always_load(t) else {}),
             })
         utility_payload = [{"schema": e["schema"], "handler_key": e["handler_key"]}
                            for e in _select_utility_schemas(name, server, config)]
@@ -437,7 +516,8 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     key = _server_key_for_task(server)
     _record_tool_trust_metadata(name, config, server._tools, key)
     _warn_unknown_cost_keys(name, key, [t.name for t in server._tools if getattr(t, "name", None)])
-    candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
+    candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout,
+                                  _make_always_load(name, config))
     candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
     # Judged by the connection's owner scope (the ``(scope, name)`` key the registration below
     # publishes into), never by the bare name resolved in the caller's context.
@@ -452,7 +532,7 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     registered = _register_candidates(
         name, _resolve_name_collisions(name, candidates),
         check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key,
-        execution_timeout=config.get("timeout"))
+        execution_timeout=config.get("timeout"), config=config)
     if registered and not (_core._server_registry_scope(key) or '').startswith('editor-session:'):
         _write_schema_cache(name, server, config, should_register)
     return registered
@@ -612,13 +692,14 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         _record_scope_trust(name, config, scope)
         if registry.get_tool_names_for_toolset(f"mcp-{name}"):
             continue
-        candidates = _tool_candidates(name, server._tools, _make_tool_filter(name, config), server.tool_timeout)
+        candidates = _tool_candidates(name, server._tools, _make_tool_filter(name, config), server.tool_timeout,
+                                      _make_always_load(name, config))
         candidates += _utility_candidates(
             name, _select_utility_schemas(name, server, config), server.tool_timeout)
         names = _register_candidates(
             name, _resolve_name_collisions(name, candidates),
             check_fn=_make_check_fn(name), scope=lambda: scope, lazy=False, key=key,
-            execution_timeout=config.get("timeout"))
+            execution_timeout=config.get("timeout"), config=config)
         if names:
             registered_servers += 1
             with _core._lock:
@@ -639,11 +720,12 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> list[str]
     tool_timeout = _resolve_tool_timeout(config)
     cached_tools = _cached_tools(tools_from_cache_entry(entry))
     _record_tool_trust_metadata(name, config, cached_tools)
-    candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout)
+    candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout,
+                                  _make_always_load(name, config))
     candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout)
     registered = _register_candidates(
         name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True,
-        execution_timeout=config.get("timeout"))
+        execution_timeout=config.get("timeout"), config=config)
     if registered:
         with _core._lock:
             key = _server_key(name)
