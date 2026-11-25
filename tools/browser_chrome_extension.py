@@ -43,7 +43,8 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
-from tools.browser_chrome_bridge import NATIVE_HOST_NAME, bridge_state_dir
+from tools.browser_chrome_bridge import (BRIDGE_PREFIX, DEFAULT_BROWSER_KEY, LEGACY_BRIDGE_FILE, NATIVE_HOST_NAME,
+                                         bridge_state_dir)
 
 #: Stable id of the unpacked extension (derived from the public ``key`` in its manifest).
 EXTENSION_ID = "ljblhmlmgflmbffbfelamefleikodmjh"
@@ -113,15 +114,16 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def read_bridge(hermes_home: Optional[str] = None) -> Optional[dict]:
-    """The live bridge written by the native host, or None (absent, stale, or unsafe)."""
-    path = bridge_state_dir(hermes_home) / "bridge.json"
+def _read_bridge_file(path: Path) -> Optional[dict]:
+    """One host's handshake file, validated, or None (absent, stale, or unsafe)."""
     try:
         st = path.stat()
         if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
             return None  # someone else's file, or readable by others: not ours to trust
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
         return None
     url = str(data.get("ws_url") or "")
     pid = data.get("pid")
@@ -133,6 +135,68 @@ def read_bridge(hermes_home: Optional[str] = None) -> Optional[dict]:
     if origin and origin.rstrip("/") + "/" not in ALLOWED_ORIGINS:
         return None
     return data
+
+
+def read_bridges(hermes_home: Optional[str] = None) -> list:
+    """Every live bridge, newest first: one per Chrome profile (or Chromium-family browser) whose
+    extension is connected right now. A legacy ``bridge.json`` (a host an older Hermes started) counts
+    unless a per-host file already names the same pid."""
+    d = bridge_state_dir(hermes_home)
+    try:
+        names = sorted(n for n in os.listdir(d) if n.startswith(BRIDGE_PREFIX) and n.endswith(".json"))
+    except OSError:
+        return []
+    out = [b for b in (_read_bridge_file(d / n) for n in names) if b]
+    legacy = _read_bridge_file(d / LEGACY_BRIDGE_FILE)
+    if legacy and all(b.get("pid") != legacy.get("pid") for b in out):
+        out.append(legacy)
+    out.sort(key=lambda b: float(b.get("started_at") or 0), reverse=True)
+    return out
+
+
+def bridge_key(bridge: dict) -> str:
+    """A stable name for one connected profile: ``<browser>:<profile dir>`` (``chrome:Profile 2``), or
+    ``<browser>`` when the host could not tell which profile it serves."""
+    browser = str(bridge.get("browser") or DEFAULT_BROWSER_KEY)
+    prof = bridge.get("profile") if isinstance(bridge.get("profile"), dict) else {}
+    return f"{browser}:{prof['dir']}" if isinstance(prof.get("dir"), str) and prof.get("dir") else browser
+
+
+def bridge_summary(bridge: dict) -> dict:
+    """What the app and the status line may show about one connected profile: names, never the socket."""
+    prof = bridge.get("profile") if isinstance(bridge.get("profile"), dict) else {}
+    ext = bridge.get("extension") if isinstance(bridge.get("extension"), dict) else {}
+    browser = str(bridge.get("browser") or DEFAULT_BROWSER_KEY)
+    return {"key": bridge_key(bridge), "browser": browser, "browser_name": BROWSER_NAMES.get(browser, browser),
+            "profile": prof.get("name") if isinstance(prof.get("name"), str) else None,
+            "profile_dir": prof.get("dir") if isinstance(prof.get("dir"), str) else None,
+            "version": ext.get("version") if isinstance(ext.get("version"), str) else None,
+            "started_at": bridge.get("started_at")}
+
+
+def preferred_profile(browser_cfg: Optional[dict]) -> str:
+    """``browser.chrome_extension.profile``: the bridge key (or bare browser key) to prefer, or ""."""
+    value = chrome_extension_config(browser_cfg).get("profile")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def read_bridge(hermes_home: Optional[str] = None, browser_cfg: Optional[dict] = None,
+                prefer: Optional[str] = None) -> Optional[dict]:
+    """The live bridge to drive, or None. With several profiles connected: the one named by ``prefer``
+    (else ``browser.chrome_extension.profile``) when it is live, matched by its full key or its browser;
+    otherwise the one connected most recently -- the profile the person most likely just opened."""
+    bridges = read_bridges(hermes_home)
+    if not bridges:
+        return None
+    want = (prefer if prefer is not None else preferred_profile(browser_cfg)).strip()
+    if want:
+        exact = [b for b in bridges if bridge_key(b) == want]
+        if exact:
+            return exact[0]
+        same_browser = [b for b in bridges if str(b.get("browser") or DEFAULT_BROWSER_KEY) == want]
+        if same_browser:
+            return same_browser[0]
+    return bridges[0]
 
 
 def read_seen(hermes_home: Optional[str] = None) -> Optional[dict]:
@@ -153,8 +217,8 @@ def read_seen(hermes_home: Optional[str] = None) -> Optional[dict]:
 
 
 def host_manifest_status(browser_dir: Optional[str] = None) -> dict:
-    """What Google Chrome will find when the extension asks for ``app.memoe.chrome_bridge``: is the
-    host manifest there, does it list every id, does its launcher exist. Reads, never writes."""
+    """What one Chromium-family browser will find when the extension asks for ``app.memoe.chrome_bridge``:
+    is the host manifest there, does it list every id, does its launcher exist. Reads, never writes."""
     path = Path(os.path.expanduser(browser_dir or MAC_BROWSER_DIRS["chrome"])) / "NativeMessagingHosts" / f"{NATIVE_HOST_NAME}.json"
     out = {"path": str(path), "present": False, "missing_ids": list(EXTENSION_IDS), "launcher_ok": False}
     try:
@@ -171,6 +235,26 @@ def host_manifest_status(browser_dir: Optional[str] = None) -> dict:
     return out
 
 
+def installed_browsers() -> list:
+    """Keys of the Chromium-family browsers on this Mac: their data folder exists (the browser has run
+    at least once, which is also what makes its NativeMessagingHosts folder meaningful). Chrome first."""
+    return [k for k, d in MAC_BROWSER_DIRS.items() if os.path.isdir(os.path.expanduser(d))]
+
+
+def host_statuses() -> Dict[str, dict]:
+    """``host_manifest_status`` for every installed Chromium-family browser (Chrome alone when none is)."""
+    keys = installed_browsers() or [DEFAULT_BROWSER_KEY]
+    return {k: host_manifest_status(MAC_BROWSER_DIRS[k]) for k in keys}
+
+
+def _best_host(statuses: Dict[str, dict]) -> dict:
+    """The host that decides lane_status: a healthy one if any browser has it, else the first present
+    (its problem is the one to fix), else Chrome's absent one."""
+    ok = [h for h in statuses.values() if h["present"] and not h["missing_ids"] and h["launcher_ok"]]
+    present = [h for h in statuses.values() if h["present"]]
+    return (ok or present or list(statuses.values()))[0]
+
+
 #: lane_status() states, in the order they are decided. Each has words Moe can say as they are.
 LANE_STATES = ("connected", "off", "host_missing", "host_outdated", "host_broken",
                "installed_not_connected", "not_installed")
@@ -181,16 +265,21 @@ def lane_status(hermes_home: Optional[str] = None, browser_cfg: Optional[dict] =
     """Why the Chrome lane is or is not usable, in one word and in the words to tell the person.
 
     The field Moe reads (``lane_status`` on the not-connected error, and ``status``): the person
-    asks "why can't you use my Chrome" and Moe can answer instead of guessing. Reads only."""
+    asks "why can't you use my Chrome" and Moe can answer instead of guessing. Reads only.
+    ``browser_dir`` checks that one browser's host; without it, every installed Chromium-family browser's."""
     from tools.fix_reasons import host_app_name
     app = host_app_name()
     row = f"{app} › Settings › Connections › Moe in your Chrome"
-    bridge = read_bridge(hermes_home)
-    host = host_manifest_status(browser_dir)
+    bridges = read_bridges(hermes_home)
+    host = host_manifest_status(browser_dir) if browser_dir else _best_host(host_statuses())
     seen = read_seen(hermes_home)
     enabled = None if browser_cfg is None else lane_enabled(browser_cfg)
-    if bridge:
-        state, text = "connected", "Moe's extension is connected to your Chrome."
+    if bridges:
+        if len(bridges) == 1:
+            state, text = "connected", "Moe's extension is connected to your Chrome."
+        else:
+            state, text = "connected", (f"Moe's extension is connected in {len(bridges)} browser profiles; Moe works "
+                                        "in the one picked in " + row + ", or the one opened most recently.")
     elif enabled is False:
         state, text = "off", f"Moe in your Chrome is turned off. Turn it on in {row}."
     elif not host["present"]:
@@ -211,10 +300,12 @@ def lane_status(hermes_home: Optional[str] = None, browser_cfg: Optional[dict] =
         state, text = "not_installed", (f"Moe's extension isn't in your Chrome yet. Open {row} and click Add to "
                                         "Chrome, then reopen Chrome.")
     out = {"state": state, "text": text, "host_manifest": host["path"]}
+    if bridges:
+        out["profiles"] = [bridge_summary(b) for b in bridges]
     if host["missing_ids"] and host["present"]:
         out["missing_ids"] = host["missing_ids"]
     if seen:
-        out["last_seen"] = {k: seen.get(k) for k in ("at", "extension_id", "version") if k in seen}
+        out["last_seen"] = {k: seen.get(k) for k in ("at", "extension_id", "version", "browser") if k in seen}
     return out
 
 
@@ -682,6 +773,11 @@ MAC_BROWSER_DIRS = {
     "brave": "~/Library/Application Support/BraveSoftware/Brave-Browser",
     "edge": "~/Library/Application Support/Microsoft Edge",
 }
+#: What the person calls each one.
+BROWSER_NAMES = {
+    "chrome": "Google Chrome", "chrome-beta": "Chrome Beta", "chrome-canary": "Chrome Canary",
+    "chromium": "Chromium", "brave": "Brave", "edge": "Microsoft Edge",
+}
 
 
 def host_manifest(host_path: str, extension_ids: Iterable[str] = EXTENSION_IDS) -> dict:
@@ -696,8 +792,15 @@ def host_manifest(host_path: str, extension_ids: Iterable[str] = EXTENSION_IDS) 
     }
 
 
+def launcher_name(browser: str = DEFAULT_BROWSER_KEY) -> str:
+    """Google Chrome's launcher keeps the name every earlier install wrote; each other browser gets its
+    own, which tells the host which browser started it (``--browser``)."""
+    return "memoe-chrome-host" if browser == DEFAULT_BROWSER_KEY else f"memoe-chrome-host-{browser}"
+
+
 def install_native_host(browser_dir: str, *, hermes_home: Optional[str] = None, python: Optional[str] = None,
-                        extension_ids: Iterable[str] = EXTENSION_IDS) -> Tuple[Path, Path]:
+                        extension_ids: Iterable[str] = EXTENSION_IDS,
+                        browser: str = DEFAULT_BROWSER_KEY) -> Tuple[Path, Path]:
     """Write the host launcher (in the Hermes home) and its manifest (in ``<browser_dir>/NativeMessagingHosts``).
 
     Writes one JSON file beside the browser's profiles and nothing inside any profile —
@@ -706,7 +809,9 @@ def install_native_host(browser_dir: str, *, hermes_home: Optional[str] = None, 
     state_dir = bridge_state_dir(str(home))
     state_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(state_dir, 0o700)
-    launcher = state_dir / "memoe-chrome-host"
+    if not re.fullmatch(r"[a-z0-9-]{1,32}", browser or ""):
+        raise ValueError(f"not a browser key: {browser!r}")
+    launcher = state_dir / launcher_name(browser)
     bridge_py = Path(__file__).resolve().parent / "browser_chrome_bridge.py"
     py = python or sys.executable
 
@@ -714,9 +819,9 @@ def install_native_host(browser_dir: str, *, hermes_home: Optional[str] = None, 
         return "'" + str(s).replace("'", "'\"'\"'") + "'"
 
     launcher.write_text(
-        "#!/bin/sh\n# Memoe Chrome bridge: started by Chrome for the Memoe extension only.\n"
+        "#!/bin/sh\n# Memoe Chrome bridge: started by the browser for the Memoe extension only.\n"
         f"HERMES_HOME={q(home)}\nexport HERMES_HOME\nunset PYTHONPATH PYTHONHOME\n"
-        f"exec {q(py)} {q(bridge_py)} \"$@\"\n", encoding="utf-8")
+        f"exec {q(py)} {q(bridge_py)} --browser {q(browser)} \"$@\"\n", encoding="utf-8")
     os.chmod(launcher, 0o700)
     target = Path(os.path.expanduser(browser_dir)) / "NativeMessagingHosts"
     target.mkdir(parents=True, exist_ok=True)
@@ -725,25 +830,65 @@ def install_native_host(browser_dir: str, *, hermes_home: Optional[str] = None, 
     return manifest, launcher
 
 
+def install_all_hosts(*, hermes_home: Optional[str] = None, python: Optional[str] = None) -> list:
+    """``install_native_host`` for every Chromium-family browser installed here (its data folder exists).
+    Never creates a browser's own folder: a browser that has never run gets nothing."""
+    out = []
+    for key in installed_browsers():
+        manifest, launcher = install_native_host(MAC_BROWSER_DIRS[key], hermes_home=hermes_home, python=python,
+                                                 browser=key)
+        out.append({"browser": key, "manifest": str(manifest), "launcher": str(launcher)})
+    return out
+
+
+def status(hermes_home: Optional[str] = None, browser_cfg: Optional[dict] = None) -> dict:
+    """The one status the app reads: connected or not, which profiles, which one Moe drives."""
+    bridges = read_bridges(hermes_home)
+    chosen = read_bridge(hermes_home, browser_cfg) if bridges else None
+    return {"connected": bool(bridges), "extension": (chosen or {}).get("extension"),
+            "profiles": [bridge_summary(b) for b in bridges],
+            "active_profile": bridge_key(chosen) if chosen else None,
+            "preferred_profile": preferred_profile(browser_cfg) or None,
+            "hosts": {k: v["present"] and not v["missing_ids"] and v["launcher_ok"] for k, v in host_statuses().items()},
+            "warnings": bridge_warnings(chosen), "lane_status": _quiet_status(browser_cfg)}
+
+
+def _config_browser_cfg() -> Optional[dict]:
+    try:
+        from tools.browser_session_cloud import browser_section
+        return browser_section()
+    except Exception:
+        return None
+
+
 def main(argv: Optional[list] = None) -> int:
     import argparse
 
     ap = argparse.ArgumentParser(prog="python -m tools.browser_chrome_extension")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    inst = sub.add_parser("install-host", help="write the native-messaging host for one browser")
+    inst = sub.add_parser("install-host", help="write the native-messaging host for one browser, or all of them")
     inst.add_argument("--browser", default="chrome", choices=sorted(MAC_BROWSER_DIRS))
     inst.add_argument("--browser-dir", help="explicit browser user-data dir (overrides --browser)")
-    sub.add_parser("status", help="print whether the extension is connected")
+    inst.add_argument("--all", action="store_true",
+                      help="every Chromium-family browser installed on this Mac (one manifest each)")
+    sub.add_parser("status", help="print whether the extension is connected, and in which profiles")
     args = ap.parse_args(argv)
     if args.cmd == "install-host":
-        manifest, launcher = install_native_host(args.browser_dir or MAC_BROWSER_DIRS[args.browser])
-        print(json.dumps({"manifest": str(manifest), "launcher": str(launcher), "extension_id": STORE_EXTENSION_ID,
-                          "extension_ids": list(EXTENSION_IDS), "extension_dir": str(EXTENSION_DIR)}))
+        common = {"extension_id": STORE_EXTENSION_ID, "extension_ids": list(EXTENSION_IDS),
+                  "extension_dir": str(EXTENSION_DIR)}
+        if args.all:
+            hosts = install_all_hosts()
+            print(json.dumps({**common, "hosts": hosts,
+                              "manifest": hosts[0]["manifest"] if hosts else None,
+                              "launcher": hosts[0]["launcher"] if hosts else None}))
+            return 0
+        manifest, launcher = install_native_host(args.browser_dir or MAC_BROWSER_DIRS[args.browser],
+                                                 browser=args.browser)
+        print(json.dumps({**common, "manifest": str(manifest), "launcher": str(launcher), "browser": args.browser}))
         return 0
-    bridge = read_bridge()
-    print(json.dumps({"connected": bool(bridge), "extension": (bridge or {}).get("extension"),
-                      "warnings": bridge_warnings(bridge), "lane_status": _quiet_status()}))
-    return 0 if bridge else 1
+    out = status(browser_cfg=_config_browser_cfg())
+    print(json.dumps(out))
+    return 0 if out["connected"] else 1
 
 
 if __name__ == "__main__":

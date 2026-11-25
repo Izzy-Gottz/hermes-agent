@@ -20,6 +20,7 @@ const on = (name) => ({ addListener: (fn) => { (listeners[name] = listeners[name
 let hookOnSend = null;
 
 const store = {};
+const localStore = {};
 // The toolbar button, as the person sees it: badge, its colour, the hover title; and how often
 // the extension asked Chrome for its native host.
 const toolbar = { badge: undefined, color: undefined, title: undefined, connects: 0 };
@@ -42,6 +43,9 @@ const chrome = {
     get: async (k) => (k in store ? { [k]: store[k] } : {}),
     set: async (o) => { Object.assign(store, o); },
     remove: async (k) => { delete store[k]; },
+  }, local: {
+    get: async (k) => (k in localStore ? { [k]: localStore[k] } : {}),
+    set: async (o) => { Object.assign(localStore, o); },
   } },
   tabGroups: {
     TAB_GROUP_ID_NONE: NONE,
@@ -105,7 +109,8 @@ const port = {
   postMessage: (m) => { if ("id" in m) replies.set(m.id, m); },
 };
 
-const ctx = vm.createContext({ chrome, navigator: { userAgent: "Chrome/153 test" }, URL, setTimeout, clearTimeout, console });
+const ctx = vm.createContext({ chrome, navigator: { userAgent: "Chrome/153 test" }, URL, setTimeout, clearTimeout, console,
+                               crypto: globalThis.crypto });
 vm.runInContext(fs.readFileSync(SRC, "utf8"), ctx, { filename: SRC });
 
 let n = 0;
@@ -121,6 +126,7 @@ const sentTo = (tabId) => calls.send.filter((c) => c.tabId === tabId);
 (async () => {
   const report = {};
   report.hello = await op("hello", {});
+  report.helloAgain = await op("hello", {});
 
   // A Moe tab: its own window, behind the person's (the person's window gets focus handed back).
   report.create = await op("create", { url: "https://example.com/" });

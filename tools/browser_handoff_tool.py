@@ -441,7 +441,7 @@ def browser_handoff(reason: str = "", url: str = "", resume_hint: str = "", done
         browser_cfg = _read_browser_cfg()
     except Exception:
         pass
-    bridge = chrome_lane.read_bridge() if chrome_lane.lane_enabled(browser_cfg) else None
+    bridge = chrome_lane.read_bridge(browser_cfg=browser_cfg) if chrome_lane.lane_enabled(browser_cfg) else None
     if bridge is not None:
         err = _open_in_chrome_group(bridge, target)
         if err is None:

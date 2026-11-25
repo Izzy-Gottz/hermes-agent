@@ -46,6 +46,8 @@ def _home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_MCP_TOOL_PROFILE", raising=False)
     # lane_status reads Chrome's NativeMessagingHosts: a scratch one, never this Mac's.
     monkeypatch.setitem(lane.MAC_BROWSER_DIRS, "chrome", str(tmp_path / "Chrome"))
+    for key in [k for k in lane.MAC_BROWSER_DIRS if k != "chrome"]:  # ...and no other browser of this Mac's
+        monkeypatch.setitem(lane.MAC_BROWSER_DIRS, key, str(tmp_path / "browsers" / key))
     lane.reset_sticky_lanes()
     bound = _bind()  # by default: the person's own live turn in the Memoe app
     yield
@@ -382,13 +384,135 @@ def test_auto_routing_reaches_the_bridge_for_a_known_blocker(tmp_path, cli):
     assert cli["env"]["BU_CDP_WS"].startswith("ws://127.0.0.1:")
 
 
-def test_where_is_in_the_schema_only_when_the_lane_is_on(monkeypatch):
+def test_where_is_in_the_schema_whether_the_lane_is_on_or_off(monkeypatch):
+    # The schema is baked in when a session starts and nothing rebuilds it when the person connects the
+    # extension mid-session: a where that appeared only with the lane on stayed missing for that session.
     monkeypatch.setattr(bu, "_real_profile_consented", lambda: False)
     monkeypatch.setattr(bu, "_description_header", lambda: "")
+    schemas = []
+    for cfg in ({}, {"chrome_extension": {"enabled": True}}):
+        monkeypatch.setattr(bu, "_read_browser_cfg", lambda cfg=cfg: cfg)
+        params = bu._dynamic_schema_overrides().get("parameters") or bu.BROWSER_EXEC_SCHEMA["parameters"]
+        assert params["properties"]["where"]["enum"] == ["own", "chrome"]
+        schemas.append(json.dumps(bu._dynamic_schema_overrides(), sort_keys=True))
+    assert schemas[0] == schemas[1]  # byte-stable: toggling the lane never changes the tool list
+
+
+def test_where_chrome_with_the_lane_off_says_how_to_turn_it_on(monkeypatch, cli):
     monkeypatch.setattr(bu, "_read_browser_cfg", lambda: {})
-    assert "where" not in (bu._dynamic_schema_overrides().get("parameters") or bu.BROWSER_EXEC_SCHEMA["parameters"])["properties"]
-    monkeypatch.setattr(bu, "_read_browser_cfg", lambda: {"chrome_extension": {"enabled": True}})
-    assert bu._dynamic_schema_overrides()["parameters"]["properties"]["where"]["enum"] == ["own", "chrome"]
+    out = json.loads(bu.browser_exec('print(1)', task_id="t", where="chrome"))
+    assert "turned off" in out["error"] and "Connections" in out["error"] and out["lane_status"]["state"] == "off"
+    assert "cmd" not in cli
+
+
+# ---- several profiles, several browsers -------------------------------------------------------
+
+def _write_host_bridge(tmp_path, pid, started, browser="chrome", profile=None):
+    d = tmp_path / "chrome-bridge"
+    d.mkdir(exist_ok=True)
+    data = {"ws_url": f"ws://127.0.0.1:{5000 + started}/devtools/browser/t{started}", "pid": pid,
+            "extension_origin": f"chrome-extension://{lane.STORE_EXTENSION_ID}/", "started_at": started,
+            "browser": browser, "extension": {"version": "0.2.3"}}
+    if profile:
+        data["profile"] = profile
+    p = d / f"bridge-{pid}.json"
+    p.write_text(json.dumps(data))
+    os.chmod(p, 0o600)
+    return p
+
+
+@pytest.fixture()
+def two_live_pids():
+    procs = [subprocess.Popen(["sleep", "60"]) for _ in range(2)]
+    yield [p.pid for p in procs]
+    for p in procs:
+        p.kill()
+        p.wait()
+
+
+def test_with_two_profiles_connected_the_preferred_one_wins_else_the_newest(tmp_path, two_live_pids):
+    a, b = two_live_pids
+    _write_host_bridge(tmp_path, a, 1, profile={"dir": "Default", "name": "Personal"})
+    _write_host_bridge(tmp_path, b, 2, browser="brave")
+    assert [x["pid"] for x in lane.read_bridges()] == [b, a]                     # newest first
+    assert lane.read_bridge()["pid"] == b
+    assert lane.read_bridge(prefer="chrome:Default")["pid"] == a
+    assert lane.read_bridge(browser_cfg={"chrome_extension": {"profile": "chrome"}})["pid"] == a
+    assert lane.read_bridge(prefer="edge")["pid"] == b                           # not connected: newest
+    st = lane.status(str(tmp_path), {"chrome_extension": {"enabled": True, "profile": "chrome:Default"}})
+    assert st["connected"] and st["active_profile"] == "chrome:Default"
+    assert [(p["key"], p["browser_name"], p["profile"]) for p in st["profiles"]] == [
+        ("brave", "Brave", None), ("chrome:Default", "Google Chrome", "Personal")]
+    assert all("ws_url" not in json.dumps(p) for p in st["profiles"])            # never the socket's secret
+    ls = lane.lane_status(str(tmp_path), {"chrome_extension": {"enabled": True}})
+    assert ls["state"] == "connected" and "2 browser profiles" in ls["text"]
+
+
+def test_a_legacy_bridge_still_counts_but_not_twice(tmp_path, two_live_pids):
+    a, b = two_live_pids
+    _write_bridge(tmp_path, pid=a)
+    assert [x["pid"] for x in lane.read_bridges()] == [a]
+    _write_host_bridge(tmp_path, a, 5)
+    assert [x["pid"] for x in lane.read_bridges()] == [a]
+
+
+def test_install_all_writes_a_host_for_every_installed_chromium_browser_and_creates_none(tmp_path):
+    (tmp_path / "Chrome").mkdir()
+    (tmp_path / "browsers" / "brave").mkdir(parents=True)
+    hosts = lane.install_all_hosts(hermes_home=str(tmp_path / "hh"), python="/usr/bin/python3")
+    assert [h["browser"] for h in hosts] == ["chrome", "brave"]
+    assert not (tmp_path / "browsers" / "edge").exists()                       # never made a browser's folder
+    brave = json.loads((tmp_path / "browsers" / "brave" / "NativeMessagingHosts" / "app.memoe.chrome_bridge.json").read_text())
+    launcher = Path(brave["path"])
+    assert launcher.name == "memoe-chrome-host-brave" and "--browser 'brave'" in launcher.read_text()
+    chrome = json.loads((tmp_path / "Chrome" / "NativeMessagingHosts" / "app.memoe.chrome_bridge.json").read_text())
+    assert Path(chrome["path"]).name == "memoe-chrome-host"                    # the name every install wrote
+    st = lane.host_statuses()
+    assert set(st) == {"chrome", "brave"} and all(h["present"] for h in st.values())
+
+
+def test_lane_status_finds_a_host_in_any_installed_browser(tmp_path):
+    brave = tmp_path / "browsers" / "brave"
+    brave.mkdir(parents=True)
+    on = {"chrome_extension": {"enabled": True}}
+    assert lane.lane_status(str(tmp_path), on)["state"] == "host_missing"
+    _host(brave, list(lane.ALLOWED_ORIGINS))
+    assert lane.lane_status(str(tmp_path), on)["state"] == "not_installed"     # host is fine; nothing seen yet
+
+
+# ---- Moe's own browser could not start ------------------------------------------------------------
+
+def _own_fails(monkeypatch, cli, msg="Moe's browser is still downloading"):
+    def fail_route(env, session, task_id, local, **_kw):
+        cli["route"] += 1
+        env["BU_CDP_URL"] = "http://127.0.0.1:9/half-made"   # whatever a failed route left behind
+        return msg
+    monkeypatch.setattr(bu, "_route_backend", fail_route)
+
+
+def test_own_browser_that_cannot_start_falls_back_to_the_connected_chrome(monkeypatch, tmp_path, cli):
+    _write_bridge(tmp_path)
+    _own_fails(monkeypatch, cli)
+    out = json.loads(bu.browser_exec('new_tab("https://example.com/account")', session="s", task_id="t"))
+    assert out["success"] and out["lane"] == "chrome" and "could not start" in out["lane_reason"]
+    assert cli["env"]["BU_CDP_WS"].startswith("ws://127.0.0.1:5555") and "BU_CDP_URL" not in cli["env"]
+    assert cli["env"]["BU_NAME"] == "chrome-s"
+
+
+def test_explicit_own_or_no_person_never_falls_back_but_says_so(monkeypatch, tmp_path, cli):
+    _write_bridge(tmp_path)
+    _own_fails(monkeypatch, cli)
+    out = json.loads(bu.browser_exec('new_tab("https://example.com/")', task_id="t", where="own"))
+    assert "still downloading" in out["error"] and 'where="chrome"' in out["hint"] and "cmd" not in cli
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t1")
+    out = json.loads(bu.browser_exec('new_tab("https://example.com/")', task_id="t"))
+    assert "error" in out and "not used on its own" in out["hint"] and "cmd" not in cli
+
+
+def test_own_browser_failure_without_the_extension_says_why_chrome_is_not_there(monkeypatch, cli):
+    _own_fails(monkeypatch, cli)
+    out = json.loads(bu.browser_exec('new_tab("https://example.com/")', task_id="t"))
+    assert "still downloading" in out["error"] and "not connected either" in out["hint"] and "cmd" not in cli
 
 
 def test_file_access_on_is_a_warning_for_the_app():

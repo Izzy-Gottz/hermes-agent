@@ -1082,6 +1082,41 @@ def _signed_out_fields(route_key: str) -> dict:
                                 "nothing behind a login was reached.")}
 
 
+def _one_line(err: Any, limit: int = 200) -> str:
+    text = " ".join(str(err or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _own_failure_can_use_chrome(where: str, browser_cfg: dict, bridge: Optional[dict], presence: dict) -> bool:
+    """Moe's own browser failed to start: may this call run in the person's connected Chrome instead?
+
+    Only when nobody chose the own browser explicitly, the lane is on, an extension is connected, and this
+    is the person's own live turn that may be routed on Hermes's judgement (not a helper's, cron's or a
+    channel's background work) -- the same conditions under which a known bot wall is routed there."""
+    from tools import browser_chrome_extension as chrome_lane
+    return (not where and bridge is not None and chrome_lane.lane_enabled(browser_cfg)
+            and presence.get("live") is True and presence.get("auto") is not False)
+
+
+def _own_failure_hint(where: str, browser_cfg: dict, bridge: Optional[dict], presence: dict) -> dict:
+    """The ``hint`` field for an own-browser start failure that did not fall back, when there is one to give."""
+    from tools import browser_chrome_extension as chrome_lane
+    if not chrome_lane.lane_enabled(browser_cfg):
+        return {}
+    if bridge is not None and presence.get("live"):
+        return {"hint": ("Moe's own browser could not start, but the person's Chrome is connected: run the same code "
+                         "again with where=\"chrome\" -- it works in Moe's own tab group there, signed in as them.")}
+    if bridge is not None:
+        return {"hint": (f"Moe's own browser could not start. The person's Chrome is connected, but this is "
+                         f"{presence.get('why') or 'a turn nobody started live'}, so it is not used on its own. "
+                         "Report what is waiting.")}
+    status = chrome_lane._quiet_status(browser_cfg) or {}
+    if status.get("text"):
+        return {"hint": "Moe's own browser could not start, and the person's Chrome is not connected either: "
+                        + status["text"]}
+    return {}
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False, where: str = "",
                  allow_signed_out: bool = False):
@@ -1125,7 +1160,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error(f"Invalid where={where!r}: use \"own\" (Moe's own browser) or \"chrome\" (the owner's Chrome).")
     if where == chrome_lane.LANE_CHROME and local:
         return tool_error("where=\"chrome\" already is the owner's real browser; drop local=true.")
-    bridge = chrome_lane.read_bridge() if chrome_lane.lane_enabled(browser_cfg) or where == chrome_lane.LANE_CHROME else None
+    bridge = (chrome_lane.read_bridge(browser_cfg=browser_cfg)
+              if chrome_lane.lane_enabled(browser_cfg) or where == chrome_lane.LANE_CHROME else None)
     # Who started this turn, asked once per call (over the tool bridge under claude-code).
     presence = chrome_lane.turn_presence() if chrome_lane.lane_enabled(browser_cfg) else {"live": False, "why": ""}
     lane, lane_reason = chrome_lane.choose_lane(where, code, task_id=task_id, session=session,
@@ -1136,8 +1172,13 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if lane == chrome_lane.LANE_CHROME:
         # Fail closed: an explicit (or routed) Chrome call never quietly runs somewhere else.
         if not chrome_lane.lane_enabled(browser_cfg):
-            return tool_error("The Chrome-extension lane is off (browser.chrome_extension.enabled). "
-                              "Nothing ran; use where=\"own\".")
+            # ``where`` is always in the schema (see BROWSER_EXEC_SCHEMA), so this is how a turn learns the
+            # lane is off: in words Moe can repeat, with the way to turn it on.
+            from tools.fix_reasons import host_app_name
+            return tool_error("Moe in your Chrome is turned off, so nothing ran in the person's Chrome. "
+                              f"They can turn it on in {host_app_name()} › Settings › Connections › Moe in your "
+                              "Chrome. Use where=\"own\" to work in Moe's own browser meanwhile.",
+                              lane_status={"state": "off"})
         if not presence.get("live") and chrome_lane.chrome_extension_config(browser_cfg).get("allow_unattended") is not True:
             return tool_error(f"This is {presence.get('why') or 'a turn nobody started live'}, not the person's own live "
                               "turn, so Moe does not open tabs in the person's Chrome. Nothing ran; use where=\"own\" "
@@ -1147,13 +1188,23 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         chrome_lane.chrome_lane_env(env, bridge, session)
     else:
         _park_check(code, task_id)
+        unrouted_env = env
         env, route_err, local_sidecar, generation = _route_exec_current(
             env, session, task_id, bool(local), local_sidecar, route_key, allow_signed_out=bool(allow_signed_out))
-        if route_err:
+        if route_err and _own_failure_can_use_chrome(where, browser_cfg, bridge, presence):
+            # Moe's own browser could not start (on a fresh install it is still downloading, or the signed-in
+            # copy would not load) while the person's own Chrome is connected and this is their turn: work
+            # there instead of failing -- it is signed in as them, which is what the own browser was for.
+            lane, lane_reason = chrome_lane.LANE_CHROME, "Moe's own browser could not start: " + _one_line(route_err)
+            env = dict(unrouted_env)  # nothing the failed own-browser route set up reaches the Chrome lane
+            chrome_lane.chrome_lane_env(env, bridge, session)
+            route_err = None
+        elif route_err:
             if env.pop(_REAL_PROFILE_REFUSED_SENTINEL, None):
                 return _real_profile_refusal(route_err)  # the reason, and the question for the person
             from tools.fix_reasons import as_tool_error
-            return as_tool_error(route_err)  # keeps a fixable cause's code (tools.fix_reasons)
+            return as_tool_error(route_err, **_own_failure_hint(where, browser_cfg, bridge, presence))
+    if lane == chrome_lane.LANE_OWN:
         if local_sidecar:
             env["BU_NAME"] = _sidecar_daemon_name(session)
         _exec_route_is_sidecar[route_key] = local_sidecar
@@ -1431,23 +1482,20 @@ def _dynamic_schema_overrides() -> dict:
                             "their sessions. Default false: the cloud browser."),
         }
         overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
-    # ``where`` exists ONLY when the Chrome-extension lane is enabled (same rule as ``local``).
-    from tools.browser_chrome_extension import lane_enabled
-    if lane_enabled(_read_browser_cfg()):
-        params = overrides.get("parameters") or BROWSER_EXEC_SCHEMA["parameters"]
-        props = dict(params["properties"])
-        props["where"] = {
-            "type": "string", "enum": ["own", "chrome"],
-            "description": ("Which browser runs the code. Omit it and Hermes picks: Moe's own browser, except "
-                            "sites known to block it, which go to the owner's Chrome. \"own\" = Moe's own "
-                            "browser (background work). \"chrome\" = a tab in Moe's own tab group in the owner's "
-                            "real Chrome, via the Memoe extension — use it when a result says blocked_by, or when "
-                            "the owner asks you to work in their Chrome. It never touches the owner's other tabs. "
-                            "Keep the same where for every call of one task."),
-        }
-        overrides["parameters"] = {**params, "properties": props}
     return overrides
 
+
+_WHERE_PARAM = {
+    "type": "string", "enum": ["own", "chrome"],
+    "description": ("Which browser runs the code. Omit it and Hermes picks: Moe's own browser, except sites known to "
+                    "block it -- or when Moe's own browser cannot start -- which go to the owner's Chrome when Moe's "
+                    "extension is connected there. \"own\" = Moe's own browser (background work). \"chrome\" = a tab "
+                    "in Moe's own tab group in the owner's real Chrome (or another Chromium browser they added it "
+                    "to), via the Memoe extension, signed in as them -- use it when a result says blocked_by, when "
+                    "the work needs the owner's own sign-ins, or when the owner asks you to work in their Chrome. It "
+                    "never touches the owner's other tabs. If the extension is not connected or is turned off, the "
+                    "result says why. Keep the same where for every call of one task."),
+}
 
 BROWSER_EXEC_SCHEMA = {
     "name": "browser_exec",
@@ -1461,6 +1509,12 @@ BROWSER_EXEC_SCHEMA = {
             "session": {"type": "string", "description": "Named isolated browser session — its own daemon and (on cloud backends) own browser, so concurrent tasks don't share tabs. Reuse the same name on every related call; omit for the shared default session."},
             "timeout_s": {"type": "integer", "default": _DEFAULT_TIMEOUT_S,
                           "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S})."},
+            # ALWAYS present, whatever browser.chrome_extension.enabled says. The schema is baked into a cached
+            # agent (and into the claude-code child's MCP tool list) when the session starts, and nothing
+            # rebuilds it when the person connects the extension mid-session; a parameter that appeared only
+            # with the lane on was missing for the rest of that session. A byte-stable schema also never
+            # costs a rebuild. With the lane off, where="chrome" answers in words how to turn it on.
+            "where": _WHERE_PARAM,
         },
         "required": ["code"],
     },

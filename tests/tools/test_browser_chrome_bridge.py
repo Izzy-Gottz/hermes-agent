@@ -99,8 +99,8 @@ def _wait(pred, timeout=20):
 def host(tmp_path):
     _set_lane(tmp_path, True)
     proc, ext = _spawn(tmp_path)
-    state = tmp_path / "chrome-bridge" / "bridge.json"
-    assert _wait(state.exists), proc.stderr.read1(4000) if proc.poll() is not None else "bridge.json never appeared"
+    state = tmp_path / "chrome-bridge" / f"bridge-{proc.pid}.json"
+    assert _wait(state.exists), proc.stderr.read1(4000) if proc.poll() is not None else "bridge file never appeared"
     yield proc, ext, state
     proc.stdin.close()
     proc.wait(timeout=10)
@@ -335,7 +335,7 @@ def test_activate_target_is_a_no_op_and_sessions_belong_to_their_socket(host):
 def test_with_the_lane_off_no_socket_exists_and_it_follows_the_config(tmp_path):
     _set_lane(tmp_path, False)
     proc, _ = _spawn(tmp_path)
-    state = tmp_path / "chrome-bridge" / "bridge.json"
+    state = tmp_path / "chrome-bridge" / f"bridge-{proc.pid}.json"
     try:
         assert not _wait(state.exists, timeout=3)
         _set_lane(tmp_path, True)
@@ -346,6 +346,59 @@ def test_with_the_lane_off_no_socket_exists_and_it_follows_the_config(tmp_path):
     finally:
         proc.stdin.close()
         proc.wait(timeout=10)
+
+
+def test_two_profiles_each_keep_their_own_bridge_and_closing_one_leaves_the_other(tmp_path, monkeypatch):
+    # Every Chrome profile with the extension starts its own host. One shared bridge.json meant the last
+    # to connect won, and the first to close deleted it under the others (the lane went dark while a
+    # profile was still connected).
+    from tools import browser_chrome_extension as lane
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_lane(tmp_path, True)
+    a, _ = _spawn(tmp_path)
+    b, _ = _spawn(tmp_path)
+    d = tmp_path / "chrome-bridge"
+    try:
+        assert _wait(lambda: (d / f"bridge-{a.pid}.json").exists() and (d / f"bridge-{b.pid}.json").exists())
+        assert not (d / "bridge.json").exists()
+        assert sorted(x["pid"] for x in lane.read_bridges()) == sorted([a.pid, b.pid])
+        a.stdin.close()
+        a.wait(timeout=10)
+        assert _wait(lambda: not (d / f"bridge-{a.pid}.json").exists())
+        assert (d / f"bridge-{b.pid}.json").exists()
+        live = lane.read_bridge()
+        assert live is not None and live["pid"] == b.pid
+    finally:
+        for p in (a, b):
+            if p.poll() is None:
+                p.stdin.close()
+                p.wait(timeout=10)
+
+
+def test_the_launcher_names_its_browser_and_an_older_one_is_chromes():
+    assert bridge.browser_from_argv(["--browser", "brave", ORIGIN]) == "brave"
+    assert bridge.browser_from_argv(["--browser=edge"]) == "edge"
+    assert bridge.browser_from_argv([ORIGIN]) == "chrome"
+
+
+def test_find_profile_by_the_id_in_the_extensions_own_storage(tmp_path):
+    ext = "nmdhnfjfpipnjbfbiligpbdnpfdkojjn"
+    root = tmp_path / "Chrome"
+    for prof, value in (("Default", b"moeProfileId\x00aaaa-1111"), ("Profile 2", b"\x01moeProfileId\"bbbb-2222\"")):
+        store = root / prof / "Local Extension Settings" / ext
+        store.mkdir(parents=True)
+        (store / "000003.log").write_bytes(b"\x00junk" + value + b"junk")
+    (root / "Profile 3").mkdir()  # no extension here
+    (root / "Local State").write_text(json.dumps({"profile": {"info_cache": {
+        "Default": {"name": "Personal"}, "Profile 2": {"name": "Work"}}}}))
+    assert bridge.find_profile(str(root), ext, "bbbb-2222") == {"dir": "Profile 2", "name": "Work"}
+    assert bridge.find_profile(str(root), ext, "aaaa-1111") == {"dir": "Default", "name": "Personal"}
+    assert bridge.find_profile(str(root), ext, "zzzz") is None            # two candidates, no match: unknown
+    assert bridge.find_profile(str(root), ext, None) is None
+    assert bridge.find_profile(str(tmp_path / "nowhere"), ext, "bbbb-2222") is None
+    only = tmp_path / "Brave"
+    (only / "Default" / "Local Extension Settings" / ext).mkdir(parents=True)
+    assert bridge.find_profile(str(only), ext, None) == {"dir": "Default", "name": "Default"}  # the only one
 
 
 @pytest.mark.parametrize("url,ok", [

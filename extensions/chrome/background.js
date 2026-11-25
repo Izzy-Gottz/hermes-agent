@@ -234,9 +234,26 @@ async function closeTab({ tabId }) {
   return {};
 }
 
+// A random id for THIS profile's copy of the extension, kept in its own chrome.storage.local (no new
+// permission). Every profile starts its own native host; the host finds which profile it serves by
+// looking for this id in the profile's extension storage, so the app can name the profiles that are
+// connected. Never sent anywhere but the local host.
+async function profileId() {
+  try {
+    const { moeProfileId } = await chrome.storage.local.get("moeProfileId");
+    if (typeof moeProfileId === "string" && moeProfileId) return moeProfileId;
+    const id = crypto.randomUUID();
+    await chrome.storage.local.set({ moeProfileId: id });
+    return id;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function hello() {
   return {
     protocol: PROTOCOL,
+    profileId: await profileId(),
     extensionId: chrome.runtime.id,
     version: chrome.runtime.getManifest().version,
     userAgent: navigator.userAgent,

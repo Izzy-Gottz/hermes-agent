@@ -34,8 +34,10 @@ Authentication of the local WebSocket: it binds loopback only, its path carries 
 256-bit secret (``/devtools/browser/<token>``), it refuses any request carrying an
 ``Origin`` header (every browser page sends one on a WebSocket upgrade; the
 harness never does), and the URL is published only in a 0600 file inside a 0700
-directory under the Hermes home. Its lifetime is the extension's port: when Chrome
-closes stdin the file is removed and the process exits.
+directory under the Hermes home (``bridge-<pid>.json``: one per host, because every
+Chrome profile and every Chromium-family browser with the extension starts its own).
+Its lifetime is the extension's port: when Chrome closes stdin THIS host's file is
+removed and the process exits; the other profiles' files stay.
 """
 
 from __future__ import annotations
@@ -380,10 +382,24 @@ def bridge_state_dir(hermes_home: Optional[str] = None) -> Path:
     return Path(home) / "chrome-bridge"
 
 
+#: One file per live host (``bridge-<pid>.json``). Every Chrome profile (and every Chromium-family browser)
+#: with the extension starts its OWN host; with one shared ``bridge.json`` the last profile to connect won and
+#: the first one to close deleted the file under the others. The reader (``read_bridges``) lists them all.
+BRIDGE_PREFIX = "bridge-"
+#: Written by hosts before per-host files; still read, so a host started by an older Hermes keeps working.
+LEGACY_BRIDGE_FILE = "bridge.json"
+
+
+def bridge_file_name(pid: int) -> str:
+    return f"{BRIDGE_PREFIX}{int(pid)}.json"
+
+
 def write_bridge_state(state_dir: Path, state: dict) -> Path:
+    """This host's handshake file, ``bridge-<pid>.json``: private, by rename."""
     state_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(state_dir, 0o700)
-    path = state_dir / "bridge.json"
+    pid = state.get("pid") if type(state.get("pid")) is int else os.getpid()
+    path = state_dir / bridge_file_name(pid)
     tmp = state_dir / f".bridge.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -392,7 +408,80 @@ def write_bridge_state(state_dir: Path, state: dict) -> Path:
     return path
 
 
-def write_seen(state_dir: Path, extension_origin: str, info: dict) -> Optional[Path]:
+# ---- which browser, which profile -------------------------------------------------------
+
+#: The launcher names its browser (``--browser <key>``, tools.browser_chrome_extension.MAC_BROWSER_DIRS);
+#: a launcher written before that names none, and is Google Chrome's (the only one Set up wrote).
+DEFAULT_BROWSER_KEY = "chrome"
+#: Extension-storage files larger than this are not scanned for the profile id.
+_PROFILE_SCAN_MAX_BYTES = 4 * 1024 * 1024
+
+
+def browser_from_argv(argv: list) -> str:
+    for i, a in enumerate(argv):
+        if a == "--browser" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--browser="):
+            return a.split("=", 1)[1]
+    return DEFAULT_BROWSER_KEY
+
+
+def find_profile(browser_dir: Optional[str], extension_id: Optional[str], profile_id: Optional[str]) -> Optional[dict]:
+    """``{"dir": "Profile 2", "name": "Work"}`` for the profile this host serves, or None.
+
+    Best effort, read only, inside the browser's own data folder (this host is the browser's child, so it
+    may read what other apps may not). The extension keeps a random ``profileId`` in its
+    ``chrome.storage.local``, which lives in ``<profile>/Local Extension Settings/<id>/``: the profile whose
+    files hold that id is ours. A browser with the extension in exactly one profile needs no id at all."""
+    if not browser_dir or not extension_id:
+        return None
+    root = Path(os.path.expanduser(browser_dir))
+    try:
+        candidates = sorted(p for p in root.iterdir()
+                            if (p / "Local Extension Settings" / extension_id).is_dir())
+    except OSError:
+        return None
+    match = None
+    if profile_id:
+        needle = str(profile_id).encode("utf-8")
+        for prof in candidates:
+            try:
+                files = list((prof / "Local Extension Settings" / extension_id).iterdir())
+            except OSError:
+                continue
+            for f in files:
+                try:
+                    if f.is_file() and f.stat().st_size <= _PROFILE_SCAN_MAX_BYTES and needle in f.read_bytes():
+                        match = prof
+                        break
+                except OSError:
+                    continue
+            if match is not None:
+                break
+    if match is None and len(candidates) == 1:
+        match = candidates[0]
+    if match is None:
+        return None
+    name = match.name
+    try:
+        state = json.loads((root / "Local State").read_text(encoding="utf-8"))
+        entry = ((state.get("profile") or {}).get("info_cache") or {}).get(match.name) or {}
+        if isinstance(entry.get("name"), str) and entry["name"].strip():
+            name = entry["name"].strip()
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {"dir": match.name, "name": name}
+
+
+def _browser_dir(browser: str) -> Optional[str]:
+    try:
+        from tools.browser_chrome_extension import MAC_BROWSER_DIRS
+    except Exception:
+        return None
+    return MAC_BROWSER_DIRS.get(browser)
+
+
+def write_seen(state_dir: Path, extension_origin: str, info: dict, browser: str = DEFAULT_BROWSER_KEY) -> Optional[Path]:
     """Record that the extension reached this host (lane on or off): ``seen.json``, private, by rename.
     It is how Moe and the app tell "installed, Chrome closed / other profile" from "never added"."""
     try:
@@ -403,7 +492,8 @@ def write_seen(state_dir: Path, extension_origin: str, info: dict) -> Optional[P
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump({"extension_origin": extension_origin, "extension_id": (info or {}).get("extensionId"),
-                       "version": (info or {}).get("version"), "at": time.time(), "pid": os.getpid()}, fh)
+                       "version": (info or {}).get("version"), "at": time.time(), "pid": os.getpid(),
+                       "browser": browser}, fh)
         os.replace(tmp, path)
         return path
     except OSError:
@@ -440,13 +530,15 @@ def lane_enabled_in_config(hermes_home: Optional[str] = None) -> bool:
         return False
 
 
-async def serve_bridge(link: ExtensionLink, extension_origin: str, state_dir: Path) -> None:
-    """Serve the socket only while the lane is enabled; with it off, no socket and no bridge.json exist."""
+async def serve_bridge(link: ExtensionLink, extension_origin: str, state_dir: Path,
+                       browser: str = DEFAULT_BROWSER_KEY) -> None:
+    """Serve the socket only while the lane is enabled; with it off, no socket and no bridge file exist."""
     info = await link.request("hello")
-    write_seen(state_dir, extension_origin, info if isinstance(info, dict) else {})
+    info = info if isinstance(info, dict) else {}
+    write_seen(state_dir, extension_origin, info, browser)
     while not link.closed.is_set():
         if lane_enabled_in_config(str(state_dir.parent)):
-            await _serve_socket(link, info, extension_origin, state_dir)
+            await _serve_socket(link, info, extension_origin, state_dir, browser)
         else:
             try:
                 await asyncio.wait_for(link.closed.wait(), _CONFIG_POLL_S)
@@ -454,7 +546,8 @@ async def serve_bridge(link: ExtensionLink, extension_origin: str, state_dir: Pa
                 pass
 
 
-async def _serve_socket(link: ExtensionLink, info: dict, extension_origin: str, state_dir: Path) -> None:
+async def _serve_socket(link: ExtensionLink, info: dict, extension_origin: str, state_dir: Path,
+                        browser: str = DEFAULT_BROWSER_KEY) -> None:
     from websockets.asyncio.server import serve
 
     relay = CDPRelay(link, info)
@@ -482,7 +575,10 @@ async def _serve_socket(link: ExtensionLink, info: dict, extension_origin: str, 
         port = server.sockets[0].getsockname()[1]
         state = {"protocol": BRIDGE_PROTOCOL, "ws_url": f"ws://127.0.0.1:{port}/devtools/browser/{token}",
                  "pid": os.getpid(), "extension_origin": extension_origin, "extension": info,
-                 "started_at": time.time()}
+                 "started_at": time.time(), "browser": browser}
+        profile = find_profile(_browser_dir(browser), info.get("extensionId"), info.get("profileId"))
+        if profile:
+            state["profile"] = profile
         path = write_bridge_state(state_dir, state)
         try:
             while not link.closed.is_set() and lane_enabled_in_config(str(state_dir.parent)):
@@ -510,13 +606,14 @@ def main(argv: Optional[list] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Chrome passes the calling extension's origin as the first argument.
     origin = next((a for a in argv if a.startswith("chrome-extension://")), "")
+    browser = browser_from_argv(argv)
     state_dir = bridge_state_dir()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     link = ExtensionLink(loop, sys.stdin.buffer, sys.stdout.buffer)
     link.start()
     try:
-        loop.run_until_complete(serve_bridge(link, origin, state_dir))
+        loop.run_until_complete(serve_bridge(link, origin, state_dir, browser))
     finally:
         loop.close()
     return 0

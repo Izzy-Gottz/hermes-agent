@@ -85,6 +85,12 @@ def test_nothing_focuses_and_moes_window_is_behind_the_persons(report):
     assert report["hello"]["result"]["fileAccess"] is False
 
 
+def test_hello_names_this_profile_with_an_id_that_stays_the_same(report):
+    # The host finds which profile it serves by this id (tools/browser_chrome_bridge.find_profile).
+    first, again = report["hello"]["result"]["profileId"], report["helloAgain"]["result"]["profileId"]
+    assert isinstance(first, str) and len(first) >= 32 and first == again
+
+
 def test_a_host_that_cannot_be_reached_is_shown_on_the_button_and_clears_when_it_answers(report):
     assert report["toolbarAfterHello"]["badge"] == ""                 # connected: nothing to see
     words = {"missing": "isn't set up for Chrome", "forbidden": "doesn't recognise this copy",
