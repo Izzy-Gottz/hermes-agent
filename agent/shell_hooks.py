@@ -84,6 +84,27 @@ def _utc_now_iso() -> str:
     return datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
 
 
+def _turn_presence_for_hook() -> Optional[dict[str, Any]]:
+    """``{"live", "why"}`` for the turn firing a tool hook, judged here -- or None where it cannot be.
+
+    A hook is a subprocess: the turn's origin (a cron job, a webhook, the person) lives in this
+    process's contextvars, which its environment does not carry. Under the claude-code runtime a hook
+    asks over the tool bridge (``__turn_presence__``), but on Hermes's own loop there is no bridge, so
+    a scheduled job's send used to wait out the hook ceiling on a confirm card nobody saw. Inside the
+    hermes-tools MCP server the contextvars are the server's, not the turn's: None, and the hook asks
+    the bridge as before. Never raises; None is "unknown", which a hook must treat as attended."""
+    if os.environ.get("HERMES_MCP_TOOL_PROFILE"):
+        return None
+    try:
+        from tools.browser_chrome_extension import local_turn_presence
+        verdict = local_turn_presence()
+    except Exception:
+        return None
+    if not isinstance(verdict, dict) or not isinstance(verdict.get("live"), bool):
+        return None
+    return {"live": verdict["live"], "why": str(verdict.get("why") or "")}
+
+
 def _payload_fields(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Common stdin/POST payload fields (shared with outbound webhooks); key order is wire order."""
     try:
@@ -96,6 +117,8 @@ def _payload_fields(kwargs: dict[str, Any]) -> dict[str, Any]:
     # Resolve in the firing execution before the descendant environment is scrubbed.
     # This is payload metadata, never permission for the hook to act as the worker.
     extra["kanban_task_id"] = owned_kanban_task()
+    if kwargs.get("tool_name"):
+        extra["turn_presence"] = _turn_presence_for_hook()
     return {
         "tool_name": kwargs.get("tool_name"),
         "tool_input": kwargs.get("args") if isinstance(kwargs.get("args"), dict) else None,
